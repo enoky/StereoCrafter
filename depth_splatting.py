@@ -2,6 +2,7 @@ import gc
 import os
 import cv2
 import glob
+import shutil  # Added for moving files
 import numpy as np
 import torch
 import torch.nn as nn
@@ -133,7 +134,7 @@ class DepthCrafterDemo:
         guidance_scale: float = 1.2,
         window_size: int = 70,
         overlap: int = 25,
-        max_res: int = 1024,
+        max_res: int = 960,
         dataset: str = "open",
         target_fps: int = -1,
         seed: int = 42,
@@ -406,7 +407,7 @@ def load_pre_rendered_depth(depth_video_path, process_length=-1, max_res=1024):
     for idx, frame in enumerate(video_depth):
         # Ensure the frame is 2D
         if frame.ndim == 2:
-            colored_frame = cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            colored_frame = cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
             colored_frame = colored_frame.astype("float32") / 255.0
             depth_vis.append(colored_frame)
         else:
@@ -451,6 +452,14 @@ def main(
     # Ensure output directory exists
     os.makedirs(output_splatted, exist_ok=True)
 
+    # Define finished folders
+    finished_source_folder = os.path.join(input_source_clips, "finished")
+    finished_depth_folder = os.path.join(input_depth_maps, "finished")
+
+    # Create finished directories if they don't exist
+    os.makedirs(finished_source_folder, exist_ok=True)
+    os.makedirs(finished_depth_folder, exist_ok=True)
+
     # Gather all video files in the input_source_clips folder
     video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
     input_videos = []
@@ -484,6 +493,7 @@ def main(
                 depth_map_path,
                 process_length=process_length
             )
+            used_pre_rendered_depth = True
         elif depthcrafter_demo:
             print(f"==> Pre-rendered depth map not found. Performing depth inference.")
             # Output path for depth visualization (can be ignored if not saving depth)
@@ -493,6 +503,7 @@ def main(
                 output_video_path=temp_depth_vis_path,  # Temporary path for visualization
                 process_length=process_length
             )
+            used_pre_rendered_depth = False
         else:
             print(f"==> No pre-rendered depth map found for {video_name} and DepthCrafterDemo is not initialized. Skipping.")
             continue
@@ -511,6 +522,21 @@ def main(
             batch_size=batch_size
         )
         print(f"==> Splatted video saved to: {output_video_path}")
+
+        # Move the processed input video to the 'finished' folder
+        try:
+            shutil.move(video_path, finished_source_folder)
+            print(f"==> Moved processed video to: {finished_source_folder}")
+        except Exception as e:
+            print(f"==> Failed to move video {video_path} to {finished_source_folder}: {e}")
+
+        # If a pre-rendered depth map was used, move it to the 'finished' folder
+        if used_pre_rendered_depth and os.path.exists(depth_map_path):
+            try:
+                shutil.move(depth_map_path, finished_depth_folder)
+                print(f"==> Moved depth map to: {finished_depth_folder}")
+            except Exception as e:
+                print(f"==> Failed to move depth map {depth_map_path} to {finished_depth_folder}: {e}")
 
     print("\n==> Batch Depth Splatting Process Completed Successfully")
 
