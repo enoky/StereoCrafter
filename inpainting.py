@@ -1,6 +1,7 @@
 import os
 import glob
 import logging
+import shutil  # Step 1: Import shutil for moving files
 from typing import Optional, Tuple
 
 import numpy as np
@@ -29,7 +30,7 @@ def load_inpainting_pipeline(
 ) -> StableVideoDiffusionInpaintingPipeline:
     """
     Loads the stable video diffusion inpainting pipeline components (image encoder, VAE, UNet)
-    and returns the pipeline object moved to the specified device.
+    and returns the pipeline object with CPU offloading enabled.
     """
     logger.info("Loading pipeline components...")
 
@@ -66,8 +67,10 @@ def load_inpainting_pipeline(
         torch_dtype=dtype,
     ).to(device)
 
-    return pipeline
+    # Enable CPU offloading to reduce GPU memory usage
+    pipeline.enable_model_cpu_offload()
 
+    return pipeline
 
 def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor, float]:
     """
@@ -84,7 +87,6 @@ def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor,
     frames = torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()  # [T, C, H, W]
 
     return frames, fps
-
 
 def write_video_ffmpeg(
     frames: np.ndarray,
@@ -123,7 +125,6 @@ def write_video_ffmpeg(
         writer.send(frame)
     writer.close()
 
-
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     """
     Blend two tensors horizontally along the right edge of `a` and left edge of `b`.
@@ -134,7 +135,6 @@ def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
     )
     return b
 
-
 def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     """
     Blend two tensors vertically along the bottom edge of `a` and top edge of `b`.
@@ -144,7 +144,6 @@ def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
         (1 - weight_b) * a[:, :, -overlap_size:, :] + weight_b * b[:, :, :overlap_size, :]
     )
     return b
-
 
 def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128)) -> torch.Tensor:
     """
@@ -179,7 +178,6 @@ def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128))
         # (pad_left, pad_right, pad_top, pad_bottom)
         frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
     return frames
-
 
 def spatial_tiled_process(
     cond_frames: torch.Tensor,
@@ -273,15 +271,14 @@ def spatial_tiled_process(
 
     return x
 
-
 def process_single_video(
     pipeline: StableVideoDiffusionInpaintingPipeline,
     input_video_path: str,
     save_dir: str,
-    frames_chunk: int = 30,
-    overlap: int = 5,
+    frames_chunk: int = 63,
+    overlap: int = 3,
     tile_num: int = 2,
-    vf: Optional[str] = None,
+    vf: Optional[str] = "scale=1920:800:sws_flags=lanczos",
 ) -> None:
     """
     Processes a single input video, writes the right side view output to `save_dir`.
@@ -371,8 +368,8 @@ def process_single_video(
                 spatial_n_compress=8,
                 min_guidance_scale=1.01,
                 max_guidance_scale=1.01,
-                decode_chunk_size=30,
-                fps=5,
+                decode_chunk_size=8,
+                fps=7,
                 motion_bucket_id=127,
                 noise_aug_strength=0.0,
                 num_inference_steps=8,
@@ -422,16 +419,15 @@ def process_single_video(
 
     logger.info(f"Done processing {input_video_path} -> {frames_output_path}")
 
-
 def batch_process(
     pre_trained_path: str = "./weights/stable-video-diffusion-img2vid-xt-1-1",
     unet_path: str = "./weights/StereoCrafter",
     input_folder: str = "./output_splatted",
     output_folder: str = "./completed_output",
-    frames_chunk: int = 30,
-    overlap: int = 5,
+    frames_chunk: int = 63,
+    overlap: int = 3,
     tile_num: int = 2,
-    vf: Optional[str] = None,
+    vf: Optional[str] = "scale=1920:800:sws_flags=lanczos",
 ) -> None:
     """
     Batch-process all .mp4 files in `input_folder` using the inpainting pipeline
@@ -453,6 +449,10 @@ def batch_process(
 
     os.makedirs(output_folder, exist_ok=True)
 
+    # Step 2: Create 'finished' directory inside input_folder
+    finished_folder = os.path.join(input_folder, "finished")
+    os.makedirs(finished_folder, exist_ok=True)
+
     # Process each video
     for video_path in input_videos:
         logger.info(f"Processing {video_path}")
@@ -467,6 +467,12 @@ def batch_process(
         )
         torch.cuda.empty_cache()
 
+        # Step 3: Move the processed video to 'finished' folder
+        try:
+            shutil.move(video_path, finished_folder)
+            logger.info(f"Moved {video_path} to {finished_folder}")
+        except Exception as e:
+            logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
 
 if __name__ == "__main__":
     Fire(batch_process)
