@@ -278,7 +278,7 @@ def process_single_video(
     frames_chunk: int = 63,
     overlap: int = 3,
     tile_num: int = 2,
-    vf: Optional[str] = "scale=1920:800:sws_flags=lanczos",
+    vf: Optional[str] = None,
 ) -> None:
     """
     Processes a single input video, writes the right side view output to `save_dir`.
@@ -427,7 +427,7 @@ def batch_process(
     frames_chunk: int = 63,
     overlap: int = 3,
     tile_num: int = 2,
-    vf: Optional[str] = "scale=1920:800:sws_flags=lanczos",
+    vf: Optional[str] = None,
 ) -> None:
     """
     Batch-process all .mp4 files in `input_folder` using the inpainting pipeline
