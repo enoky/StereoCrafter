@@ -2,9 +2,9 @@ import os
 import cv2
 import numpy as np
 from fire import Fire
-from decord import VideoReader, cpu
 
 import torch
+from decord import VideoReader, cpu
 
 from transformers import CLIPVisionModelWithProjection
 from diffusers import (
