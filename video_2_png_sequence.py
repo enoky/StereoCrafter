@@ -2,28 +2,36 @@ import os
 import cv2
 import glob
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import threading
 import queue
 
 # Global variable for PNG compression quality (0-9, where 0 is no compression and 9 is maximum compression)
 PNG_COMPRESSION_QUALITY = 3  # Default value
 
-def convert_videos_to_png_sequence(input_folder, output_folder, log_queue=None):
+def convert_videos_to_png_sequence(input_folder, output_folder, log_queue=None, output_width=None, output_height=None):
     """
     Converts all common video formats in the input folder into a PNG sequence in the output folder.
     Frames are saved as 8-digit zero-padded filenames starting with 00000000.png.
+    If output_width and output_height are specified, frames are resized to those dimensions.
+    Sends progress updates via log_queue as tuples ('progress', processed_frames, total_frames).
     """
     def log(msg):
         if log_queue is not None:
-            log_queue.put(msg)
+            log_queue.put(('log', msg))
 
     os.makedirs(output_folder, exist_ok=True)
+
+    # Log resizing information
+    if output_width is not None and output_height is not None:
+        log(f"Resizing frames to {output_width}x{output_height}")
+    else:
+        log("Using original frame dimensions")
 
     # List of common video file extensions
     video_extensions = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.flv", "*.wmv", "*.mpeg", "*.mpg"]
 
-    # Collect all video paths in one go
+    # Collect all video paths
     video_paths = [f for ext in video_extensions for f in glob.glob(os.path.join(input_folder, ext))]
 
     if not video_paths:
@@ -31,7 +39,17 @@ def convert_videos_to_png_sequence(input_folder, output_folder, log_queue=None):
         return
 
     video_paths.sort()
+
+    # Calculate total number of frames for progress
+    total_frames = 0
+    for video_path in video_paths:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            total_frames += int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
     frame_counter = 0
+    processed_frames = 0
 
     for video_path in video_paths:
         log(f"Processing video: {video_path}")
@@ -45,17 +63,26 @@ def convert_videos_to_png_sequence(input_folder, output_folder, log_queue=None):
             ret, frame = cap.read()
             if not ret:
                 break
+            # Resize frame if dimensions are specified
+            if output_width is not None and output_height is not None:
+                frame = cv2.resize(frame, (output_width, output_height))
             png_name = f"{frame_counter:08d}.png"
             # Save the frame with the specified compression quality
             cv2.imwrite(os.path.join(output_folder, png_name), frame, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION_QUALITY])
             frame_counter += 1
             frame_count += 1
+            processed_frames += 1
+            # Send progress update
+            if total_frames > 0:
+                log_queue.put(('progress', processed_frames, total_frames))
 
         cap.release()
         log(f"Processed {frame_count} frames from {video_path}.")
 
     log("Conversion complete.")
-
+    # Ensure progress bar reaches 100%
+    if total_frames > 0:
+        log_queue.put(('progress', processed_frames, total_frames))
 
 class Application(tk.Frame):
     def __init__(self, master=None):
@@ -70,6 +97,7 @@ class Application(tk.Frame):
 
         self.log_queue = queue.Queue()
         self.processing_thread = None
+        self.progress = tk.DoubleVar(value=0.0)
 
         self.create_widgets()
         self.check_log_queue()
@@ -94,6 +122,23 @@ class Application(tk.Frame):
         compression_frame.pack(fill="x", padx=10, pady=5)
         tk.Label(compression_frame, text="PNG Compression Quality (0-9):").pack(side="left")
         tk.Scale(compression_frame, from_=0, to=9, orient="horizontal", variable=self.compression_quality).pack(side="left", padx=5)
+
+        # Output dimensions
+        dimensions_frame = tk.Frame(self)
+        dimensions_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(dimensions_frame, text="Output Dimensions (width x height):").pack(side="left")
+        self.output_width_entry = tk.Entry(dimensions_frame, width=5)
+        self.output_width_entry.pack(side="left", padx=5)
+        tk.Label(dimensions_frame, text="x").pack(side="left")
+        self.output_height_entry = tk.Entry(dimensions_frame, width=5)
+        self.output_height_entry.pack(side="left", padx=5)
+
+        # Progress bar
+        progress_frame = tk.Frame(self)
+        progress_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(progress_frame, text="Progress:").pack(side="left")
+        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", length=300, mode="determinate", variable=self.progress, maximum=100)
+        self.progress_bar.pack(side="left", padx=5)
 
         # Convert button
         button_frame = tk.Frame(self)
@@ -126,7 +171,7 @@ class Application(tk.Frame):
         global PNG_COMPRESSION_QUALITY
         input_dir = self.input_folder.get()
         output_dir = self.output_folder.get()
-        PNG_COMPRESSION_QUALITY = self.compression_quality.get()  # Update the global compression quality
+        PNG_COMPRESSION_QUALITY = self.compression_quality.get()
 
         if not os.path.isdir(input_dir):
             messagebox.showerror("Error", "Invalid input folder.")
@@ -139,25 +184,54 @@ class Application(tk.Frame):
                 messagebox.showerror("Error", f"Could not create output folder:\n{e}")
                 return
 
-        self.log("Starting conversion...")
+        # Validate output dimensions
+        width_str = self.output_width_entry.get().strip()
+        height_str = self.output_height_entry.get().strip()
 
-        # Start the worker thread for processing
+        if bool(width_str) != bool(height_str):
+            messagebox.showerror("Error", "Both width and height must be specified or both left empty.")
+            return
+
+        if width_str and height_str:
+            try:
+                output_width = int(width_str)
+                output_height = int(height_str)
+                if output_width <= 0 or output_height <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Error", "Width and height must be positive integers.")
+                return
+        else:
+            output_width = None
+            output_height = None
+
+        self.log("Starting conversion...")
+        self.progress.set(0.0)  # Reset progress bar
+        self.progress_bar.update_idletasks()
+
+        # Start the worker thread with dimensions
         self.processing_thread = threading.Thread(
             target=convert_videos_to_png_sequence,
-            args=(input_dir, output_dir, self.log_queue),
+            args=(input_dir, output_dir, self.log_queue, output_width, output_height),
             daemon=True
         )
         self.processing_thread.start()
 
     def check_log_queue(self):
-        """Check the log queue and update the log text widget periodically."""
+        """Check the log queue for log messages and progress updates."""
         while True:
             try:
-                msg = self.log_queue.get_nowait()
-                self.log(msg)
+                item = self.log_queue.get_nowait()
+                if item[0] == 'log':
+                    self.log(item[1])
+                elif item[0] == 'progress':
+                    processed, total = item[1], item[2]
+                    progress_percent = (processed / total) * 100 if total > 0 else 0
+                    self.progress.set(progress_percent)
+                    self.progress_bar.update_idletasks()
             except queue.Empty:
                 break
-        self.after(500, self.check_log_queue)  # check again after 500 ms
+        self.after(500, self.check_log_queue)
 
 if __name__ == "__main__":
     root = tk.Tk()
