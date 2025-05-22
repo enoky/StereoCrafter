@@ -1,0 +1,5 @@
+Metadata-Version: 2.2
+Name: forward_warp_cuda
+Version: 0.1.0
+Summary: Forward warp extension for PyTorch using CUDA.
+Dynamic: summary
