@@ -21,6 +21,8 @@ from pipelines.stereo_video_inpainting import (
     tensor2vid
 )
 
+# torch.backends.cudnn.benchmark = True
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,6 +126,7 @@ def write_video_ffmpeg(
         codec=codec,
         quality=None,
         bitrate=None,
+        macro_block_size=1,  # Set to 1 to avoid resizing
         output_params=output_params
     )
     writer.send(None)
