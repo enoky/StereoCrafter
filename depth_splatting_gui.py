@@ -161,7 +161,13 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
     num_frames = len(input_frames)
     height, width, _ = input_frames[0].shape
     os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
-    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), original_fps, (width * 2, height * 2))
+    out = cv2.VideoWriter(
+        output_video_path, 
+        cv2.VideoWriter_fourcc(*"mp4v"), 
+        original_fps, 
+        (width * 2, height * 2),
+        True
+    )
     print(f"==> Writing output video to: {output_video_path}")
     for i in range(0, num_frames, batch_size):
         if stop_event.is_set():
@@ -194,7 +200,14 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
         gc.collect()
         print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)}")
     out.release()
-    print("==> Output video writing completed")
+    print("==> Optimizing output video for file size")
+    temp_output = output_video_path + ".temp.mp4"
+    os.system(
+        f"ffmpeg -y -i {output_video_path} -c:v libx264 -preset medium -crf 23 {temp_output}"
+    )
+    os.remove(output_video_path)
+    os.rename(temp_output, output_video_path)
+    print("==> Output video writing and optimization completed")
 
 def load_pre_rendered_depth(depth_video_path, process_length=-1, max_res=1024):
     print(f"==> Loading pre-rendered depth maps from: {depth_video_path}")
