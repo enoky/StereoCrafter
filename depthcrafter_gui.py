@@ -338,7 +338,7 @@ class DepthCrafterGUI:
                 self.overlap.set(config.get("overlap", 25))
                 self.seed.set(config.get("seed", 42))
                 self.cpu_offload.set(config.get("cpu_offload", "model"))
-                self.use_cudnn_benchmark.set(config.get("use_cudnn_benchmark", True))
+                self.use_cudnn_benchmark.set(config.get("use_cudnn_benchmark", False))
             except Exception as e:
                 print(f"Warning: Could not load config: {e}")
 
