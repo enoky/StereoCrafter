@@ -117,7 +117,7 @@ class DepthCrafterGUI:
     """
     GUI class for the DepthCrafter application.
     """
-    CONFIG_FILENAME = "config.json"
+    CONFIG_FILENAME = "config_dc.json"
 
     def __init__(self, root):
         """
