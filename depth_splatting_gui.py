@@ -22,6 +22,8 @@ from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTempora
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 from Forward_Warp import forward_warp
 
+# torch.backends.cudnn.benchmark = True
+
 # Global variables for GUI control
 stop_event = threading.Event()
 progress_queue = queue.Queue()
