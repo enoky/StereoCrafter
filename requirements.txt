@@ -13,6 +13,7 @@ mediapy
 fire
 decord
 OpenEXR
+opencv-python
 imageio_ffmpeg
 imageio
 Imath
