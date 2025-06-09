@@ -205,7 +205,7 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
     print("==> Optimizing output video for file size")
     temp_output = output_video_path + ".temp.mp4"
     os.system(
-        f"ffmpeg -y -i {output_video_path} -c:v libx264 -preset medium -crf 23 {temp_output}"
+        f"ffmpeg -y -i {output_video_path} -c:v libx264 -preset medium -crf 16 {temp_output}"
     )
     os.remove(output_video_path)
     os.rename(temp_output, output_video_path)
