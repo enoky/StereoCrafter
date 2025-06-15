@@ -202,14 +202,7 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
         gc.collect()
         print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)}")
     out.release()
-    print("==> Optimizing output video for file size")
-    temp_output = output_video_path + ".temp.mp4"
-    os.system(
-        f"ffmpeg -y -i {output_video_path} -c:v libx264 -preset medium -crf 16 {temp_output}"
-    )
-    os.remove(output_video_path)
-    os.rename(temp_output, output_video_path)
-    print("==> Output video writing and optimization completed")
+    print("==> Output video writing completed.")
 
 def load_pre_rendered_depth(depth_video_path, process_length=-1, max_res=1024):
     print(f"==> Loading pre-rendered depth maps from: {depth_video_path}")
