@@ -591,7 +591,7 @@ class InpaintingGUI(tk.Tk):
 
     def load_config(self):
         try:
-            with open("config.json", "r") as f:
+            with open("config_inpaint.json", "r") as f:
                 return json.load(f)
         except FileNotFoundError:
             return {}
@@ -599,3 +599,4 @@ class InpaintingGUI(tk.Tk):
 if __name__ == "__main__":
     app = InpaintingGUI()
     app.mainloop()
+
