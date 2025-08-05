@@ -16,7 +16,7 @@
 
 #### 2. INSTALL:
    - Run script from folder where you want StereoCrafter installed
-   - Download and extract <a href="https://github.com/enoky/StereoCrafter/edit/main/README.md#-model-weights">model</a> "weights" to StereoCrafter folder
+   - Download and extract <a href="https://github.com/enoky/StereoCrafter/tree/main?tab=readme-ov-file#-model-weights">model</a> "weights" to StereoCrafter folder
 
 #### 3. LAUNCH GUI SCRIPTS:
    - First activate virtual environment:
