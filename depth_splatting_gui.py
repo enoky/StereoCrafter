@@ -20,7 +20,8 @@ import queue
 from dependency.DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
 from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
-from Forward_Warp import forward_warp
+# from Forward_Warp import forward_warp
+from dependency.forward_warp_pytorch import forward_warp
 
 # torch.backends.cudnn.benchmark = True
 
