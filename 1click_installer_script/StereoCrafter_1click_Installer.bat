@@ -1,6 +1,6 @@
 @echo off
 REM StereoCrafter Installer Script
-REM Version: 1.2
+REM Version: 1.3
 REM Logs output to install_log.txt for debugging
 
 REM Initialize log file
@@ -46,15 +46,47 @@ if %minor% neq 12 (
     exit /b 1
 )
 
-REM Check for CUDA 12.8 support
-echo Checking for CUDA 12.8 support... >> install_log.txt
-python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" >nul 2>&1
+REM Check for CUDA Toolkit and version 12.8 or 12.9
+echo Checking for CUDA 12.8 or 12.9 Toolkit... >> install_log.txt
+where nvcc >nul 2>&1
 if %errorlevel% neq 0 (
-    echo CUDA 12.8 support is not available. Installation requires CUDA 12.8. >> install_log.txt
-    echo CUDA 12.8 support is not available. Installation requires CUDA 12.8.
+    echo NVIDIA CUDA Toolkit [nvcc] not found in PATH. >> install_log.txt
+    echo NVIDIA CUDA Toolkit [nvcc] not found in PATH.
+    echo Please install CUDA Toolkit 12.8 or 12.9 from https://developer.nvidia.com/cuda-toolkit and ensure it is in your PATH.
     pause
     exit /b 1
 )
+
+REM Log raw nvcc --version output for debugging
+echo Raw nvcc --version output: >> install_log.txt
+nvcc --version >> install_log.txt
+
+REM Parse the output of nvcc --version to get the version number
+set "CUDA_VERSION="
+for /f "tokens=5 delims= " %%v in ('nvcc --version ^| findstr "release"') do (
+    for /f "tokens=1 delims=," %%c in ("%%v") do set CUDA_VERSION=%%c
+)
+
+REM Check if CUDA_VERSION was successfully set
+if not defined CUDA_VERSION (
+    echo Failed to determine CUDA version. Check install_log.txt for nvcc output. >> install_log.txt
+    echo Failed to determine CUDA version.
+    echo Please ensure CUDA Toolkit 12.8 or 12.9 is correctly installed and nvcc is functioning.
+    pause
+    exit /b 1
+)
+
+echo Found CUDA version: %CUDA_VERSION% >> install_log.txt
+echo Found CUDA version: %CUDA_VERSION%
+
+if not "%CUDA_VERSION%"=="12.8" if not "%CUDA_VERSION%"=="12.9" (
+    echo Incorrect CUDA version detected. This script requires version 12.8 or 12.9, but found %CUDA_VERSION%. >> install_log.txt
+    echo Incorrect CUDA version detected. This script requires version 12.8 or 12.9, but found %CUDA_VERSION%.
+    pause
+    exit /b 1
+)
+
+echo CUDA %CUDA_VERSION% Toolkit found. >> install_log.txt
 
 REM If the StereoCrafter directory exists, prompt user
 if exist "StereoCrafter" (
@@ -159,6 +191,18 @@ if %errorlevel% neq 0 (
     exit /b %errorlevel%
 )
 
+REM Final verification that PyTorch can see the GPU
+echo Verifying PyTorch can access CUDA... >> install_log.txt
+python -c "import torch; exit(0 if torch.cuda.is_available() and torch.version.cuda in ['12.8', '12.9'] else 1)"
+if %errorlevel% neq 0 (
+    echo Verification failed: PyTorch cannot access CUDA 12.8 or 12.9. >> install_log.txt
+    echo Verification failed: PyTorch cannot access CUDA 12.8 or 12.9.
+    echo Please check your NVIDIA driver, PyTorch, and CUDA Toolkit installation compatibility.
+    pause
+    exit /b 1
+)
+
+echo PyTorch CUDA verification successful. >> install_log.txt
 echo All dependencies installed successfully. >> install_log.txt
 echo All dependencies installed successfully.
 echo Installation log saved to install_log.txt
