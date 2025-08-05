@@ -20,7 +20,7 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
 
 #### 2. INSTALL:
    - Run <a href="https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
-   - Download and extract <a href="https://github.com/enoky/StereoCrafter/tree/main?tab=readme-ov-file#-model-weights">model</a> "weights" to StereoCrafter folder
+   - Download and extract <a href="https://drive.google.com/file/d/1bKL7Hag8AG4WTEX3jFGJA69nO8_kZQLP/view?usp=drive_link">model</a> "weights" to StereoCrafter folder
 
 #### 3. LAUNCH GUI SCRIPTS:
    - First activate virtual environment:
