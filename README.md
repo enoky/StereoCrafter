@@ -1,4 +1,6 @@
-# StereoCrafter GUI 
+# StereoCrafter GUI + DepthCrafter GUI Seg
+
+You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billynom8/DepthCrafter_GUI_Seg">here</a>.
 
 ## Installation (1-click installer script)
 
@@ -23,12 +25,12 @@
 #### 3. LAUNCH GUI SCRIPTS:
    - First activate virtual environment:
        `venv\scripts\activate.bat`
+   - Run DepthCrafter GUI Seg:
+       `python dc_gui_seg.py`
    - Run DepthSplat GUI:
        `python depth_splatting_gui.py`
    - Run Inpaint GUI:
        `python inpainting_gui.py`
-   - Run DepthCrafter GUI:
-       `python depthcrafter_gui.py`
 
 <hr>
 <div align="center">
