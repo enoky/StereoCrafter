@@ -1,4 +1,34 @@
+# StereoCrafter GUI 
 
+## Installation (1-click installer script)
+
+#### 1. PREREQUISITES:
+   - GIT: Ensure Git is installed and added to your system’s PATH.<br>
+     Download here: https://git-scm.com/downloads/win<br>
+     You can check the installation by running the command:<br>
+       `git --version`<br>
+     If it shows a version, Git is installed and on PATH.
+   
+   - PYTHON: Ensure Python 3.12 is installed and added to your PATH.<br>
+     Download here: https://www.python.org/downloads<br>
+     You can check by running the command:<br>
+       `python --version`
+
+#### 2. INSTALL:
+   - Run script from folder where you want StereoCrafter installed
+   - Download and extract <a href="https://github.com/enoky/StereoCrafter/edit/main/README.md#-model-weights">model</a> "weights" to StereoCrafter folder
+
+#### 3. LAUNCH GUI SCRIPTS:
+   - First activate virtual environment:
+       `venv\scripts\activate.bat`
+   - Run DepthSplat GUI:
+       `python depth_splatting_gui.py`
+   - Run Inpaint GUI:
+       `python inpainting_gui.py`
+   - Run DepthCrafter GUI:
+       `python depthcrafter_gui.py`
+
+<hr>
 <div align="center">
 <h2>StereoCrafter: Diffusion-based Generation of Long and High-fidelity Stereoscopic 3D from Monocular Videos</h2>
 
