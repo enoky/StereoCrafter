@@ -15,7 +15,7 @@
        `python --version`
 
 #### 2. INSTALL:
-   - Run <a href="https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
+   - Run <a href="[https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat](https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat)">script</a> from folder where you want StereoCrafter installed
    - Download and extract <a href="https://github.com/enoky/StereoCrafter/tree/main?tab=readme-ov-file#-model-weights">model</a> "weights" to StereoCrafter folder
 
 #### 3. LAUNCH GUI SCRIPTS:
