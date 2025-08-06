@@ -1080,6 +1080,7 @@ MESSAGES = {
     "PROCESSING_ERROR": {"template": "Error processing {item_name}: {error_message}", "level": ERROR},
     "PROCESSING_NO_FRAMES": {"template": "No frames to process for {item_name}. Skipping.", "level": WARNING},
     "PROCESSING_FINALIZE_ERROR": {"template": "Error during finalization for {item_name}: {error_message}", "level": ERROR},
+    "GUI_SCAN_FOLDER_START": {"template": "Scanning input folder: Please wait...", "level": INFO},
 
 
     # Model / System
