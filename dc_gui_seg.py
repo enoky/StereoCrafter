@@ -475,6 +475,8 @@ class DepthCrafterGUI:
             return
 
         all_videos_master_metadata = {} 
+
+        global_log_message("GUI_SCAN_FOLDER_START") # New ID
         
         for i, job_info_to_run in enumerate(video_processing_jobs):
             if self.stop_event.is_set():
