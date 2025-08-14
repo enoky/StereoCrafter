@@ -15,6 +15,7 @@ from tkinter import filedialog, ttk
 import json
 import threading
 import queue
+import subprocess
 
 # Import custom modules
 from dependency.DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
@@ -150,7 +151,8 @@ class ForwardWarpStereo(nn.Module):
             occlu_map = 1.0 - occlu_map
             return res, occlu_map
 
-def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size):
+def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
+                   dual_output: bool, enable_low_res_output: bool, low_res_width: int, low_res_height: int):
     print(f"==> Reading input video for splatting: {input_video_path}")
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     original_fps = vid_reader.get_avg_fps()
@@ -164,14 +166,60 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
     num_frames = len(input_frames)
     height, width, _ = input_frames[0].shape
     os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
-    out = cv2.VideoWriter(
-        output_video_path, 
-        cv2.VideoWriter_fourcc(*"mp4v"), 
-        original_fps, 
-        (width * 2, height * 2),
+
+    # Determine output video suffix and dimensions
+    if dual_output:
+        suffix = "_splatted2"
+        output_video_width = width * 2 # Mask + Warped
+        output_video_height = height
+    else: # Quad output
+        suffix = "_splatted4"
+        output_video_width = width * 2
+        output_video_height = height * 2
+
+    # Update the main output path
+    base_output_name = os.path.splitext(output_video_path)[0]
+    main_output_video_path = f"{base_output_name}{suffix}.mp4"
+
+    # Initialize the main video writer
+    main_out = cv2.VideoWriter(
+        main_output_video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        original_fps,
+        (output_video_width, output_video_height),
         True
     )
-    print(f"==> Writing output video to: {output_video_path}")
+    print(f"==> Writing main output video to: {main_output_video_path}")
+
+    low_res_out = None
+    low_res_output_video_path = None
+    if enable_low_res_output:
+        # Determine low-res output path
+        low_res_output_video_path = f"{base_output_name}_low{suffix}.mp4"
+
+        # Validate low_res_width/height (ensure they are positive)
+        if low_res_width <= 0 or low_res_height <= 0:
+            print("==> Warning: Low resolution dimensions must be positive. Disabling low-res output.")
+            enable_low_res_output = False # Disable it if dimensions are invalid
+        else:
+            # Calculate the overall grid dimensions for the low-resolution output
+            if dual_output:
+                # Dual output: Mask | Warped (width*2, height)
+                low_res_output_grid_width = low_res_width * 2
+                low_res_output_grid_height = low_res_height
+            else: # Quad output
+                # Quad output: Original | DepthVis (Top), Mask | Warped (Bottom) (width*2, height*2)
+                low_res_output_grid_width = low_res_width * 2
+                low_res_output_grid_height = low_res_height * 2
+
+            low_res_out = cv2.VideoWriter(
+                low_res_output_video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                original_fps,
+                (low_res_output_grid_width, low_res_output_grid_height), # <-- CORRECTED DIMENSIONS HERE
+                True
+            )
+            print(f"==> Writing low-resolution output video to: {low_res_output_video_path}")
     for i in range(0, num_frames, batch_size):
         if stop_event.is_set():
             print("==> Stopping DepthSplatting due to user request")
@@ -192,17 +240,33 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
         right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
         occlusion_mask = occlusion_mask.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
         for j in range(len(batch_frames)):
-            video_grid_top = np.concatenate([batch_frames[j], batch_depth_vis[j]], axis=1)
-            video_grid_bottom = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
-            video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
+            # Determine the video grid based on dual_output setting
+            if dual_output:
+                # Dual output: Mask | Warped
+                video_grid = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
+            else:
+                # Quad output: Original | DepthVis (Top), Mask | Warped (Bottom)
+                video_grid_top = np.concatenate([batch_frames[j], batch_depth_vis[j]], axis=1)
+                video_grid_bottom = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
+                video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
+
             video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(np.uint8)
             video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
-            out.write(video_grid_bgr)
+
+            # Write to main output video
+            main_out.write(video_grid_bgr)
+
+            # Write to low-resolution output video if enabled
+            if enable_low_res_output and low_res_out is not None:
+                resized_frame = cv2.resize(video_grid_bgr, (low_res_output_grid_width, low_res_output_grid_height), interpolation=cv2.INTER_AREA)
+                low_res_out.write(resized_frame)
         del left_video, disp_map, right_video, occlusion_mask
         torch.cuda.empty_cache()
         gc.collect()
         print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)}")
-    out.release()
+    main_out.release()
+    if low_res_out is not None:
+        low_res_out.release()
     print("==> Output video writing completed.")
 
 def load_pre_rendered_depth(depth_video_path, process_length=-1, max_res=1024):
@@ -262,6 +326,10 @@ def main(settings):
     max_res = settings["max_res"]
     seed = settings["seed"]
     save_depth = settings["save_depth"]
+    dual_output = settings["dual_output"]
+    enable_low_res_output = settings["enable_low_res_output"]
+    low_res_width = settings["low_res_width"]
+    low_res_height = settings["low_res_height"]
 
     os.makedirs(output_splatted, exist_ok=True)
     finished_source_folder = os.path.join(input_source_clips, "finished")
@@ -319,11 +387,13 @@ def main(settings):
             release_resources()
             progress_queue.put("finished")
             return
-        output_video_path = os.path.join(output_splatted, f"{video_name}_splatted.mp4")
+        output_video_path = os.path.join(output_splatted, f"{video_name}.mp4")
         DepthSplatting(
             input_video_path=video_path, output_video_path=output_video_path,
             video_depth=video_depth, depth_vis=depth_vis, max_disp=max_disp,
-            process_length=process_length, batch_size=batch_size
+            process_length=process_length, batch_size=batch_size,
+            dual_output=dual_output, enable_low_res_output=enable_low_res_output,
+            low_res_width=low_res_width, low_res_height=low_res_height
         )
         if stop_event.is_set():
             print("==> Stopping after DepthSplatting due to user request")
@@ -374,7 +444,11 @@ def start_processing():
         "overlap": int(overlap_var.get()),
         "max_res": int(max_res_var.get()),
         "seed": int(seed_var.get()),
-        "save_depth": save_depth_var.get()
+        "save_depth": save_depth_var.get(),
+        "dual_output": dual_output_var.get(),
+        "enable_low_res_output": enable_low_res_output_var.get(),
+        "low_res_width": int(low_res_width_var.get()),
+        "low_res_height": int(low_res_height_var.get())
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -434,7 +508,11 @@ def save_config():
         "overlap": overlap_var.get(),
         "max_res": max_res_var.get(),
         "seed": seed_var.get(),
-        "save_depth": save_depth_var.get()
+        "save_depth": save_depth_var.get(),
+        "dual_output": dual_output_var.get(),
+        "enable_low_res_output": enable_low_res_output_var.get(),
+        "low_res_width": low_res_width_var.get(),
+        "low_res_height": low_res_height_var.get()
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -459,6 +537,10 @@ def load_config():
             max_res_var.set(config.get("max_res", "1024"))
             seed_var.set(config.get("seed", "42"))
             save_depth_var.set(config.get("save_depth", False))
+            dual_output_var.set(config.get("dual_output", False))
+            enable_low_res_output_var.set(config.get("enable_low_res_output", False))
+            low_res_width_var.set(config.get("low_res_width", "1024"))
+            low_res_height_var.set(config.get("low_res_height", "576"))
 
 # GUI Setup
 root = tk.Tk()
@@ -481,6 +563,10 @@ overlap_var = tk.StringVar(value="25")
 max_res_var = tk.StringVar(value="960")
 seed_var = tk.StringVar(value="42")
 save_depth_var = tk.BooleanVar(value=False)
+dual_output_var = tk.BooleanVar(value=False) # Default to Quad
+enable_low_res_output_var = tk.BooleanVar(value=False)
+low_res_width_var = tk.StringVar(value="1024")
+low_res_height_var = tk.StringVar(value="576")
 
 # Load configuration
 load_config()
@@ -519,14 +605,49 @@ tk.Label(depthcrafter_frame, text="Seed:").grid(row=9, column=0, sticky="e")
 tk.Entry(depthcrafter_frame, textvariable=seed_var).grid(row=9, column=1)
 tk.Checkbutton(depthcrafter_frame, text="Save Depth Maps", variable=save_depth_var).grid(row=10, column=0, columnspan=2)
 
-# DepthSplatting settings frame
-splatting_frame = tk.Frame(root)
-splatting_frame.pack(pady=10)
-tk.Label(splatting_frame, text="DepthSplatting Settings:").grid(row=0, column=0, columnspan=2)
-tk.Label(splatting_frame, text="Max Disparity:").grid(row=1, column=0, sticky="e")
-tk.Entry(splatting_frame, textvariable=max_disp_var).grid(row=1, column=1)
-tk.Label(splatting_frame, text="Batch Size:").grid(row=2, column=0, sticky="e")
-tk.Entry(splatting_frame, textvariable=batch_size_var).grid(row=2, column=1)
+# Output Settings Frame
+output_settings_frame = tk.LabelFrame(root, text="Output Settings")
+output_settings_frame.pack(pady=10, padx=10, fill="x")
+
+# Max Disparity and Batch Size within Output Settings (or keep them where they are if preferred, but for this instruction, they are here)
+tk.Label(output_settings_frame, text="Max Disparity:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+tk.Entry(output_settings_frame, textvariable=max_disp_var, width=15).grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+tk.Label(output_settings_frame, text="Batch Size:").grid(row=0, column=2, sticky="e", padx=5, pady=2)
+tk.Entry(output_settings_frame, textvariable=batch_size_var, width=15).grid(row=0, column=3, sticky="w", padx=5, pady=2)
+
+# Dual Output Checkbox
+dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
+dual_output_checkbox.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+# Enable 2nd downscaled output Checkbox
+enable_low_res_output_checkbox = tk.Checkbutton(output_settings_frame, text="Enable 2nd Downscaled Output", variable=enable_low_res_output_var)
+enable_low_res_output_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+# Low Resolution Width and Height fields
+low_res_width_label = tk.Label(output_settings_frame, text="Low Res Width:")
+low_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
+low_res_width_entry = tk.Entry(output_settings_frame, textvariable=low_res_width_var, width=10)
+low_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+low_res_height_label = tk.Label(output_settings_frame, text="Low Res Height:")
+low_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
+low_res_height_entry = tk.Entry(output_settings_frame, textvariable=low_res_height_var, width=10)
+low_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
+
+# Function to enable/disable low-res input fields
+def toggle_low_res_fields():
+    state = "normal" if enable_low_res_output_var.get() else "disabled"
+    low_res_width_label.config(state=state)
+    low_res_width_entry.config(state=state)
+    low_res_height_label.config(state=state)
+    low_res_height_entry.config(state=state)
+
+# Trace the enable_low_res_output_var to call the toggle function
+enable_low_res_output_var.trace_add("write", lambda *args: toggle_low_res_fields())
+
+# Initial call to set the correct state based on loaded config
+root.after(10, toggle_low_res_fields) # Call after GUI elements are fully drawn
 
 # Progress frame
 progress_frame = tk.Frame(root)
