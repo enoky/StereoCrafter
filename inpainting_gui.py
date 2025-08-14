@@ -15,6 +15,7 @@ from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
 import imageio_ffmpeg
 import torch.nn.functional as F
+import time
 
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
@@ -376,6 +377,9 @@ def process_single_video(
             overlap_actual = min(overlap, len(generated))
             input_frames_i[:overlap_actual] = generated[-overlap_actual:]
 
+        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx}...")
+        start_time = time.time()
+
         with torch.no_grad():
             video_latents = spatial_tiled_process(
                 input_frames_i,
@@ -400,6 +404,10 @@ def process_single_video(
                 decode_chunk_size=2,
             )
 
+        end_time = time.time()
+        inference_duration = end_time - start_time
+        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
+        
         video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
         temp_generated_frames = []
         for j in range(len(video_frames)):
