@@ -279,17 +279,30 @@ def process_single_video(
     stop_event: threading.Event = None,
 ) -> bool:
     """
-    Processes a single input video, writes the SBS output (left view | inpainted output) to `save_dir`.
+    Processes a single input video.
+    Determines input format (quad or dual) based on filename suffix.
+    Outputs SBS (left view | inpainted output) for quad input,
+    or only inpainted output for dual input.
     Returns True if processing completed successfully, False if stopped.
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    video_name = (
-        os.path.basename(input_video_path)
-        .replace(".mp4", "")
-        .replace("_splatting_results", "")
-        + "_inpainting_results"
-    )
+    base_video_name = os.path.basename(input_video_path)
+    video_name_without_ext = os.path.splitext(base_video_name)[0]
+
+    # Determine if input is dual splatted based on suffix
+    is_dual_input = video_name_without_ext.endswith("_splatted2")
+    if is_dual_input:
+        logger.info(f"Dual Splat detected for '{base_video_name}'. Processing and outputting Inpainted Right Eye only.")
+    else:
+        logger.info(f"Quad Splat (or default) detected for '{base_video_name}'. Processing and outputting Inpainted SBS video.")
+
+    output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+
+    video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+    output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
+    output_video_path = os.path.join(save_dir, output_video_filename)
+
 
     frames, fps = read_video_frames(input_video_path)
     num_frames = frames.shape[0]
@@ -303,18 +316,42 @@ def process_single_video(
         logger.warning(f"Video {input_video_path} is too small ({num_h}x{num_w}), skipping.")
         return False
 
-    half_h = num_h // 2
-    half_w = num_w // 2
+    # Frame chunking and mask extraction based on input type
+    if is_dual_input:
+        # Input is (Mask | Warped) from _splatted2
+        half_w_input = num_w // 2 # Half width of the _splatted2 video
+        frames_mask_raw = frames[:, :, :, :half_w_input]  # Left half is mask
+        frames_warpped_raw = frames[:, :, :, half_w_input:] # Right half is warped
+        frames_left_original = None # No original left eye in dual input
+        
+        # Ensure the warped frame for inpainting has correct dimensions (height, half_w_input)
+        frames_warpped = frames_warpped_raw
+        frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
+        
+        # The target dimensions for the *single* inpainted output frame
+        target_output_h = frames_warpped.shape[2]
+        target_output_w = frames_warpped.shape[3]
 
-    frames_left = frames[:, :, :half_h, :half_w]
-    frames_mask = frames[:, :, half_h:, :half_w]
-    frames_warpped = frames[:, :, half_h:, half_w:]
+    else:
+        # Input is (Original | DepthVis (Top), Mask | Warped (Bottom)) from _splatted4 or other
+        half_h_input = num_h // 2 # Half height of the quad video
+        half_w_input = num_w // 2 # Half width of the quad video
 
-    frames_combined = torch.cat([frames_warpped, frames_left, frames_mask], dim=0)
-    frames_combined = frames_combined / 255.0
+        frames_left_original = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
+        frames_mask_raw = frames[:, :, half_h_input:, :half_w_input]  # Bottom-Left is mask
+        frames_warpped_raw = frames[:, :, half_h_input:, half_w_input:] # Bottom-Right is warped
 
-    frames_warpped, frames_left, frames_mask = torch.chunk(frames_combined, 3, dim=0)
-    frames_mask = frames_mask.mean(dim=1, keepdim=True)
+        # The warped frames are the input for inpainting
+        frames_warpped = frames_warpped_raw
+        frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
+
+        # The target dimensions for the *single* inpainted output frame (which is half of the full output)
+        target_output_h = frames_warpped.shape[2]
+        target_output_w = frames_warpped.shape[3]
+
+    # Pre-process frames for inpainting pipeline
+    frames_warpped = frames_warpped / 255.0 # Normalize to 0-1
+    # frames_mask is already normalized and grayscale after mean(dim=1) and is 0-1 from read_video_frames
 
     frames_warpped = pad_for_tiling(frames_warpped, tile_num, tile_overlap=(128, 128))
     frames_mask = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
@@ -349,7 +386,7 @@ def process_single_video(
                 min_guidance_scale=1.01,
                 max_guidance_scale=1.01,
                 decode_chunk_size=8,
-                fps=7,
+                fps=7, # Fixed FPS for pipeline, might not match video's original FPS
                 motion_bucket_id=127,
                 noise_aug_strength=0.0,
                 num_inference_steps=num_inference_steps,
@@ -364,13 +401,12 @@ def process_single_video(
             )
 
         video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
+        temp_generated_frames = []
         for j in range(len(video_frames)):
             img = video_frames[j]
-            video_frames[j] = (
-                torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0
-            )
+            temp_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
 
-        generated = torch.stack(video_frames)
+        generated = torch.stack(temp_generated_frames)
         if i != 0 and overlap > 0:
             generated = generated[overlap:]
 
@@ -380,23 +416,33 @@ def process_single_video(
 
     frames_output = torch.cat(results, dim=0).cpu()
 
-    frames_output_cropped = frames_output[:, :, :half_h, :half_w]
-    sbs_frames = torch.cat([frames_left, frames_output_cropped], dim=3)
+    # Crop the output to the original dimensions before tiling
+    # This assumes pad_for_tiling added padding at the bottom/right.
+    # The dimensions here should match `frames_warpped_raw` or `frames_left_original` for the height/width.
+    frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
 
-    sbs_frames_np = (sbs_frames * 255).permute(0, 2, 3, 1).byte().numpy()
+    if is_dual_input:
+        # Output only the inpainted right eye
+        final_video_frames_np = (frames_output_final * 255).permute(0, 2, 3, 1).byte().numpy()
+    else:
+        # Output SBS: Original Left | Inpainted Right
+        # Ensure frames_left_original is in the correct format (0-1 float)
+        frames_left_original_normalized = frames_left_original.float() / 255.0
 
-    sbs_output_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
+        sbs_frames = torch.cat([frames_left_original_normalized, frames_output_final], dim=3)
+        final_video_frames_np = (sbs_frames * 255).permute(0, 2, 3, 1).byte().numpy()
+
     write_video_ffmpeg(
-        frames=sbs_frames_np,
+        frames=final_video_frames_np,
         fps=fps,
-        output_path=sbs_output_path,
+        output_path=output_video_path,
         vf=vf if vf else None,
         codec="libx264",
         crf=16,
         preset="ultrafast",
     )
 
-    logger.info(f"Done processing {input_video_path} -> {sbs_output_path}")
+    logger.info(f"Done processing {input_video_path} -> {output_video_path}")
     return True
 
 class InpaintingGUI(tk.Tk):
