@@ -2,7 +2,9 @@
 
 You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billynom8/DepthCrafter_GUI_Seg">here</a>.
 
-## Installation (1-click installer script)
+## Installation
+
+### Option 1: Installer script (Windows)
 
 #### PREREQUISITES:
    - GIT: Ensure Git is installed and added to your system’s PATH.<br>
@@ -21,6 +23,12 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
 #### INSTALL:
    - Run <a href="https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
    - Download and extract <a href="https://drive.google.com/file/d/1bKL7Hag8AG4WTEX3jFGJA69nO8_kZQLP/view?usp=drive_link">model</a> "weights" to StereoCrafter folder
+
+<hr>
+
+### Option 2: Manual Install (Windows / Linux)
+
+For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/55dce8ec0b8f9d1ddfd69bc1fbaf831f6473bba5/1click_installer_script/StereoCrafter_Manual_Install.md">Click Here</a>
 
 <hr>
 <div align="center">
