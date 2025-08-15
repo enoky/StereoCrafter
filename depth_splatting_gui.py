@@ -32,31 +32,56 @@ progress_queue = queue.Queue()
 depthcrafter_instance = None
 processing_thread = None
 
-def read_video_frames(video_path, process_length, target_fps, max_res, dataset="open"):
+def round_to_nearest_64(value):
+    return max(64, round(value / 64) * 64)
+
+def read_video_frames(video_path, process_length, target_fps,
+                      set_pre_res, pre_res_width, pre_res_height, dataset="open"):
+    """
+    Reads video frames and determines the processing resolution.
+    Resolution is determined by set_pre_res, otherwise original resolution is used (rounded to 64).
+    max_res is NOT used here; it's handled during DepthCrafter inference.
+    """
     if dataset == "open":
         print(f"==> Processing video: {video_path}")
-        vid = VideoReader(video_path, ctx=cpu(0))
-        print(f"==> Original video shape: {len(vid)} frames, {vid.get_batch([0]).shape[1:]} per frame")
-        original_height, original_width = vid.get_batch([0]).shape[1:3]
-        height = round(original_height / 64) * 64
-        width = round(original_width / 64) * 64
-        if max(height, width) > max_res:
-            scale = max_res / max(original_height, original_width)
-            height = round(original_height * scale / 64) * 64
-            width = round(original_width * scale / 64) * 64
+        vid_info = VideoReader(video_path, ctx=cpu(0))
+        original_height, original_width = vid_info.get_batch([0]).shape[1:3]
+        print(f"==> Original video shape: {len(vid_info)} frames, {original_height}x{original_width} per frame")
+        
+        height_for_processing = original_height
+        width_for_processing = original_width
+
+        if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
+            # User specified pre-processing resolution, overrides max_res
+            height_for_processing = round_to_nearest_64(pre_res_height)
+            width_for_processing = round_to_nearest_64(pre_res_width)
+            print(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
+        else:
+            # If set_pre_res is False, use original resolution rounded to 64.
+            height_for_processing = round_to_nearest_64(original_height)
+            width_for_processing = round_to_nearest_64(original_width)
+            print(f"==> Using original video resolution ({original_width}x{original_height}) rounded to nearest 64 for processing: {width_for_processing}x{height_for_processing}")
+
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
 
-    vid = VideoReader(video_path, ctx=cpu(0), width=width, height=height)
+    # decord automatically resizes if width/height are passed to VideoReader
+    vid = VideoReader(video_path, ctx=cpu(0), width=width_for_processing, height=height_for_processing)
     fps = vid.get_avg_fps() if target_fps == -1 else target_fps
     stride = max(round(vid.get_avg_fps() / fps), 1)
     frames_idx = list(range(0, len(vid), stride))
     print(f"==> Downsampled to {len(frames_idx)} frames with stride {stride}")
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
-    print(f"==> Final processing shape: {len(frames_idx)} frames, {vid.get_batch([0]).shape[1:]} per frame")
+    
+    # Verify the actual shape after Decord processing
+    first_frame_shape = vid.get_batch([0]).shape
+    actual_processed_height, actual_processed_width = first_frame_shape[1:3]
+    print(f"==> Final processing shape: {len(frames_idx)} frames, {actual_processed_height}x{actual_processed_width} per frame")
+    
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
-    return frames, fps, original_height, original_width
+
+    return frames, fps, original_height, original_width, actual_processed_height, actual_processed_width
 
 class DepthCrafterDemo:
     def __init__(self, unet_path: str, pre_trained_path: str, cpu_offload: str = "sequential"):
@@ -88,40 +113,62 @@ class DepthCrafterDemo:
         print("==> Enabled attention slicing")
 
     def infer(
-        self, input_video_path: str, output_video_path: str, process_length: int = -1,
+        self, frames_to_process: np.ndarray, output_video_path: str, processed_fps: float,
         num_denoising_steps: int = 5, guidance_scale: float = 1.0, window_size: int = 70,
-        overlap: int = 25, max_res: int = 960, seed: int = 42, save_depth: bool = False
+        overlap: int = 25, max_inference_res: int = 960, seed: int = 42, save_depth: bool = False
     ):
+        """
+        Performs depth inference on pre-loaded frames.
+        max_inference_res caps the resolution for the UNet model's processing,
+        but depth output is scaled back to the original frames_to_process resolution.
+        """
         set_seed(seed)
-        print(f"==> Reading video frames from {input_video_path}")
-        frames, target_fps, original_height, original_width = read_video_frames(
-            input_video_path, process_length, target_fps=-1, max_res=max_res
-        )
         if stop_event.is_set():
             print("==> Depth inference aborted due to stop request")
             return None, None
+        
+        current_frames_height, current_frames_width = frames_to_process.shape[1:3]
+        
+        inference_height = current_frames_height
+        inference_width = current_frames_width
+
+        # Apply max_inference_res as a cap for the model's processing dimensions
+        if max_inference_res > 0 and max(current_frames_height, current_frames_width) > max_inference_res:
+            scale = max_inference_res / max(current_frames_height, current_frames_width)
+            inference_height = round_to_nearest_64(current_frames_height * scale)
+            inference_width = round_to_nearest_64(current_frames_width * scale)
+            print(f"==> Input frames exceed max_inference_res ({max_inference_res}). Downscaling for inference to: {inference_width}x{inference_height}")
+        else:
+             print(f"==> Inferring at input resolution: {current_frames_width}x{current_frames_height}")
+
         print("==> Performing depth inference using DepthCrafter pipeline")
         with torch.inference_mode():
             res = self.pipe(
-                frames, height=frames.shape[1], width=frames.shape[2], output_type="np",
+                frames_to_process, height=inference_height, width=inference_width, output_type="np",
                 guidance_scale=guidance_scale, num_inference_steps=num_denoising_steps,
                 window_size=window_size, overlap=overlap
             ).frames[0]
+
         res = res.sum(-1) / res.shape[-1]
         tensor_res = torch.tensor(res).unsqueeze(1).float().contiguous().cuda()
-        res = F.interpolate(tensor_res, size=(original_height, original_width), mode='bilinear', align_corners=False)
+        
+        # Interpolate depth back to the *input resolution* of frames_to_process
+        # This ensures depth map matches the video frames it will be splatted with.
+        res = F.interpolate(tensor_res, size=(current_frames_height, current_frames_width), mode='bilinear', align_corners=False)
         res = res.cpu().numpy()[:, 0, :, :]
         res = (res - res.min()) / (res.max() - res.min())
         print("==> Visualizing depth maps")
-        vis = vis_sequence_depth(res)
+        vis = vis_sequence_depth(res) # vis will also be at current_frames_height/width
+
         save_path = os.path.splitext(output_video_path)[0]
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         if save_depth:
-            print(f"==> Saving depth maps to {save_path}.npz")
+            print(f"==> Saving depth maps to {save_path}.npz at processed resolution.")
             np.savez_compressed(save_path + ".npz", depth=res)
-            print(f"==> Saving depth visualization video to {save_path}_depth_vis.mp4")
-            write_video(save_path + "_depth_vis.mp4", vis * 255.0, fps=target_fps, video_codec="h264", options={"crf": "16"})
-        return res, vis
+            print(f"==> Saving depth visualization video to {save_path}_depth_vis.mp4 at processed resolution.")
+            write_video(save_path + "_depth_vis.mp4", vis * 255.0, fps=processed_fps, video_codec="h264", options={"crf": "16"})
+        
+        return res, vis # res and vis are now at current_frames_height/width
 
 class ForwardWarpStereo(nn.Module):
     def __init__(self, eps=1e-6, occlu_map=False):
@@ -151,20 +198,14 @@ class ForwardWarpStereo(nn.Module):
             occlu_map = 1.0 - occlu_map
             return res, occlu_map
 
-def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
+def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
                    dual_output: bool, enable_low_res_output: bool, low_res_width: int, low_res_height: int):
-    print(f"==> Reading input video for splatting: {input_video_path}")
-    vid_reader = VideoReader(input_video_path, ctx=cpu(0))
-    original_fps = vid_reader.get_avg_fps()
-    input_frames = vid_reader[:].asnumpy() / 255.0
-    if process_length != -1 and process_length < len(input_frames):
-        input_frames = input_frames[:process_length]
-        video_depth = video_depth[:process_length]
-        depth_vis = depth_vis[:process_length]
+    
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-    num_frames = len(input_frames)
-    height, width, _ = input_frames[0].shape
+    
+    num_frames = len(input_frames_processed)
+    height, width, _ = input_frames_processed[0].shape # Get dimensions from already processed frames
     os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
 
     # Determine output video suffix and dimensions
@@ -185,14 +226,13 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
     main_out = cv2.VideoWriter(
         main_output_video_path,
         cv2.VideoWriter_fourcc(*"mp4v"),
-        original_fps,
+        processed_fps, # Use the fps of the processed video
         (output_video_width, output_video_height),
         True
     )
     print(f"==> Writing main output video to: {main_output_video_path}")
 
     low_res_out = None
-    low_res_output_video_path = None
     if enable_low_res_output:
         # Determine low-res output path
         low_res_output_video_path = f"{base_output_name}_low{suffix}.mp4"
@@ -204,33 +244,43 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
         else:
             # Calculate the overall grid dimensions for the low-resolution output
             if dual_output:
-                # Dual output: Mask | Warped (width*2, height)
                 low_res_output_grid_width = low_res_width * 2
                 low_res_output_grid_height = low_res_height
             else: # Quad output
-                # Quad output: Original | DepthVis (Top), Mask | Warped (Bottom) (width*2, height*2)
                 low_res_output_grid_width = low_res_width * 2
                 low_res_output_grid_height = low_res_height * 2
 
             low_res_out = cv2.VideoWriter(
                 low_res_output_video_path,
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                original_fps,
-                (low_res_output_grid_width, low_res_output_grid_height), # <-- CORRECTED DIMENSIONS HERE
+                processed_fps,
+                (low_res_output_grid_width, low_res_output_grid_height),
                 True
             )
             print(f"==> Writing low-resolution output video to: {low_res_output_video_path}")
+            
+    # Process only up to process_length if specified, for consistency
+    if process_length != -1 and process_length < num_frames:
+        input_frames_processed = input_frames_processed[:process_length]
+        video_depth = video_depth[:process_length]
+        depth_vis = depth_vis[:process_length]
+        num_frames = process_length
+
+
     for i in range(0, num_frames, batch_size):
         if stop_event.is_set():
             print("==> Stopping DepthSplatting due to user request")
             del stereo_projector
             torch.cuda.empty_cache()
             gc.collect()
-            out.release()
+            main_out.release()
+            if low_res_out: low_res_out.release()
             return
-        batch_frames = input_frames[i:i+batch_size]
+        
+        batch_frames = input_frames_processed[i:i+batch_size]
         batch_depth = video_depth[i:i+batch_size]
         batch_depth_vis = depth_vis[i:i+batch_size]
+        
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
         disp_map = disp_map * 2.0 - 1.0
@@ -269,26 +319,54 @@ def DepthSplatting(input_video_path, output_video_path, video_depth, depth_vis, 
         low_res_out.release()
     print("==> Output video writing completed.")
 
-def load_pre_rendered_depth(depth_video_path, process_length=-1, max_res=1024):
+def load_pre_rendered_depth(depth_video_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=False):
+    """
+    Loads pre-rendered depth maps. If match_resolution_to_target is True, it resizes
+    the depth maps to the target_height/width for compatibility.
+    """
     print(f"==> Loading pre-rendered depth maps from: {depth_video_path}")
     vid = VideoReader(depth_video_path, ctx=cpu(0))
     frames = vid[:].asnumpy().astype("float32") / 255.0
     if process_length != -1 and process_length < len(frames):
         frames = frames[:process_length]
+    
+    video_depth_raw = None
     if frames.shape[-1] == 3:
         print("==> Converting RGB depth frames to grayscale")
-        video_depth = frames.mean(axis=-1)
+        video_depth_raw = frames.mean(axis=-1)
     else:
-        video_depth = frames.squeeze(-1)
-    video_depth_min = video_depth.min()
-    video_depth_max = video_depth.max()
+        video_depth_raw = frames.squeeze(-1)
+    
+    # Normalize depth
+    video_depth_min = video_depth_raw.min()
+    video_depth_max = video_depth_raw.max()
     if video_depth_max - video_depth_min > 1e-5:
-        video_depth = (video_depth - video_depth_min) / (video_depth_max - video_depth_min)
+        video_depth_normalized = (video_depth_raw - video_depth_min) / (video_depth_max - video_depth_min)
     else:
-        video_depth = np.zeros_like(video_depth)
-    print("==> Applying colormap to depth maps")
-    depth_vis = [cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth]
-    depth_vis = np.stack(depth_vis, axis=0)
+        video_depth_normalized = np.zeros_like(video_depth_raw)
+
+    # Resize if matching resolution to target video
+    if match_resolution_to_target and target_height > 0 and target_width > 0:
+        print(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
+        resized_depths = []
+        resized_viss = []
+        for i in range(video_depth_normalized.shape[0]):
+            depth_frame = video_depth_normalized[i]
+            # OpenCV expects (width, height)
+            resized_depth_frame = cv2.resize(depth_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+            resized_depths.append(resized_depth_frame)
+            
+            # Apply colormap to the resized depth for visualization
+            vis_frame = cv2.applyColorMap((resized_depth_frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+            resized_viss.append(vis_frame.astype("float32") / 255.0)
+
+        video_depth = np.stack(resized_depths, axis=0)
+        depth_vis = np.stack(resized_viss, axis=0)
+    else:
+        print(f"==> Not resizing loaded depth maps. Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
+        video_depth = video_depth_normalized
+        depth_vis = np.stack([cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
+    
     print("==> Depth maps and visualizations loaded successfully")
     return video_depth, depth_vis
 
@@ -323,13 +401,17 @@ def main(settings):
     guidance_scale = settings["guidance_scale"]
     window_size = settings["window_size"]
     overlap = settings["overlap"]
-    max_res = settings["max_res"]
+    max_inference_res = settings["max_inference_res"] # Renamed from max_res
     seed = settings["seed"]
     save_depth = settings["save_depth"]
     dual_output = settings["dual_output"]
     enable_low_res_output = settings["enable_low_res_output"]
     low_res_width = settings["low_res_width"]
     low_res_height = settings["low_res_height"]
+    set_pre_res = settings["set_pre_res"]
+    pre_res_width = int(settings["pre_res_width"])
+    pre_res_height = int(settings["pre_res_height"])
+    match_depth_res = settings["match_depth_res"]
 
     os.makedirs(output_splatted, exist_ok=True)
     finished_source_folder = os.path.join(input_source_clips, "finished")
@@ -360,12 +442,33 @@ def main(settings):
             return
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
+
+        # 1. Read input video frames at the determined pre-processing resolution
+        # This resolution will be the target for depth maps and splatting output
+        try:
+            input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_video_processed_height, current_video_processed_width = read_video_frames(
+                video_path, process_length, target_fps=-1, # target_fps unused here, -1 default
+                set_pre_res=set_pre_res, pre_res_width=pre_res_width, pre_res_height=pre_res_height
+            )
+        except Exception as e:
+            print(f"==> Error reading input video {video_path}: {e}. Skipping this video.")
+            continue # Skip to next video
+
         depth_map_path = os.path.join(input_depth_maps, f"{video_name}_depth.mp4")
         used_pre_rendered_depth = False
+        video_depth = None
+        depth_vis = None
+
         if os.path.exists(depth_map_path):
             print(f"==> Found pre-rendered depth map: {depth_map_path}")
             try:
-                video_depth, depth_vis = load_pre_rendered_depth(depth_map_path, process_length=process_length, max_res=max_res)
+                video_depth, depth_vis = load_pre_rendered_depth(
+                    depth_map_path,
+                    process_length=process_length,
+                    target_height=current_video_processed_height, # Pass the height of the processed video
+                    target_width=current_video_processed_width,   # Pass the width of the processed video
+                    match_resolution_to_target=match_depth_res    # Use new setting
+                )
                 used_pre_rendered_depth = True
             except Exception as e:
                 print(f"==> Error loading pre-rendered depth: {e}")
@@ -374,26 +477,51 @@ def main(settings):
             print(f"==> Pre-rendered depth map not found. Performing depth inference.")
             temp_depth_vis_path = os.path.join(output_splatted, f"{video_name}_depth_vis_temp.mp4")
             video_depth, depth_vis = depthcrafter_instance.infer(
-                input_video_path=video_path, output_video_path=temp_depth_vis_path,
-                process_length=process_length, num_denoising_steps=num_denoising_steps,
-                guidance_scale=guidance_scale, window_size=window_size, overlap=overlap,
-                max_res=max_res, seed=seed, save_depth=save_depth
+                frames_to_process=input_frames_processed, # Pass already loaded and sized frames
+                output_video_path=temp_depth_vis_path,
+                processed_fps=processed_fps,
+                num_denoising_steps=num_denoising_steps,
+                guidance_scale=guidance_scale,
+                window_size=window_size,
+                overlap=overlap,
+                max_inference_res=max_inference_res, # Use this for internal inference cap
+                seed=seed,
+                save_depth=save_depth
             )
+        
         if video_depth is None or depth_vis is None:
-            print("==> Skipping video due to depth inference failure or stop request")
+            print("==> Skipping video due to depth inference/load failure or stop request")
             continue
+        
+        # Ensure the depth map resolution matches the input frames for splatting
+        if not (video_depth.shape[1] == current_video_processed_height and video_depth.shape[2] == current_video_processed_width):
+            print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_video_processed_width}x{current_video_processed_height}). Attempting resize for splatting.")
+            # This case should ideally not happen with the new logic, but as a safeguard:
+            resized_video_depth = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
+            resized_depth_vis = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
+            video_depth = resized_video_depth
+            depth_vis = resized_depth_vis
+
         if stop_event.is_set():
             print("==> Stopping processing due to user request")
             release_resources()
             progress_queue.put("finished")
             return
+
         output_video_path = os.path.join(output_splatted, f"{video_name}.mp4")
         DepthSplatting(
-            input_video_path=video_path, output_video_path=output_video_path,
-            video_depth=video_depth, depth_vis=depth_vis, max_disp=max_disp,
-            process_length=process_length, batch_size=batch_size,
-            dual_output=dual_output, enable_low_res_output=enable_low_res_output,
-            low_res_width=low_res_width, low_res_height=low_res_height
+            input_frames_processed=input_frames_processed, # Pass already loaded frames
+            processed_fps=processed_fps,                   # Pass calculated FPS
+            output_video_path=output_video_path,
+            video_depth=video_depth,
+            depth_vis=depth_vis,
+            max_disp=max_disp,
+            process_length=process_length,
+            batch_size=batch_size,
+            dual_output=dual_output,
+            enable_low_res_output=enable_low_res_output,
+            low_res_width=low_res_width,
+            low_res_height=low_res_height
         )
         if stop_event.is_set():
             print("==> Stopping after DepthSplatting due to user request")
@@ -428,6 +556,30 @@ def start_processing():
     stop_event.clear()
     start_button.config(state="disabled")
     stop_button.config(state="normal")
+    status_label.config(text="Starting processing...")
+    
+    # Input validation for new fields
+    try:
+        if set_pre_res_var.get():
+            pre_res_w = int(pre_res_width_var.get())
+            pre_res_h = int(pre_res_height_var.get())
+            if pre_res_w <= 0 or pre_res_h <= 0:
+                raise ValueError("Pre-processing Width and Height must be positive.")
+        
+        max_disp_val = float(max_disp_var.get())
+        if max_disp_val <= 0:
+            raise ValueError("Max Disparity must be positive.")
+
+        # Validate max_inference_res_var
+        max_inf_res = int(max_res_var.get())
+        # No explicit check for positive, as 0 is now a valid "disable" value
+        
+    except ValueError as e:
+        status_label.config(text=f"Error: {e}")
+        start_button.config(state="normal")
+        stop_button.config(state="disabled")
+        return
+    
     settings = {
         "input_source_clips": input_source_clips_var.get(),
         "input_depth_maps": input_depth_maps_var.get(),
@@ -442,13 +594,17 @@ def start_processing():
         "guidance_scale": float(guidance_scale_var.get()),
         "window_size": int(window_size_var.get()),
         "overlap": int(overlap_var.get()),
-        "max_res": int(max_res_var.get()),
+        "max_inference_res": int(max_res_var.get()), # Pass this renamed variable
         "seed": int(seed_var.get()),
         "save_depth": save_depth_var.get(),
         "dual_output": dual_output_var.get(),
         "enable_low_res_output": enable_low_res_output_var.get(),
         "low_res_width": int(low_res_width_var.get()),
-        "low_res_height": int(low_res_height_var.get())
+        "low_res_height": int(low_res_height_var.get()),
+        "set_pre_res": set_pre_res_var.get(),
+        "pre_res_width": pre_res_width_var.get(),
+        "pre_res_height": pre_res_height_var.get(),
+        "match_depth_res": match_depth_res_var.get()
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -477,16 +633,18 @@ def check_queue():
                 status_label.config(text="Processing finished")
                 start_button.config(state="normal")
                 stop_button.config(state="disabled")
+                progress_var.set(0) # Reset progress bar
                 break
             elif message[0] == "total":
                 total_videos = message[1]
                 progress_bar.config(maximum=total_videos)
-                status_label.config(text=f"Processing 1 of {total_videos}")
+                progress_var.set(0) # Start from 0
+                status_label.config(text=f"Processing 0 of {total_videos}")
             elif message[0] == "processed":
                 processed = message[1]
                 progress_var.set(processed)
                 total = progress_bar["maximum"]
-                status_label.config(text=f"Processing {processed + 1} of {total}")
+                status_label.config(text=f"Processing {processed} of {total}")
     except queue.Empty:
         pass
     root.after(100, check_queue)
@@ -506,13 +664,17 @@ def save_config():
         "guidance_scale": guidance_scale_var.get(),
         "window_size": window_size_var.get(),
         "overlap": overlap_var.get(),
-        "max_res": max_res_var.get(),
+        "max_inference_res": max_res_var.get(), # Save under new name
         "seed": seed_var.get(),
         "save_depth": save_depth_var.get(),
         "dual_output": dual_output_var.get(),
         "enable_low_res_output": enable_low_res_output_var.get(),
         "low_res_width": low_res_width_var.get(),
-        "low_res_height": low_res_height_var.get()
+        "low_res_height": low_res_height_var.get(),
+        "set_pre_res": set_pre_res_var.get(),
+        "pre_res_width": pre_res_width_var.get(),
+        "pre_res_height": pre_res_height_var.get(),
+        "match_depth_res": match_depth_res_var.get()
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -534,13 +696,17 @@ def load_config():
             guidance_scale_var.set(config.get("guidance_scale", "1.0"))
             window_size_var.set(config.get("window_size", "70"))
             overlap_var.set(config.get("overlap", "25"))
-            max_res_var.set(config.get("max_res", "1024"))
+            max_res_var.set(config.get("max_inference_res", "960")) # Load from new name
             seed_var.set(config.get("seed", "42"))
             save_depth_var.set(config.get("save_depth", False))
             dual_output_var.set(config.get("dual_output", False))
             enable_low_res_output_var.set(config.get("enable_low_res_output", False))
             low_res_width_var.set(config.get("low_res_width", "1024"))
             low_res_height_var.set(config.get("low_res_height", "576"))
+            set_pre_res_var.set(config.get("set_pre_res", False))
+            pre_res_width_var.set(config.get("pre_res_width", "1920"))
+            pre_res_height_var.set(config.get("pre_res_height", "1080"))
+            match_depth_res_var.set(config.get("match_depth_res", False))
 
 # GUI Setup
 root = tk.Tk()
@@ -560,13 +726,17 @@ num_denoising_steps_var = tk.StringVar(value="5")
 guidance_scale_var = tk.StringVar(value="1.0")
 window_size_var = tk.StringVar(value="70")
 overlap_var = tk.StringVar(value="25")
-max_res_var = tk.StringVar(value="960")
+max_res_var = tk.StringVar(value="960") # This now represents max_inference_res
 seed_var = tk.StringVar(value="42")
 save_depth_var = tk.BooleanVar(value=False)
 dual_output_var = tk.BooleanVar(value=False) # Default to Quad
 enable_low_res_output_var = tk.BooleanVar(value=False)
 low_res_width_var = tk.StringVar(value="1024")
 low_res_height_var = tk.StringVar(value="576")
+set_pre_res_var = tk.BooleanVar(value=False)
+pre_res_width_var = tk.StringVar(value="1920")
+pre_res_height_var = tk.StringVar(value="1080")
+match_depth_res_var = tk.BooleanVar(value=False)
 
 # Load configuration
 load_config()
@@ -584,29 +754,63 @@ tk.Label(folder_frame, text="Output Splatted:").grid(row=2, column=0, sticky="e"
 tk.Entry(folder_frame, textvariable=output_splatted_var, width=50).grid(row=2, column=1)
 tk.Button(folder_frame, text="Browse", command=lambda: browse_folder(output_splatted_var)).grid(row=2, column=2)
 
+# Pre-processing Settings Frame
+preprocessing_frame = tk.LabelFrame(root, text="Pre-processing & Resolution Settings")
+preprocessing_frame.pack(pady=10, padx=10, fill="x")
+
+# Set Pre-processing Resolution
+set_pre_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Set Pre-processing Resolution", variable=set_pre_res_var)
+set_pre_res_checkbox.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+pre_res_width_label = tk.Label(preprocessing_frame, text="Width:")
+pre_res_width_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+pre_res_width_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_width_var, width=10)
+pre_res_width_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+pre_res_height_label = tk.Label(preprocessing_frame, text="Height:")
+pre_res_height_label.grid(row=1, column=2, sticky="e", padx=5, pady=2)
+pre_res_height_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_height_var, width=10)
+pre_res_height_entry.grid(row=1, column=3, sticky="w", padx=5, pady=2)
+
+# Match Depthmap Resolution
+match_depth_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Match Depthmap Resolution to Processed Source", variable=match_depth_res_var)
+match_depth_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+
+# Function to enable/disable pre-res input fields
+def toggle_pre_res_fields():
+    state = "normal" if set_pre_res_var.get() else "disabled"
+    pre_res_width_label.config(state=state)
+    pre_res_width_entry.config(state=state)
+    pre_res_height_label.config(state=state)
+    pre_res_height_entry.config(state=state)
+
+# Trace the enable_low_res_output_var to call the toggle function
+set_pre_res_var.trace_add("write", lambda *args: toggle_pre_res_fields())
+
+
 # DepthCrafter settings frame
-depthcrafter_frame = tk.Frame(root)
-depthcrafter_frame.pack(pady=10)
-tk.Label(depthcrafter_frame, text="DepthCrafter Settings:").grid(row=0, column=0, columnspan=2)
-tk.Label(depthcrafter_frame, text="CPU Offload:").grid(row=3, column=0, sticky="e")
+depthcrafter_frame = tk.LabelFrame(root, text="DepthCrafter Inference Settings")
+depthcrafter_frame.pack(pady=10, padx=10, fill="x")
+tk.Label(depthcrafter_frame, text="CPU Offload:").grid(row=0, column=0, sticky="e")
 cpu_offload_menu = ttk.Combobox(depthcrafter_frame, textvariable=cpu_offload_var, values=["model", "sequential", "none"], state="readonly")
-cpu_offload_menu.grid(row=3, column=1, sticky="w")
-tk.Label(depthcrafter_frame, text="Num Denoising Steps:").grid(row=4, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=num_denoising_steps_var).grid(row=4, column=1)
-tk.Label(depthcrafter_frame, text="Guidance Scale:").grid(row=5, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=guidance_scale_var).grid(row=5, column=1)
-tk.Label(depthcrafter_frame, text="Window Size:").grid(row=6, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=window_size_var).grid(row=6, column=1)
-tk.Label(depthcrafter_frame, text="Overlap:").grid(row=7, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=overlap_var).grid(row=7, column=1)
-tk.Label(depthcrafter_frame, text="Max Resolution:").grid(row=8, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=max_res_var).grid(row=8, column=1)
-tk.Label(depthcrafter_frame, text="Seed:").grid(row=9, column=0, sticky="e")
-tk.Entry(depthcrafter_frame, textvariable=seed_var).grid(row=9, column=1)
-tk.Checkbutton(depthcrafter_frame, text="Save Depth Maps", variable=save_depth_var).grid(row=10, column=0, columnspan=2)
+cpu_offload_menu.grid(row=0, column=1, sticky="w")
+tk.Label(depthcrafter_frame, text="Num Denoising Steps:").grid(row=1, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=num_denoising_steps_var).grid(row=1, column=1)
+tk.Label(depthcrafter_frame, text="Guidance Scale:").grid(row=2, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=guidance_scale_var).grid(row=2, column=1)
+tk.Label(depthcrafter_frame, text="Window Size:").grid(row=3, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=window_size_var).grid(row=3, column=1)
+tk.Label(depthcrafter_frame, text="Overlap:").grid(row=4, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=overlap_var).grid(row=4, column=1)
+tk.Label(depthcrafter_frame, text="Max Inference Resolution (0 to disable cap):").grid(row=5, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=max_res_var).grid(row=5, column=1)
+tk.Label(depthcrafter_frame, text="Seed:").grid(row=6, column=0, sticky="e")
+tk.Entry(depthcrafter_frame, textvariable=seed_var).grid(row=6, column=1)
+tk.Checkbutton(depthcrafter_frame, text="Save Inferred Depth Maps", variable=save_depth_var).grid(row=7, column=0, columnspan=2, sticky="w")
+
 
 # Output Settings Frame
-output_settings_frame = tk.LabelFrame(root, text="Output Settings")
+output_settings_frame = tk.LabelFrame(root, text="Splatting Output Settings")
 output_settings_frame.pack(pady=10, padx=10, fill="x")
 
 # Max Disparity and Batch Size within Output Settings (or keep them where they are if preferred, but for this instruction, they are here)
@@ -646,16 +850,18 @@ def toggle_low_res_fields():
 # Trace the enable_low_res_output_var to call the toggle function
 enable_low_res_output_var.trace_add("write", lambda *args: toggle_low_res_fields())
 
-# Initial call to set the correct state based on loaded config
-root.after(10, toggle_low_res_fields) # Call after GUI elements are fully drawn
+# Initial calls to set the correct state based on loaded config
+root.after(10, toggle_low_res_fields)
+root.after(10, toggle_pre_res_fields)
+
 
 # Progress frame
 progress_frame = tk.Frame(root)
 progress_frame.pack(pady=10)
 progress_var = tk.DoubleVar()
 progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100)
-progress_bar.pack()
-status_label = tk.Label(progress_frame, text="")
+progress_bar.pack(fill="x", expand=True)
+status_label = tk.Label(progress_frame, text="Ready")
 status_label.pack()
 
 # Button frame
