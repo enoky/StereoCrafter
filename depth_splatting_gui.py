@@ -53,9 +53,9 @@ def read_video_frames(video_path, process_length, target_fps,
 
         if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
             # User specified pre-processing resolution, overrides max_res
-            height_for_processing = round_to_nearest_64(pre_res_height)
-            width_for_processing = round_to_nearest_64(pre_res_width)
-            print(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
+            height_for_processing = pre_res_height
+            width_for_processing = pre_res_width
+            print(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
         else:
             # If set_pre_res is False, use original resolution rounded to 64.
             height_for_processing = round_to_nearest_64(original_height)
@@ -508,6 +508,10 @@ def main(settings):
             progress_queue.put("finished")
             return
 
+        percentage_max_disp = float(settings["max_disp"]) # Get the percentage value from settings
+        actual_max_disp_pixels = (percentage_max_disp / 100.0) * current_video_processed_width
+        print(f"==> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
+
         output_video_path = os.path.join(output_splatted, f"{video_name}.mp4")
         DepthSplatting(
             input_frames_processed=input_frames_processed, # Pass already loaded frames
@@ -719,7 +723,7 @@ output_splatted_var = tk.StringVar(value="./output_splatted")
 unet_path_var = tk.StringVar(value="./weights/DepthCrafter")
 pre_trained_path_var = tk.StringVar(value="./weights/stable-video-diffusion-img2vid-xt-1-1")
 cpu_offload_var = tk.StringVar(value="sequential")
-max_disp_var = tk.StringVar(value="20.0")
+max_disp_var = tk.StringVar(value="2.5")
 process_length_var = tk.StringVar(value="-1")
 batch_size_var = tk.StringVar(value="10")
 num_denoising_steps_var = tk.StringVar(value="5")
@@ -814,7 +818,7 @@ output_settings_frame = tk.LabelFrame(root, text="Splatting Output Settings")
 output_settings_frame.pack(pady=10, padx=10, fill="x")
 
 # Max Disparity and Batch Size within Output Settings (or keep them where they are if preferred, but for this instruction, they are here)
-tk.Label(output_settings_frame, text="Max Disparity:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+tk.Label(output_settings_frame, text="Max Disparity % width:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
 tk.Entry(output_settings_frame, textvariable=max_disp_var, width=15).grid(row=0, column=1, sticky="w", padx=5, pady=2)
 
 tk.Label(output_settings_frame, text="Batch Size:").grid(row=0, column=2, sticky="e", padx=5, pady=2)
