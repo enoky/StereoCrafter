@@ -637,7 +637,7 @@ class InpaintingGUI(tk.Tk):
             "overlap": self.overlap_var.get()
         }
         try:
-            with open("config.json", "w") as f:
+            with open("config_inpaint.json", "w") as f:
                 json.dump(config, f, indent=4)
         except Exception as e:
             messagebox.showwarning("Warning", f"Failed to save config: {str(e)}")
