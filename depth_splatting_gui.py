@@ -218,9 +218,11 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         output_video_width = width * 2
         output_video_height = height * 2
 
+    res_suffix = f"_{width}"
+
     # Update the main output path
     base_output_name = os.path.splitext(output_video_path)[0]
-    main_output_video_path = f"{base_output_name}{suffix}.mp4"
+    main_output_video_path = f"{base_output_name}{res_suffix}{suffix}.mp4"
 
     # Initialize the main video writer
     main_out = cv2.VideoWriter(
@@ -235,7 +237,7 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     low_res_out = None
     if enable_low_res_output:
         # Determine low-res output path
-        low_res_output_video_path = f"{base_output_name}_low{suffix}.mp4"
+        low_res_output_video_path = f"{base_output_name}{res_suffix}_low{suffix}.mp4"
 
         # Validate low_res_width/height (ensure they are positive)
         if low_res_width <= 0 or low_res_height <= 0:
@@ -519,7 +521,7 @@ def main(settings):
             output_video_path=output_video_path,
             video_depth=video_depth,
             depth_vis=depth_vis,
-            max_disp=max_disp,
+            max_disp=actual_max_disp_pixels,
             process_length=process_length,
             batch_size=batch_size,
             dual_output=dual_output,
