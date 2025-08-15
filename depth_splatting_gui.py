@@ -39,8 +39,8 @@ def read_video_frames(video_path, process_length, target_fps,
                       set_pre_res, pre_res_width, pre_res_height, dataset="open"):
     """
     Reads video frames and determines the processing resolution.
-    Resolution is determined by set_pre_res, otherwise original resolution is used (rounded to 64).
-    max_res is NOT used here; it's handled during DepthCrafter inference.
+    Resolution is determined by set_pre_res, otherwise original resolution is used.
+    max_inference_res is NOT used here; it's handled during DepthCrafter inference.
     """
     if dataset == "open":
         print(f"==> Processing video: {video_path}")
@@ -53,14 +53,14 @@ def read_video_frames(video_path, process_length, target_fps,
 
         if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
             # User specified pre-processing resolution, overrides max_res
-            height_for_processing = pre_res_height
-            width_for_processing = pre_res_width
-            print(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
+            height_for_processing = pre_res_height  # Removed rounding
+            width_for_processing = pre_res_width    # Removed rounding
+            print(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
         else:
-            # If set_pre_res is False, use original resolution rounded to 64.
-            height_for_processing = round_to_nearest_64(original_height)
-            width_for_processing = round_to_nearest_64(original_width)
-            print(f"==> Using original video resolution ({original_width}x{original_height}) rounded to nearest 64 for processing: {width_for_processing}x{height_for_processing}")
+            # If set_pre_res is False, use original resolution.
+            height_for_processing = original_height # Removed rounding
+            width_for_processing = original_width   # Removed rounding
+            print(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
 
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
