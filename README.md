@@ -26,7 +26,7 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
 
 <hr>
 
-### Option 2: Manual Install (Windows / Linux)
+### Option 2: Manual Install
 
 For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/55dce8ec0b8f9d1ddfd69bc1fbaf831f6473bba5/1click_installer_script/StereoCrafter_Manual_Install.md">Click Here</a>
 
