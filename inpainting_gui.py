@@ -278,6 +278,7 @@ def process_single_video(
     vf: Optional[str] = None,
     num_inference_steps: int = 5,
     stop_event: threading.Event = None,
+    update_info_callback=None, # Callback to update GUI info
 ) -> bool:
     """
     Processes a single input video.
@@ -310,12 +311,20 @@ def process_single_video(
 
     if num_frames == 0:
         logger.warning(f"No frames found in {input_video_path}, skipping.")
+        if update_info_callback:
+            update_info_callback(base_video_name, "N/A", "0 (skipped)")
         return False
 
     _, _, num_h, num_w = frames.shape
     if num_h < 2 or num_w < 2:
         logger.warning(f"Video {input_video_path} is too small ({num_h}x{num_w}), skipping.")
+        if update_info_callback:
+            update_info_callback(base_video_name, f"{num_w}x{num_h}", num_frames)
         return False
+
+    # Update GUI with video info before processing
+    if update_info_callback:
+        update_info_callback(base_video_name, f"{num_w}x{num_h}", num_frames)
 
     # Frame chunking and mask extraction based on input type
     if is_dual_input:
@@ -457,7 +466,8 @@ class InpaintingGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Batch Video Inpainting")
-        self.geometry("600x400")
+        # Adjusted geometry to accommodate new widgets
+        self.geometry("600x550") # Increased height from 400 to 550
         self.config = self.load_config()
 
         self.input_folder_var = tk.StringVar(value=self.config.get("input_folder", "./output_splatted"))
@@ -473,7 +483,8 @@ class InpaintingGUI(tk.Tk):
         self.pipeline = None
 
         self.create_widgets()
-        self.update_progress()
+        self.update_progress() # Start the progress bar and status updates
+        self.update_status_label("Ready")
 
     def create_widgets(self):
         folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
@@ -503,6 +514,9 @@ class InpaintingGUI(tk.Tk):
         progress_frame.pack(fill="x", padx=10, pady=5)
         self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
         self.progress_bar.pack(fill="x")
+        # New: Progress count and status label
+        self.status_label = ttk.Label(progress_frame, text="Ready")
+        self.status_label.pack(pady=5)
 
         buttons_frame = ttk.Frame(self, padding=10)
         buttons_frame.pack(fill="x")
@@ -511,6 +525,19 @@ class InpaintingGUI(tk.Tk):
         self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5)
         ttk.Button(buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
+
+        # New: Information window for current video
+        info_frame = ttk.LabelFrame(self, text="Current Video Information", padding=10)
+        info_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.video_name_label = ttk.Label(info_frame, text="Name: N/A")
+        self.video_name_label.pack(anchor="w", padx=5, pady=1)
+        
+        self.video_res_label = ttk.Label(info_frame, text="Resolution: N/A")
+        self.video_res_label.pack(anchor="w", padx=5, pady=1)
+        
+        self.video_frames_label = ttk.Label(info_frame, text="Frames: N/A")
+        self.video_frames_label.pack(anchor="w", padx=5, pady=1)
 
     def browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
@@ -521,6 +548,14 @@ class InpaintingGUI(tk.Tk):
         folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
         if folder:
             self.output_folder_var.set(folder)
+
+    def update_status_label(self, message):
+        self.status_label.config(text=message)
+
+    def update_video_info_display(self, name, resolution, frames):
+        self.video_name_label.config(text=f"Name: {name}")
+        self.video_res_label.config(text=f"Resolution: {resolution}")
+        self.video_frames_label.config(text=f"Frames: {frames}")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
@@ -546,6 +581,8 @@ class InpaintingGUI(tk.Tk):
         self.stop_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+        self.update_status_label("Starting processing...")
+        self.update_video_info_display("N/A", "N/A", "N/A") # Clear info on start
 
         threading.Thread(target=self.run_batch_process,
                          args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap),
@@ -574,6 +611,19 @@ class InpaintingGUI(tk.Tk):
             for idx, video_path in enumerate(input_videos):
                 if self.stop_event.is_set():
                     break
+                
+                # Get video info for display before processing
+                temp_frames, _ = read_video_frames(video_path)
+                current_video_name = os.path.basename(video_path)
+                current_num_frames = temp_frames.shape[0] if temp_frames.numel() > 0 else 0
+                current_res = "N/A"
+                if current_num_frames > 0:
+                    _, _, h, w = temp_frames.shape
+                    current_res = f"{w}x{h}"
+
+                self.after(0, self.update_video_info_display, current_video_name, current_res, current_num_frames)
+                self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
+
                 logger.info(f"Processing {video_path}")
                 completed = process_single_video(
                     pipeline=self.pipeline,
@@ -584,7 +634,8 @@ class InpaintingGUI(tk.Tk):
                     tile_num=tile_num,
                     vf=None,
                     num_inference_steps=num_inference_steps,
-                    stop_event=self.stop_event
+                    stop_event=self.stop_event,
+                    update_info_callback=None # Info updated by run_batch_process directly
                 )
                 if completed:
                     try:
@@ -595,7 +646,7 @@ class InpaintingGUI(tk.Tk):
                 else:
                     logger.info(f"Processing of {video_path} was stopped")
                 self.processed_count.set(idx + 1)
-
+                
             stopped = self.stop_event.is_set()
             self.after(0, lambda: self.processing_done(stopped))
         except Exception as e:
@@ -605,26 +656,42 @@ class InpaintingGUI(tk.Tk):
     def stop_processing(self):
         self.stop_event.set()
         if self.pipeline:
-            torch.cuda.empty_cache()
+            # Attempt to clear CUDA cache if pipeline exists
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as e:
+                logger.warning(f"Failed to clear CUDA cache: {e}")
+        self.update_status_label("Stopping...")
 
     def update_progress(self):
         total = self.total_videos.get()
+        processed = self.processed_count.get()
         if total > 0:
-            progress = (self.processed_count.get() / total) * 100
+            progress = (processed / total) * 100
             self.progress_bar['value'] = progress
-        self.after(100, self.update_progress)
+        else:
+            self.progress_bar['value'] = 0
+            # Status label is updated directly by start/run_batch_process/processing_done
+        self.after(100, self.update_progress) # Schedule next update
 
     def processing_done(self, stopped=False):
         if self.pipeline:
-            del self.pipeline
-            torch.cuda.empty_cache()
-        self.pipeline = None
+            # Ensure pipeline is properly released and cache cleared
+            try:
+                del self.pipeline
+                torch.cuda.empty_cache()
+            except RuntimeError as e:
+                logger.warning(f"Failed to clear CUDA cache during cleanup: {e}")
+            self.pipeline = None
+
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
         if stopped:
-            messagebox.showinfo("Info", "Processing stopped")
+            self.update_status_label("Processing stopped.")
         else:
-            messagebox.showinfo("Info", "Processing completed")
+            self.update_status_label("Processing completed.")
+            
+        self.update_video_info_display("N/A", "N/A", "N/A") # Clear info after completion
 
     def exit_application(self):
         config = {
@@ -653,4 +720,3 @@ class InpaintingGUI(tk.Tk):
 if __name__ == "__main__":
     app = InpaintingGUI()
     app.mainloop()
-
