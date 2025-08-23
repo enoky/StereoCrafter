@@ -5,7 +5,7 @@ import logging
 import shutil
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, Toplevel, Label
 from typing import Optional, Tuple
 
 import numpy as np
@@ -27,6 +27,39 @@ from pipelines.stereo_video_inpainting import (
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- Tooltip Class ---
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
+
+    def show_tooltip(self, event=None):
+        if self.tooltip_window or not self.text:
+            return
+        # Adjust position slightly for better visibility
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 20
+
+        self.tooltip_window = Toplevel(self.widget)
+        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
+        self.tooltip_window.wm_geometry(f"+{x}+{y}")
+
+        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
+                      font=("tahoma", "8", "normal"), justify="left", wraplength=250)
+        label.pack(ipadx=1)
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
+# --- END Tooltip Class ---
+
 
 def load_inpainting_pipeline(
     pre_trained_path: str,
@@ -279,6 +312,7 @@ def process_single_video(
     num_inference_steps: int = 5,
     stop_event: threading.Event = None,
     update_info_callback=None, # Callback to update GUI info
+    original_input_blend_strength: float = 0.5, # NEW PARAMETER WITH DEFAULT
 ) -> bool:
     """
     Processes a single input video.
@@ -367,8 +401,8 @@ def process_single_video(
     frames_mask = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
 
     stride = max(1, frames_chunk - overlap)
-    results = []
-    generated = None
+    results = [] # Stores chunks to be concatenated in final video
+    previous_chunk_output_frames = None # Will hold the *full* generated output of the previous chunk
 
     for i in range(0, num_frames, stride):
         if stop_event and stop_event.is_set():
@@ -379,19 +413,47 @@ def process_single_video(
         if chunk_size <= 0:
             break
 
-        input_frames_i = frames_warpped[i:end_idx].clone()
+        # Get the original input for the current chunk
+        original_input_frames_for_chunk = frames_warpped[i:end_idx].clone()
         mask_frames_i = frames_mask[i:end_idx].clone()
 
-        if generated is not None and overlap > 0 and i != 0:
-            overlap_actual = min(overlap, len(generated))
-            input_frames_i[:overlap_actual] = generated[-overlap_actual:]
+        input_frames_to_pipeline = original_input_frames_for_chunk.clone() # Start with original, modify if blending
+
+        # --- NEW: Input-level blending for overlapping frames ---
+        if previous_chunk_output_frames is not None and overlap > 0:
+            # Determine actual number of frames to overlap, limited by available frames
+            # Ensure we don't try to blend more frames than are available in either the previous output or current input
+            overlap_actual = min(overlap, len(previous_chunk_output_frames), len(original_input_frames_for_chunk))
+
+            if overlap_actual > 0:
+                # 1. Get the generated overlap frames from the end of the previous chunk's output
+                prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
+                
+                # 2. Get the corresponding original input frames for the start of the current chunk
+                orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
+
+                # Calculate weights for blending based on original_input_blend_strength
+                # This scales the influence of the original input across the overlap period.
+                # If original_input_blend_strength is 0, original_weights_scaled will be 0, meaning no original influence.
+                # If original_input_blend_strength is 1, original_weights_scaled will be linspace(0,1), meaning full influence.
+                original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
+
+                # The weight for the previous generated output will be (1 - original_weights_scaled)
+                # The weight for the original input will be original_weights_scaled
+                blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
+                                                original_weights_scaled * orig_input_overlap_frames
+                
+                # Replace the overlapping part of the current chunk's input with the blended frames
+                input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
+            # else: overlap_actual is 0, no blending, input_frames_to_pipeline remains original_input_frames_for_chunk
+        # --- END NEW Input-level blending ---
 
         logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx}...")
         start_time = time.time()
 
         with torch.no_grad():
             video_latents = spatial_tiled_process(
-                input_frames_i,
+                input_frames_to_pipeline, # Use the potentially blended input frames
                 mask_frames_i,
                 pipeline,
                 tile_num,
@@ -418,16 +480,26 @@ def process_single_video(
         logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
         
         video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
-        temp_generated_frames = []
+        current_chunk_generated_frames = []
         for j in range(len(video_frames)):
             img = video_frames[j]
-            temp_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
+            current_chunk_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
 
-        generated = torch.stack(temp_generated_frames)
-        if i != 0 and overlap > 0:
-            generated = generated[overlap:]
+        current_chunk_generated = torch.stack(current_chunk_generated_frames)
 
-        results.append(generated)
+        # --- CRITICAL FIX: Append only the non-overlapping part for subsequent chunks ---
+        if i == 0:
+            # For the first chunk, append the full generated output.
+            results.append(current_chunk_generated)
+        else:
+            # For subsequent chunks, append only the portion beyond the overlap.
+            # The overlap frames from this chunk's output are already accounted for (or blended into)
+            # by the previous chunk's output.
+            results.append(current_chunk_generated[overlap:])
+        
+        # Always store the full generated chunk for the *next* iteration's input blend
+        previous_chunk_output_frames = current_chunk_generated 
+
         if end_idx == num_frames:
             break
 
@@ -469,13 +541,17 @@ class InpaintingGUI(tk.Tk):
         # Adjusted geometry to accommodate new widgets
         self.geometry("600x550") # Increased height from 400 to 550
         self.config = self.load_config()
+        # NEW: Load help data from renamed file
+        self.help_data = self.load_help_data()
 
         self.input_folder_var = tk.StringVar(value=self.config.get("input_folder", "./output_splatted"))
         self.output_folder_var = tk.StringVar(value=self.config.get("output_folder", "./completed_output"))
         self.num_inference_steps_var = tk.StringVar(value=str(self.config.get("num_inference_steps", 5)))
         self.tile_num_var = tk.StringVar(value=str(self.config.get("tile_num", 2)))
         self.frames_chunk_var = tk.StringVar(value=str(self.config.get("frames_chunk", 23)))
-        self.overlap_var = tk.StringVar(value=str(self.config.get("overlap", 3)))
+        # Renamed variable key for consistency
+        self.overlap_var = tk.StringVar(value=str(self.config.get("frame_overlap", 3)))
+        self.original_input_blend_strength_var = tk.StringVar(value=str(self.config.get("original_input_blend_strength", 0.5))) # Default to 0.5
         self.offload_type_var = tk.StringVar(value=self.config.get("offload_type", "model"))
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -489,26 +565,61 @@ class InpaintingGUI(tk.Tk):
     def create_widgets(self):
         folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
         folder_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Label(folder_frame, text="Input Folder:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        
+        # Input Folder
+        input_label = ttk.Label(folder_frame, text="Input Folder:")
+        input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(input_label, self.help_data.get("input_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=0, column=1, padx=5)
         ttk.Button(folder_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5)
-        ttk.Label(folder_frame, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        
+        # Output Folder
+        output_label = ttk.Label(folder_frame, text="Output Folder:")
+        output_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(output_label, self.help_data.get("output_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=1, column=1, padx=5)
         ttk.Button(folder_frame, text="Browse", command=self.browse_output).grid(row=1, column=2, padx=5)
 
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
         param_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Label(param_frame, text="Inference Steps:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        
+        # Inference Steps
+        inference_steps_label = ttk.Label(param_frame, text="Inference Steps:")
+        inference_steps_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(inference_steps_label, self.help_data.get("num_inference_steps", ""))
         ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=0, column=1, sticky="w")
-        ttk.Label(param_frame, text="Tile Number:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        
+        # Tile Number
+        tile_num_label = ttk.Label(param_frame, text="Tile Number:")
+        tile_num_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
         ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=1, column=1, sticky="w")
-        ttk.Label(param_frame, text="Frames Chunk:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        
+        # Frames Chunk
+        frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
+        frames_chunk_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=2, column=1, sticky="w")
-        ttk.Label(param_frame, text="Overlap:").grid(row=3, column=0, sticky="e", padx=5, pady=2)
+        
+        # Frame Overlap (Renamed from Overlap)
+        # Updated label text and tooltip key
+        frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
+        frame_overlap_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(frame_overlap_label, self.help_data.get("frame_overlap", "")) 
         ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=3, column=1, sticky="w")
-        ttk.Label(param_frame, text="CPU Offload:").grid(row=4, column=0, sticky="e", padx=5, pady=2)
+        
+        # Original Input Bias (NEW PARAMETER)
+        original_blend_label = ttk.Label(param_frame, text="Original Input Bias:") # Concise name for GUI
+        original_blend_label.grid(row=4, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(original_blend_label, self.help_data.get("original_input_blend_strength", ""))
+        ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=4, column=1, sticky="w")
+
+        # CPU Offload
+        offload_label = ttk.Label(param_frame, text="CPU Offload:")
+        offload_label.grid(row=5, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(offload_label, self.help_data.get("offload_type", ""))
         offload_options = ["model", "sequential", "none"]
-        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=4, column=1, sticky="w")
+        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=5, column=1, sticky="w")
 
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
@@ -524,6 +635,8 @@ class InpaintingGUI(tk.Tk):
         self.start_button.pack(side="left", padx=5)
         self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5)
+        # NEW: Help button
+        ttk.Button(buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
         ttk.Button(buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
 
         # New: Information window for current video
@@ -564,11 +677,14 @@ class InpaintingGUI(tk.Tk):
             num_inference_steps = int(self.num_inference_steps_var.get())
             tile_num = int(self.tile_num_var.get())
             frames_chunk = int(self.frames_chunk_var.get())
-            overlap = int(self.overlap_var.get())
-            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or overlap < 0:
+            overlap = int(self.overlap_var.get()) # Use self.overlap_var
+            original_input_blend_strength = float(self.original_input_blend_strength_var.get()) # NEW LINE
+            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or overlap < 0 or \
+               not (0.0 <= original_input_blend_strength <= 1.0): # NEW VALIDATION
                 raise ValueError("Invalid parameter values")
         except ValueError:
-            messagebox.showerror("Error", "Please enter valid integer values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Overlap >=0")
+            # UPDATED ERROR MESSAGE
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0")
             return
         offload_type = self.offload_type_var.get()
 
@@ -585,10 +701,10 @@ class InpaintingGUI(tk.Tk):
         self.update_video_info_display("N/A", "N/A", "N/A") # Clear info on start
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap, original_input_blend_strength),
                          daemon=True).start()
 
-    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap):
+    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap, original_input_blend_strength):
         try:
             self.pipeline = load_inpainting_pipeline(
                 pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
@@ -616,12 +732,23 @@ class InpaintingGUI(tk.Tk):
                 temp_frames, _ = read_video_frames(video_path)
                 current_video_name = os.path.basename(video_path)
                 current_num_frames = temp_frames.shape[0] if temp_frames.numel() > 0 else 0
-                current_res = "N/A"
+                current_display_res = "N/A"
                 if current_num_frames > 0:
-                    _, _, h, w = temp_frames.shape
-                    current_res = f"{w}x{h}"
+                    _, _, total_h, total_w = temp_frames.shape # Get total dimensions of the raw input video
+                    video_name_without_ext = os.path.splitext(current_video_name)[0]
+                    is_dual_input = video_name_without_ext.endswith("_splatted2")
 
-                self.after(0, self.update_video_info_display, current_video_name, current_res, current_num_frames)
+                    if is_dual_input:
+                        # For dual input (Mask | Warped), the output is the size of the warped half
+                        display_h = total_h
+                        display_w = total_w // 2
+                    else:
+                        # For quad input (Original, Depth, Mask, Warped), the output is the size of one of the quarters (e.g., warped)
+                        display_h = total_h // 2
+                        display_w = total_w // 2
+                    current_display_res = f"{display_w}x{display_h}"
+
+                self.after(0, self.update_video_info_display, current_video_name, current_display_res, current_num_frames)
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
 
                 logger.info(f"Processing {video_path}")
@@ -635,7 +762,8 @@ class InpaintingGUI(tk.Tk):
                     vf=None,
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
-                    update_info_callback=None # Info updated by run_batch_process directly
+                    update_info_callback=None, # Info updated by run_batch_process directly
+                    original_input_blend_strength=original_input_blend_strength # NEW LINE: Pass the 
                 )
                 if completed:
                     try:
@@ -701,7 +829,9 @@ class InpaintingGUI(tk.Tk):
             "tile_num": self.tile_num_var.get(),
             "offload_type": self.offload_type_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
-            "overlap": self.overlap_var.get()
+            # Renamed config key to match GUI and help file
+            "frame_overlap": self.overlap_var.get(),
+            "original_input_blend_strength": self.original_input_blend_strength_var.get()             
         }
         try:
             with open("config_inpaint.json", "w") as f:
@@ -716,6 +846,23 @@ class InpaintingGUI(tk.Tk):
                 return json.load(f)
         except FileNotFoundError:
             return {}
+
+    # NEW: Method to load help data from renamed file
+    def load_help_data(self):
+        try:
+            with open("inpaint_help.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.warning("inpaint_help.json not found. No help tips will be available.")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding inpaint_help.json: {e}")
+            return {}
+
+    # NEW: Method to show general help
+    def show_general_help(self):
+        help_text = self.help_data.get("general_help", "No general help information available.")
+        messagebox.showinfo("Help", help_text)
 
 if __name__ == "__main__":
     app = InpaintingGUI()

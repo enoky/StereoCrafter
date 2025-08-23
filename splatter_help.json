@@ -1,0 +1,18 @@
+{
+    "input_source_clips": "Path to the folder containing your input video clips (MP4, AVI, MOV, MKV).",
+    "input_depth_maps": "Path to the folder containing your pre-rendered depth maps. Depth maps should be named 'videoname_depth.mp4' or 'videoname_depth.npz' matching your input videos.",
+    "output_splatted": "Path to the folder where the splatted output videos will be saved.",
+    "set_pre_res": "Enable to resize input videos to a specific resolution before processing. This affects both the video frames and the depth maps (if 'Resize Depthmap' is enabled).",
+    "pre_res_width": "Target width for pre-processing input videos if 'Set Pre-processing Resolution' is enabled.",
+    "pre_res_height": "Target height for pre-processing input videos if 'Set Pre-processing Resolution' is enabled.",
+    "match_depth_res": "If checked, loaded depth maps will be resized (interpolated) to match the resolution of the processed input video frames.",
+    "max_disp": "Maximum disparity value as a percentage of the video's width. Higher values result in more extreme parallax effects (depth shift). Example: '20.0' means 20% of the video width.",
+    "batch_size": "Number of frames to process in a single batch during the forward warping (splatting) stage. Adjust based on your GPU's VRAM; lower values use less VRAM but can be slower.",
+    "dual_output": "If checked, the output video will show two panels: the generated occlusion mask on the left and the warped (right-eye view) video on the right. If unchecked, it will generate a 2x2 grid: Original | DepthVis (Top), Mask | Warped (Bottom).",
+    "enable_low_res_output": "If checked, an additional, smaller resolution output video will be generated alongside the main output. This is useful for quickly previewing results or for specific downstream uses.",
+    "low_res_width": "The target width for the second, downscaled output video.",
+    "low_res_height": "The target height for the second, downscaled output video.",
+    "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
+    "stop_button": "Stops the currently running processing task cleanly.",
+    "exit_button": "Saves the current GUI settings to 'config_splat.json' and closes the application."
+}
