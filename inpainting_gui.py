@@ -307,12 +307,12 @@ def process_single_video(
     save_dir: str,
     frames_chunk: int = 23,
     overlap: int = 3,
-    tile_num: int = 2,
+    tile_num: int = 1,
     vf: Optional[str] = None,
     num_inference_steps: int = 5,
     stop_event: threading.Event = None,
     update_info_callback=None, # Callback to update GUI info
-    original_input_blend_strength: float = 0.5, # NEW PARAMETER WITH DEFAULT
+    original_input_blend_strength: float = 0.8, # NEW PARAMETER WITH DEFAULT
 ) -> bool:
     """
     Processes a single input video.
