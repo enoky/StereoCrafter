@@ -7,7 +7,7 @@
     "pre_res_height": "Target height for pre-processing input videos if 'Set Pre-processing Resolution' is enabled.",
     "match_depth_res": "If checked, loaded depth maps will be resized (interpolated) to match the resolution of the processed input video frames.",
     "max_disp": "Maximum disparity value as a percentage of the video's width x 20. Higher values result in more extreme parallax effects (depth shift). Example: '30.0' means a maximum of 1.5% shift horizontally at the forground.",
-    "batch_size": "Number of frames to process in a single batch during the forward warping (splatting) stage. Adjust based on your GPU's VRAM; lower values use less VRAM but can be slower.",
+    "batch_size": "Number of frames to process in a single batch during the forward warping (splatting) stage. Adjust based on your GPU's VRAM; lower values use less VRAM but can be slower. Default:10",
     "dual_output": "If checked, the output video will show two panels: the generated occlusion mask on the left and the warped (right-eye view) video on the right. If unchecked, it will generate a 2x2 grid: Original | DepthVis (Top), Mask | Warped (Bottom).",
     "enable_low_res_output": "If checked, an additional, smaller resolution output video will be generated alongside the main output. This is useful for quickly previewing results or for specific downstream uses. IT IS NOT RECOMMENDED to use this for inpainting as the downscaled mask will not produce a clean result. This option maybe removed in the future.",
     "low_res_width": "The target width for the second, downscaled output video.",
