@@ -85,3 +85,6 @@ weights/
 
 
 
+config.json
+config_inpaint.json
+config_splat.json
