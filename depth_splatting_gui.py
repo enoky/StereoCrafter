@@ -118,6 +118,8 @@ class ForwardWarpStereo(nn.Module):
         disp = disp.contiguous()
         weights_map = disp - disp.min()
         weights_map = (1.414) ** weights_map
+        # Reverted to original flow calculation with negative sign for standard right-eye view.
+        # If inverting is desired, this line is the one to change from -disp to disp.
         flow = -disp.squeeze(1)
         dummy_flow = torch.zeros_like(flow, requires_grad=False)
         flow = torch.stack((flow, dummy_flow), dim=-1)
@@ -135,7 +137,7 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool, zero_disparity_anchor_val: float): # Removed enable_low_res_output, low_res_width, low_res_height
+                   dual_output: bool, zero_disparity_anchor_val: float): # Added zero_disparity_anchor_val
 
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -190,12 +192,16 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         batch_frames = input_frames_processed[i:i+batch_size]
         batch_depth = video_depth[i:i+batch_size]
         batch_depth_vis = depth_vis[i:i+batch_size]
-        
+
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
+
+        # REMOVED: disp_map = disp_map * 2.0 - 1.0
         
-        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0
-        disp_map = disp_map * max_disp
+        # MODIFIED: Use the passed anchor value
+        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0 # Use the anchor value passed to the function
+
+        disp_map = disp_map * max_disp # This line scales the adjusted disparity and remains.
         with torch.no_grad():
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
         right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
@@ -304,8 +310,9 @@ def main(settings):
     set_pre_res = settings["set_pre_res"]
     pre_res_width = int(settings["pre_res_width"])
     pre_res_height = int(settings["pre_res_height"])
-    zero_disparity_normalized_depth_anchor = settings["zero_disparity_anchor"]
-    # match_depth_res is now permanently True within load_pre_rendered_depth call
+    
+    # NEW: Retrieve default anchor value from GUI settings
+    default_zero_disparity_anchor = settings["zero_disparity_anchor"]
 
     is_single_file_mode = False
     input_videos = []
@@ -359,6 +366,9 @@ def main(settings):
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
 
+        # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
+        current_zero_disparity_anchor = default_zero_disparity_anchor
+
         # 1. Read input video frames at the determined pre-processing resolution
         # This resolution will be the target for depth maps and splatting output
         try:
@@ -392,7 +402,37 @@ def main(settings):
         depth_vis = None
 
         if actual_depth_map_path:
+            # First, normalize the actual_depth_map_path for consistent handling and printing
+            actual_depth_map_path = os.path.normpath(actual_depth_map_path) 
+            
             print(f"==> Found depth map: {actual_depth_map_path}")
+
+            # Now, use the normalized path for constructing the sidecar path
+            depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
+            json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
+
+            if os.path.exists(json_sidecar_path):
+                try:
+                    with open(json_sidecar_path, 'r') as f:
+                        sidecar_data = json.load(f)
+                    if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
+                        current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
+                        print(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
+                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from JSON: {current_zero_disparity_anchor:.2f})"))
+                    else:
+                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                except json.JSONDecodeError:
+                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                except Exception as e:
+                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+            else:
+                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+            # END NEW SIDECAR JSON DETECTION LOGIC
+
             try:
                 video_depth, depth_vis = load_pre_rendered_depth(
                     actual_depth_map_path,
@@ -446,7 +486,7 @@ def main(settings):
             process_length=process_length,
             batch_size=batch_size,
             dual_output=dual_output,
-            zero_disparity_anchor_val=zero_disparity_normalized_depth_anchor
+            zero_disparity_anchor_val=current_zero_disparity_anchor # Pass the (potentially overridden) anchor value
         )
         if stop_event.is_set():
             print("==> Stopping after DepthSplatting due to user request")
@@ -500,13 +540,15 @@ def start_processing():
             pre_res_h = int(pre_res_height_var.get())
             if pre_res_w <= 0 or pre_res_h <= 0:
                 raise ValueError("Pre-processing Width and Height must be positive.")
-        anchor_val = float(zero_disparity_anchor_var.get())
-        if not (0.0 <= anchor_val <= 1.0):
-            raise ValueError("Zero Disparity Anchor must be between 0.0 and 1.0.")
 
         max_disp_val = float(max_disp_var.get())
         if max_disp_val <= 0:
             raise ValueError("Max Disparity must be positive.")
+            
+        # NEW: Validate Zero Disparity Anchor
+        anchor_val = float(zero_disparity_anchor_var.get())
+        if not (0.0 <= anchor_val <= 1.0):
+            raise ValueError("Zero Disparity Anchor must be between 0.0 and 1.0.")
 
     except ValueError as e:
         status_label.config(text=f"Error: {e}")
@@ -528,8 +570,8 @@ def start_processing():
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
-        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), 
-        "match_depth_res": True         # Permanently set to True
+        "match_depth_res": True,         # Permanently set to True
+        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), # NEW: Add to settings
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -570,9 +612,21 @@ def check_queue():
                 status_label.config(text=f"Processing 0 of {total_videos}")
             elif message[0] == "processed":
                 processed = message[1]
-                progress_var.set(processed)
                 total = progress_bar["maximum"]
-                status_label.config(text=f"Processing {processed} of {total}")
+                progress_var.set(processed)
+                # Update status label to show progress, but don't overwrite custom status
+                current_status_text = status_label.cget("text")
+                if not current_status_text.startswith("Processing ") or ("Anchor from" in current_status_text and not "finished" in current_status_text):
+                    # If it's a custom anchor message, just update progress part
+                    parts = current_status_text.split("(")
+                    if len(parts) > 1: # If it has an anchor part
+                        progress_queue.put(("status", f"Processing {processed}/{total} ({parts[1]}"))
+                    else: # If it's a basic processing message
+                        status_label.config(text=f"Processing {processed} of {total}")
+                else: # Default behavior if no custom status or if it's already "Processing X of Y"
+                    status_label.config(text=f"Processing {processed} of {total}")
+            elif message[0] == "status": # NEW: Handle custom status messages
+                status_label.config(text=message[1])
     except queue.Empty:
         pass
     root.after(100, check_queue)
@@ -599,12 +653,10 @@ def save_config():
         "process_length": process_length_var.get(),
         "batch_size": batch_size_var.get(),
         "dual_output": dual_output_var.get(),
-        # Removed "enable_low_res_output", "low_res_width", "low_res_height"
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
-        "zero_disparity_anchor": zero_disparity_anchor_var.get()
-        # Removed "match_depth_res"
+        "convergence_point": zero_disparity_anchor_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -620,12 +672,10 @@ def load_config():
             process_length_var.set(config.get("process_length", "-1"))
             batch_size_var.set(config.get("batch_size", "10"))
             dual_output_var.set(config.get("dual_output", False))
-            # Removed loading for "enable_low_res_output", "low_res_width", "low_res_height"
             set_pre_res_var.set(config.get("set_pre_res", False))
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
-            zero_disparity_anchor_var.set(config.get("zero_disparity_anchor", "0.5"))
-            # Removed loading for "match_depth_res"
+            zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
 
 # Load help texts at the start
 load_help_texts()
@@ -645,7 +695,7 @@ dual_output_var = tk.BooleanVar(value=False) # Default to Quad
 set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
-zero_disparity_anchor_var = tk.StringVar(value="0.5")
+zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
 
 # Load configuration
 load_config()
@@ -663,10 +713,10 @@ btn_browse_source_clips_folder = tk.Button(folder_frame, text="Browse Folder", c
 btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
 btn_select_source_clips_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
 btn_select_source_clips_file.grid(row=0, column=3, padx=2, pady=2)
-create_hover_tooltip(lbl_source_clips, "input_source_clips")
-create_hover_tooltip(entry_source_clips, "input_source_clips")
-create_hover_tooltip(btn_browse_source_clips_folder, "input_source_clips_folder")
-create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file")
+create_hover_tooltip(lbl_source_clips, "input_source_clips") # Existing
+create_hover_tooltip(entry_source_clips, "input_source_clips") # Existing
+create_hover_tooltip(btn_browse_source_clips_folder, "input_source_clips_folder") # NEW TOOLTIP
+create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file") # NEW TOOLTIP
 
 
 # Input Depth Maps Row
@@ -678,10 +728,10 @@ btn_browse_input_depth_maps_folder = tk.Button(folder_frame, text="Browse Folder
 btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
 btn_select_input_depth_maps_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
 btn_select_input_depth_maps_file.grid(row=1, column=3, padx=2, pady=2)
-create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps")
-create_hover_tooltip(entry_input_depth_maps, "input_depth_maps")
-create_hover_tooltip(btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
-create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file")
+create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps") # Existing
+create_hover_tooltip(entry_input_depth_maps, "input_depth_maps") # Existing
+create_hover_tooltip(btn_browse_input_depth_maps_folder, "input_depth_maps_folder") # NEW TOOLTIP
+create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file") # NEW TOOLTIP
 
 
 # Output Splatted Row
@@ -752,27 +802,27 @@ entry_batch_size.grid(row=0, column=3, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_batch_size, "batch_size")
 create_hover_tooltip(entry_batch_size, "batch_size")
 
-# NEW: Zero Disparity Anchor Point input
-lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Zero Disparity Anchor (0-1):")
-lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2) # Adjust row/column as needed
+
+# NEW: Zero Disparity Anchor Point input (Moved to row 1)
+lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Convergence Point (0-1):")
+lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=2 to row=1
 entry_zero_disparity_anchor = tk.Entry(output_settings_frame, textvariable=zero_disparity_anchor_var, width=15)
-entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2) # Adjust row/column as needed
-create_hover_tooltip(lbl_zero_disparity_anchor, "zero_disparity_anchor")
-create_hover_tooltip(entry_zero_disparity_anchor, "zero_disparity_anchor")
+entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=2 to row=1
+create_hover_tooltip(lbl_zero_disparity_anchor, "convergence_point")
+create_hover_tooltip(entry_zero_disparity_anchor, "convergence_point")
 
-# Dual Output Checkbox
-dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
-dual_output_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-create_hover_tooltip(dual_output_checkbox, "dual_output")
-
-
-# Process Length (moved from original)
+# Process Length (Moved to row 2)
 lbl_process_length = tk.Label(output_settings_frame, text="Process Length (-1 for all):")
-lbl_process_length.grid(row=3, column=2, sticky="e", padx=5, pady=2)
+lbl_process_length.grid(row=2, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=3 to row=2
 entry_process_length = tk.Entry(output_settings_frame, textvariable=process_length_var, width=15)
-entry_process_length.grid(row=3, column=3, sticky="w", padx=5, pady=2)
+entry_process_length.grid(row=2, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=3 to row=2
 create_hover_tooltip(lbl_process_length, "process_length")
 create_hover_tooltip(entry_process_length, "process_length")
+
+# Dual Output Checkbox (Moved to row 3, now at the bottom of these settings)
+dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
+dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
+create_hover_tooltip(dual_output_checkbox, "dual_output")
 
 
 # Progress frame
