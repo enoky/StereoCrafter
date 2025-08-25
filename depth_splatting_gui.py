@@ -135,7 +135,7 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool): # Removed enable_low_res_output, low_res_width, low_res_height
+                   dual_output: bool, zero_disparity_anchor_val: float): # Removed enable_low_res_output, low_res_width, low_res_height
 
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -190,10 +190,11 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         batch_frames = input_frames_processed[i:i+batch_size]
         batch_depth = video_depth[i:i+batch_size]
         batch_depth_vis = depth_vis[i:i+batch_size]
-
+        
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
-        disp_map = disp_map * 2.0 - 1.0
+        
+        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0
         disp_map = disp_map * max_disp
         with torch.no_grad():
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
@@ -303,6 +304,7 @@ def main(settings):
     set_pre_res = settings["set_pre_res"]
     pre_res_width = int(settings["pre_res_width"])
     pre_res_height = int(settings["pre_res_height"])
+    zero_disparity_normalized_depth_anchor = settings["zero_disparity_anchor"]
     # match_depth_res is now permanently True within load_pre_rendered_depth call
 
     is_single_file_mode = False
@@ -443,7 +445,8 @@ def main(settings):
             max_disp=actual_max_disp_pixels,
             process_length=process_length,
             batch_size=batch_size,
-            dual_output=dual_output
+            dual_output=dual_output,
+            zero_disparity_anchor_val=zero_disparity_normalized_depth_anchor
         )
         if stop_event.is_set():
             print("==> Stopping after DepthSplatting due to user request")
@@ -497,6 +500,9 @@ def start_processing():
             pre_res_h = int(pre_res_height_var.get())
             if pre_res_w <= 0 or pre_res_h <= 0:
                 raise ValueError("Pre-processing Width and Height must be positive.")
+        anchor_val = float(zero_disparity_anchor_var.get())
+        if not (0.0 <= anchor_val <= 1.0):
+            raise ValueError("Zero Disparity Anchor must be between 0.0 and 1.0.")
 
         max_disp_val = float(max_disp_var.get())
         if max_disp_val <= 0:
@@ -522,6 +528,7 @@ def start_processing():
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
+        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), 
         "match_depth_res": True         # Permanently set to True
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
@@ -596,6 +603,7 @@ def save_config():
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
+        "zero_disparity_anchor": zero_disparity_anchor_var.get()
         # Removed "match_depth_res"
     }
     with open("config_splat.json", "w") as f:
@@ -616,6 +624,7 @@ def load_config():
             set_pre_res_var.set(config.get("set_pre_res", False))
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
+            zero_disparity_anchor_var.set(config.get("zero_disparity_anchor", "0.5"))
             # Removed loading for "match_depth_res"
 
 # Load help texts at the start
@@ -636,6 +645,7 @@ dual_output_var = tk.BooleanVar(value=False) # Default to Quad
 set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
+zero_disparity_anchor_var = tk.StringVar(value="0.5")
 
 # Load configuration
 load_config()
@@ -742,18 +752,25 @@ entry_batch_size.grid(row=0, column=3, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_batch_size, "batch_size")
 create_hover_tooltip(entry_batch_size, "batch_size")
 
+# NEW: Zero Disparity Anchor Point input
+lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Zero Disparity Anchor (0-1):")
+lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2) # Adjust row/column as needed
+entry_zero_disparity_anchor = tk.Entry(output_settings_frame, textvariable=zero_disparity_anchor_var, width=15)
+entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2) # Adjust row/column as needed
+create_hover_tooltip(lbl_zero_disparity_anchor, "zero_disparity_anchor")
+create_hover_tooltip(entry_zero_disparity_anchor, "zero_disparity_anchor")
 
 # Dual Output Checkbox
 dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
-dual_output_checkbox.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+dual_output_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 create_hover_tooltip(dual_output_checkbox, "dual_output")
 
 
 # Process Length (moved from original)
 lbl_process_length = tk.Label(output_settings_frame, text="Process Length (-1 for all):")
-lbl_process_length.grid(row=1, column=2, sticky="e", padx=5, pady=2)
+lbl_process_length.grid(row=3, column=2, sticky="e", padx=5, pady=2)
 entry_process_length = tk.Entry(output_settings_frame, textvariable=process_length_var, width=15)
-entry_process_length.grid(row=1, column=3, sticky="w", padx=5, pady=2)
+entry_process_length.grid(row=3, column=3, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_process_length, "process_length")
 create_hover_tooltip(entry_process_length, "process_length")
 

@@ -14,5 +14,10 @@
     "low_res_height": "The target height for the second, downscaled output video.",
     "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
     "stop_button": "Stops the currently running processing task cleanly.",
-    "exit_button": "Saves the current GUI settings to 'config_splat.json' and closes the application."
+    "exit_button": "Saves the current GUI settings to 'config_splat.json' and closes the application.",
+    "input_source_clips_folder": "Browse for a folder containing multiple video clips to process in batch.",
+    "input_source_clips_file": "Select a single video clip file to process.",
+    "input_depth_maps_folder": "Browse for a folder containing corresponding depth maps (e.g., video_name_depth.mp4/npz) for batch processing.",
+    "input_depth_maps_file": "Select a single depth map file corresponding to the selected source video.",
+    "zero_disparity_anchor": "Set the normalized depth value (0.0 to 1.0) that will appear stationary (zero horizontal shift). 0.0 is closest, 1.0 is farthest. Adjust to move the 'anchor' plane forward or backward in the scene."
 }
