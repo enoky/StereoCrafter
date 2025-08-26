@@ -1,5 +1,3 @@
-# convergence_json_tool.py
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
@@ -11,7 +9,7 @@ import _tkinter # Import _tkinter for error handling
 class ConvergenceJSONTool:
     def __init__(self, root):
         self.root = root
-        self.root.title("Convergence JSON Sidecar Creator")
+        self.root.title("SidecarEdit JSON Sidecar Creator") # Changed title
         self.root.geometry("600x500") # Initial window size
 
         # --- Variables ---
@@ -22,14 +20,16 @@ class ConvergenceJSONTool:
         self.current_filename_var = tk.StringVar(value="No file loaded")
         self.file_status_var = tk.StringVar(value="0 of 0")
         self.convergence_var = tk.DoubleVar(value=0.5) # Slider needs DoubleVar
+        self.max_disparity_var = tk.DoubleVar(value=35.0) # NEW: Slider for max disparity (default 35)
         self.jump_to_file_var = tk.StringVar(value="1")
         self.status_message_var = tk.StringVar(value="Ready.")
 
         self.all_depth_map_files = [] # Stores full paths to depth maps
         self.current_file_index = -1  # -1 means no file loaded
-        self.progress_save_data = {}  # Dict to store {filename: convergence_value} for all files
+        # self.progress_save_data will now store {filename_basename: {"convergence_plane": value, "max_disparity": value}}
+        self.progress_save_data = {}  
 
-        self.config_file_path = "convergence_tool_config.json"
+        self.config_file_path = "sidecaredit_config.json" # Changed config filename
         self.progress_file_path = None  # Will be set dynamically based on folder
 
         # --- Load Configuration and Progress on startup ---
@@ -43,6 +43,7 @@ class ConvergenceJSONTool:
 
         # Sync slider and entry
         self.convergence_var.trace_add("write", self._sync_convergence_entry_from_slider)
+        self.max_disparity_var.trace_add("write", self._sync_max_disparity_entry_from_slider) # NEW: Sync disparity slider and entry
         
         # Initial folder load if any in recent list
         if self.recent_folders_list:
@@ -90,7 +91,33 @@ class ConvergenceJSONTool:
         ttk.Label(file_info_frame, text="Filename:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(file_info_frame, textvariable=self.current_filename_var, wraplength=400).grid(row=0, column=1, sticky="w", padx=5, pady=2)
 
-        # Convergence Control Frame
+        # NEW: Max Disparity Control Frame (placed above Convergence)
+        max_disparity_frame = ttk.LabelFrame(self.root, text="Max Disparity (0-100)")
+        max_disparity_frame.pack(pady=5, padx=10, fill="x")
+
+        # Slider for Max Disparity
+        self.max_disparity_slider = ttk.Scale(
+            max_disparity_frame,
+            from_=0.0,
+            to=100.0,
+            orient=tk.HORIZONTAL,
+            variable=self.max_disparity_var
+        )
+        self.max_disparity_slider.pack(fill="x", padx=5, pady=5)
+
+        # Entry for numerical input for Max Disparity, synced with slider
+        vcmd_disparity = (self.root.register(self._validate_max_disparity_input), '%P')
+        self.max_disparity_entry = ttk.Entry(
+            max_disparity_frame,
+            textvariable=self.max_disparity_var,
+            width=10,
+            validate="focusout", # Validate on losing focus
+            validatecommand=vcmd_disparity
+        )
+        self.max_disparity_entry.pack(padx=5, pady=2)
+        self.max_disparity_entry.bind("<Return>", self._sync_max_disparity_slider_from_entry) # Sync on Enter key
+
+        # Convergence Control Frame (EXISTING)
         convergence_frame = ttk.LabelFrame(self.root, text="Convergence Plane (0.0=Nearest, 1.0=Furthest)")
         convergence_frame.pack(pady=5, padx=10, fill="x")
 
@@ -144,14 +171,9 @@ class ConvergenceJSONTool:
         status_bar = ttk.Label(self.root, textvariable=self.status_message_var, anchor="w")
         status_bar.pack(side="bottom", fill="x", pady=2, padx=10)
 
-        # Action Buttons Frame
+        # Action Buttons Frame (buttons removed as they are in the menu)
         action_frame = ttk.Frame(self.root)
         action_frame.pack(pady=10, padx=10, fill="x")
-
-        # Removed redundant Save/Generate/Exit buttons from GUI, they are in the menu
-        # ttk.Button(action_frame, text="Save Progress", command=self._save_progress).pack(side="left", padx=5)
-        # ttk.Button(action_frame, text="Generate Sidecar JSONs", command=self._generate_sidecar_jsons).pack(side="right", padx=5)
-        # ttk.Button(action_frame, text="Exit", command=self._exit_app).pack(side="right", padx=5)
 
     def _update_recent_folders_menu(self):
         self.recent_folders_submenu.delete(0, tk.END) # Clear existing items
@@ -211,7 +233,8 @@ class ConvergenceJSONTool:
             self._update_gui_for_no_files("Please select a valid depth map folder.")
             return
 
-        self.progress_file_path = os.path.join(folder, "convergence_tool_progress.json")
+        # --- Change 1: Update progress file name ---
+        self.progress_file_path = os.path.join(folder, "sidecaredit_progress.json")
         self._load_progress() # Load progress specifically for this new folder
 
         video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
@@ -233,6 +256,7 @@ class ConvergenceJSONTool:
         self.current_filename_var.set(message)
         self.file_status_var.set("0 of 0")
         self.convergence_var.set(0.5)
+        self.max_disparity_var.set(35.0) # NEW: Reset max disparity
         self.jump_to_file_var.set("1")
         self.status_message_var.set(message)
         self._update_navigation_buttons()
@@ -248,11 +272,23 @@ class ConvergenceJSONTool:
         self.file_status_var.set(f"{self.current_file_index + 1} of {len(self.all_depth_map_files)}")
         self.jump_to_file_var.set(str(self.current_file_index + 1))
 
-        # Load convergence value from progress_save_data or default
-        saved_value = self.progress_save_data.get(full_path, 0.5)
-        
-        # Set the DoubleVar. This should automatically update the slider and trigger the entry sync.
-        self.convergence_var.set(saved_value) 
+        # --- Change 2: Lookup saved data using the basename ---
+        saved_data = self.progress_save_data.get(filename)
+
+        convergence_value = 0.5
+        max_disparity_value = 35.0
+
+        if saved_data is not None:
+            if isinstance(saved_data, dict): # New format: dictionary of values
+                convergence_value = saved_data.get("convergence_plane", 0.5)
+                max_disparity_value = saved_data.get("max_disparity", 35.0)
+            else: # Old format (before max_disparity): just a float (assumed to be convergence_plane)
+                convergence_value = saved_data 
+                # max_disparity_value remains default 35.0
+
+        # Set the DoubleVars. This automatically updates the sliders and triggers the entry sync.
+        self.convergence_var.set(convergence_value) 
+        self.max_disparity_var.set(max_disparity_value) # NEW: Set max disparity value
 
         self._update_navigation_buttons()
 
@@ -264,6 +300,8 @@ class ConvergenceJSONTool:
             self.jump_entry.config(state="disabled")
             self.convergence_slider.config(state="disabled")
             self.convergence_entry.config(state="disabled")
+            self.max_disparity_slider.config(state="disabled") # NEW
+            self.max_disparity_entry.config(state="disabled")   # NEW
             return
         
         self.prev_button.config(state="normal" if self.current_file_index > 0 else "disabled")
@@ -271,6 +309,8 @@ class ConvergenceJSONTool:
         self.jump_entry.config(state="normal")
         self.convergence_slider.config(state="normal")
         self.convergence_entry.config(state="normal")
+        self.max_disparity_slider.config(state="normal") # NEW
+        self.max_disparity_entry.config(state="normal")   # NEW
 
     def _sync_convergence_entry_from_slider(self, *args):
         try:
@@ -278,7 +318,6 @@ class ConvergenceJSONTool:
             self.convergence_entry.delete(0, tk.END)
             self.convergence_entry.insert(0, f"{val:.2f}")
         except _tkinter.TclError:
-            # print("DEBUG: _tkinter.TclError caught in _sync_convergence_entry_from_slider. convergence_var likely empty.")
             pass
         except ValueError:
             pass
@@ -287,6 +326,24 @@ class ConvergenceJSONTool:
         try:
             val = float(self.convergence_entry.get())
             self.convergence_var.set(val)
+        except ValueError:
+            pass
+
+    # NEW: Sync methods for Max Disparity
+    def _sync_max_disparity_entry_from_slider(self, *args):
+        try:
+            val = self.max_disparity_var.get()
+            self.max_disparity_entry.delete(0, tk.END)
+            self.max_disparity_entry.insert(0, f"{val:.2f}")
+        except _tkinter.TclError:
+            pass
+        except ValueError:
+            pass
+
+    def _sync_max_disparity_slider_from_entry(self, event=None):
+        try:
+            val = float(self.max_disparity_entry.get())
+            self.max_disparity_var.set(val)
         except ValueError:
             pass
 
@@ -304,6 +361,23 @@ class ConvergenceJSONTool:
                 return False
         except ValueError:
             self.status_message_var.set("Error: Invalid number for convergence.")
+            return False
+
+    # NEW: Validation method for Max Disparity
+    def _validate_max_disparity_input(self, p):
+        if p == "":
+            self.status_message_var.set("Error: Max Disparity cannot be empty.")
+            return False
+        try:
+            val = float(p)
+            if 0.0 <= val <= 100.0:
+                self.status_message_var.set("Ready.")
+                return True
+            else:
+                self.status_message_var.set("Error: Max Disparity must be between 0.0 and 100.0.")
+                return False
+        except ValueError:
+            self.status_message_var.set("Error: Invalid number for max disparity.")
             return False
 
     def _validate_jump_input(self, p):
@@ -357,8 +431,13 @@ class ConvergenceJSONTool:
             return
 
         if self.current_file_index != -1 and self.all_depth_map_files:
-            # Ensure the latest value from the GUI is in the internal data before saving
-            self.progress_save_data[self.all_depth_map_files[self.current_file_index]] = self.convergence_var.get()
+            current_file_path = self.all_depth_map_files[self.current_file_index]
+            # --- Change 3: Store basename as the key ---
+            current_file_basename = os.path.basename(current_file_path)
+            self.progress_save_data[current_file_basename] = {
+                "convergence_plane": self.convergence_var.get(),
+                "max_disparity": self.max_disparity_var.get()
+            }
         
         try:
             with open(self.progress_file_path, 'w') as f:
@@ -398,9 +477,24 @@ class ConvergenceJSONTool:
         errors = []
 
         for full_path in self.all_depth_map_files:
-            convergence_value = self.progress_save_data.get(full_path, 0.5) # Get saved or default to 0.5
+            # --- Change 4: Lookup saved data using the basename ---
+            filename_only = os.path.basename(full_path) 
+            saved_data = self.progress_save_data.get(filename_only)
+            
+            convergence_value = 0.5
+            max_disparity_value = 35.0
 
-            json_data = {"convergence_plane": convergence_value}
+            if saved_data is not None:
+                if isinstance(saved_data, dict):
+                    convergence_value = saved_data.get("convergence_plane", 0.5)
+                    max_disparity_value = saved_data.get("max_disparity", 35.0)
+                else: # Old format, only convergence was saved
+                    convergence_value = saved_data
+
+            json_data = {
+                "convergence_plane": convergence_value,
+                "max_disparity": max_disparity_value # NEW: Include max_disparity
+            }
             
             # Construct sidecar JSON filename (e.g., video.mp4 -> video.mp4.json)
             base_name_without_ext = os.path.splitext(full_path)[0] # Get the path without the last extension
