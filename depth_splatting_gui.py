@@ -72,7 +72,7 @@ def read_video_frames(video_path, process_length, target_fps,
         vid_info = VideoReader(video_path, ctx=cpu(0))
         original_height, original_width = vid_info.get_batch([0]).shape[1:3]
         print(f"==> Original video shape: {len(vid_info)} frames, {original_height}x{original_width} per frame")
-        
+
         height_for_processing = original_height
         width_for_processing = original_width
 
@@ -96,12 +96,12 @@ def read_video_frames(video_path, process_length, target_fps,
     print(f"==> Downsampled to {len(frames_idx)} frames with stride {stride}")
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
-    
+
     # Verify the actual shape after Decord processing
     first_frame_shape = vid.get_batch([0]).shape
     actual_processed_height, actual_processed_width = first_frame_shape[1:3]
     print(f"==> Final processing shape: {len(frames_idx)} frames, {actual_processed_height}x{actual_processed_width} per frame")
-    
+
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
 
     return frames, fps, original_height, original_width, actual_processed_height, actual_processed_width
@@ -118,6 +118,8 @@ class ForwardWarpStereo(nn.Module):
         disp = disp.contiguous()
         weights_map = disp - disp.min()
         weights_map = (1.414) ** weights_map
+        # Reverted to original flow calculation with negative sign for standard right-eye view.
+        # If inverting is desired, this line is the one to change from -disp to disp.
         flow = -disp.squeeze(1)
         dummy_flow = torch.zeros_like(flow, requires_grad=False)
         flow = torch.stack((flow, dummy_flow), dim=-1)
@@ -135,14 +137,14 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool, enable_low_res_output: bool, low_res_width: int, low_res_height: int):
-    
+                   dual_output: bool, zero_disparity_anchor_val: float): # Added zero_disparity_anchor_val
+
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-    
+
     num_frames = len(input_frames_processed)
     height, width, _ = input_frames_processed[0].shape # Get dimensions from already processed frames
-    os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
+    os.makedirs(os.path.dirname(output_video_path), exist_ok=True) # Ensure output directory exists
 
     # Determine output video suffix and dimensions
     if dual_output:
@@ -170,33 +172,6 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     )
     print(f"==> Writing main output video to: {main_output_video_path}")
 
-    low_res_out = None
-    if enable_low_res_output:
-        # Determine low-res output path
-        low_res_output_video_path = f"{base_output_name}{res_suffix}_low{suffix}.mp4"
-
-        # Validate low_res_width/height (ensure they are positive)
-        if low_res_width <= 0 or low_res_height <= 0:
-            print("==> Warning: Low resolution dimensions must be positive. Disabling low-res output.")
-            enable_low_res_output = False # Disable it if dimensions are invalid
-        else:
-            # Calculate the overall grid dimensions for the low-resolution output
-            if dual_output:
-                low_res_output_grid_width = low_res_width * 2
-                low_res_output_grid_height = low_res_height
-            else: # Quad output
-                low_res_output_grid_width = low_res_width * 2
-                low_res_output_grid_height = low_res_height * 2
-
-            low_res_out = cv2.VideoWriter(
-                low_res_output_video_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                processed_fps,
-                (low_res_output_grid_width, low_res_output_grid_height),
-                True
-            )
-            print(f"==> Writing low-resolution output video to: {low_res_output_video_path}")
-            
     # Process only up to process_length if specified, for consistency
     if process_length != -1 and process_length < num_frames:
         input_frames_processed = input_frames_processed[:process_length]
@@ -212,17 +187,21 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
             torch.cuda.empty_cache()
             gc.collect()
             main_out.release()
-            if low_res_out: low_res_out.release()
             return
-        
+
         batch_frames = input_frames_processed[i:i+batch_size]
         batch_depth = video_depth[i:i+batch_size]
         batch_depth_vis = depth_vis[i:i+batch_size]
-        
+
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
-        disp_map = disp_map * 2.0 - 1.0
-        disp_map = disp_map * max_disp
+
+        # REMOVED: disp_map = disp_map * 2.0 - 1.0
+        
+        # MODIFIED: Use the passed anchor value
+        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0 # Use the anchor value passed to the function
+
+        disp_map = disp_map * max_disp # This line scales the adjusted disparity and remains.
         with torch.no_grad():
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
         right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
@@ -244,30 +223,20 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
             # Write to main output video
             main_out.write(video_grid_bgr)
 
-            # Write to low-resolution output video if enabled
-            if enable_low_res_output and low_res_out is not None:
-                # Check for output dimensions before resizing
-                if low_res_output_grid_width > 0 and low_res_output_grid_height > 0:
-                    resized_frame = cv2.resize(video_grid_bgr, (low_res_output_grid_width, low_res_output_grid_height), interpolation=cv2.INTER_AREA)
-                    low_res_out.write(resized_frame)
-                else:
-                    print("==> Error: Low-res output dimensions are invalid. Skipping low-res frame.")
         del left_video, disp_map, right_video, occlusion_mask
         torch.cuda.empty_cache()
         gc.collect()
         print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)}")
     main_out.release()
-    if low_res_out is not None:
-        low_res_out.release()
     print("==> Output video writing completed.")
 
-def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=False):
+def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True): # match_resolution_to_target permanently True
     """
     Loads pre-rendered depth maps from MP4 or NPZ.
     If match_resolution_to_target is True, it resizes the depth maps to the target_height/width for compatibility.
     """
     print(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
-    
+
     video_depth_raw = None
     if depth_map_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         vid = VideoReader(depth_map_path, ctx=cpu(0))
@@ -288,7 +257,7 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
 
     if process_length != -1 and process_length < len(video_depth_raw):
         video_depth_raw = video_depth_raw[:process_length]
-    
+
     # Normalize depth (0 to 1)
     video_depth_min = video_depth_raw.min()
     video_depth_max = video_depth_raw.max()
@@ -307,7 +276,7 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
             # OpenCV expects (width, height)
             resized_depth_frame = cv2.resize(depth_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
             resized_depths.append(resized_depth_frame)
-            
+
             # Apply colormap to the resized depth for visualization
             vis_frame = cv2.applyColorMap((resized_depth_frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
             resized_viss.append(vis_frame.astype("float32") / 255.0)
@@ -315,10 +284,10 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
         video_depth = np.stack(resized_depths, axis=0)
         depth_vis = np.stack(resized_viss, axis=0)
     else:
-        print(f"==> Not resizing loaded depth maps. Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
+        print(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
         video_depth = video_depth_normalized
         depth_vis = np.stack([cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
-    
+
     print("==> Depth maps and visualizations loaded successfully")
     return video_depth, depth_vis
 
@@ -331,35 +300,56 @@ def release_resources():
         print(f"==> Error releasing VRAM: {e}")
 
 def main(settings):
-    input_source_clips = settings["input_source_clips"]
-    input_depth_maps = settings["input_depth_maps"]
+    input_source_clips_path_setting = settings["input_source_clips"]
+    input_depth_maps_path_setting = settings["input_depth_maps"]
     output_splatted = settings["output_splatted"]
     max_disp = settings["max_disp"]
     process_length = settings["process_length"]
     batch_size = settings["batch_size"]
     dual_output = settings["dual_output"]
-    enable_low_res_output = settings["enable_low_res_output"]
-    low_res_width = settings["low_res_width"]
-    low_res_height = settings["low_res_height"]
     set_pre_res = settings["set_pre_res"]
     pre_res_width = int(settings["pre_res_width"])
     pre_res_height = int(settings["pre_res_height"])
-    match_depth_res = settings["match_depth_res"]
+    
+    # NEW: Retrieve default anchor value from GUI settings
+    default_zero_disparity_anchor = settings["zero_disparity_anchor"]
 
-    os.makedirs(output_splatted, exist_ok=True)
-    finished_source_folder = os.path.join(input_source_clips, "finished")
-    finished_depth_folder = os.path.join(input_depth_maps, "finished")
-    os.makedirs(finished_source_folder, exist_ok=True)
-    os.makedirs(finished_depth_folder, exist_ok=True)
-
-    video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+    is_single_file_mode = False
     input_videos = []
-    for ext in video_extensions:
-        input_videos.extend(glob.glob(os.path.join(input_source_clips, ext)))
-    input_videos = sorted(input_videos)
+    finished_source_folder = None
+    finished_depth_folder = None
+
+    is_source_file = os.path.isfile(input_source_clips_path_setting)
+    is_source_dir = os.path.isdir(input_source_clips_path_setting)
+    is_depth_file = os.path.isfile(input_depth_maps_path_setting)
+    is_depth_dir = os.path.isdir(input_depth_maps_path_setting)
+
+    if is_source_file and is_depth_file:
+        is_single_file_mode = True
+        print("==> Running in single file mode. Files will not be moved to 'finished' folders.")
+        input_videos.append(input_source_clips_path_setting)
+        # Ensure output directory exists for single file output
+        os.makedirs(output_splatted, exist_ok=True)
+    elif is_source_dir and is_depth_dir:
+        print("==> Running in batch (folder) mode.")
+        finished_source_folder = os.path.join(input_source_clips_path_setting, "finished")
+        finished_depth_folder = os.path.join(input_depth_maps_path_setting, "finished")
+        os.makedirs(finished_source_folder, exist_ok=True)
+        os.makedirs(finished_depth_folder, exist_ok=True)
+        os.makedirs(output_splatted, exist_ok=True) # Ensure main output folder exists
+
+        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+        for ext in video_extensions:
+            input_videos.extend(glob.glob(os.path.join(input_source_clips_path_setting, ext)))
+        input_videos = sorted(input_videos)
+    else:
+        print("==> Error: Input Source Clips and Input Depth Maps must both be either files or directories. Skipping processing.")
+        progress_queue.put("finished")
+        release_resources()
+        return
 
     if not input_videos:
-        print(f"No video files found in {input_source_clips}")
+        print(f"No video files found in {input_source_clips_path_setting}")
         progress_queue.put("finished")
         release_resources()
         return
@@ -372,8 +362,12 @@ def main(settings):
             release_resources()
             progress_queue.put("finished")
             return
+
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
+
+        # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
+        current_zero_disparity_anchor = default_zero_disparity_anchor
 
         # 1. Read input video frames at the determined pre-processing resolution
         # This resolution will be the target for depth maps and splatting output
@@ -387,46 +381,84 @@ def main(settings):
             progress_queue.put(("processed", idx + 1)) # Still count it as processed to move progress bar
             continue # Skip to next video
 
-        depth_map_path_mp4 = os.path.join(input_depth_maps, f"{video_name}_depth.mp4")
-        depth_map_path_npz = os.path.join(input_depth_maps, f"{video_name}_depth.npz")
-        
         actual_depth_map_path = None
-        if os.path.exists(depth_map_path_mp4):
-            actual_depth_map_path = depth_map_path_mp4
-        elif os.path.exists(depth_map_path_npz):
-            actual_depth_map_path = depth_map_path_npz
+        if is_single_file_mode:
+            actual_depth_map_path = input_depth_maps_path_setting
+            # If in single file mode, and the provided depth map doesn't exist, this is an error.
+            if not os.path.exists(actual_depth_map_path):
+                 print(f"==> Error: Single depth map file '{actual_depth_map_path}' not found. Skipping this video.")
+                 progress_queue.put(("processed", idx + 1))
+                 continue
+        else: # Batch mode
+            depth_map_path_mp4 = os.path.join(input_depth_maps_path_setting, f"{video_name}_depth.mp4")
+            depth_map_path_npz = os.path.join(input_depth_maps_path_setting, f"{video_name}_depth.npz")
+
+            if os.path.exists(depth_map_path_mp4):
+                actual_depth_map_path = depth_map_path_mp4
+            elif os.path.exists(depth_map_path_npz):
+                actual_depth_map_path = depth_map_path_npz
 
         video_depth = None
         depth_vis = None
 
         if actual_depth_map_path:
-            print(f"==> Found pre-rendered depth map: {actual_depth_map_path}")
+            # First, normalize the actual_depth_map_path for consistent handling and printing
+            actual_depth_map_path = os.path.normpath(actual_depth_map_path) 
+            
+            print(f"==> Found depth map: {actual_depth_map_path}")
+
+            # Now, use the normalized path for constructing the sidecar path
+            depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
+            json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
+
+            if os.path.exists(json_sidecar_path):
+                try:
+                    with open(json_sidecar_path, 'r') as f:
+                        sidecar_data = json.load(f)
+                    if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
+                        current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
+                        print(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
+                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from JSON: {current_zero_disparity_anchor:.2f})"))
+                    else:
+                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                except json.JSONDecodeError:
+                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                except Exception as e:
+                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+            else:
+                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+            # END NEW SIDECAR JSON DETECTION LOGIC
+
             try:
                 video_depth, depth_vis = load_pre_rendered_depth(
                     actual_depth_map_path,
                     process_length=process_length,
                     target_height=current_video_processed_height, # Pass the height of the processed video
                     target_width=current_video_processed_width,   # Pass the width of the processed video
-                    match_resolution_to_target=match_depth_res    # Use new setting
+                    match_resolution_to_target=True               # Permanently set to True
                 )
             except Exception as e:
-                print(f"==> Error loading pre-rendered depth from {actual_depth_map_path}: {e}. Skipping this video.")
+                print(f"==> Error loading depth map from {actual_depth_map_path}: {e}. Skipping this video.")
                 progress_queue.put(("processed", idx + 1))
                 continue
         else:
-            print(f"==> Error: No pre-rendered depth map found for {video_name} in {input_depth_maps}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz'. Skipping this video.")
+            print(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
             progress_queue.put(("processed", idx + 1))
             continue
-        
+
         if video_depth is None or depth_vis is None:
             print(f"==> Skipping video {video_name} due to depth load failure or stop request.")
             progress_queue.put(("processed", idx + 1))
             continue
-        
+
         # Ensure the depth map resolution matches the input frames for splatting
         if not (video_depth.shape[1] == current_video_processed_height and video_depth.shape[2] == current_video_processed_width):
-            print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_video_processed_width}x{current_video_processed_height}). This should ideally be handled by 'match_depth_res'. Attempting final resize for splatting.")
-            # As a safeguard, perform a final resize if mismatch persists (should be rare with match_depth_res)
+            print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_video_processed_width}x{current_video_processed_height}). This should have been handled by 'match_depth_res' being True. Attempting final resize as safeguard.")
+            # As a safeguard, perform a final resize if mismatch persists (should be rare with match_depth_res=True)
             resized_video_depth = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
             resized_depth_vis = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
             video_depth = resized_video_depth
@@ -439,32 +471,32 @@ def main(settings):
             return
 
         percentage_max_disp_input = float(settings["max_disp"]) # Get the percentage value from settings
-        actual_percentage_for_calculation = percentage_max_disp_input / 20.0 
+        actual_percentage_for_calculation = percentage_max_disp_input / 20.0
         actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_video_processed_width
         print(f"==> Max Disparity Input: {percentage_max_disp_input:.1f}% -> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
 
-        output_video_path = os.path.join(output_splatted, f"{video_name}.mp4")
+        output_video_path_base = os.path.join(output_splatted, f"{video_name}.mp4") # This is the base path before _res_suffix_suffix is added
         DepthSplatting(
             input_frames_processed=input_frames_processed, # Pass already loaded frames
             processed_fps=processed_fps,                   # Pass calculated FPS
-            output_video_path=output_video_path,
+            output_video_path=output_video_path_base,
             video_depth=video_depth,
             depth_vis=depth_vis,
             max_disp=actual_max_disp_pixels,
             process_length=process_length,
             batch_size=batch_size,
             dual_output=dual_output,
-            enable_low_res_output=enable_low_res_output,
-            low_res_width=low_res_width,
-            low_res_height=low_res_height
+            zero_disparity_anchor_val=current_zero_disparity_anchor # Pass the (potentially overridden) anchor value
         )
         if stop_event.is_set():
             print("==> Stopping after DepthSplatting due to user request")
             release_resources()
             progress_queue.put("finished")
             return
-        print(f"==> Splatted video saved to: {output_video_path}")
-        if not stop_event.is_set():
+        # The DepthSplatting function returns the actual output path, but for simplicity we rely on its print statement
+        print(f"==> Splatted video saved for {video_name}.") # Actual path printed by DepthSplatting
+
+        if not stop_event.is_set() and not is_single_file_mode: # Only move if not single file mode
             try:
                 shutil.move(video_path, finished_source_folder)
                 print(f"==> Moved processed video to: {finished_source_folder}")
@@ -476,6 +508,9 @@ def main(settings):
                     print(f"==> Moved depth map to: {finished_depth_folder}")
                 except Exception as e:
                     print(f"==> Failed to move depth map {actual_depth_map_path}: {e}")
+        elif is_single_file_mode:
+            print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
+
         progress_queue.put(("processed", idx + 1))
     release_resources()
     progress_queue.put("finished")
@@ -486,13 +521,18 @@ def browse_folder(var):
     if folder:
         var.set(folder)
 
+def browse_file(var, filetypes_list):
+    file_path = filedialog.askopenfilename(filetypes=filetypes_list)
+    if file_path:
+        var.set(file_path)
+
 def start_processing():
     global processing_thread
     stop_event.clear()
     start_button.config(state="disabled")
     stop_button.config(state="normal")
     status_label.config(text="Starting processing...")
-    
+
     # Input validation for new fields
     try:
         if set_pre_res_var.get():
@@ -500,23 +540,22 @@ def start_processing():
             pre_res_h = int(pre_res_height_var.get())
             if pre_res_w <= 0 or pre_res_h <= 0:
                 raise ValueError("Pre-processing Width and Height must be positive.")
-        
+
         max_disp_val = float(max_disp_var.get())
         if max_disp_val <= 0:
             raise ValueError("Max Disparity must be positive.")
-        
-        if enable_low_res_output_var.get():
-            low_res_w = int(low_res_width_var.get())
-            low_res_h = int(low_res_height_var.get())
-            if low_res_w <= 0 or low_res_h <= 0:
-                raise ValueError("Low Resolution Width and Height must be positive if enabled.")
-        
+            
+        # NEW: Validate Zero Disparity Anchor
+        anchor_val = float(zero_disparity_anchor_var.get())
+        if not (0.0 <= anchor_val <= 1.0):
+            raise ValueError("Zero Disparity Anchor must be between 0.0 and 1.0.")
+
     except ValueError as e:
         status_label.config(text=f"Error: {e}")
         start_button.config(state="normal")
         stop_button.config(state="disabled")
         return
-    
+
     settings = {
         "input_source_clips": input_source_clips_var.get(),
         "input_depth_maps": input_depth_maps_var.get(),
@@ -525,13 +564,14 @@ def start_processing():
         "process_length": int(process_length_var.get()),
         "batch_size": int(batch_size_var.get()),
         "dual_output": dual_output_var.get(),
-        "enable_low_res_output": enable_low_res_output_var.get(),
-        "low_res_width": int(low_res_width_var.get()),
-        "low_res_height": int(low_res_height_var.get()),
+        "enable_low_res_output": False, # Permanently disabled
+        "low_res_width": 0,             # Placeholder value
+        "low_res_height": 0,            # Placeholder value
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
-        "match_depth_res": match_depth_res_var.get()
+        "match_depth_res": True,         # Permanently set to True
+        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), # NEW: Add to settings
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -572,9 +612,21 @@ def check_queue():
                 status_label.config(text=f"Processing 0 of {total_videos}")
             elif message[0] == "processed":
                 processed = message[1]
-                progress_var.set(processed)
                 total = progress_bar["maximum"]
-                status_label.config(text=f"Processing {processed} of {total}")
+                progress_var.set(processed)
+                # Update status label to show progress, but don't overwrite custom status
+                current_status_text = status_label.cget("text")
+                if not current_status_text.startswith("Processing ") or ("Anchor from" in current_status_text and not "finished" in current_status_text):
+                    # If it's a custom anchor message, just update progress part
+                    parts = current_status_text.split("(")
+                    if len(parts) > 1: # If it has an anchor part
+                        progress_queue.put(("status", f"Processing {processed}/{total} ({parts[1]}"))
+                    else: # If it's a basic processing message
+                        status_label.config(text=f"Processing {processed} of {total}")
+                else: # Default behavior if no custom status or if it's already "Processing X of Y"
+                    status_label.config(text=f"Processing {processed} of {total}")
+            elif message[0] == "status": # NEW: Handle custom status messages
+                status_label.config(text=message[1])
     except queue.Empty:
         pass
     root.after(100, check_queue)
@@ -601,13 +653,10 @@ def save_config():
         "process_length": process_length_var.get(),
         "batch_size": batch_size_var.get(),
         "dual_output": dual_output_var.get(),
-        "enable_low_res_output": enable_low_res_output_var.get(),
-        "low_res_width": low_res_width_var.get(),
-        "low_res_height": low_res_height_var.get(),
         "set_pre_res": set_pre_res_var.get(),
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
-        "match_depth_res": match_depth_res_var.get()
+        "convergence_point": zero_disparity_anchor_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -623,13 +672,10 @@ def load_config():
             process_length_var.set(config.get("process_length", "-1"))
             batch_size_var.set(config.get("batch_size", "10"))
             dual_output_var.set(config.get("dual_output", False))
-            enable_low_res_output_var.set(config.get("enable_low_res_output", False))
-            low_res_width_var.set(config.get("low_res_width", "1024"))
-            low_res_height_var.set(config.get("low_res_height", "576"))
             set_pre_res_var.set(config.get("set_pre_res", False))
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
-            match_depth_res_var.set(config.get("match_depth_res", False))
+            zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
 
 # Load help texts at the start
 load_help_texts()
@@ -646,13 +692,10 @@ max_disp_var = tk.StringVar(value="20.0")
 process_length_var = tk.StringVar(value="-1")
 batch_size_var = tk.StringVar(value="10")
 dual_output_var = tk.BooleanVar(value=False) # Default to Quad
-enable_low_res_output_var = tk.BooleanVar(value=False)
-low_res_width_var = tk.StringVar(value="1024")
-low_res_height_var = tk.StringVar(value="576")
 set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
-match_depth_res_var = tk.BooleanVar(value=False)
+zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
 
 # Load configuration
 load_config()
@@ -661,34 +704,43 @@ load_config()
 folder_frame = tk.LabelFrame(root, text="Input/Output Folders")
 folder_frame.pack(pady=10, padx=10, fill="x")
 
+# Input Source Clips Row
 lbl_source_clips = tk.Label(folder_frame, text="Input Source Clips:")
 lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var, width=50)
+entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var, width=40) # Reduced width for more buttons
 entry_source_clips.grid(row=0, column=1, padx=5, pady=2)
-btn_browse_source_clips = tk.Button(folder_frame, text="Browse", command=lambda: browse_folder(input_source_clips_var))
-btn_browse_source_clips.grid(row=0, column=2, padx=5, pady=2)
-create_hover_tooltip(lbl_source_clips, "input_source_clips")
-create_hover_tooltip(entry_source_clips, "input_source_clips")
-create_hover_tooltip(btn_browse_source_clips, "input_source_clips")
+btn_browse_source_clips_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_source_clips_var))
+btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
+btn_select_source_clips_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
+btn_select_source_clips_file.grid(row=0, column=3, padx=2, pady=2)
+create_hover_tooltip(lbl_source_clips, "input_source_clips") # Existing
+create_hover_tooltip(entry_source_clips, "input_source_clips") # Existing
+create_hover_tooltip(btn_browse_source_clips_folder, "input_source_clips_folder") # NEW TOOLTIP
+create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file") # NEW TOOLTIP
 
 
+# Input Depth Maps Row
 lbl_input_depth_maps = tk.Label(folder_frame, text="Input Depth Maps:")
 lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var, width=50)
+entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var, width=40) # Reduced width
 entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2)
-btn_browse_input_depth_maps = tk.Button(folder_frame, text="Browse", command=lambda: browse_folder(input_depth_maps_var))
-btn_browse_input_depth_maps.grid(row=1, column=2, padx=5, pady=2)
-create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps")
-create_hover_tooltip(entry_input_depth_maps, "input_depth_maps")
-create_hover_tooltip(btn_browse_input_depth_maps, "input_depth_maps")
+btn_browse_input_depth_maps_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_depth_maps_var))
+btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
+btn_select_input_depth_maps_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
+btn_select_input_depth_maps_file.grid(row=1, column=3, padx=2, pady=2)
+create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps") # Existing
+create_hover_tooltip(entry_input_depth_maps, "input_depth_maps") # Existing
+create_hover_tooltip(btn_browse_input_depth_maps_folder, "input_depth_maps_folder") # NEW TOOLTIP
+create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file") # NEW TOOLTIP
 
 
+# Output Splatted Row
 lbl_output_splatted = tk.Label(folder_frame, text="Output Splatted:")
 lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var, width=50)
+entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var, width=40) # Reduced width
 entry_output_splatted.grid(row=2, column=1, padx=5, pady=2)
-btn_browse_output_splatted = tk.Button(folder_frame, text="Browse", command=lambda: browse_folder(output_splatted_var))
-btn_browse_output_splatted.grid(row=2, column=2, padx=5, pady=2)
+btn_browse_output_splatted = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(output_splatted_var))
+btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2) # Spanning two columns
 create_hover_tooltip(lbl_output_splatted, "output_splatted")
 create_hover_tooltip(entry_output_splatted, "output_splatted")
 create_hover_tooltip(btn_browse_output_splatted, "output_splatted")
@@ -717,11 +769,6 @@ pre_res_height_entry.grid(row=1, column=3, sticky="w", padx=5, pady=2)
 create_hover_tooltip(pre_res_height_label, "pre_res_height")
 create_hover_tooltip(pre_res_height_entry, "pre_res_height")
 
-
-# Match Depthmap Resolution
-match_depth_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Resize Depthmap to Source Resolution", variable=match_depth_res_var)
-match_depth_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
-create_hover_tooltip(match_depth_res_checkbox, "match_depth_res")
 
 # Function to enable/disable pre-res input fields
 def toggle_pre_res_fields():
@@ -756,43 +803,26 @@ create_hover_tooltip(lbl_batch_size, "batch_size")
 create_hover_tooltip(entry_batch_size, "batch_size")
 
 
-# Dual Output Checkbox
+# NEW: Zero Disparity Anchor Point input (Moved to row 1)
+lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Convergence Point (0-1):")
+lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=2 to row=1
+entry_zero_disparity_anchor = tk.Entry(output_settings_frame, textvariable=zero_disparity_anchor_var, width=15)
+entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=2 to row=1
+create_hover_tooltip(lbl_zero_disparity_anchor, "convergence_point")
+create_hover_tooltip(entry_zero_disparity_anchor, "convergence_point")
+
+# Process Length (Moved to row 2)
+lbl_process_length = tk.Label(output_settings_frame, text="Process Length (-1 for all):")
+lbl_process_length.grid(row=2, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=3 to row=2
+entry_process_length = tk.Entry(output_settings_frame, textvariable=process_length_var, width=15)
+entry_process_length.grid(row=2, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=3 to row=2
+create_hover_tooltip(lbl_process_length, "process_length")
+create_hover_tooltip(entry_process_length, "process_length")
+
+# Dual Output Checkbox (Moved to row 3, now at the bottom of these settings)
 dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
-dual_output_checkbox.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
-
-
-# Enable 2nd downscaled output Checkbox
-enable_low_res_output_checkbox = tk.Checkbutton(output_settings_frame, text="Enable 2nd Downscaled Output", variable=enable_low_res_output_var)
-enable_low_res_output_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-create_hover_tooltip(enable_low_res_output_checkbox, "enable_low_res_output")
-
-
-# Low Resolution Width and Height fields
-low_res_width_label = tk.Label(output_settings_frame, text="Low Res Width:")
-low_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-low_res_width_entry = tk.Entry(output_settings_frame, textvariable=low_res_width_var, width=10)
-low_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-create_hover_tooltip(low_res_width_label, "low_res_width")
-create_hover_tooltip(low_res_width_entry, "low_res_width")
-
-low_res_height_label = tk.Label(output_settings_frame, text="Low Res Height:")
-low_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
-low_res_height_entry = tk.Entry(output_settings_frame, textvariable=low_res_height_var, width=10)
-low_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
-create_hover_tooltip(low_res_height_label, "low_res_height")
-create_hover_tooltip(low_res_height_entry, "low_res_height")
-
-# Function to enable/disable low-res input fields
-def toggle_low_res_fields():
-    state = "normal" if enable_low_res_output_var.get() else "disabled"
-    low_res_width_label.config(state=state)
-    low_res_width_entry.config(state=state)
-    low_res_height_label.config(state=state)
-    low_res_height_entry.config(state=state)
-
-# Trace the enable_low_res_output_var to call the toggle function
-enable_low_res_output_var.trace_add("write", lambda *args: toggle_low_res_fields())
 
 
 # Progress frame
@@ -821,7 +851,6 @@ create_hover_tooltip(exit_button, "exit_button")
 
 
 # Initial calls to set the correct state based on loaded config
-root.after(10, toggle_low_res_fields)
 root.after(10, toggle_pre_res_fields)
 
 # Run the GUI
