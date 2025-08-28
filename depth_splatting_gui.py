@@ -230,43 +230,79 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     main_out.release()
     print("==> Output video writing completed.")
 
-def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True): # match_resolution_to_target permanently True
+def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True, enable_autogain=True):
     """
     Loads pre-rendered depth maps from MP4 or NPZ.
     If match_resolution_to_target is True, it resizes the depth maps to the target_height/width for compatibility.
+    Includes an option to enable/disable min-max normalization (autogain).
+    If autogain is disabled, MP4 depth maps are scaled to 0-1 based on their detected bit depth (8-bit -> /255, 10-bit -> /1023).
+    For NPZ with autogain disabled, it assumes the data is already in the desired absolute range (e.g., 0-1).
     """
     print(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
 
-    video_depth_raw = None
+    video_depth_working_range = None # This will hold the float32 array before final normalization/scaling
+
     if depth_map_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         vid = VideoReader(depth_map_path, ctx=cpu(0))
-        frames = vid[:].asnumpy().astype("float32") / 255.0
-        if frames.shape[-1] == 3:
+        # Read raw frames as float32, without any initial fixed scaling like /255.0
+        # This allows us to inspect the actual raw pixel values for bit depth detection.
+        raw_frames_data = vid[:].asnumpy().astype("float32")
+
+        if raw_frames_data.shape[-1] == 3:
             print("==> Converting RGB depth frames to grayscale")
-            video_depth_raw = frames.mean(axis=-1)
+            raw_frames_data = raw_frames_data.mean(axis=-1)
         else:
-            video_depth_raw = frames.squeeze(-1)
+            raw_frames_data = raw_frames_data.squeeze(-1)
+
+        if enable_autogain:
+            # If autogain is enabled, we work with the raw float data.
+            # The min-max normalization below will then scale this observed range to 0-1.
+            video_depth_working_range = raw_frames_data
+        else:
+            # Autogain disabled: Scale to 0-1 absolutely based on detected bit depth.
+            # This logic assumes common bit-depth ranges for MP4 depth maps.
+            max_raw_value_in_content = np.max(raw_frames_data)
+            if max_raw_value_in_content > 255 and max_raw_value_in_content <= 1023: # Heuristic for 10-bit range
+                print(f"==> Autogain disabled. Detected potential 10-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 1023.0.")
+                video_depth_working_range = raw_frames_data / 1023.0
+            else: # Assume 8-bit or standard 0-255 range
+                print(f"==> Autogain disabled. Detected potential 8-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 255.0.")
+                video_depth_working_range = raw_frames_data / 255.0
+
     elif depth_map_path.lower().endswith('.npz'):
         loaded_data = np.load(depth_map_path)
         if 'depth' in loaded_data:
-            video_depth_raw = loaded_data['depth'].astype("float32")
+            video_depth_working_range = loaded_data['depth'].astype("float32")
+            if not enable_autogain:
+                # For NPZ, if autogain is off, we *assume* it's already 0-1 or has an absolute meaning.
+                # If NPZ data is NOT already 0-1 and needs a fixed scaling (e.g., from 0-1000 to 0-1),
+                # the user would need to preprocess the NPZ or a new GUI setting for NPZ absolute scaling factor would be required.
+                print("==> Autogain disabled for NPZ. Assuming depth data is already in desired absolute range (e.g., 0-1).")
         else:
             raise ValueError("NPZ file does not contain a 'depth' array.")
     else:
         raise ValueError(f"Unsupported depth map format: {os.path.basename(depth_map_path)}. Only MP4/NPZ are supported.")
 
-    if process_length != -1 and process_length < len(video_depth_raw):
-        video_depth_raw = video_depth_raw[:process_length]
+    if process_length != -1 and process_length < len(video_depth_working_range):
+        video_depth_working_range = video_depth_working_range[:process_length]
 
-    # Normalize depth (0 to 1)
-    video_depth_min = video_depth_raw.min()
-    video_depth_max = video_depth_raw.max()
-    if video_depth_max - video_depth_min > 1e-5:
-        video_depth_normalized = (video_depth_raw - video_depth_min) / (video_depth_max - video_depth_min)
+    if enable_autogain:
+        # Perform Autogain (Min-Max Scaling) on the raw working range
+        video_depth_min = video_depth_working_range.min()
+        video_depth_max = video_depth_working_range.max()
+        if video_depth_max - video_depth_min > 1e-5:
+            video_depth_normalized = (video_depth_working_range - video_depth_min) / (video_depth_max - video_depth_min)
+            print(f"==> Depth maps autogained (min-max scaled) from observed range [{video_depth_min:.3f}, {video_depth_max:.3f}] to [0, 1].")
+        else:
+            video_depth_normalized = np.zeros_like(video_depth_working_range)
+            print("==> Depth map range too small, setting to zeros after autogain.")
     else:
-        video_depth_normalized = np.zeros_like(video_depth_raw)
+        # Autogain is disabled; video_depth_working_range already contains absolute 0-1 for MP4, or assumed for NPZ.
+        video_depth_normalized = video_depth_working_range
+        print("==> Autogain (min-max scaling) disabled. Depth maps are used with their absolute scaling.")
 
-    # Resize if matching resolution to target video
+
+    # Resize logic remains the same as before
     if match_resolution_to_target and target_height > 0 and target_width > 0:
         print(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
         resized_depths = []
@@ -277,8 +313,9 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
             resized_depth_frame = cv2.resize(depth_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
             resized_depths.append(resized_depth_frame)
 
-            # Apply colormap to the resized depth for visualization
-            vis_frame = cv2.applyColorMap((resized_depth_frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+            # Apply colormap to the resized depth for visualization.
+            # Clip to 0-1 range for reliable visualization, as the colormap expects this.
+            vis_frame = cv2.applyColorMap((np.clip(resized_depth_frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
             resized_viss.append(vis_frame.astype("float32") / 255.0)
 
         video_depth = np.stack(resized_depths, axis=0)
@@ -286,7 +323,8 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
     else:
         print(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
         video_depth = video_depth_normalized
-        depth_vis = np.stack([cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
+        # Visualization: Ensure 0-1 range for colormap if autogain is off and values might naturally exceed 1.
+        depth_vis = np.stack([cv2.applyColorMap((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
 
     print("==> Depth maps and visualizations loaded successfully")
     return video_depth, depth_vis
@@ -407,7 +445,8 @@ def main(settings):
                     process_length=process_length,
                     target_height=current_video_processed_height, # Pass the height of the processed video
                     target_width=current_video_processed_width,   # Pass the width of the processed video
-                    match_resolution_to_target=True               # Permanently set to True
+                    match_resolution_to_target=True,
+                    enable_autogain=settings["enable_autogain"] # NEW
                 )
             except Exception as e:
                 print(f"==> Error loading depth map from {actual_depth_map_path}: {e}. Skipping this video.")
@@ -539,7 +578,8 @@ def start_processing():
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
         "match_depth_res": True,         # Permanently set to True
-        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), # NEW: Add to settings
+        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
+        "enable_autogain": enable_autogain_var.get(), # NEW
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -612,6 +652,7 @@ def save_config():
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
+        "enable_autogain": enable_autogain_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -631,6 +672,7 @@ def load_config():
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
+            enable_autogain_var.set(config.get("enable_autogain", True)) # NEW, default to True
 
 # Load help texts at the start
 load_help_texts()
@@ -651,6 +693,7 @@ set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
+enable_autogain_var = tk.BooleanVar(value=True) # Default to True (current behavior)
 
 # Load configuration
 load_config()
@@ -779,6 +822,10 @@ dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
 
+# New: Autogain/Normalization Checkbox
+enable_autogain_checkbox = tk.Checkbutton(output_settings_frame, text="Enable Autogain (Min-Max Normalize Depth)", variable=enable_autogain_var)
+enable_autogain_checkbox.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2) # Spanning more columns
+create_hover_tooltip(enable_autogain_checkbox, "enable_autogain") # Need to add this to splatter_help.json
 
 # Progress frame
 progress_frame = tk.LabelFrame(root, text="Progress")
