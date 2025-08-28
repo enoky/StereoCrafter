@@ -84,3 +84,13 @@ weights/
 
 
 
+config.json
+config_inpaint.json
+config_splat.json
+yolo12s.pt
+yolo12n.pt
+yolo12m.pt
+config_auto_conv.json
+models/res10_300x300_ssd_iter_140000.caffemodel
+models/deploy.prototxt.txt
+convergence_tool_config.json

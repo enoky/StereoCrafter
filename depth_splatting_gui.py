@@ -367,11 +367,6 @@ def main(settings):
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
 
-        # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
-        current_zero_disparity_anchor = default_zero_disparity_anchor
-        # NEW: Determine the initial max_disparity percentage from the GUI setting (this can be overridden by JSON)
-        current_max_disparity_percentage = gui_max_disp
-
         # 1. Read input video frames at the determined pre-processing resolution
         # This resolution will be the target for depth maps and splatting output
         try:
@@ -405,53 +400,7 @@ def main(settings):
         depth_vis = None
 
         if actual_depth_map_path:
-            # First, normalize the actual_depth_map_path for consistent handling and printing
-            actual_depth_map_path = os.path.normpath(actual_depth_map_path) 
-            
-            print(f"==> Found depth map: {actual_depth_map_path}")
-
-            # Now, use the normalized path for constructing the sidecar path
-            depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-            json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
-
-            anchor_source = "GUI"
-            max_disp_source = "GUI"
-
-            if os.path.exists(json_sidecar_path):
-                try:
-                    with open(json_sidecar_path, 'r') as f:
-                        sidecar_data = json.load(f)
-
-                    if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
-                        current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                        print(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
-                        anchor_source = "JSON"
-                    else:
-                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                        anchor_source = "GUI (Invalid JSON)"
-
-                    # NEW: Check for max_disparity in sidecar JSON
-                    if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
-                        current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                        print(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
-                        max_disp_source = "JSON"
-                    else:
-                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
-                        max_disp_source = "GUI (Invalid JSON)"
-
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} ({anchor_source}), MaxDisp: {current_max_disparity_percentage:.1f}% ({max_disp_source}))"))
-
-                except json.JSONDecodeError:
-                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
-                except Exception as e:
-                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
-            else:
-                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
-            # END SIDECAR JSON DETECTION LOGIC
-
+            print(f"==> Found pre-rendered depth map: {actual_depth_map_path}")
             try:
                 video_depth, depth_vis = load_pre_rendered_depth(
                     actual_depth_map_path,
@@ -489,8 +438,8 @@ def main(settings):
             progress_queue.put("finished")
             return
 
-        # Use the (potentially overridden) current_max_disparity_percentage
-        actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
+        percentage_max_disp_input = float(settings["max_disp"]) # Get the percentage value from settings
+        actual_percentage_for_calculation = percentage_max_disp_input / 20.0 
         actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_video_processed_width
         print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
 
@@ -632,20 +581,7 @@ def check_queue():
             elif message[0] == "processed":
                 processed = message[1]
                 total = progress_bar["maximum"]
-                progress_var.set(processed)
-                # Update status label to show progress, but don't overwrite custom status
-                current_status_text = status_label.cget("text")
-                if not current_status_text.startswith(f"Processing {processed}/{total}") and not "finished" in current_status_text:
-                    # If it's a custom anchor/max_disp message, just update progress part
-                    parts = current_status_text.split("(", 1) # Split only on the first '('
-                    if len(parts) > 1: # If it has an anchor/max_disp part
-                        status_label.config(text=f"Processing {processed}/{total} ({parts[1]}")
-                    else: # If it's a basic processing message
-                        status_label.config(text=f"Processing {processed} of {total}")
-                else: # Default behavior if no custom status or if it's already "Processing X of Y"
-                    status_label.config(text=f"Processing {processed} of {total}")
-            elif message[0] == "status": # NEW: Handle custom status messages
-                status_label.config(text=message[1])
+                status_label.config(text=f"Processing {processed} of {total}")
     except queue.Empty:
         pass
     root.after(100, check_queue)
