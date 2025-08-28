@@ -405,6 +405,11 @@ def main(settings):
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
 
+        # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
+        current_zero_disparity_anchor = default_zero_disparity_anchor
+        # NEW: Determine the initial max_disparity percentage from the GUI setting (this can be overridden by JSON)
+        current_max_disparity_percentage = gui_max_disp # <--- THIS LINE IS CRUCIAL AND MUST BE HERE
+
         # 1. Read input video frames at the determined pre-processing resolution
         # This resolution will be the target for depth maps and splatting output
         try:
@@ -504,17 +509,23 @@ def main(settings):
         print(f"==> Splatted video saved for {video_name}.") # Actual path printed by DepthSplatting
 
         if not stop_event.is_set() and not is_single_file_mode: # Only move if not single file mode
-            try:
-                shutil.move(video_path, finished_source_folder)
-                print(f"==> Moved processed video to: {finished_source_folder}")
-            except Exception as e:
-                print(f"==> Failed to move video {video_path}: {e}")
-            if actual_depth_map_path and os.path.exists(actual_depth_map_path):
+            if finished_source_folder is not None: # ADD THIS CHECK
+                try:
+                    shutil.move(video_path, finished_source_folder)
+                    print(f"==> Moved processed video to: {finished_source_folder}")
+                except Exception as e:
+                    print(f"==> Failed to move video {video_path}: {e}")
+            else:
+                print(f"==> Cannot move source video: 'finished_source_folder' is not set.")
+
+            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None: # ADD THIS CHECK
                 try:
                     shutil.move(actual_depth_map_path, finished_depth_folder)
                     print(f"==> Moved depth map to: {finished_depth_folder}")
                 except Exception as e:
                     print(f"==> Failed to move depth map {actual_depth_map_path}: {e}")
+            elif actual_depth_map_path and finished_depth_folder is None:
+                print(f"==> Cannot move depth map: 'finished_depth_folder' is not set.")
         elif is_single_file_mode:
             print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
 
@@ -524,12 +535,30 @@ def main(settings):
     print("\n==> Batch Depth Splatting Process Completed Successfully")
 
 def browse_folder(var):
-    folder = filedialog.askdirectory()
+    current_path = var.get()
+    # Ensure the path exists and is a directory, otherwise get its parent directory if it's a file
+    # If path is invalid or empty, initialdir will be None, letting filedialog choose default.
+    if os.path.isdir(current_path):
+        initial_dir = current_path
+    elif os.path.exists(current_path): # It's a file, so open in its directory
+        initial_dir = os.path.dirname(current_path)
+    else: # Path doesn't exist
+        initial_dir = None
+
+    folder = filedialog.askdirectory(initialdir=initial_dir)
     if folder:
         var.set(folder)
 
 def browse_file(var, filetypes_list):
-    file_path = filedialog.askopenfilename(filetypes=filetypes_list)
+    current_path = var.get()
+    # Ensure the path exists, otherwise get its parent directory if it's a file
+    # If path is invalid or empty, initialdir will be None, letting filedialog choose default.
+    if os.path.exists(current_path): # It's a file or directory
+        initial_dir = os.path.dirname(current_path) if os.path.isfile(current_path) else current_path
+    else: # Path doesn't exist
+        initial_dir = None
+
+    file_path = filedialog.askopenfilename(initialdir=initial_dir, filetypes=filetypes_list)
     if file_path:
         var.set(file_path)
 
@@ -621,6 +650,7 @@ def check_queue():
             elif message[0] == "processed":
                 processed = message[1]
                 total = progress_bar["maximum"]
+                progress_var.set(processed)
                 status_label.config(text=f"Processing {processed} of {total}")
     except queue.Empty:
         pass
@@ -701,12 +731,13 @@ load_config()
 # Folder selection frame
 folder_frame = tk.LabelFrame(root, text="Input/Output Folders")
 folder_frame.pack(pady=10, padx=10, fill="x")
+folder_frame.grid_columnconfigure(1, weight=1) # This makes column 1 expand horizontally
 
 # Input Source Clips Row
 lbl_source_clips = tk.Label(folder_frame, text="Input Source Clips:")
 lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var, width=40) # Reduced width for more buttons
-entry_source_clips.grid(row=0, column=1, padx=5, pady=2)
+entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var) # Reduced width for more buttons
+entry_source_clips.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_source_clips_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_source_clips_var))
 btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
 btn_select_source_clips_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
@@ -720,8 +751,8 @@ create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file") # 
 # Input Depth Maps Row
 lbl_input_depth_maps = tk.Label(folder_frame, text="Input Depth Maps:")
 lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var, width=40) # Reduced width
-entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2)
+entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var) # Reduced width
+entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_input_depth_maps_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_depth_maps_var))
 btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
 btn_select_input_depth_maps_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
@@ -735,8 +766,8 @@ create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file") 
 # Output Splatted Row
 lbl_output_splatted = tk.Label(folder_frame, text="Output Splatted:")
 lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var, width=40) # Reduced width
-entry_output_splatted.grid(row=2, column=1, padx=5, pady=2)
+entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var) # Reduced width
+entry_output_splatted.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_output_splatted = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(output_splatted_var))
 btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2) # Spanning two columns
 create_hover_tooltip(lbl_output_splatted, "output_splatted")
