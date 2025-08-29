@@ -419,34 +419,32 @@ def process_single_video(
 
         input_frames_to_pipeline = original_input_frames_for_chunk.clone() # Start with original, modify if blending
 
-        # --- NEW: Input-level blending for overlapping frames ---
+        # --- Input-level blending for overlapping frames ---
         if previous_chunk_output_frames is not None and overlap > 0:
             # Determine actual number of frames to overlap, limited by available frames
-            # Ensure we don't try to blend more frames than are available in either the previous output or current input
             overlap_actual = min(overlap, len(previous_chunk_output_frames), len(original_input_frames_for_chunk))
 
             if overlap_actual > 0:
-                # 1. Get the generated overlap frames from the end of the previous chunk's output
                 prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
                 
-                # 2. Get the corresponding original input frames for the start of the current chunk
-                orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
-
-                # Calculate weights for blending based on original_input_blend_strength
-                # This scales the influence of the original input across the overlap period.
-                # If original_input_blend_strength is 0, original_weights_scaled will be 0, meaning no original influence.
-                # If original_input_blend_strength is 1, original_weights_scaled will be linspace(0,1), meaning full influence.
-                original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
-
-                # The weight for the previous generated output will be (1 - original_weights_scaled)
-                # The weight for the original input will be original_weights_scaled
-                blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
-                                                original_weights_scaled * orig_input_overlap_frames
+                if original_input_blend_strength > 0:
+                    # Only create and use orig_input_overlap_frames if there's an actual blend
+                    orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
+                    original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
+                    
+                    blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
+                                                    original_weights_scaled * orig_input_overlap_frames
+                    
+                    input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
+                    # Explicitly delete the temporary tensor if it's large and no longer needed
+                    del orig_input_overlap_frames # This helps reclaim VRAM immediately
+                    del original_weights_scaled
+                    del blended_input_overlap_frames
+                else:
+                    # If blend strength is 0, we simply use the previous generated frames for the overlap
+                    input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
                 
-                # Replace the overlapping part of the current chunk's input with the blended frames
-                input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
-            # else: overlap_actual is 0, no blending, input_frames_to_pipeline remains original_input_frames_for_chunk
-        # --- END NEW Input-level blending ---
+                del prev_gen_overlap_frames # Clean up temporary tensor
 
         logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx}...")
         start_time = time.time()

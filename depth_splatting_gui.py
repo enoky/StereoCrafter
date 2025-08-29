@@ -230,43 +230,79 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     main_out.release()
     print("==> Output video writing completed.")
 
-def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True): # match_resolution_to_target permanently True
+def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True, enable_autogain=True):
     """
     Loads pre-rendered depth maps from MP4 or NPZ.
     If match_resolution_to_target is True, it resizes the depth maps to the target_height/width for compatibility.
+    Includes an option to enable/disable min-max normalization (autogain).
+    If autogain is disabled, MP4 depth maps are scaled to 0-1 based on their detected bit depth (8-bit -> /255, 10-bit -> /1023).
+    For NPZ with autogain disabled, it assumes the data is already in the desired absolute range (e.g., 0-1).
     """
     print(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
 
-    video_depth_raw = None
+    video_depth_working_range = None # This will hold the float32 array before final normalization/scaling
+
     if depth_map_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
         vid = VideoReader(depth_map_path, ctx=cpu(0))
-        frames = vid[:].asnumpy().astype("float32") / 255.0
-        if frames.shape[-1] == 3:
+        # Read raw frames as float32, without any initial fixed scaling like /255.0
+        # This allows us to inspect the actual raw pixel values for bit depth detection.
+        raw_frames_data = vid[:].asnumpy().astype("float32")
+
+        if raw_frames_data.shape[-1] == 3:
             print("==> Converting RGB depth frames to grayscale")
-            video_depth_raw = frames.mean(axis=-1)
+            raw_frames_data = raw_frames_data.mean(axis=-1)
         else:
-            video_depth_raw = frames.squeeze(-1)
+            raw_frames_data = raw_frames_data.squeeze(-1)
+
+        if enable_autogain:
+            # If autogain is enabled, we work with the raw float data.
+            # The min-max normalization below will then scale this observed range to 0-1.
+            video_depth_working_range = raw_frames_data
+        else:
+            # Autogain disabled: Scale to 0-1 absolutely based on detected bit depth.
+            # This logic assumes common bit-depth ranges for MP4 depth maps.
+            max_raw_value_in_content = np.max(raw_frames_data)
+            if max_raw_value_in_content > 255 and max_raw_value_in_content <= 1023: # Heuristic for 10-bit range
+                print(f"==> Autogain disabled. Detected potential 10-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 1023.0.")
+                video_depth_working_range = raw_frames_data / 1023.0
+            else: # Assume 8-bit or standard 0-255 range
+                print(f"==> Autogain disabled. Detected potential 8-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 255.0.")
+                video_depth_working_range = raw_frames_data / 255.0
+
     elif depth_map_path.lower().endswith('.npz'):
         loaded_data = np.load(depth_map_path)
         if 'depth' in loaded_data:
-            video_depth_raw = loaded_data['depth'].astype("float32")
+            video_depth_working_range = loaded_data['depth'].astype("float32")
+            if not enable_autogain:
+                # For NPZ, if autogain is off, we *assume* it's already 0-1 or has an absolute meaning.
+                # If NPZ data is NOT already 0-1 and needs a fixed scaling (e.g., from 0-1000 to 0-1),
+                # the user would need to preprocess the NPZ or a new GUI setting for NPZ absolute scaling factor would be required.
+                print("==> Autogain disabled for NPZ. Assuming depth data is already in desired absolute range (e.g., 0-1).")
         else:
             raise ValueError("NPZ file does not contain a 'depth' array.")
     else:
         raise ValueError(f"Unsupported depth map format: {os.path.basename(depth_map_path)}. Only MP4/NPZ are supported.")
 
-    if process_length != -1 and process_length < len(video_depth_raw):
-        video_depth_raw = video_depth_raw[:process_length]
+    if process_length != -1 and process_length < len(video_depth_working_range):
+        video_depth_working_range = video_depth_working_range[:process_length]
 
-    # Normalize depth (0 to 1)
-    video_depth_min = video_depth_raw.min()
-    video_depth_max = video_depth_raw.max()
-    if video_depth_max - video_depth_min > 1e-5:
-        video_depth_normalized = (video_depth_raw - video_depth_min) / (video_depth_max - video_depth_min)
+    if enable_autogain:
+        # Perform Autogain (Min-Max Scaling) on the raw working range
+        video_depth_min = video_depth_working_range.min()
+        video_depth_max = video_depth_working_range.max()
+        if video_depth_max - video_depth_min > 1e-5:
+            video_depth_normalized = (video_depth_working_range - video_depth_min) / (video_depth_max - video_depth_min)
+            print(f"==> Depth maps autogained (min-max scaled) from observed range [{video_depth_min:.3f}, {video_depth_max:.3f}] to [0, 1].")
+        else:
+            video_depth_normalized = np.zeros_like(video_depth_working_range)
+            print("==> Depth map range too small, setting to zeros after autogain.")
     else:
-        video_depth_normalized = np.zeros_like(video_depth_raw)
+        # Autogain is disabled; video_depth_working_range already contains absolute 0-1 for MP4, or assumed for NPZ.
+        video_depth_normalized = video_depth_working_range
+        print("==> Autogain (min-max scaling) disabled. Depth maps are used with their absolute scaling.")
 
-    # Resize if matching resolution to target video
+
+    # Resize logic remains the same as before
     if match_resolution_to_target and target_height > 0 and target_width > 0:
         print(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
         resized_depths = []
@@ -277,8 +313,9 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
             resized_depth_frame = cv2.resize(depth_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
             resized_depths.append(resized_depth_frame)
 
-            # Apply colormap to the resized depth for visualization
-            vis_frame = cv2.applyColorMap((resized_depth_frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+            # Apply colormap to the resized depth for visualization.
+            # Clip to 0-1 range for reliable visualization, as the colormap expects this.
+            vis_frame = cv2.applyColorMap((np.clip(resized_depth_frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
             resized_viss.append(vis_frame.astype("float32") / 255.0)
 
         video_depth = np.stack(resized_depths, axis=0)
@@ -286,7 +323,8 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
     else:
         print(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
         video_depth = video_depth_normalized
-        depth_vis = np.stack([cv2.applyColorMap((frame * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
+        # Visualization: Ensure 0-1 range for colormap if autogain is off and values might naturally exceed 1.
+        depth_vis = np.stack([cv2.applyColorMap((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
 
     print("==> Depth maps and visualizations loaded successfully")
     return video_depth, depth_vis
@@ -303,7 +341,8 @@ def main(settings):
     input_source_clips_path_setting = settings["input_source_clips"]
     input_depth_maps_path_setting = settings["input_depth_maps"]
     output_splatted = settings["output_splatted"]
-    max_disp = settings["max_disp"]
+    # Original max_disp from GUI
+    gui_max_disp = float(settings["max_disp"]) 
     process_length = settings["process_length"]
     batch_size = settings["batch_size"]
     dual_output = settings["dual_output"]
@@ -368,6 +407,8 @@ def main(settings):
 
         # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
         current_zero_disparity_anchor = default_zero_disparity_anchor
+        # NEW: Determine the initial max_disparity percentage from the GUI setting (this can be overridden by JSON)
+        current_max_disparity_percentage = gui_max_disp
 
         # 1. Read input video frames at the determined pre-processing resolution
         # This resolution will be the target for depth maps and splatting output
@@ -411,27 +452,43 @@ def main(settings):
             depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
             json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
 
+            anchor_source = "GUI"
+            max_disp_source = "GUI"
+
             if os.path.exists(json_sidecar_path):
                 try:
                     with open(json_sidecar_path, 'r') as f:
                         sidecar_data = json.load(f)
+
                     if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
                         current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
                         print(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
-                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from JSON: {current_zero_disparity_anchor:.2f})"))
+                        anchor_source = "JSON"
                     else:
                         print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                        progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                        anchor_source = "GUI (Invalid JSON)"
+
+                    # NEW: Check for max_disparity in sidecar JSON
+                    if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
+                        current_max_disparity_percentage = float(sidecar_data["max_disparity"])
+                        print(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
+                        max_disp_source = "JSON"
+                    else:
+                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
+                        max_disp_source = "GUI (Invalid JSON)"
+
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} ({anchor_source}), MaxDisp: {current_max_disparity_percentage:.1f}% ({max_disp_source}))"))
+
                 except json.JSONDecodeError:
-                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
                 except Exception as e:
-                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
+                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
             else:
-                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor from GUI: {current_zero_disparity_anchor:.2f})"))
-            # END NEW SIDECAR JSON DETECTION LOGIC
+                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
+            # END SIDECAR JSON DETECTION LOGIC
 
             try:
                 video_depth, depth_vis = load_pre_rendered_depth(
@@ -439,7 +496,8 @@ def main(settings):
                     process_length=process_length,
                     target_height=current_video_processed_height, # Pass the height of the processed video
                     target_width=current_video_processed_width,   # Pass the width of the processed video
-                    match_resolution_to_target=True               # Permanently set to True
+                    match_resolution_to_target=True,
+                    enable_autogain=settings["enable_autogain"] # NEW
                 )
             except Exception as e:
                 print(f"==> Error loading depth map from {actual_depth_map_path}: {e}. Skipping this video.")
@@ -470,10 +528,10 @@ def main(settings):
             progress_queue.put("finished")
             return
 
-        percentage_max_disp_input = float(settings["max_disp"]) # Get the percentage value from settings
-        actual_percentage_for_calculation = percentage_max_disp_input / 20.0
+        # Use the (potentially overridden) current_max_disparity_percentage
+        actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
         actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_video_processed_width
-        print(f"==> Max Disparity Input: {percentage_max_disp_input:.1f}% -> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
+        print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
 
         output_video_path_base = os.path.join(output_splatted, f"{video_name}.mp4") # This is the base path before _res_suffix_suffix is added
         DepthSplatting(
@@ -497,17 +555,23 @@ def main(settings):
         print(f"==> Splatted video saved for {video_name}.") # Actual path printed by DepthSplatting
 
         if not stop_event.is_set() and not is_single_file_mode: # Only move if not single file mode
-            try:
-                shutil.move(video_path, finished_source_folder)
-                print(f"==> Moved processed video to: {finished_source_folder}")
-            except Exception as e:
-                print(f"==> Failed to move video {video_path}: {e}")
-            if actual_depth_map_path and os.path.exists(actual_depth_map_path):
+            if finished_source_folder is not None: # ADD THIS CHECK
+                try:
+                    shutil.move(video_path, finished_source_folder)
+                    print(f"==> Moved processed video to: {finished_source_folder}")
+                except Exception as e:
+                    print(f"==> Failed to move video {video_path}: {e}")
+            else:
+                print(f"==> Cannot move source video: 'finished_source_folder' is not set.")
+
+            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None: # ADD THIS CHECK
                 try:
                     shutil.move(actual_depth_map_path, finished_depth_folder)
                     print(f"==> Moved depth map to: {finished_depth_folder}")
                 except Exception as e:
                     print(f"==> Failed to move depth map {actual_depth_map_path}: {e}")
+            elif actual_depth_map_path and finished_depth_folder is None:
+                print(f"==> Cannot move depth map: 'finished_depth_folder' is not set.")
         elif is_single_file_mode:
             print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
 
@@ -517,12 +581,30 @@ def main(settings):
     print("\n==> Batch Depth Splatting Process Completed Successfully")
 
 def browse_folder(var):
-    folder = filedialog.askdirectory()
+    current_path = var.get()
+    # Ensure the path exists and is a directory, otherwise get its parent directory if it's a file
+    # If path is invalid or empty, initialdir will be None, letting filedialog choose default.
+    if os.path.isdir(current_path):
+        initial_dir = current_path
+    elif os.path.exists(current_path): # It's a file, so open in its directory
+        initial_dir = os.path.dirname(current_path)
+    else: # Path doesn't exist
+        initial_dir = None
+
+    folder = filedialog.askdirectory(initialdir=initial_dir)
     if folder:
         var.set(folder)
 
 def browse_file(var, filetypes_list):
-    file_path = filedialog.askopenfilename(filetypes=filetypes_list)
+    current_path = var.get()
+    # Ensure the path exists, otherwise get its parent directory if it's a file
+    # If path is invalid or empty, initialdir will be None, letting filedialog choose default.
+    if os.path.exists(current_path): # It's a file or directory
+        initial_dir = os.path.dirname(current_path) if os.path.isfile(current_path) else current_path
+    else: # Path doesn't exist
+        initial_dir = None
+
+    file_path = filedialog.askopenfilename(initialdir=initial_dir, filetypes=filetypes_list)
     if file_path:
         var.set(file_path)
 
@@ -571,7 +653,8 @@ def start_processing():
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
         "match_depth_res": True,         # Permanently set to True
-        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()), # NEW: Add to settings
+        "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
+        "enable_autogain": enable_autogain_var.get(), # NEW
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -616,11 +699,11 @@ def check_queue():
                 progress_var.set(processed)
                 # Update status label to show progress, but don't overwrite custom status
                 current_status_text = status_label.cget("text")
-                if not current_status_text.startswith("Processing ") or ("Anchor from" in current_status_text and not "finished" in current_status_text):
-                    # If it's a custom anchor message, just update progress part
-                    parts = current_status_text.split("(")
-                    if len(parts) > 1: # If it has an anchor part
-                        progress_queue.put(("status", f"Processing {processed}/{total} ({parts[1]}"))
+                if not current_status_text.startswith(f"Processing {processed}/{total}") and not "finished" in current_status_text:
+                    # If it's a custom anchor/max_disp message, just update progress part
+                    parts = current_status_text.split("(", 1) # Split only on the first '('
+                    if len(parts) > 1: # If it has an anchor/max_disp part
+                        status_label.config(text=f"Processing {processed}/{total} ({parts[1]}")
                     else: # If it's a basic processing message
                         status_label.config(text=f"Processing {processed} of {total}")
                 else: # Default behavior if no custom status or if it's already "Processing X of Y"
@@ -657,6 +740,7 @@ def save_config():
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
+        "enable_autogain": enable_autogain_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -676,6 +760,7 @@ def load_config():
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
+            enable_autogain_var.set(config.get("enable_autogain", True)) # NEW, default to True
 
 # Load help texts at the start
 load_help_texts()
@@ -696,6 +781,7 @@ set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
+enable_autogain_var = tk.BooleanVar(value=True) # Default to True (current behavior)
 
 # Load configuration
 load_config()
@@ -703,12 +789,13 @@ load_config()
 # Folder selection frame
 folder_frame = tk.LabelFrame(root, text="Input/Output Folders")
 folder_frame.pack(pady=10, padx=10, fill="x")
+folder_frame.grid_columnconfigure(1, weight=1) # This makes column 1 expand horizontally
 
 # Input Source Clips Row
 lbl_source_clips = tk.Label(folder_frame, text="Input Source Clips:")
 lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var, width=40) # Reduced width for more buttons
-entry_source_clips.grid(row=0, column=1, padx=5, pady=2)
+entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var) # Reduced width for more buttons
+entry_source_clips.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_source_clips_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_source_clips_var))
 btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
 btn_select_source_clips_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
@@ -722,8 +809,8 @@ create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file") # 
 # Input Depth Maps Row
 lbl_input_depth_maps = tk.Label(folder_frame, text="Input Depth Maps:")
 lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var, width=40) # Reduced width
-entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2)
+entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var) # Reduced width
+entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_input_depth_maps_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_depth_maps_var))
 btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
 btn_select_input_depth_maps_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
@@ -737,8 +824,8 @@ create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file") 
 # Output Splatted Row
 lbl_output_splatted = tk.Label(folder_frame, text="Output Splatted:")
 lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var, width=40) # Reduced width
-entry_output_splatted.grid(row=2, column=1, padx=5, pady=2)
+entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var) # Reduced width
+entry_output_splatted.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 btn_browse_output_splatted = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(output_splatted_var))
 btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2) # Spanning two columns
 create_hover_tooltip(lbl_output_splatted, "output_splatted")
@@ -824,6 +911,10 @@ dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
 
+# New: Autogain/Normalization Checkbox
+enable_autogain_checkbox = tk.Checkbutton(output_settings_frame, text="Enable Autogain (Min-Max Normalize Depth)", variable=enable_autogain_var)
+enable_autogain_checkbox.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2) # Spanning more columns
+create_hover_tooltip(enable_autogain_checkbox, "enable_autogain") # Need to add this to splatter_help.json
 
 # Progress frame
 progress_frame = tk.LabelFrame(root, text="Progress")
