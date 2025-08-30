@@ -18,3 +18,5 @@ imageio_ffmpeg
 imageio
 Imath
 triton-windows
+moviepy==1.0.3
+pyperclip

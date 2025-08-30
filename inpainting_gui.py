@@ -563,19 +563,20 @@ class InpaintingGUI(tk.Tk):
     def create_widgets(self):
         folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
         folder_frame.pack(fill="x", padx=10, pady=5)
+        folder_frame.grid_columnconfigure(1, weight=1)
         
         # Input Folder
         input_label = ttk.Label(folder_frame, text="Input Folder:")
         input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=0, column=1, padx=5)
+        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=0, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5)
         
         # Output Folder
         output_label = ttk.Label(folder_frame, text="Output Folder:")
         output_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_label, self.help_data.get("output_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=1, column=1, padx=5)
+        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=1, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=self.browse_output).grid(row=1, column=2, padx=5)
 
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)

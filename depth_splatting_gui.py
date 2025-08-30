@@ -654,7 +654,7 @@ def start_processing():
         "pre_res_height": pre_res_height_var.get(),
         "match_depth_res": True,         # Permanently set to True
         "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
-        "enable_autogain": enable_autogain_var.get(), # NEW
+        "enable_autogain": True, # Permanently enabled
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -740,7 +740,6 @@ def save_config():
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
-        "enable_autogain": enable_autogain_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -760,7 +759,6 @@ def load_config():
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
-            enable_autogain_var.set(config.get("enable_autogain", True)) # NEW, default to True
 
 # Load help texts at the start
 load_help_texts()
@@ -781,7 +779,6 @@ set_pre_res_var = tk.BooleanVar(value=False)
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
-enable_autogain_var = tk.BooleanVar(value=True) # Default to True (current behavior)
 
 # Load configuration
 load_config()
@@ -910,11 +907,6 @@ create_hover_tooltip(entry_process_length, "process_length")
 dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
-
-# New: Autogain/Normalization Checkbox
-enable_autogain_checkbox = tk.Checkbutton(output_settings_frame, text="Enable Autogain (Min-Max Normalize Depth)", variable=enable_autogain_var)
-enable_autogain_checkbox.grid(row=4, column=0, columnspan=4, sticky="w", padx=5, pady=2) # Spanning more columns
-create_hover_tooltip(enable_autogain_checkbox, "enable_autogain") # Need to add this to splatter_help.json
 
 # Progress frame
 progress_frame = tk.LabelFrame(root, text="Progress")
