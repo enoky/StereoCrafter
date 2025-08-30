@@ -19,6 +19,5 @@
     "input_source_clips_file": "Select a single video clip file to process.",
     "input_depth_maps_folder": "Browse for a folder containing corresponding depth maps (e.g., video_name_depth.mp4/npz) for batch processing.",
     "input_depth_maps_file": "Select a single depth map file corresponding to the selected source video.",
-    "convergence_point": "Set the normalized depth value (0.0 to 1.0) that will appear stationary (zero horizontal shift). 0.0 is closest, 1.0 is farthest. This defines the 'screen plane' or 'convergence plane' for the stereo effect.",
-    "enable_autogain": "If enabled, depth maps are scaled to the full 0-1 range based on their min/max values in each video."
+    "convergence_point": "Set the normalized depth value (0.0 to 1.0) that will appear stationary (zero horizontal shift). 0.0 is closest, 1.0 is farthest. This defines the 'screen plane' or 'convergence plane' for the stereo effect."
 }
