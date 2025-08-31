@@ -4,52 +4,83 @@ import os
 import json
 import glob
 import math
-import _tkinter # Import _tkinter for error handling
+import _tkinter
+import pyperclip
+import re
+from moviepy.editor import VideoFileClip
+import luadata # Correctly imported
 
-class ConvergenceJSONTool:
+class SidecarEditTool:
     def __init__(self, root):
         self.root = root
-        self.root.title("SidecarEdit JSON Sidecar Creator") # Changed title
-        self.root.geometry("600x500") # Initial window size
+        self.root.title("SidecarEdit - Depthmap Parameters")
+        self.root.geometry("800x650")
 
-        # --- Variables ---
-        self.current_folder_var = tk.StringVar(value="") # Holds the currently selected folder
-        self.recent_folders_list = [] # Stores list of recent folder paths
-        self.MAX_RECENT_FOLDERS = 10 # Max number of recent folders to keep
+        # --- Step 1: Initialize all Tkinter control variables and basic data structures ---
+        self.current_folder_var = tk.StringVar(value="")
+        self.recent_folders_list = []
+        self.MAX_RECENT_FOLDERS = 10
 
         self.current_filename_var = tk.StringVar(value="No file loaded")
         self.file_status_var = tk.StringVar(value="0 of 0")
-        self.convergence_var = tk.DoubleVar(value=0.5) # Slider needs DoubleVar
-        self.max_disparity_var = tk.DoubleVar(value=35.0) # NEW: Slider for max disparity (default 35)
+        self.convergence_var = tk.DoubleVar(value=0.5)
+        self.max_disparity_var = tk.DoubleVar(value=35.0)
         self.jump_to_file_var = tk.StringVar(value="1")
         self.status_message_var = tk.StringVar(value="Ready.")
 
-        self.all_depth_map_files = [] # Stores full paths to depth maps
-        self.current_file_index = -1  # -1 means no file loaded
-        # self.progress_save_data will now store {filename_basename: {"convergence_plane": value, "max_disparity": value}}
-        self.progress_save_data = {}  
-
-        self.config_file_path = "sidecaredit_config.json" # Changed config filename
-        self.progress_file_path = None  # Will be set dynamically based on folder
-
-        # --- Load Configuration and Progress on startup ---
-        self._load_gui_config()
-        # Progress will be loaded dynamically when a folder is selected
-
-        # --- GUI Layout ---
-        self._create_menu() # Create the File menu first
-        self._create_widgets()
-        self._update_navigation_buttons() # Initial state of buttons
-
-        # Sync slider and entry
-        self.convergence_var.trace_add("write", self._sync_convergence_entry_from_slider)
-        self.max_disparity_var.trace_add("write", self._sync_max_disparity_entry_from_slider) # NEW: Sync disparity slider and entry
+        self.all_depth_map_files = []
+        self.current_file_index = -1
         
-        # Initial folder load if any in recent list
+        self.progress_save_data = {}
+
+        self.parsed_convergence_keyframes = []
+        self.parsed_disparity_keyframes = []
+        self.applied_paste_data = {}
+
+        self.config_file_path = "sidecaredit_config.json"
+        self.progress_file_path = None
+
+        # --- Step 2: Load Configuration (this doesn't interact with GUI directly yet) ---
+        self._load_gui_config()
+
+        # --- Step 3: Create all GUI widgets and menus ---
+        self._create_menu()
+        self._create_widgets() # <-- ALL WIDGETS ARE NOW GUARANTEED TO BE CREATED HERE
+
+        # --- Step 4: Set up Traces (after vars and widgets are defined) ---
+        self.convergence_var.trace_add("write", self._update_convergence_entry_display)
+        self.max_disparity_var.trace_add("write", self._update_max_disparity_entry_display)
+        
+        # --- Step 5: Set Initial UI States (these methods now safely configure existing widgets) ---
+        self._update_navigation_buttons()
+        self._update_paste_buttons_state()
+
+        # --- Step 6: Perform Initial Data Load (This should be the very last step in __init__) ---
+        # This call is now safe because all GUI elements are initialized.
         if self.recent_folders_list:
-            # Set the current folder var to the most recent one
             self.current_folder_var.set(self.recent_folders_list[0])
             self._load_depth_maps()
+
+    def _update_convergence_entry_display(self, *args):
+        try:
+            val = self.convergence_var.get()
+            self.convergence_entry.delete(0, tk.END)
+            self.convergence_entry.insert(0, f"{val:.2f}") # Format to 2 decimal places
+        except _tkinter.TclError:
+            pass # Ignore TclErrors during partial updates
+        except ValueError:
+            pass
+
+    # NEW: Helper to update max disparity entry display with formatting
+    def _update_max_disparity_entry_display(self, *args):
+        try:
+            val = self.max_disparity_var.get()
+            self.max_disparity_entry.delete(0, tk.END)
+            self.max_disparity_entry.insert(0, f"{val:.1f}") # Format to 1 decimal place
+        except _tkinter.TclError:
+            pass # Ignore TclErrors during partial updates
+        except ValueError:
+            pass
 
     def _create_menu(self):
         self.menubar = tk.Menu(self.root)
@@ -60,42 +91,55 @@ class ConvergenceJSONTool:
 
         self.file_menu.add_command(label="Load Depth Map Folder...", command=self._browse_folder)
         
-        # Recent Folders Submenu
         self.recent_folders_submenu = tk.Menu(self.file_menu, tearoff=0)
         self.file_menu.add_cascade(label="Recent Folders", menu=self.recent_folders_submenu)
-        self._update_recent_folders_menu() # Populate initial list
+        self._update_recent_folders_menu()
 
         self.file_menu.add_separator()
-        self.file_menu.add_command(label="Save Progress", command=self._save_progress)
-        self.file_menu.add_command(label="Generate Sidecar JSONs...", command=self._generate_sidecar_jsons)
+        self.file_menu.add_command(label="Save Current File Progress", command=self._save_progress)
+        self.file_menu.add_command(label="Generate All Sidecar JSONs...", command=self._generate_sidecar_jsons)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self._exit_app)
 
     def _create_widgets(self):
-        # Folder Selection Frame
         folder_frame = ttk.LabelFrame(self.root, text="Depth Map Folder")
         folder_frame.pack(pady=10, padx=10, fill="x")
         
-        # Entry for folder path (allows pasting)
         self.folder_entry = ttk.Entry(folder_frame, textvariable=self.current_folder_var, width=60)
         self.folder_entry.grid(row=0, column=0, padx=5, pady=5)
-        self.folder_entry.bind("<Return>", self._load_folder_from_entry) # Load on Enter key
-        self.folder_entry.bind("<FocusOut>", self._load_folder_from_entry) # Load on focus out
+        self.folder_entry.bind("<Return>", self._load_folder_from_entry)
+        self.folder_entry.bind("<FocusOut>", self._load_folder_from_entry)
 
         ttk.Button(folder_frame, text="Browse", command=self._browse_folder).grid(row=0, column=1, padx=5, pady=5)
 
-        # Current File Info Frame
         file_info_frame = ttk.LabelFrame(self.root, text="Current Depth Map")
         file_info_frame.pack(pady=5, padx=10, fill="x")
 
         ttk.Label(file_info_frame, text="Filename:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(file_info_frame, textvariable=self.current_filename_var, wraplength=400).grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(file_info_frame, text="File Status:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(file_info_frame, textvariable=self.file_status_var).grid(row=1, column=1, sticky="w", padx=5, pady=2)
 
-        # NEW: Max Disparity Control Frame (placed above Convergence)
+        clipboard_frame = ttk.LabelFrame(self.root, text="Fusion Node Clipboard")
+        clipboard_frame.pack(pady=5, padx=10, fill="x")
+
+        self.paste_button = ttk.Button(clipboard_frame, text="Paste Fusion Node Data", command=self._read_clipboard_and_process)
+        self.paste_button.pack(side="left", padx=5, pady=5)
+
+        self.commit_paste_button = ttk.Button(clipboard_frame, text="Commit Pasted Values", command=self._commit_pasted_values)
+        self.commit_paste_button.pack(side="left", padx=5, pady=5)
+        self.commit_paste_button.config(state="disabled")
+
+        self.reset_paste_button = ttk.Button(clipboard_frame, text="Reset Paste", command=self._reset_paste)
+        self.reset_paste_button.pack(side="left", padx=5, pady=5)
+        self.reset_paste_button.config(state="disabled")
+
+        self.info_text_area = tk.Text(clipboard_frame, height=5, wrap="word", state="disabled")
+        self.info_text_area.pack(pady=5, padx=5, fill="x", expand=True)
+
         max_disparity_frame = ttk.LabelFrame(self.root, text="Max Disparity (0-100)")
         max_disparity_frame.pack(pady=5, padx=10, fill="x")
 
-        # Slider for Max Disparity
         self.max_disparity_slider = ttk.Scale(
             max_disparity_frame,
             from_=0.0,
@@ -105,23 +149,20 @@ class ConvergenceJSONTool:
         )
         self.max_disparity_slider.pack(fill="x", padx=5, pady=5)
 
-        # Entry for numerical input for Max Disparity, synced with slider
         vcmd_disparity = (self.root.register(self._validate_max_disparity_input), '%P')
         self.max_disparity_entry = ttk.Entry(
             max_disparity_frame,
             textvariable=self.max_disparity_var,
             width=10,
-            validate="focusout", # Validate on losing focus
+            validate="focusout",
             validatecommand=vcmd_disparity
         )
         self.max_disparity_entry.pack(padx=5, pady=2)
-        self.max_disparity_entry.bind("<Return>", self._sync_max_disparity_slider_from_entry) # Sync on Enter key
+        self.max_disparity_entry.bind("<Return>", self._sync_max_disparity_slider_from_entry)
 
-        # Convergence Control Frame (EXISTING)
         convergence_frame = ttk.LabelFrame(self.root, text="Convergence Plane (0.0=Nearest, 1.0=Furthest)")
         convergence_frame.pack(pady=5, padx=10, fill="x")
 
-        # Slider
         self.convergence_slider = ttk.Scale(
             convergence_frame,
             from_=0.0,
@@ -131,29 +172,22 @@ class ConvergenceJSONTool:
         )
         self.convergence_slider.pack(fill="x", padx=5, pady=5)
 
-        # Entry for numerical input, synced with slider
         vcmd = (self.root.register(self._validate_convergence_input), '%P')
         self.convergence_entry = ttk.Entry(
             convergence_frame,
             textvariable=self.convergence_var,
             width=10,
-            validate="focusout", # Validate on losing focus
+            validate="focusout",
             validatecommand=vcmd
         )
         self.convergence_entry.pack(padx=5, pady=2)
-        self.convergence_entry.bind("<Return>", self._sync_convergence_slider_from_entry) # Sync on Enter key
+        self.convergence_entry.bind("<Return>", self._sync_convergence_slider_from_entry)
 
-        # Navigation Frame
         nav_frame = ttk.Frame(self.root)
         nav_frame.pack(pady=10, padx=10, fill="x")
 
         self.prev_button = ttk.Button(nav_frame, text="< Previous", command=lambda: self._nav_file(-1))
         self.prev_button.pack(side="left", padx=5)
-
-        ttk.Label(nav_frame, textvariable=self.file_status_var).pack(side="left", padx=10)
-
-        self.next_button = ttk.Button(nav_frame, text="Next >", command=lambda: self._nav_file(1))
-        self.next_button.pack(side="left", padx=5)
 
         ttk.Label(nav_frame, text="Jump to file #:", anchor="e").pack(side="left", padx=(20, 5))
         vcmd_jump = (self.root.register(self._validate_jump_input), '%P')
@@ -166,30 +200,25 @@ class ConvergenceJSONTool:
         )
         self.jump_entry.pack(side="left", padx=5)
         self.jump_entry.bind("<Return>", self._jump_to_file)
+        
+        self.next_button = ttk.Button(nav_frame, text="Next >", command=lambda: self._nav_file(1))
+        self.next_button.pack(side="right", padx=5)
 
-        # Status Bar
         status_bar = ttk.Label(self.root, textvariable=self.status_message_var, anchor="w")
         status_bar.pack(side="bottom", fill="x", pady=2, padx=10)
 
-        # Action Buttons Frame (buttons removed as they are in the menu)
-        action_frame = ttk.Frame(self.root)
-        action_frame.pack(pady=10, padx=10, fill="x")
-
     def _update_recent_folders_menu(self):
-        self.recent_folders_submenu.delete(0, tk.END) # Clear existing items
+        self.recent_folders_submenu.delete(0, tk.END)
         if not self.recent_folders_list:
             self.recent_folders_submenu.add_command(label="(No recent folders)", state="disabled")
             return
 
         for folder_path in self.recent_folders_list:
-            # Use lambda to capture folder_path for each command
             self.recent_folders_submenu.add_command(label=folder_path, command=lambda p=folder_path: self._load_folder_from_recent(p))
 
     def _load_folder_from_recent(self, folder_path):
-        # Update current folder variable
         self.current_folder_var.set(folder_path)
-        # Move selected folder to top of recent list
-        self._add_to_recent_folders(folder_path) # This also updates the menu and saves config
+        self._add_to_recent_folders(folder_path)
         self._load_depth_maps()
 
     def _load_folder_from_entry(self, event=None):
@@ -202,121 +231,201 @@ class ConvergenceJSONTool:
             self.status_message_var.set(f"Error: Not a valid directory: {folder_path}")
             return
 
-        self._add_to_recent_folders(folder_path) # Update recent list, menu, and save config
+        self._add_to_recent_folders(folder_path)
         self._load_depth_maps()
 
     def _browse_folder(self):
         folder_selected = filedialog.askdirectory()
         if folder_selected:
             self.current_folder_var.set(folder_selected)
-            self._add_to_recent_folders(folder_selected) # Update recent list, menu, and save config
+            self._add_to_recent_folders(folder_selected)
             self._load_depth_maps()
 
     def _add_to_recent_folders(self, folder_path):
-        # Ensure it's in the list and at the top
         if folder_path in self.recent_folders_list:
             self.recent_folders_list.remove(folder_path)
         self.recent_folders_list.insert(0, folder_path)
         self._trim_recent_folders()
-        self._update_recent_folders_menu() # Update the menu's list
-        self._save_gui_config() # Save config with new recent list
+        self._update_recent_folders_menu()
+        self._save_gui_config()
 
     def _trim_recent_folders(self):
         self.recent_folders_list = self.recent_folders_list[:self.MAX_RECENT_FOLDERS]
 
+    def _get_video_frame_count(self, file_path):
+        try:
+            clip = VideoFileClip(file_path)
+            fps = clip.fps
+            duration = clip.duration
+            if fps is None or duration is None:
+                self._log_info(f"Warning: Could not get precise FPS/duration for {os.path.basename(file_path)}. Assuming 24fps.")
+                fps = 24 
+                if duration is None: return 0 
+            
+            frames = math.ceil(duration * fps)
+            clip.close()
+            return frames
+        except Exception as e:
+            self.status_message_var.set(f"Error getting frame count for {os.path.basename(file_path)}: {e}")
+            self._log_info(f"Error getting frame count for {os.path.basename(file_path)}: {e}")
+            return 0
+
     def _load_depth_maps(self):
         folder = self.current_folder_var.get()
+        self.all_depth_map_files = []
+        self.current_file_index = -1
+        self.progress_save_data = {}
+        self.applied_paste_data = {} # Clear any old temporary paste data
+
         if not folder or not os.path.isdir(folder):
-            self.all_depth_map_files = []
-            self.current_file_index = -1
-            self.progress_file_path = None # Reset if folder is invalid
-            self._update_gui_for_no_files("Please select a valid depth map folder.")
+            self.progress_file_path = None
+            # Fix 1: Call with self.
+            self._update_gui_for_no_files("Please select a valid depth map folder.") 
             return
 
-        # --- Change 1: Update progress file name ---
         self.progress_file_path = os.path.join(folder, "sidecaredit_progress.json")
-        self._load_progress() # Load progress specifically for this new folder
+        self._load_progress() # This loads existing progress from disk into self.progress_save_data
 
         video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
-        found_files = []
+        found_files_paths = []
         for ext in video_extensions:
-            found_files.extend(glob.glob(os.path.join(folder, ext)))
-        self.all_depth_map_files = sorted(found_files)
+            found_files_paths.extend(glob.glob(os.path.join(folder, ext)))
+        sorted_files_paths = sorted(found_files_paths)
 
-        if not self.all_depth_map_files:
-            self.current_file_index = -1
+        if not sorted_files_paths:
+            # Fix 1: Call with self.
             self._update_gui_for_no_files("No depth map video files found in the selected folder.")
             return
 
+        cumulative_frames = 0
+        total_files = len(sorted_files_paths)
+        
+        self.status_message_var.set(f"Loading {total_files} depth map files...")
+        self._log_info(f"Loading {total_files} depth map files from {folder}")
+
+        # Initialize last known values for carry-forward logic
+        last_conv_val = 0.5
+        last_disp_val = 35.0
+
+        for i, full_path in enumerate(sorted_files_paths):
+            basename = os.path.basename(full_path)
+            total_frames = self._get_video_frame_count(full_path)
+            
+            saved_data = self.progress_save_data.get(basename)
+            
+            conv_val = last_conv_val
+            disp_val = last_disp_val
+            
+            if saved_data:
+                # If saved data exists, use it
+                if isinstance(saved_data, dict):
+                    conv_val = saved_data.get("convergence_plane", 0.5)
+                    disp_val = saved_data.get("max_disparity", 35.0)
+                elif isinstance(saved_data, (float, int)): # Old format compatibility
+                    conv_val = float(saved_data)
+                    disp_val = 35.0 # Default for old format
+            else:
+                # If NO saved data, use the last determined values (carry-forward)
+                conv_val = last_conv_val
+                disp_val = last_disp_val
+            
+            file_info = {
+                "full_path": full_path,
+                "basename": basename,
+                "total_frames": total_frames,
+                "timeline_start_frame": cumulative_frames,
+                "timeline_end_frame": cumulative_frames + total_frames - 1,
+                "current_convergence": conv_val,
+                "current_max_disparity": disp_val
+            }
+            self.all_depth_map_files.append(file_info)
+            cumulative_frames += total_frames
+            
+            # Update last_conv_val and last_disp_val for the next iteration
+            last_conv_val = conv_val
+            last_disp_val = disp_val
+
+            self.status_message_var.set(f"Loading file {i+1}/{total_files}: {basename} ({total_frames} frames)...")
+            self.root.update_idletasks()
+
         self.current_file_index = 0
-        self._display_current_file()
-        self.status_message_var.set(f"Loaded {len(self.all_depth_map_files)} depth map files.")
+        # Fix 2: _display_current_file() correctly gets values from self.all_depth_map_files
+        self._display_current_file() 
+        self.status_message_var.set(f"Loaded {len(self.all_depth_map_files)} depth map files. Total frames: {cumulative_frames}.")
+        self._log_info(f"Loaded {len(self.all_depth_map_files)} depth map files. Total frames: {cumulative_frames}.")
 
     def _update_gui_for_no_files(self, message):
         self.current_filename_var.set(message)
         self.file_status_var.set("0 of 0")
-        self.convergence_var.set(0.5)
-        self.max_disparity_var.set(35.0) # NEW: Reset max disparity
+        # Round default values for consistent display
+        self.convergence_var.set(round(0.5, 2))
+        self.max_disparity_var.set(round(35.0, 1))
         self.jump_to_file_var.set("1")
         self.status_message_var.set(message)
         self._update_navigation_buttons()
+        self._update_paste_buttons_state()
+        self._log_info(message)
 
     def _display_current_file(self):
         if not self.all_depth_map_files or self.current_file_index == -1:
+            # If there are no files, or no file is selected, revert GUI to 'no files' state.
             self._update_gui_for_no_files("No depth map files to display.")
             return
 
-        full_path = self.all_depth_map_files[self.current_file_index]
-        filename = os.path.basename(full_path)
-        self.current_filename_var.set(filename)
+        current_file_data = self.all_depth_map_files[self.current_file_index]
+        basename = current_file_data["basename"]
+        
+        # Update StringVar widgets
+        self.current_filename_var.set(basename)
         self.file_status_var.set(f"{self.current_file_index + 1} of {len(self.all_depth_map_files)}")
         self.jump_to_file_var.set(str(self.current_file_index + 1))
+        
+        # Update DoubleVar widgets, ensuring rounding for display consistency
+        self.convergence_var.set(round(current_file_data["current_convergence"], 2)) # Round to 2 decimals
+        self.max_disparity_var.set(round(current_file_data["current_max_disparity"], 1)) # Round to 1 decimal
 
-        # --- Change 2: Lookup saved data using the basename ---
-        saved_data = self.progress_save_data.get(filename)
-
-        convergence_value = 0.5
-        max_disparity_value = 35.0
-
-        if saved_data is not None:
-            if isinstance(saved_data, dict): # New format: dictionary of values
-                convergence_value = saved_data.get("convergence_plane", 0.5)
-                max_disparity_value = saved_data.get("max_disparity", 35.0)
-            else: # Old format (before max_disparity): just a float (assumed to be convergence_plane)
-                convergence_value = saved_data 
-                # max_disparity_value remains default 35.0
-
-        # Set the DoubleVars. This automatically updates the sliders and triggers the entry sync.
-        self.convergence_var.set(convergence_value) 
-        self.max_disparity_var.set(max_disparity_value) # NEW: Set max disparity value
-
+        # Update button states based on current file and paste status
         self._update_navigation_buttons()
+        self._update_paste_buttons_state()
 
     def _update_navigation_buttons(self):
         total_files = len(self.all_depth_map_files)
         if total_files == 0:
-            self.prev_button.config(state="disabled")
-            self.next_button.config(state="disabled")
-            self.jump_entry.config(state="disabled")
-            self.convergence_slider.config(state="disabled")
-            self.convergence_entry.config(state="disabled")
-            self.max_disparity_slider.config(state="disabled") # NEW
-            self.max_disparity_entry.config(state="disabled")   # NEW
-            return
-        
+            state = "disabled"
+        else:
+            state = "normal"
+
         self.prev_button.config(state="normal" if self.current_file_index > 0 else "disabled")
         self.next_button.config(state="normal" if self.current_file_index < total_files - 1 else "disabled")
-        self.jump_entry.config(state="normal")
-        self.convergence_slider.config(state="normal")
-        self.convergence_entry.config(state="normal")
-        self.max_disparity_slider.config(state="normal") # NEW
-        self.max_disparity_entry.config(state="normal")   # NEW
+        
+        self.jump_entry.config(state=state)
+        self.convergence_slider.config(state=state)
+        self.convergence_entry.config(state=state)
+        self.max_disparity_slider.config(state=state)
+        self.max_disparity_entry.config(state=state)
+        
+    def _update_paste_buttons_state(self):
+        if not self.all_depth_map_files:
+            self.paste_button.config(state="disabled")
+            self.commit_paste_button.config(state="disabled")
+            self.reset_paste_button.config(state="disabled")
+            return
+
+        self.paste_button.config(state="normal")
+        
+        if self.applied_paste_data:
+            self.commit_paste_button.config(state="normal")
+            self.reset_paste_button.config(state="normal")
+        else:
+            self.commit_paste_button.config(state="disabled")
+            self.reset_paste_button.config(state="disabled")
 
     def _sync_convergence_entry_from_slider(self, *args):
+        # This method is triggered when the DoubleVar changes (e.g., slider move)
         try:
             val = self.convergence_var.get()
             self.convergence_entry.delete(0, tk.END)
-            self.convergence_entry.insert(0, f"{val:.2f}")
+            self.convergence_entry.insert(0, f"{val:.2f}") # Changed to 2 decimal places
         except _tkinter.TclError:
             pass
         except ValueError:
@@ -324,17 +433,21 @@ class ConvergenceJSONTool:
 
     def _sync_convergence_slider_from_entry(self, event=None):
         try:
-            val = float(self.convergence_entry.get())
-            self.convergence_var.set(val)
+            val_str = self.convergence_entry.get()
+            # The validation function will now also handle setting the DoubleVar and internal data
+            if not self._validate_convergence_input(val_str, is_sync_attempt=True):
+                return # Validation failed, value was not set
+            # If validation passed, _validate_convergence_input already updated self.convergence_var and internal data
         except ValueError:
+            # Error message is already set by _validate_convergence_input
             pass
 
-    # NEW: Sync methods for Max Disparity
     def _sync_max_disparity_entry_from_slider(self, *args):
+        # This method is triggered when the DoubleVar changes (e.g., slider move)
         try:
             val = self.max_disparity_var.get()
             self.max_disparity_entry.delete(0, tk.END)
-            self.max_disparity_entry.insert(0, f"{val:.2f}")
+            self.max_disparity_entry.insert(0, f"{val:.1f}") # Changed to 1 decimal place
         except _tkinter.TclError:
             pass
         except ValueError:
@@ -342,19 +455,28 @@ class ConvergenceJSONTool:
 
     def _sync_max_disparity_slider_from_entry(self, event=None):
         try:
-            val = float(self.max_disparity_entry.get())
-            self.max_disparity_var.set(val)
+            val_str = self.max_disparity_entry.get()
+            # The validation function will now also handle setting the DoubleVar and internal data
+            if not self._validate_max_disparity_input(val_str, is_sync_attempt=True):
+                return # Validation failed, value was not set
+            # If validation passed, _validate_max_disparity_input already updated self.max_disparity_var and internal data
         except ValueError:
+            # Error message is already set by _validate_max_disparity_input
             pass
 
-    def _validate_convergence_input(self, p):
+    def _validate_convergence_input(self, p, is_sync_attempt=False):
         if p == "":
-            self.status_message_var.set("Error: Convergence cannot be empty.")
+            if not is_sync_attempt:
+                self.status_message_var.set("Error: Convergence cannot be empty.")
             return False
         try:
             val = float(p)
             if 0.0 <= val <= 1.0:
                 self.status_message_var.set("Ready.")
+                rounded_val = round(val, 2) # NEW: Round here
+                self.convergence_var.set(rounded_val) 
+                if self.current_file_index != -1 and self.all_depth_map_files:
+                    self.all_depth_map_files[self.current_file_index]["current_convergence"] = rounded_val # NEW: Store rounded
                 return True
             else:
                 self.status_message_var.set("Error: Convergence must be between 0.0 and 1.0.")
@@ -363,15 +485,19 @@ class ConvergenceJSONTool:
             self.status_message_var.set("Error: Invalid number for convergence.")
             return False
 
-    # NEW: Validation method for Max Disparity
-    def _validate_max_disparity_input(self, p):
+    def _validate_max_disparity_input(self, p, is_sync_attempt=False):
         if p == "":
-            self.status_message_var.set("Error: Max Disparity cannot be empty.")
+            if not is_sync_attempt:
+                self.status_message_var.set("Error: Max Disparity cannot be empty.")
             return False
         try:
             val = float(p)
             if 0.0 <= val <= 100.0:
                 self.status_message_var.set("Ready.")
+                rounded_val = round(val, 1) # NEW: Round here
+                self.max_disparity_var.set(rounded_val)
+                if self.current_file_index != -1 and self.all_depth_map_files:
+                    self.all_depth_map_files[self.current_file_index]["current_max_disparity"] = rounded_val # NEW: Store rounded
                 return True
             else:
                 self.status_message_var.set("Error: Max Disparity must be between 0.0 and 100.0.")
@@ -382,7 +508,7 @@ class ConvergenceJSONTool:
 
     def _validate_jump_input(self, p):
         if p == "":
-            return True # Allow empty input temporarily
+            return True
         try:
             val = int(p)
             if 1 <= val <= len(self.all_depth_map_files):
@@ -398,15 +524,15 @@ class ConvergenceJSONTool:
     def _nav_file(self, direction):
         if not self.all_depth_map_files:
             return
-
-        self._save_progress() # Save current file's value before navigating
-
+        
+        self._save_current_file_gui_values()
+        
         new_index = self.current_file_index + direction
         if 0 <= new_index < len(self.all_depth_map_files):
             self.current_file_index = new_index
             self._display_current_file()
         else:
-            self._update_navigation_buttons() # Re-disable if at ends
+            self._update_navigation_buttons()
             self.status_message_var.set("Already at first/last file.")
 
     def _jump_to_file(self, event=None):
@@ -414,9 +540,9 @@ class ConvergenceJSONTool:
             return
 
         try:
-            target_index = int(self.jump_to_file_var.get()) - 1 # Convert to 0-based index
+            target_index = int(self.jump_to_file_var.get()) - 1
             if 0 <= target_index < len(self.all_depth_map_files):
-                self._save_progress() # Save current file's convergence before jumping
+                self._save_current_file_gui_values() # NEW: Save current GUI values before jumping
                 
                 self.current_file_index = target_index
                 self._display_current_file()
@@ -425,79 +551,521 @@ class ConvergenceJSONTool:
         except ValueError:
             self.status_message_var.set("Invalid file number for jump.")
 
-    def _save_progress(self):
+    def _save_current_file_gui_values(self):
+        """Saves the current GUI slider/entry values to the internal all_depth_map_files list."""
+        if self.current_file_index != -1 and self.all_depth_map_files:
+            current_data = self.all_depth_map_files[self.current_file_index]
+            # Ensure the values are correctly read from the DoubleVars, not just what was last set
+            current_data["current_convergence"] = self.convergence_var.get()
+            current_data["current_max_disparity"] = self.max_disparity_var.get()
+            # print(f"DEBUG: Saved GUI values for {current_data['basename']} (Conv: {current_data['current_convergence']:.4f}, Disp: {current_data['current_max_disparity']:.2f})")
+
+    def _log_info(self, message):
+        self.info_text_area.config(state="normal")
+        self.info_text_area.insert(tk.END, message + "\n")
+        self.info_text_area.see(tk.END)
+        self.info_text_area.config(state="disabled")
+
+    def _read_clipboard_and_process(self):
+        if not self.all_depth_map_files:
+            self.status_message_var.set("Error: No depth map files loaded to apply data to.")
+            self._log_info("Error: No depth map files loaded for clipboard processing.")
+            return
+
+        self.status_message_var.set("Reading clipboard...")
+        self._log_info("Attempting to read Fusion node data from clipboard...")
+        self.parsed_convergence_keyframes = []
+        self.parsed_disparity_keyframes = []
+        self.applied_paste_data = {}
+
+        try:
+            clipboard_content = pyperclip.paste()
+            if not clipboard_content.strip():
+                self.status_message_var.set("Clipboard is empty or contains no text.")
+                self._log_info("Clipboard is empty.")
+                return
+
+            self.parsed_convergence_keyframes, self.parsed_disparity_keyframes = self._parse_fusion_node_text(clipboard_content)
+
+            if not self.parsed_convergence_keyframes and not self.parsed_disparity_keyframes:
+                self.status_message_var.set("No Convergence or MaxDisparity keyframes found in clipboard data.")
+                self._log_info("Parsing failed: No relevant keyframes found.")
+                return
+
+            self._log_info(f"Parsed {len(self.parsed_convergence_keyframes)} Convergence keyframes and {len(self.parsed_disparity_keyframes)} Max Disparity keyframes.")
+
+            self._match_keyframes_to_files(self.parsed_convergence_keyframes, self.parsed_disparity_keyframes)
+            self._log_info("Keyframe data matched to depth map files.")
+            self.status_message_var.set("Clipboard data successfully processed. Review and Commit.")
+            self._update_paste_buttons_state()
+            self._display_current_file()
+
+        except pyperclip.PyperclipException as e:
+            self.status_message_var.set(f"Error accessing clipboard: {e}")
+            self._log_info(f"Error accessing clipboard: {e}")
+        except json.JSONDecodeError as e: # Catch JSON specific errors
+            self.status_message_var.set(f"Error parsing Fusion node data (JSON syntax issue after conversion): {e}")
+            self._log_info(f"JSON parsing error after conversion: {e}\nProblematic clipboard (first 500 chars):\n{clipboard_content[:500]}...")
+        except Exception as e: # Catch any other unexpected errors
+            self.status_message_var.set(f"An unexpected error occurred during clipboard processing: {e}")
+            self._log_info(f"Unexpected error during clipboard processing: {e}")
+
+    def _convert_fusion_to_json_like(self, fusion_text):
+        self._log_info("\n--- Starting Lua-to-JSON Conversion (Robust Regex) ---")
+        # self._log_info(f"Original Text (first 1000 chars):\n{fusion_text[:1000]}...")
+
+        # Step 1: Remove Lua comments (-- single line, --[[ multi-line ]])
+        cleaned_text = re.sub(r'--\[\[.*?\]\]', '', fusion_text, flags=re.DOTALL) # Multi-line
+        cleaned_text = re.sub(r'--.*', '', cleaned_text) # Single line
+        
+        # Step 2: Remove problematic, non-essential blocks that have complex Lua syntax
+        # Using a more robust pattern for nested braces: match any char, or balanced braces.
+        # This is a common pattern for "match anything between braces, including nested braces, non-greedily".
+        # This regex is still a heuristic, as Python's re doesn't support true recursion.
+        balanced_braces_pattern = r'\{[^{}]*(?:(?R)[^{}]*)*\}' # (?:(?R)[^{}]*)* for recursion (might not work in Python's re)
+        
+        # Simpler, iterative approach for block removal:
+        # We need to remove the whole block definition including its name and the outer braces.
+        # This requires matching the keyword, the '=', and then the brace-enclosed content.
+        
+        # Remove UserControls block (most complex, has ordered() {})
+        cleaned_text = re.sub(r'\bUserControls\s*=\s*(?:ordered\s*\(\)\s*)?\{.*?\}\s*(?:,)?', '', cleaned_text, flags=re.DOTALL)
+        self._log_info("Removed UserControls block.")
+        
+        # Remove CustomData block
+        cleaned_text = re.sub(r'\bCustomData\s*=\s*\{.*?\}\s*(?:,)?', '', cleaned_text, flags=re.DOTALL)
+        self._log_info("Removed CustomData block.")
+
+        # Remove ViewInfo block
+        cleaned_text = re.sub(r'\bViewInfo\s*=\s*OperatorInfo\s*\{.*?\}\s*(?:,)?', '', cleaned_text, flags=re.DOTALL)
+        self._log_info("Removed ViewInfo block.")
+        
+        # Remove SplineColor block (nested in BezierSpline, but not useful)
+        cleaned_text = re.sub(r'\bSplineColor\s*=\s*\{.*?\}\s*(?:,)?', '', cleaned_text, flags=re.DOTALL)
+        self._log_info("Removed SplineColor block.")
+
+        # Remove simple assignments that are not needed
+        cleaned_text = re.sub(r'\bCtrlWZoom\s*=\s*(?:true|false)\s*(?:,)?', '', cleaned_text)
+        cleaned_text = re.sub(r'\bNameSet\s*=\s*(?:true|false)\s*(?:,)?', '', cleaned_text)
+        cleaned_text = re.sub(r'\bActiveTool\s*=\s*".*?"\s*(?:,)?', '', cleaned_text)
+        self._log_info("Removed specific simple assignments.")
+
+        # Step 3: Convert Lua constructors/types to just their content braces `{}`
+        # e.g., `ordered() {` -> `{`, `BezierSpline {` -> `{`, `Number {` -> `{`, `Input {` -> `{`
+        cleaned_text = re.sub(r'\b(?:ordered\s*\(\)|BezierSpline|sMerge|Number|Float|Input|OperatorInfo)\s*(\{)', r'\1', cleaned_text)
+        self._log_info("Removed Lua constructor keywords.")
+
+        # Step 4: Quote keys and convert `=` to `:`
+        #   a. Bracketed string keys: `["Key"] = ` -> `"Key": ` (this was problematic)
+        #      The previous error was `["Setting:"] = "Settings:\\"`
+        #      We need to capture the quoted string inside the brackets and then re-quote it as a JSON key.
+        cleaned_text = re.sub(r'\[(".*?")\]\s*=', r'\1:', cleaned_text)
+        self._log_info("Handled bracketed string keys.")
+
+        #   b. Bracketed numeric keys: `[0] = ` -> `"0": `
+        cleaned_text = re.sub(r'\[(\d+)\]\s*=', r'"\1":', cleaned_text)
+        self._log_info("Handled bracketed numeric keys.")
+
+        #   c. Simple alphanumeric keys: `Key = Value` or `Key {` -> `"Key": Value` or `"Key": {`
+        #      This needs to run AFTER bracketed keys. It finds a word, ensures it's not already quoted,
+        #      and is followed by a colon (from previous `=` conversion) or an opening brace.
+        cleaned_text = re.sub(r'(\b[a-zA-Z_]\w*\b)\s*:', r'"\1":', cleaned_text) # If = already converted to :
+        cleaned_text = re.sub(r'(\b[a-zA-Z_]\w*\b)\s*(\{)', r'"\1":{', cleaned_text) # If followed by {
+        self._log_info("Handled simple alphanumeric keys.")
+        
+        # Step 5: Convert Lua boolean literals to JSON
+        cleaned_text = re.sub(r'\btrue\b', 'true', cleaned_text)
+        cleaned_text = re.sub(r'\bfalse\b', 'false', cleaned_text)
+        self._log_info("Converted booleans.")
+
+        # Step 6: Convert Lua-style single-quoted strings to JSON double-quoted strings
+        cleaned_text = re.sub(r"'([^']*)'", r'"\1"', cleaned_text)
+        self._log_info("Converted single quotes to double quotes.")
+
+        # Step 7: Clean up trailing commas before a closing brace/bracket
+        # This replaces a comma followed by zero or more whitespace and then a } or ]
+        cleaned_text = re.sub(r',\s*([}\]])', r'\1', cleaned_text)
+        self._log_info("Cleaned up trailing commas.")
+
+        # Step 8: Normalize whitespace (reduce multiple spaces/newlines to single space)
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        self._log_info("Normalized whitespace.")
+
+        # Step 9: Ensure the whole string is a single valid JSON object.
+        # The Fusion clipboard starts with `{ Tools = ... }`, so we expect a single outer object.
+        # If any of the removals left it in a state that's not a single `{}` block, this might be needed.
+        if not cleaned_text.startswith('{') or not cleaned_text.endswith('}'):
+            self._log_info("Warning: Outer curly braces missing after conversion. Attempting to add.")
+            cleaned_text = '{' + cleaned_text + '}'
+        self._log_info("Ensured outer braces.")
+
+        # Step 10: Final JSON normalization via load/dump to validate and format
+        try:
+            temp_obj = json.loads(cleaned_text)
+            # Re-dump to normalize whitespace and ensure a perfectly valid JSON string
+            cleaned_text = json.dumps(temp_obj, indent=None, separators=(',', ':')) 
+            self._log_info("Final JSON normalization successful.")
+        except json.JSONDecodeError as e:
+            self._log_info(f"Final JSON normalization failed: {e}")
+            self._log_info(f"Problematic JSON string during normalization (first 1000 chars):\n{cleaned_text[:1000]}...")
+            raise # Re-raise error if we can't make it valid JSON
+
+        self._log_info("--- Finished Lua-to-JSON Conversion ---")
+        return cleaned_text
+
+
+        conv_keyframes = []
+        disp_keyframes = []
+
+        self._log_info("--- Starting Fusion Node Text Parsing (luadata direct approach) ---")
+        
+        try:
+            # Basic cleanup: remove Lua comments and trim whitespace
+            # luadata.loads is generally robust to surrounding whitespace, but comments can be tricky.
+            cleaned_node_text = re.sub(r'--\[\[.*?\]\]', '', node_text, flags=re.DOTALL) # Multi-line comments
+            cleaned_node_text = re.sub(r'--.*', '', cleaned_node_text) # Single line comments
+            cleaned_node_text = cleaned_node_text.strip()
+
+            if not cleaned_node_text:
+                raise ValueError("Clipboard content is empty after cleaning comments.") # Use ValueError for controlled empty content
+
+            # luadata.loads expects a single Lua table.
+            # The Fusion clipboard content should be exactly that (e.g., { Tools = ordered() { ... } })
+            parsed_data = luadata.loads(cleaned_node_text) # Correct usage of luadata.loads()
+            self._log_info("Successfully parsed Fusion node data using luadata.loads().")
+            # self._log_info(f"Parsed data structure:\n{json.dumps(parsed_data, indent=2)}") # Uncomment for full debug
+
+            # Access the 'Tools' table from the top-level dictionary
+            # luadata converts 'ordered() { ... }' to a Python dict (specifically, an OrderedDict by default),
+            # so we can access its elements by key.
+            tools = parsed_data.get("Tools", {})
+
+            # --- Convergence ---
+            conv_node = tools.get("Depth_ControlConvergence") # Access directly by key
+            
+            if conv_node:
+                conv_keyframes_data = conv_node.get("KeyFrames", {})
+                
+                if conv_keyframes_data:
+                    self._log_info("Found KeyFrames for Convergence.")
+                    for frame_num_key, frame_data in conv_keyframes_data.items():
+                        try:
+                            # luadata will convert Lua table array indices (e.g. [0]) to Python integers
+                            frame_num = int(frame_num_key) 
+                            # The actual value is at the integer index 0 within the inner dictionary/list
+                            if isinstance(frame_data, dict) and 0 in frame_data:
+                                value = float(frame_data[0])
+                                conv_keyframes.append((frame_num, value))
+                            # luadata might also represent simple tables like {val, prop=val} as lists
+                            elif isinstance(frame_data, (list, tuple)) and len(frame_data) > 0:
+                                value = float(frame_data[0])
+                                conv_keyframes.append((frame_num, value))
+                            else:
+                                self._log_info(f"Warning: Unexpected format for Convergence keyframe {frame_num_key}: {frame_data}")
+                        except (ValueError, TypeError):
+                            self._log_info(f"Warning: Could not parse frame number or value for Convergence keyframe: {frame_num_key}")
+                    self._log_info(f"Extracted {len(conv_keyframes)} keyframes for Convergence.")
+                else:
+                    self._log_info("No KeyFrames found for Depth_ControlConvergence. Defaulting to 0.5.")
+                    conv_keyframes.append((0, 0.5))
+            else:
+                self._log_info("Depth_ControlConvergence node not found in clipboard data.")
+                conv_keyframes.append((0, 0.5)) # Ensure at least one default value if node missing
+
+            # --- MaxDisparity ---
+            disp_node = tools.get("Depth_ControlMaxDisparity") # Access directly by key
+
+            if disp_node:
+                disp_keyframes_data = disp_node.get("KeyFrames", {})
+                
+                if disp_keyframes_data:
+                    self._log_info("Found KeyFrames for MaxDisparity.")
+                    for frame_num_key, frame_data in disp_keyframes_data.items():
+                        try:
+                            frame_num = int(frame_num_key)
+                            if isinstance(frame_data, dict) and 0 in frame_data:
+                                value = float(frame_data[0])
+                                disp_keyframes.append((frame_num, value))
+                            elif isinstance(frame_data, (list, tuple)) and len(frame_data) > 0:
+                                value = float(frame_data[0])
+                                disp_keyframes.append((frame_num, value))
+                            else:
+                                self._log_info(f"Warning: Unexpected format for MaxDisparity keyframe {frame_num_key}: {frame_data}")
+                        except (ValueError, TypeError):
+                            self._log_info(f"Warning: Could not parse frame number or value for MaxDisparity keyframe: {frame_num_key}")
+                    self._log_info(f"Extracted {len(disp_keyframes)} keyframes for MaxDisparity.")
+                else:
+                    self._log_info("No KeyFrames found for Depth_ControlMaxDisparity. Defaulting to 35.0.")
+                    disp_keyframes.append((0, 35.0))
+            else:
+                self._log_info("Depth_ControlMaxDisparity node not found in clipboard data.")
+                disp_keyframes.append((0, 35.0)) # Ensure at least one default value if node missing
+
+
+        except Exception as e: # Catch any exception during luadata parsing or data extraction
+            self._log_info(f"Error during Fusion node parsing: {e}")
+            raise # Re-raise to be caught by the calling function
+
+        conv_keyframes.sort()
+        disp_keyframes.sort()
+        self._log_info("--- Finished Fusion Node Text Parsing ---")
+
+        return conv_keyframes, disp_keyframes
+
+    def _parse_fusion_node_text(self, node_text):
+        conv_keyframes = []
+        disp_keyframes = []
+
+        self._log_info("--- Starting Fusion Node Text Parsing (Robust JSON conversion approach) ---")
+        
+        try:
+            cleaned_json_text = self._convert_fusion_to_json_like(node_text)
+            self._log_info(f"Cleaned JSON-like text (first 500 chars):\n{cleaned_json_text[:500]}...")
+            
+            parsed_data = json.loads(cleaned_json_text)
+            self._log_info("Successfully parsed Fusion node data as JSON.")
+
+            # Now, navigate the parsed JSON structure which should be a standard Python dictionary.
+            tools = parsed_data.get("Tools", {})
+            
+            # --- Convergence ---
+            # Access directly by key, as ordered() is gone and keys are quoted
+            conv_node = tools.get("Depth_ControlConvergence", {}) 
+            conv_keyframes_data = conv_node.get("KeyFrames", {})
+            
+            if conv_keyframes_data:
+                self._log_info("Found KeyFrames for Convergence.")
+                for frame_str, frame_data in conv_keyframes_data.items():
+                    try:
+                        frame_num = int(frame_str) # Keys are now strings like "0", "153"
+                        # The actual value is the first element in the array `[0.5, RH={...}, Flags={...}]`
+                        if isinstance(frame_data, (list, tuple)) and len(frame_data) > 0:
+                            value = float(frame_data[0])
+                            conv_keyframes.append((frame_num, value))
+                        # If for some reason it converted to a dict like {"0": value, ...}
+                        elif isinstance(frame_data, dict) and 0 in frame_data:
+                             value = float(frame_data[0])
+                             conv_keyframes.append((frame_num, value))
+                        else:
+                            self._log_info(f"Warning: Unexpected format for Convergence keyframe {frame_str}: {frame_data}")
+                    except (ValueError, TypeError):
+                        self._log_info(f"Warning: Could not parse frame number or value for Convergence keyframe: {frame_str}")
+                self._log_info(f"Extracted {len(conv_keyframes)} keyframes for Convergence.")
+            else:
+                self._log_info("No KeyFrames found for Convergence. Defaulting to 0.5 if no keyframes.")
+                conv_keyframes.append((0, 0.5))
+
+            # --- MaxDisparity ---
+            disp_node = tools.get("Depth_ControlMaxDisparity", {})
+            disp_keyframes_data = disp_node.get("KeyFrames", {})
+            
+            if disp_keyframes_data:
+                self._log_info("Found KeyFrames for MaxDisparity.")
+                for frame_str, frame_data in disp_keyframes_data.items():
+                    try:
+                        frame_num = int(frame_str)
+                        if isinstance(frame_data, (list, tuple)) and len(frame_data) > 0:
+                            value = float(frame_data[0])
+                            disp_keyframes.append((frame_num, value))
+                        elif isinstance(frame_data, dict) and 0 in frame_data:
+                             value = float(frame_data[0])
+                             disp_keyframes.append((frame_num, value))
+                        else:
+                            self._log_info(f"Warning: Unexpected format for MaxDisparity keyframe {frame_str}: {frame_data}")
+                    except (ValueError, TypeError):
+                        self._log_info(f"Warning: Could not parse frame number or value for MaxDisparity keyframe: {frame_str}")
+                self._log_info(f"Extracted {len(disp_keyframes)} keyframes for MaxDisparity.")
+            else:
+                self._log_info("No KeyFrames found for MaxDisparity. Defaulting to 35.0 if no keyframes.")
+                disp_keyframes.append((0, 35.0))
+
+
+        except json.JSONDecodeError as e:
+            self._log_info(f"JSON Decode Error: {e}")
+            self._log_info(f"Problematic JSON string (first 500 chars):\n{cleaned_json_text[:500]}...")
+            raise
+        except Exception as e:
+            self._log_info(f"Error during JSON conversion or data extraction: {e}")
+            raise
+
+        conv_keyframes.sort()
+        disp_keyframes.sort()
+        self._log_info("--- Finished Fusion Node Text Parsing ---")
+
+        return conv_keyframes, disp_keyframes
+
+    def _match_keyframes_to_files(self, conv_keyframes, disp_keyframes, frame_tolerance=5):
+        self.applied_paste_data = {}
+        
+        last_effective_conv = 0.5
+        last_effective_disp = 35.0
+
+        processed_info = []
+
+        for i, file_data in enumerate(self.all_depth_map_files):
+            file_basename = file_data["basename"]
+            file_start_frame = file_data["timeline_start_frame"]
+            
+            current_conv_value = last_effective_conv
+            for frame_num, value in conv_keyframes:
+                if frame_num <= file_start_frame + frame_tolerance:
+                    current_conv_value = value
+                else:
+                    break
+
+            current_disp_value = last_effective_disp
+            for frame_num, value in disp_keyframes:
+                if frame_num <= file_start_frame + frame_tolerance:
+                    current_disp_value = value
+                else:
+                    break
+
+            self.applied_paste_data[file_basename] = {
+                "convergence_plane": current_conv_value,
+                "max_disparity": current_disp_value
+            }
+            
+            file_data["current_convergence"] = current_conv_value
+            file_data["current_max_disparity"] = current_disp_value
+
+            last_effective_conv = current_conv_value
+            last_effective_disp = current_disp_value
+            
+            processed_info.append(f"{file_basename}: Conv={current_conv_value:.4f}, Disp={current_disp_value:.2f}")
+
+        self._log_info("\n".join(processed_info))
+
+    def _commit_pasted_values(self):
+        if not self.applied_paste_data:
+            self.status_message_var.set("No pasted data to commit.")
+            self._log_info("Attempted to commit, but no pasted data found.")
+            return
+
+        for file_data in self.all_depth_map_files:
+            basename = file_data["basename"]
+            if basename in self.applied_paste_data:
+                self.progress_save_data[basename] = {
+                    "convergence_plane": file_data["current_convergence"],
+                    "max_disparity": file_data["current_max_disparity"]
+                }
+        
+        self._save_progress(bulk_save=True)
+        self.applied_paste_data = {}
+        self._update_paste_buttons_state()
+        self.status_message_var.set("Pasted values committed successfully.")
+        self._log_info("All pasted values have been committed and saved.")
+        self._display_current_file()
+
+    def _reset_paste(self):
+        if not self.applied_paste_data:
+            self.status_message_var.set("No pasted data to reset.")
+            self._log_info("Attempted to reset, but no pasted data found.")
+            return
+        
+        self.applied_paste_data = {}
+        
+        for file_data in self.all_depth_map_files:
+            basename = file_data["basename"]
+            saved_data = self.progress_save_data.get(basename)
+            if saved_data and isinstance(saved_data, dict):
+                file_data["current_convergence"] = saved_data.get("convergence_plane", 0.5)
+                file_data["current_max_disparity"] = saved_data.get("max_disparity", 35.0)
+            elif saved_data is not None and isinstance(saved_data, (float, int)):
+                file_data["current_convergence"] = float(saved_data)
+                file_data["current_max_disparity"] = 35.0
+            else:
+                file_data["current_convergence"] = 0.5
+                file_data["current_max_disparity"] = 35.0
+
+        self._update_paste_buttons_state()
+        self.status_message_var.set("Pasted values reset. Reverted to last saved values.")
+        self._log_info("Pasted values reset.")
+        self._display_current_file()
+
+    def _save_progress(self, bulk_save=False):
         if self.progress_file_path is None:
             self.status_message_var.set("Cannot save progress: No depth map folder selected.")
             return
 
-        if self.current_file_index != -1 and self.all_depth_map_files:
-            current_file_path = self.all_depth_map_files[self.current_file_index]
-            # --- Change 3: Store basename as the key ---
-            current_file_basename = os.path.basename(current_file_path)
-            self.progress_save_data[current_file_basename] = {
-                "convergence_plane": self.convergence_var.get(),
-                "max_disparity": self.max_disparity_var.get()
+        # Ensure all internal data (from manual edits or paste) is correctly reflected in progress_save_data
+        # before writing to disk.
+        # This loop iterates through all files in 'all_depth_map_files' and updates/adds them to 'progress_save_data'.
+        for file_data in self.all_depth_map_files:
+            self.progress_save_data[file_data["basename"]] = {
+                "convergence_plane": file_data["current_convergence"],
+                "max_disparity": file_data["current_max_disparity"]
             }
         
         try:
             with open(self.progress_file_path, 'w') as f:
                 json.dump(self.progress_save_data, f, indent=4)
-            self.status_message_var.set(f"Progress saved to {os.path.basename(self.progress_file_path)}")
+            if not bulk_save: # Only show explicit message if not part of a larger operation
+                self.status_message_var.set(f"Progress for all files saved to {os.path.basename(self.progress_file_path)}")
+            else:
+                 self.status_message_var.set(f"Progress saved (bulk operation) to {os.path.basename(self.progress_file_path)}")
         except Exception as e:
             self.status_message_var.set(f"Error saving progress: {e}")
+            self._log_info(f"Error saving progress: {e}")
 
     def _load_progress(self):
         if self.progress_file_path is None:
-            self.progress_save_data = {} # Ensure it's clear if no folder selected
+            self.progress_save_data = {}
             return
 
         if os.path.exists(self.progress_file_path):
             try:
                 with open(self.progress_file_path, 'r') as f:
-                    self.progress_save_data = json.load(f)
+                    loaded_data = json.load(f)
+                    self.progress_save_data = {}
+                    for key, value in loaded_data.items():
+                        if isinstance(value, dict):
+                            self.progress_save_data[key] = value
+                        else:
+                            self.progress_save_data[key] = {
+                                "convergence_plane": float(value),
+                                "max_disparity": 35.0
+                            }
                 self.status_message_var.set(f"Loaded progress from {os.path.basename(self.progress_file_path)}")
+                self._log_info(f"Loaded progress from {os.path.basename(self.progress_file_path)}")
             except json.JSONDecodeError as e:
                 self.status_message_var.set(f"Error reading progress file (corrupted JSON?): {e}")
+                self._log_info(f"Error reading progress file: {e}")
                 self.progress_save_data = {}
             except Exception as e:
                 self.status_message_var.set(f"Error loading progress: {e}")
+                self._log_info(f"Error loading progress: {e}")
                 self.progress_save_data = {}
         else:
-            self.progress_save_data = {} # Clear progress if file doesn't exist for new folder
+            self.progress_save_data = {}
 
     def _generate_sidecar_jsons(self):
         if not self.all_depth_map_files:
             messagebox.showwarning("No Files", "No depth map files loaded to generate JSONs for.")
             return
         
-        # Ensure all current edits are saved before generating
-        self._save_progress() 
+        if self.current_file_index != -1 and self.all_depth_map_files:
+            current_data = self.all_depth_map_files[self.current_file_index]
+            self.progress_save_data[current_data["basename"]] = {
+                "convergence_plane": self.convergence_var.get(),
+                "max_disparity": self.max_disparity_var.get()
+            }
+            self._save_progress(bulk_save=True)
 
         output_count = 0
         errors = []
 
-        for full_path in self.all_depth_map_files:
-            # --- Change 4: Lookup saved data using the basename ---
-            filename_only = os.path.basename(full_path) 
-            saved_data = self.progress_save_data.get(filename_only)
+        for file_data in self.all_depth_map_files:
+            basename = file_data["basename"]
             
-            convergence_value = 0.5
-            max_disparity_value = 35.0
-
-            if saved_data is not None:
-                if isinstance(saved_data, dict):
-                    convergence_value = saved_data.get("convergence_plane", 0.5)
-                    max_disparity_value = saved_data.get("max_disparity", 35.0)
-                else: # Old format, only convergence was saved
-                    convergence_value = saved_data
+            convergence_value = file_data["current_convergence"]
+            max_disparity_value = file_data["current_max_disparity"]
 
             json_data = {
                 "convergence_plane": convergence_value,
-                "max_disparity": max_disparity_value # NEW: Include max_disparity
+                "max_disparity": max_disparity_value
             }
             
-            # Construct sidecar JSON filename (e.g., video.mp4 -> video.mp4.json)
-            base_name_without_ext = os.path.splitext(full_path)[0] # Get the path without the last extension
+            base_name_without_ext = os.path.splitext(file_data["full_path"])[0]
             json_filename = base_name_without_ext + ".json"
             
             try:
@@ -506,10 +1074,12 @@ class ConvergenceJSONTool:
                 output_count += 1
             except Exception as e:
                 errors.append(f"Failed to write {json_filename}: {e}")
+                self._log_info(f"Failed to write {json_filename}: {e}")
         
         if errors:
             messagebox.showerror("Errors Generating JSONs", "\n".join(errors))
         self.status_message_var.set(f"Generated {output_count} JSON sidecar files. {len(errors)} errors.")
+        self._log_info(f"Generated {output_count} JSON sidecar files. {len(errors)} errors.")
         messagebox.showinfo("JSON Generation Complete", f"Successfully generated {output_count} JSON files.")
 
     def _save_gui_config(self):
@@ -527,12 +1097,10 @@ class ConvergenceJSONTool:
             try:
                 with open(self.config_file_path, 'r') as f:
                     config = json.load(f)
-                    # Load recent folders, ensuring it's a list
                     self.recent_folders_list = config.get("recent_depth_maps_folders", [])
-                    # Clean up list, remove duplicates and invalid paths (optional but good)
-                    self.recent_folders_list = list(dict.fromkeys(self.recent_folders_list)) # Remove duplicates
-                    self.recent_folders_list = [f for f in self.recent_folders_list if os.path.isdir(f)] # Only keep valid paths
-                    self._trim_recent_folders() # Ensure it's trimmed to MAX_RECENT_FOLDERS
+                    self.recent_folders_list = list(dict.fromkeys(self.recent_folders_list))
+                    self.recent_folders_list = [f for f in self.recent_folders_list if os.path.isdir(f)]
+                    self._trim_recent_folders()
             except json.JSONDecodeError as e:
                 print(f"Error reading GUI config (corrupted JSON?): {e}")
                 self.recent_folders_list = []
@@ -542,11 +1110,12 @@ class ConvergenceJSONTool:
 
     def _exit_app(self):
         self._save_gui_config()
-        self._save_progress() # Always save progress on exit
+        self._save_current_file_gui_values() # NEW: Ensure current file's GUI values are in internal data
+        self._save_progress(bulk_save=True) # Save all accumulated progress on exit
         self.root.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = ConvergenceJSONTool(root)
-    root.protocol("WM_DELETE_WINDOW", app._exit_app) # Handle window close button
+    app = SidecarEditTool(root)
+    root.protocol("WM_DELETE_WINDOW", app._exit_app)
     root.mainloop()
