@@ -5,6 +5,9 @@ narrative_convergence_gui.py
 
 Tkinter GUI for running `narrative_convergence.py` with convenient controls.
 
+This updated version includes a more robust check for CUDA-enabled devices,
+looking for support in both PyTorch and OpenCV.
+
 Features:
 - Choose RGB videos folder and aligned depth folder (depth names may end with "_depth").
 - For each processed depth map, a JSON file with the convergence value is saved in the same folder.
@@ -32,8 +35,11 @@ from typing import List, Tuple, Dict, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import cv2  # <-- IMPORT ADDED FOR CUDA CHECK
 
 # Import the processing implementation
+# Assumes 'narrative_convergence_cuda.py' is renamed to 'narrative_convergence.py'
+# or is otherwise importable as 'narrative_convergence'.
 try:
     from narrative_convergence import NarrativeProcessor  # type: ignore
 except Exception as e:
@@ -53,8 +59,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Narrative Convergence – GUI")
-        self.geometry("980x600")
-        self.minsize(980, 530)
+        self.geometry("980x750")
+        self.minsize(980, 650)
 
         self._build_ui()
         self._load_settings()
@@ -121,8 +127,13 @@ class App(tk.Tk):
         # Device
         ttk.Label(grid, text="Device:").grid(row=1, column=0, sticky="w")
         device_values = ["cpu"]
-        if HAVE_TORCH and hasattr(torch, "cuda") and torch.cuda.is_available():  # type: ignore[attr-defined]
+        # --- MODIFIED BLOCK FOR ROBUST CUDA CHECK ---
+        # Check if either PyTorch or OpenCV can see a CUDA device
+        pytorch_cuda = HAVE_TORCH and hasattr(torch, "cuda") and torch.cuda.is_available()
+        opencv_cuda = hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0
+        if pytorch_cuda or opencv_cuda:
             device_values.append("cuda")
+        # --- END MODIFICATION ---
         self.var_device = tk.StringVar(value=("cuda" if "cuda" in device_values else "cpu"))
         cb_device = ttk.Combobox(grid, textvariable=self.var_device, values=device_values, state="readonly", width=14)
         cb_device.grid(row=1, column=1, padx=6, pady=4, sticky="w")
@@ -230,7 +241,7 @@ class App(tk.Tk):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            
+
             self.var_videos.set(cfg.get("videos", ""))
             self.var_depths.set(cfg.get("depths", ""))
             self.var_detector.set(cfg.get("detector", "yolo12s"))
@@ -256,7 +267,7 @@ class App(tk.Tk):
                 self.var_debug_layers.set(",".join([str(x) for x in dbg_layers]))
             else:
                 self.var_debug_layers.set(str(dbg_layers))
-            
+
             self._log(f"Loaded settings from {cfg_path.resolve()}\n")
         except Exception as e:
             self._log(f"Warning: failed to load config: {e}\n")
@@ -391,7 +402,7 @@ class App(tk.Tk):
     def _worker_run(self, video_dir: Path, depth_dir: Path, pairs: List[Tuple[Path, Path]]) -> None:
         # Define logger to pipe messages from processor to the GUI queue
         gui_logger = lambda msg: self.msg_q.put(f"{msg}\n")
-        
+
         # Dictionary to hold all results for the master JSON file
         master_convergence_list = {}
 
@@ -413,13 +424,13 @@ class App(tk.Tk):
                     dbg_out.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     pass # Fail silently if dir creation fails, handled later
-            
+
             dbg_scale = 1.0
             try:
                 dbg_scale = float(self.var_debug_scale.get() or "1.0")
             except Exception:
                 pass
-            
+
             layers_str = (self.var_debug_layers.get() or "").strip()
             dbg_layers = [s.strip().lower() for s in layers_str.split(",") if s.strip()] if layers_str else None
 
@@ -451,10 +462,10 @@ class App(tk.Tk):
                 try:
                     # Per-video call for explicit progress
                     conv = processor._process_single(rgb_path, depth_path)
-                    
+
                     # Add result to the master list
                     master_convergence_list[rgb_path.stem] = conv
-                    
+
                     # Define and save the output JSON for this video
                     output_json_path = depth_path.with_suffix('.json')
                     output_data = {"convergence_plane": conv}
@@ -466,7 +477,7 @@ class App(tk.Tk):
 
                 except Exception as e:
                     gui_logger(f"  ! Error processing {rgb_path.name}: {e}")
-                
+
                 self.progress_done += 1
                 self._update_progress()
 
