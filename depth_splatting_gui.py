@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 import json
 import threading
 import queue
@@ -564,10 +564,17 @@ def main(settings):
             else:
                 print(f"==> Cannot move source video: 'finished_source_folder' is not set.")
 
-            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None: # ADD THIS CHECK
+            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None:
                 try:
                     shutil.move(actual_depth_map_path, finished_depth_folder)
                     print(f"==> Moved depth map to: {finished_depth_folder}")
+                    depth_map_dirname = os.path.dirname(actual_depth_map_path)
+                    depth_map_basename_without_ext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
+                    json_sidecar_path = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.json")
+
+                    if os.path.exists(json_sidecar_path):
+                        shutil.move(json_sidecar_path, finished_depth_folder)
+                        print(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path)}' to: {finished_depth_folder}")
                 except Exception as e:
                     print(f"==> Failed to move depth map {actual_depth_map_path}: {e}")
             elif actual_depth_map_path and finished_depth_folder is None:
@@ -714,6 +721,91 @@ def check_queue():
         pass
     root.after(100, check_queue)
 
+def reset_to_defaults():
+    """Resets all GUI parameters to their default hardcoded values."""
+    if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
+        return
+
+    input_source_clips_var.set("./input_source_clips")
+    input_depth_maps_var.set("./input_depth_maps")
+    output_splatted_var.set("./output_splatted")
+    max_disp_var.set("20.0")
+    process_length_var.set("-1")
+    batch_size_var.set("10")
+    dual_output_var.set(False)
+    set_pre_res_var.set(False)
+    pre_res_width_var.set("1920")
+    pre_res_height_var.set("1080")
+    zero_disparity_anchor_var.set("0.5")
+    
+    toggle_pre_res_fields() # Update UI state for pre-res fields
+    save_config() # Save the reset defaults
+    status_label.config(text="Settings reset to defaults.")
+
+def restore_finished_files():
+    """Moves all files from 'finished' folders back to their original input folders."""
+    if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all files from 'finished' folders back to their input directories?"):
+        return
+
+    source_clip_dir = input_source_clips_var.get()
+    depth_map_dir = input_depth_maps_var.get()
+
+    # Determine if we are in folder mode based on current settings
+    is_source_dir = os.path.isdir(source_clip_dir)
+    is_depth_dir = os.path.isdir(depth_map_dir)
+
+    if not (is_source_dir and is_depth_dir):
+        messagebox.showerror("Restore Error", "Restore 'finished' operation is only applicable when Input Source Clips and Input Depth Maps are set to directories (batch mode). Please ensure current settings reflect this.")
+        status_label.config(text="Restore finished: Not in batch mode.")
+        return
+
+    finished_source_folder = os.path.join(source_clip_dir, "finished")
+    finished_depth_folder = os.path.join(depth_map_dir, "finished")
+
+    restored_count = 0
+    errors_count = 0
+    
+    # Restore Source Clips
+    if os.path.isdir(finished_source_folder):
+        print(f"==> Restoring source clips from: {finished_source_folder}")
+        for filename in os.listdir(finished_source_folder):
+            src_path = os.path.join(finished_source_folder, filename)
+            dest_path = os.path.join(source_clip_dir, filename)
+            if os.path.isfile(src_path):
+                try:
+                    shutil.move(src_path, dest_path)
+                    restored_count += 1
+                    print(f"Moved '{filename}' to '{source_clip_dir}'")
+                except Exception as e:
+                    errors_count += 1
+                    print(f"Error moving source clip '{filename}': {e}")
+    else:
+        print(f"==> Finished source folder not found: {finished_source_folder}")
+
+    # Restore Depth Maps and Sidecar JSONs
+    if os.path.isdir(finished_depth_folder):
+        print(f"==> Restoring depth maps and sidecars from: {finished_depth_folder}")
+        for filename in os.listdir(finished_depth_folder):
+            src_path = os.path.join(finished_depth_folder, filename)
+            dest_path = os.path.join(depth_map_dir, filename)
+            if os.path.isfile(src_path):
+                try:
+                    shutil.move(src_path, dest_path)
+                    restored_count += 1
+                    print(f"Moved '{filename}' to '{depth_map_dir}'")
+                except Exception as e:
+                    errors_count += 1
+                    print(f"Error moving depth map/sidecar '{filename}': {e}")
+    else:
+        print(f"==> Finished depth folder not found: {finished_depth_folder}")
+
+    if restored_count > 0 or errors_count > 0:
+        status_label.config(text=f"Restore complete: {restored_count} files moved, {errors_count} errors.")
+        messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
+    else:
+        status_label.config(text="No files found to restore.")
+        messagebox.showinfo("Restore Complete", "No files found in 'finished' folders to restore.")
+
 def load_help_texts():
     global help_texts
     try:
@@ -725,7 +817,6 @@ def load_help_texts():
     except json.JSONDecodeError:
         print("Error: Could not decode splatter_help.json. Check file format.")
         help_texts = {}
-
 
 def save_config():
     config = {
@@ -766,6 +857,18 @@ load_help_texts()
 # GUI Setup
 root = tk.Tk()
 root.title("Batch Depth Splatting")
+
+# Create a menu bar
+menubar = tk.Menu(root)
+root.config(menu=menubar)
+
+# Create "Option" menu
+option_menu = tk.Menu(menubar, tearoff=0)
+menubar.add_cascade(label="Option", menu=option_menu)
+
+# Add commands to the "Option" menu
+option_menu.add_command(label="Reset to Default", command=reset_to_defaults)
+option_menu.add_command(label="Restore Finished", command=restore_finished_files)
 
 # Variables with defaults
 input_source_clips_var = tk.StringVar(value="./input_source_clips")
