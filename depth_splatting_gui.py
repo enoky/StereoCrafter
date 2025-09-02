@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, ttk, messagebox
 import json
 import threading
 import queue
@@ -341,17 +341,19 @@ def main(settings):
     input_source_clips_path_setting = settings["input_source_clips"]
     input_depth_maps_path_setting = settings["input_depth_maps"]
     output_splatted = settings["output_splatted"]
-    # Original max_disp from GUI
-    gui_max_disp = float(settings["max_disp"]) 
+    gui_max_disp = float(settings["max_disp"])
     process_length = settings["process_length"]
-    batch_size = settings["batch_size"]
     dual_output = settings["dual_output"]
-    set_pre_res = settings["set_pre_res"]
-    pre_res_width = int(settings["pre_res_width"])
-    pre_res_height = int(settings["pre_res_height"])
-    
-    # NEW: Retrieve default anchor value from GUI settings
     default_zero_disparity_anchor = settings["zero_disparity_anchor"]
+
+    # NEW: Retrieve resolution-specific settings
+    enable_full_resolution = settings["enable_full_resolution"]
+    full_res_batch_size = settings["full_res_batch_size"]
+    enable_low_resolution = settings["enable_low_resolution"]
+    low_res_width = settings["low_res_width"]
+    low_res_height = settings["low_res_height"]
+    low_res_batch_size = settings["low_res_batch_size"]
+
 
     is_single_file_mode = False
     input_videos = []
@@ -367,7 +369,6 @@ def main(settings):
         is_single_file_mode = True
         print("==> Running in single file mode. Files will not be moved to 'finished' folders.")
         input_videos.append(input_source_clips_path_setting)
-        # Ensure output directory exists for single file output
         os.makedirs(output_splatted, exist_ok=True)
     elif is_source_dir and is_depth_dir:
         print("==> Running in batch (folder) mode.")
@@ -375,7 +376,7 @@ def main(settings):
         finished_depth_folder = os.path.join(input_depth_maps_path_setting, "finished")
         os.makedirs(finished_source_folder, exist_ok=True)
         os.makedirs(finished_depth_folder, exist_ok=True)
-        os.makedirs(output_splatted, exist_ok=True) # Ensure main output folder exists
+        os.makedirs(output_splatted, exist_ok=True)
 
         video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
         for ext in video_extensions:
@@ -393,7 +394,21 @@ def main(settings):
         release_resources()
         return
 
-    progress_queue.put(("total", len(input_videos)))
+    # Determine total tasks for the progress bar
+    total_processing_tasks_count = 0
+    if enable_full_resolution:
+        total_processing_tasks_count += len(input_videos)
+    if enable_low_resolution:
+        total_processing_tasks_count += len(input_videos)
+
+    if total_processing_tasks_count == 0:
+        print("==> Error: No resolution output enabled. Processing stopped.")
+        progress_queue.put("finished")
+        release_resources()
+        return
+
+    progress_queue.put(("total", total_processing_tasks_count))
+    overall_task_counter = 0
 
     for idx, video_path in enumerate(input_videos):
         if stop_event.is_set():
@@ -405,30 +420,15 @@ def main(settings):
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
 
-        # Determine the initial anchor value from the GUI setting (this can be overridden by JSON)
         current_zero_disparity_anchor = default_zero_disparity_anchor
-        # NEW: Determine the initial max_disparity percentage from the GUI setting (this can be overridden by JSON)
         current_max_disparity_percentage = gui_max_disp
-
-        # 1. Read input video frames at the determined pre-processing resolution
-        # This resolution will be the target for depth maps and splatting output
-        try:
-            input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_video_processed_height, current_video_processed_width = read_video_frames(
-                video_path, process_length, target_fps=-1, # target_fps unused here, -1 default
-                set_pre_res=set_pre_res, pre_res_width=pre_res_width, pre_res_height=pre_res_height
-            )
-        except Exception as e:
-            print(f"==> Error reading input video {video_path}: {e}. Skipping this video.")
-            progress_queue.put(("processed", idx + 1)) # Still count it as processed to move progress bar
-            continue # Skip to next video
 
         actual_depth_map_path = None
         if is_single_file_mode:
             actual_depth_map_path = input_depth_maps_path_setting
-            # If in single file mode, and the provided depth map doesn't exist, this is an error.
             if not os.path.exists(actual_depth_map_path):
                  print(f"==> Error: Single depth map file '{actual_depth_map_path}' not found. Skipping this video.")
-                 progress_queue.put(("processed", idx + 1))
+                 progress_queue.put(("processed", overall_task_counter)) # Still update to indicate skipping
                  continue
         else: # Batch mode
             depth_map_path_mp4 = os.path.join(input_depth_maps_path_setting, f"{video_name}_depth.mp4")
@@ -439,16 +439,8 @@ def main(settings):
             elif os.path.exists(depth_map_path_npz):
                 actual_depth_map_path = depth_map_path_npz
 
-        video_depth = None
-        depth_vis = None
-
         if actual_depth_map_path:
-            # First, normalize the actual_depth_map_path for consistent handling and printing
-            actual_depth_map_path = os.path.normpath(actual_depth_map_path) 
-            
-            print(f"==> Found depth map: {actual_depth_map_path}")
-
-            # Now, use the normalized path for constructing the sidecar path
+            actual_depth_map_path = os.path.normpath(actual_depth_map_path)
             depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
             json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
 
@@ -468,7 +460,6 @@ def main(settings):
                         print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
                         anchor_source = "GUI (Invalid JSON)"
 
-                    # NEW: Check for max_disparity in sidecar JSON
                     if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
                         current_max_disparity_percentage = float(sidecar_data["max_disparity"])
                         print(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
@@ -477,85 +468,149 @@ def main(settings):
                         print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
                         max_disp_source = "GUI (Invalid JSON)"
 
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} ({anchor_source}), MaxDisp: {current_max_disparity_percentage:.1f}% ({max_disp_source}))"))
+                    # Update status message for sidecar detection
+                    progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: ({anchor_source}:{current_zero_disparity_anchor:.2f}, {max_disp_source}:{current_max_disparity_percentage:.1f}%)"))
 
                 except json.JSONDecodeError:
                     print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
+                    progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
                 except Exception as e:
                     print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                    progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
+                    progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
             else:
                 print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                progress_queue.put(("status", f"Processing {idx+1}/{len(input_videos)} (Anchor: {current_zero_disparity_anchor:.2f} (GUI), MaxDisp: {current_max_disparity_percentage:.1f}% (GUI))"))
-            # END SIDECAR JSON DETECTION LOGIC
+                progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
+        else:
+            print(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
+            progress_queue.put(("processed", overall_task_counter))
+            continue
+
+        # --- Dynamic Processing Task Generation ---
+        processing_tasks = []
+        if enable_full_resolution:
+            processing_tasks.append({
+                "name": "Full-Resolution",
+                "output_subdir": "hires",
+                "set_pre_res": False,
+                "target_width": -1, # Signals to read_video_frames to use original
+                "target_height": -1, # Signals to read_video_frames to use original
+                "batch_size": full_res_batch_size
+            })
+        if enable_low_resolution:
+            processing_tasks.append({
+                "name": "Low-Resolution",
+                "output_subdir": "lowres",
+                "set_pre_res": True,
+                "target_width": low_res_width,
+                "target_height": low_res_height,
+                "batch_size": low_res_batch_size
+            })
+
+        if not processing_tasks:
+            print(f"==> No processing tasks configured for {video_name}. Skipping.")
+            progress_queue.put(("processed", overall_task_counter))
+            continue
+
+        for task_num, task in enumerate(processing_tasks):
+            if stop_event.is_set():
+                print(f"==> Stopping {task['name']} processing for {video_name} due to user request")
+                release_resources()
+                progress_queue.put("finished")
+                return
+
+            print(f"\n==> Starting {task['name']} pass for {video_name}")
+            progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)} [{task['name']}] ({anchor_source}:{current_zero_disparity_anchor:.2f}, {max_disp_source}:{current_max_disparity_percentage:.1f}%)"))
+
+            input_frames_processed = None
+            processed_fps = None
+            current_processed_height = None
+            current_processed_width = None
 
             try:
+                # 1. Read input video frames at the determined resolution for this pass
+                input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width = read_video_frames(
+                    video_path, process_length, target_fps=-1,
+                    set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
+                )
+            except Exception as e:
+                print(f"==> Error reading input video {video_path} for {task['name']} pass: {e}. Skipping this pass.")
+                overall_task_counter += 1
+                progress_queue.put(("processed", overall_task_counter))
+                continue # Skip to next task
+
+            video_depth = None
+            depth_vis = None
+            try:
+                # 2. Load and resize depth maps for this pass's resolution
                 video_depth, depth_vis = load_pre_rendered_depth(
                     actual_depth_map_path,
                     process_length=process_length,
-                    target_height=current_video_processed_height, # Pass the height of the processed video
-                    target_width=current_video_processed_width,   # Pass the width of the processed video
-                    match_resolution_to_target=True,
-                    enable_autogain=settings["enable_autogain"] # NEW
+                    target_height=current_processed_height,
+                    target_width=current_processed_width,
+                    match_resolution_to_target=settings["match_depth_res"], # This should always be True now
+                    enable_autogain=settings["enable_autogain"]
                 )
             except Exception as e:
-                print(f"==> Error loading depth map from {actual_depth_map_path}: {e}. Skipping this video.")
-                progress_queue.put(("processed", idx + 1))
+                print(f"==> Error loading depth map for {video_name} {task['name']} pass: {e}. Skipping this pass.")
+                overall_task_counter += 1
+                progress_queue.put(("processed", overall_task_counter))
                 continue
-        else:
-            print(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
-            progress_queue.put(("processed", idx + 1))
-            continue
 
-        if video_depth is None or depth_vis is None:
-            print(f"==> Skipping video {video_name} due to depth load failure or stop request.")
-            progress_queue.put(("processed", idx + 1))
-            continue
+            if video_depth is None or depth_vis is None:
+                print(f"==> Skipping {video_name} {task['name']} pass due to depth load failure or stop request.")
+                overall_task_counter += 1
+                progress_queue.put(("processed", overall_task_counter))
+                continue
 
-        # Ensure the depth map resolution matches the input frames for splatting
-        if not (video_depth.shape[1] == current_video_processed_height and video_depth.shape[2] == current_video_processed_width):
-            print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_video_processed_width}x{current_video_processed_height}). This should have been handled by 'match_depth_res' being True. Attempting final resize as safeguard.")
-            # As a safeguard, perform a final resize if mismatch persists (should be rare with match_depth_res=True)
-            resized_video_depth = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
-            resized_depth_vis = np.stack([cv2.resize(frame, (current_video_processed_width, current_video_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
-            video_depth = resized_video_depth
-            depth_vis = resized_depth_vis
+            # Ensure depth map matches current processed video frames (safeguard)
+            if not (video_depth.shape[1] == current_processed_height and video_depth.shape[2] == current_processed_width):
+                print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. Attempting final resize as safeguard.")
+                resized_video_depth = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
+                resized_depth_vis = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
+                video_depth = resized_video_depth
+                depth_vis = resized_depth_vis
 
-        if stop_event.is_set():
-            print("==> Stopping processing due to user request")
+            # Use the (potentially overridden) current_max_disparity_percentage
+            actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
+            actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_processed_width
+            print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels")
+
+            # 3. Create output directory and construct video path
+            current_output_subdir = os.path.join(output_splatted, task["output_subdir"])
+            os.makedirs(current_output_subdir, exist_ok=True)
+            output_video_path_base = os.path.join(current_output_subdir, f"{video_name}.mp4")
+
+            # 4. Perform Depth Splatting
+            DepthSplatting(
+                input_frames_processed=input_frames_processed,
+                processed_fps=processed_fps,
+                output_video_path=output_video_path_base,
+                video_depth=video_depth,
+                depth_vis=depth_vis,
+                max_disp=actual_max_disp_pixels,
+                process_length=process_length,
+                batch_size=task["batch_size"], # Use task-specific batch size
+                dual_output=dual_output,
+                zero_disparity_anchor_val=current_zero_disparity_anchor
+            )
+            if stop_event.is_set():
+                print(f"==> Stopping {task['name']} pass for {video_name} due to user request")
+                release_resources()
+                progress_queue.put("finished")
+                return
+
+            print(f"==> Splatted {task['name']} video saved for {video_name}.")
+
+            # Release resources after EACH pass to manage VRAM
             release_resources()
-            progress_queue.put("finished")
-            return
+            overall_task_counter += 1
+            progress_queue.put(("processed", overall_task_counter))
+            print(f"==> Completed {task['name']} pass for {video_name}.")
 
-        # Use the (potentially overridden) current_max_disparity_percentage
-        actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
-        actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_video_processed_width
-        print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting: {actual_max_disp_pixels:.2f} pixels")
-
-        output_video_path_base = os.path.join(output_splatted, f"{video_name}.mp4") # This is the base path before _res_suffix_suffix is added
-        DepthSplatting(
-            input_frames_processed=input_frames_processed, # Pass already loaded frames
-            processed_fps=processed_fps,                   # Pass calculated FPS
-            output_video_path=output_video_path_base,
-            video_depth=video_depth,
-            depth_vis=depth_vis,
-            max_disp=actual_max_disp_pixels,
-            process_length=process_length,
-            batch_size=batch_size,
-            dual_output=dual_output,
-            zero_disparity_anchor_val=current_zero_disparity_anchor # Pass the (potentially overridden) anchor value
-        )
-        if stop_event.is_set():
-            print("==> Stopping after DepthSplatting due to user request")
-            release_resources()
-            progress_queue.put("finished")
-            return
-        # The DepthSplatting function returns the actual output path, but for simplicity we rely on its print statement
-        print(f"==> Splatted video saved for {video_name}.") # Actual path printed by DepthSplatting
-
-        if not stop_event.is_set() and not is_single_file_mode: # Only move if not single file mode
-            if finished_source_folder is not None: # ADD THIS CHECK
+        # --- End of all tasks for a single video. Now move files if not single file mode. ---
+        if not stop_event.is_set() and not is_single_file_mode:
+            # Move source video
+            if finished_source_folder is not None:
                 try:
                     shutil.move(video_path, finished_source_folder)
                     print(f"==> Moved processed video to: {finished_source_folder}")
@@ -564,18 +619,32 @@ def main(settings):
             else:
                 print(f"==> Cannot move source video: 'finished_source_folder' is not set.")
 
-            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None: # ADD THIS CHECK
+            # Move depth map and its sidecar JSON
+            if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None:
                 try:
                     shutil.move(actual_depth_map_path, finished_depth_folder)
                     print(f"==> Moved depth map to: {finished_depth_folder}")
+
+                    # Logic to move the sidecar JSON file
+                    # Reconstruct the sidecar path based on the depth map's original location
+                    # Note: actual_depth_map_path is already normalized, so its dirname is safe
+                    depth_map_dirname = os.path.dirname(actual_depth_map_path)
+                    depth_map_basename_without_ext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
+                    json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.json")
+
+                    if os.path.exists(json_sidecar_path_to_move):
+                        shutil.move(json_sidecar_path_to_move, finished_depth_folder)
+                        print(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
+                    else:
+                        print(f"==> No sidecar JSON '{json_sidecar_path_to_move}' found to move.")
+
                 except Exception as e:
-                    print(f"==> Failed to move depth map {actual_depth_map_path}: {e}")
+                    print(f"==> Failed to move depth map {actual_depth_map_path} or its sidecar: {e}")
             elif actual_depth_map_path and finished_depth_folder is None:
                 print(f"==> Cannot move depth map: 'finished_depth_folder' is not set.")
         elif is_single_file_mode:
             print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
 
-        progress_queue.put(("processed", idx + 1))
     release_resources()
     progress_queue.put("finished")
     print("\n==> Batch Depth Splatting Process Completed Successfully")
@@ -611,30 +680,45 @@ def browse_file(var, filetypes_list):
 def start_processing():
     global processing_thread
     stop_event.clear()
-    start_button.config(state="disabled")
+    start_button.config(state="disabled") # Disable immediately until all checks pass
     stop_button.config(state="normal")
     status_label.config(text="Starting processing...")
 
-    # Input validation for new fields
+    # Input validation for all fields
     try:
-        if set_pre_res_var.get():
-            pre_res_w = int(pre_res_width_var.get())
-            pre_res_h = int(pre_res_height_var.get())
-            if pre_res_w <= 0 or pre_res_h <= 0:
-                raise ValueError("Pre-processing Width and Height must be positive.")
-
+        # Validate Max Disparity
         max_disp_val = float(max_disp_var.get())
         if max_disp_val <= 0:
             raise ValueError("Max Disparity must be positive.")
-            
-        # NEW: Validate Zero Disparity Anchor
+
+        # Validate Zero Disparity Anchor
         anchor_val = float(zero_disparity_anchor_var.get())
         if not (0.0 <= anchor_val <= 1.0):
             raise ValueError("Zero Disparity Anchor must be between 0.0 and 1.0.")
 
+        # Validate Full Resolution Batch Size if enabled
+        if enable_full_res_var.get():
+            full_res_batch_size_val = int(batch_size_var.get())
+            if full_res_batch_size_val <= 0:
+                raise ValueError("Full Resolution Batch Size must be positive.")
+
+        # Validate Low Resolution settings if enabled
+        if enable_low_res_var.get():
+            pre_res_w = int(pre_res_width_var.get())
+            pre_res_h = int(pre_res_height_var.get())
+            if pre_res_w <= 0 or pre_res_h <= 0:
+                raise ValueError("Low-Resolution Width and Height must be positive.")
+            low_res_batch_size_val = int(low_res_batch_size_var.get())
+            if low_res_batch_size_val <= 0:
+                raise ValueError("Low-Resolution Batch Size must be positive.")
+
+        # Crucial check: At least one resolution must be enabled
+        if not (enable_full_res_var.get() or enable_low_res_var.get()):
+            raise ValueError("At least one resolution (Full or Low) must be enabled to start processing.")
+
     except ValueError as e:
         status_label.config(text=f"Error: {e}")
-        start_button.config(state="normal")
+        start_button.config(state="normal") # Re-enable start button on error
         stop_button.config(state="disabled")
         return
 
@@ -644,17 +728,19 @@ def start_processing():
         "output_splatted": output_splatted_var.get(),
         "max_disp": float(max_disp_var.get()),
         "process_length": int(process_length_var.get()),
-        "batch_size": int(batch_size_var.get()),
+
+        # NEW & RENAMED settings
+        "enable_full_resolution": enable_full_res_var.get(),
+        "full_res_batch_size": int(batch_size_var.get()), # Renamed internally for clarity
+        "enable_low_resolution": enable_low_res_var.get(),
+        "low_res_width": int(pre_res_width_var.get()),
+        "low_res_height": int(pre_res_height_var.get()),
+        "low_res_batch_size": int(low_res_batch_size_var.get()), # NEW
+
         "dual_output": dual_output_var.get(),
-        "enable_low_res_output": False, # Permanently disabled
-        "low_res_width": 0,             # Placeholder value
-        "low_res_height": 0,            # Placeholder value
-        "set_pre_res": set_pre_res_var.get(),
-        "pre_res_width": pre_res_width_var.get(),
-        "pre_res_height": pre_res_height_var.get(),
-        "match_depth_res": True,         # Permanently set to True
         "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
-        "enable_autogain": True, # Permanently enabled
+        "enable_autogain": True,
+        "match_depth_res": True, # Permanently set to True (handled by load_pre_rendered_depth)
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -708,11 +794,121 @@ def check_queue():
                         status_label.config(text=f"Processing {processed} of {total}")
                 else: # Default behavior if no custom status or if it's already "Processing X of Y"
                     status_label.config(text=f"Processing {processed} of {total}")
-            elif message[0] == "status": # NEW: Handle custom status messages
+            elif message[0] == "status":
+                # Custom status messages are now more detailed, just display them directly
                 status_label.config(text=message[1])
+            elif message[0] == "processed":
+                # This needs to be smarter now that "processed" means a task, not a whole video
+                processed_tasks = message[1]
+                total_tasks = progress_bar["maximum"]
+                progress_var.set(processed_tasks)
+
+                # The status_label will usually be set by a "status" message before this,
+                # but we can provide a fallback if needed or update just the numbers.
+                current_status_text = status_label.cget("text")
+                # Try to update only the numerical part if a detailed message is present
+                import re
+                match = re.search(r"Video (\d+)/(\d+) \[([^\]]+)\]", current_status_text)
+                if match:
+                    video_idx = int(match.group(1))
+                    total_videos = int(match.group(2))
+                    resolution_name = match.group(3)
+                    # We can't easily get which video corresponds to which task number
+                    # so for now, we'll just update the overall task count if the message is too generic.
+                    # For more granular video-specific progress, the "status" message is key.
+                    status_label.config(text=f"Processed tasks: {processed_tasks}/{total_tasks}. Currently: {current_status_text}")
+                else: # Fallback for generic or initial "processed" messages
+                    status_label.config(text=f"Processed tasks: {processed_tasks}/{total_tasks}")
     except queue.Empty:
         pass
     root.after(100, check_queue)
+
+def reset_to_defaults():
+    """Resets all GUI parameters to their default hardcoded values."""
+    if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
+        return
+
+    input_source_clips_var.set("./input_source_clips")
+    input_depth_maps_var.set("./input_depth_maps")
+    output_splatted_var.set("./output_splatted")
+    max_disp_var.set("20.0")
+    process_length_var.set("-1")
+    enable_full_res_var.set(True)
+    batch_size_var.set("10") # Full Res Batch Size
+    enable_low_res_var.set(False)
+    pre_res_width_var.set("1920")
+    pre_res_height_var.set("1080")
+    low_res_batch_size_var.set("50") # Low Res Batch Size
+    dual_output_var.set(False)
+    zero_disparity_anchor_var.set("0.5")
+    
+    toggle_pre_res_fields() # Update UI state for pre-res fields
+    save_config() # Save the reset defaults
+    status_label.config(text="Settings reset to defaults.")
+
+def restore_finished_files():
+    """Moves all files from 'finished' folders back to their original input folders."""
+    if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all files from 'finished' folders back to their input directories?"):
+        return
+
+    source_clip_dir = input_source_clips_var.get()
+    depth_map_dir = input_depth_maps_var.get()
+
+    # Determine if we are in folder mode based on current settings
+    is_source_dir = os.path.isdir(source_clip_dir)
+    is_depth_dir = os.path.isdir(depth_map_dir)
+
+    if not (is_source_dir and is_depth_dir):
+        messagebox.showerror("Restore Error", "Restore 'finished' operation is only applicable when Input Source Clips and Input Depth Maps are set to directories (batch mode). Please ensure current settings reflect this.")
+        status_label.config(text="Restore finished: Not in batch mode.")
+        return
+
+    finished_source_folder = os.path.join(source_clip_dir, "finished")
+    finished_depth_folder = os.path.join(depth_map_dir, "finished")
+
+    restored_count = 0
+    errors_count = 0
+    
+    # Restore Source Clips
+    if os.path.isdir(finished_source_folder):
+        print(f"==> Restoring source clips from: {finished_source_folder}")
+        for filename in os.listdir(finished_source_folder):
+            src_path = os.path.join(finished_source_folder, filename)
+            dest_path = os.path.join(source_clip_dir, filename)
+            if os.path.isfile(src_path):
+                try:
+                    shutil.move(src_path, dest_path)
+                    restored_count += 1
+                    print(f"Moved '{filename}' to '{source_clip_dir}'")
+                except Exception as e:
+                    errors_count += 1
+                    print(f"Error moving source clip '{filename}': {e}")
+    else:
+        print(f"==> Finished source folder not found: {finished_source_folder}")
+
+    # Restore Depth Maps and Sidecar JSONs
+    if os.path.isdir(finished_depth_folder):
+        print(f"==> Restoring depth maps and sidecars from: {finished_depth_folder}")
+        for filename in os.listdir(finished_depth_folder):
+            src_path = os.path.join(finished_depth_folder, filename)
+            dest_path = os.path.join(depth_map_dir, filename)
+            if os.path.isfile(src_path):
+                try:
+                    shutil.move(src_path, dest_path)
+                    restored_count += 1
+                    print(f"Moved '{filename}' to '{depth_map_dir}'")
+                except Exception as e:
+                    errors_count += 1
+                    print(f"Error moving depth map/sidecar '{filename}': {e}")
+    else:
+        print(f"==> Finished depth folder not found: {finished_depth_folder}")
+
+    if restored_count > 0 or errors_count > 0:
+        status_label.config(text=f"Restore complete: {restored_count} files moved, {errors_count} errors.")
+        messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
+    else:
+        status_label.config(text="No files found to restore.")
+        messagebox.showinfo("Restore Complete", "No files found in 'finished' folders to restore.")
 
 def load_help_texts():
     global help_texts
@@ -726,7 +922,6 @@ def load_help_texts():
         print("Error: Could not decode splatter_help.json. Check file format.")
         help_texts = {}
 
-
 def save_config():
     config = {
         "input_source_clips": input_source_clips_var.get(),
@@ -736,9 +931,11 @@ def save_config():
         "process_length": process_length_var.get(),
         "batch_size": batch_size_var.get(),
         "dual_output": dual_output_var.get(),
-        "set_pre_res": set_pre_res_var.get(),
+        "enable_full_resolution": enable_full_res_var.get(), # NEW
+        "enable_low_resolution": enable_low_res_var.get(),   # RENAMED from set_pre_res
         "pre_res_width": pre_res_width_var.get(),
         "pre_res_height": pre_res_height_var.get(),
+        "low_res_batch_size": low_res_batch_size_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
     }
     with open("config_splat.json", "w") as f:
@@ -755,9 +952,11 @@ def load_config():
             process_length_var.set(config.get("process_length", "-1"))
             batch_size_var.set(config.get("batch_size", "10"))
             dual_output_var.set(config.get("dual_output", False))
-            set_pre_res_var.set(config.get("set_pre_res", False))
+            enable_full_res_var.set(config.get("enable_full_resolution", True))
+            enable_low_res_var.set(config.get("enable_low_resolution", False))
             pre_res_width_var.set(config.get("pre_res_width", "1920"))
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
+            low_res_batch_size_var.set(config.get("low_res_batch_size", "25")) # NEW
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
 
 # Load help texts at the start
@@ -766,6 +965,19 @@ load_help_texts()
 # GUI Setup
 root = tk.Tk()
 root.title("Batch Depth Splatting")
+root.geometry("600x600")
+
+# Create a menu bar
+menubar = tk.Menu(root)
+root.config(menu=menubar)
+
+# Create "Option" menu
+option_menu = tk.Menu(menubar, tearoff=0)
+menubar.add_cascade(label="Option", menu=option_menu)
+
+# Add commands to the "Option" menu
+option_menu.add_command(label="Reset to Default", command=reset_to_defaults)
+option_menu.add_command(label="Restore Finished", command=restore_finished_files)
 
 # Variables with defaults
 input_source_clips_var = tk.StringVar(value="./input_source_clips")
@@ -775,9 +987,11 @@ max_disp_var = tk.StringVar(value="20.0")
 process_length_var = tk.StringVar(value="-1")
 batch_size_var = tk.StringVar(value="10")
 dual_output_var = tk.BooleanVar(value=False) # Default to Quad
-set_pre_res_var = tk.BooleanVar(value=False)
+enable_full_res_var = tk.BooleanVar(value=True) # NEW: Default to True
+enable_low_res_var = tk.BooleanVar(value=False) # RENAMED from set_pre_res_var
 pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
+low_res_batch_size_var = tk.StringVar(value="25")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
 
 # Load configuration
@@ -830,41 +1044,89 @@ create_hover_tooltip(entry_output_splatted, "output_splatted")
 create_hover_tooltip(btn_browse_output_splatted, "output_splatted")
 
 
-# Pre-processing Settings Frame
-preprocessing_frame = tk.LabelFrame(root, text="Pre-processing & Resolution Settings")
+# Process Resolution and Settings Frame (RENAMED)
+preprocessing_frame = tk.LabelFrame(root, text="Process Resolution and Settings")
 preprocessing_frame.pack(pady=10, padx=10, fill="x")
+preprocessing_frame.grid_columnconfigure(1, weight=1) # Makes column 1 expand
+preprocessing_frame.grid_columnconfigure(3, weight=1) # Makes column 3 expand (for horizontal spacing)
 
-# Set Pre-processing Resolution
-set_pre_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Set Pre-processing Resolution", variable=set_pre_res_var)
-set_pre_res_checkbox.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-create_hover_tooltip(set_pre_res_checkbox, "set_pre_res")
 
-pre_res_width_label = tk.Label(preprocessing_frame, text="Width:")
-pre_res_width_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+# --- Enable Full Resolution Section ---
+enable_full_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Enable Full Resolution Output (Native Video Resolution)", variable=enable_full_res_var)
+enable_full_res_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+create_hover_tooltip(enable_full_res_checkbox, "enable_full_res")
+
+lbl_full_res_batch_size = tk.Label(preprocessing_frame, text="Full Res Batch Size:") # RENAMED LABEL
+lbl_full_res_batch_size.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+entry_full_res_batch_size = tk.Entry(preprocessing_frame, textvariable=batch_size_var, width=15) # Uses existing batch_size_var
+entry_full_res_batch_size.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+create_hover_tooltip(lbl_full_res_batch_size, "full_res_batch_size")
+create_hover_tooltip(entry_full_res_batch_size, "full_res_batch_size")
+
+
+# --- Enable Low Resolution Section ---
+enable_low_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Enable Low Resolution Output (Pre-defined Below)", variable=enable_low_res_var) # RENAMED
+enable_low_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(10, 2)) # Use pady=(top, bottom) for desired separation
+create_hover_tooltip(enable_low_res_checkbox, "enable_low_res")
+
+pre_res_width_label = tk.Label(preprocessing_frame, text="Low Res Width:") # RENAMED LABEL
+pre_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
 pre_res_width_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_width_var, width=10)
-pre_res_width_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-create_hover_tooltip(pre_res_width_label, "pre_res_width")
-create_hover_tooltip(pre_res_width_entry, "pre_res_width")
+pre_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+create_hover_tooltip(pre_res_width_label, "low_res_width")
+create_hover_tooltip(pre_res_width_entry, "low_res_width")
 
-pre_res_height_label = tk.Label(preprocessing_frame, text="Height:")
-pre_res_height_label.grid(row=1, column=2, sticky="e", padx=5, pady=2)
+pre_res_height_label = tk.Label(preprocessing_frame, text="Low Res Height:") # RENAMED LABEL
+pre_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
 pre_res_height_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_height_var, width=10)
-pre_res_height_entry.grid(row=1, column=3, sticky="w", padx=5, pady=2)
-create_hover_tooltip(pre_res_height_label, "pre_res_height")
-create_hover_tooltip(pre_res_height_entry, "pre_res_height")
+pre_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
+create_hover_tooltip(pre_res_height_label, "low_res_height")
+create_hover_tooltip(pre_res_height_entry, "low_res_height")
+
+lbl_low_res_batch_size = tk.Label(preprocessing_frame, text="Low Res Batch Size:") # NEW
+lbl_low_res_batch_size.grid(row=4, column=0, sticky="e", padx=5, pady=2)
+entry_low_res_batch_size = tk.Entry(preprocessing_frame, textvariable=low_res_batch_size_var, width=15) # NEW
+entry_low_res_batch_size.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+create_hover_tooltip(lbl_low_res_batch_size, "low_res_batch_size")
+create_hover_tooltip(entry_low_res_batch_size, "low_res_batch_size")
 
 
-# Function to enable/disable pre-res input fields
-def toggle_pre_res_fields():
-    state = "normal" if set_pre_res_var.get() else "disabled"
-    pre_res_width_label.config(state=state)
-    pre_res_width_entry.config(state=state)
-    pre_res_height_label.config(state=state)
-    pre_res_height_entry.config(state=state)
+# Function to enable/disable required resolution.
+def toggle_processing_settings_fields():
+    """Enables/disables resolution input fields and the START button based on checkbox states."""
+    # Full Resolution controls
+    if enable_full_res_var.get():
+        entry_full_res_batch_size.config(state="normal")
+        lbl_full_res_batch_size.config(state="normal")
+    else:
+        entry_full_res_batch_size.config(state="disabled")
+        lbl_full_res_batch_size.config(state="disabled")
 
-# Trace the enable_low_res_output_var to call the toggle function
-set_pre_res_var.trace_add("write", lambda *args: toggle_pre_res_fields())
+    # Low Resolution controls
+    if enable_low_res_var.get():
+        pre_res_width_label.config(state="normal")
+        pre_res_width_entry.config(state="normal")
+        pre_res_height_label.config(state="normal")
+        pre_res_height_entry.config(state="normal")
+        lbl_low_res_batch_size.config(state="normal")
+        entry_low_res_batch_size.config(state="normal")
+    else:
+        pre_res_width_label.config(state="disabled")
+        pre_res_width_entry.config(state="disabled")
+        pre_res_height_label.config(state="disabled")
+        pre_res_height_entry.config(state="disabled")
+        lbl_low_res_batch_size.config(state="disabled")
+        entry_low_res_batch_size.config(state="disabled")
 
+    # START button enable/disable logic: Must have at least one resolution enabled
+    if enable_full_res_var.get() or enable_low_res_var.get():
+        start_button.config(state="normal")
+    else:
+        start_button.config(state="disabled")
+
+# Link the toggle function to the checkboxes' state changes
+enable_full_res_var.trace_add("write", lambda *args: toggle_processing_settings_fields())
+enable_low_res_var.trace_add("write", lambda *args: toggle_processing_settings_fields())
 
 # Output Settings Frame
 output_settings_frame = tk.LabelFrame(root, text="Splatting & Output Settings")
@@ -877,15 +1139,6 @@ entry_max_disp = tk.Entry(output_settings_frame, textvariable=max_disp_var, widt
 entry_max_disp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_max_disp, "max_disp")
 create_hover_tooltip(entry_max_disp, "max_disp")
-
-
-lbl_batch_size = tk.Label(output_settings_frame, text="Batch Size:")
-lbl_batch_size.grid(row=0, column=2, sticky="e", padx=5, pady=2)
-entry_batch_size = tk.Entry(output_settings_frame, textvariable=batch_size_var, width=15)
-entry_batch_size.grid(row=0, column=3, sticky="w", padx=5, pady=2)
-create_hover_tooltip(lbl_batch_size, "batch_size")
-create_hover_tooltip(entry_batch_size, "batch_size")
-
 
 # NEW: Zero Disparity Anchor Point input (Moved to row 1)
 lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Convergence Point (0-1):")
@@ -934,7 +1187,7 @@ create_hover_tooltip(exit_button, "exit_button")
 
 
 # Initial calls to set the correct state based on loaded config
-root.after(10, toggle_pre_res_fields)
+root.after(10, toggle_processing_settings_fields) # UPDATED CALL
 
 # Run the GUI
 root.mainloop()

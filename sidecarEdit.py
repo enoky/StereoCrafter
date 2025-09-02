@@ -27,6 +27,10 @@ class SidecarEditTool:
         self.max_disparity_var = tk.DoubleVar(value=35.0)
         self.jump_to_file_var = tk.StringVar(value="1")
         self.status_message_var = tk.StringVar(value="Ready.")
+        
+        self.frame_overlap_var = tk.IntVar(value=5)
+        self.input_bias_var = tk.DoubleVar(value=0.8)
+        self.inpaint_enabled_var = tk.BooleanVar(value=False)
 
         self.all_depth_map_files = []
         self.current_file_index = -1
@@ -50,10 +54,12 @@ class SidecarEditTool:
         # --- Step 4: Set up Traces (after vars and widgets are defined) ---
         self.convergence_var.trace_add("write", self._update_convergence_entry_display)
         self.max_disparity_var.trace_add("write", self._update_max_disparity_entry_display)
+        self.inpaint_enabled_var.trace_add("write", self._update_inpaint_controls_state)
         
         # --- Step 5: Set Initial UI States (these methods now safely configure existing widgets) ---
         self._update_navigation_buttons()
         self._update_paste_buttons_state()
+        self._update_inpaint_controls_state() # Initialize the state of inpaint controls
 
         # --- Step 6: Perform Initial Data Load (This should be the very last step in __init__) ---
         # This call is now safe because all GUI elements are initialized.
@@ -105,8 +111,9 @@ class SidecarEditTool:
         folder_frame = ttk.LabelFrame(self.root, text="Depth Map Folder")
         folder_frame.pack(pady=10, padx=10, fill="x")
         
-        self.folder_entry = ttk.Entry(folder_frame, textvariable=self.current_folder_var, width=60)
-        self.folder_entry.grid(row=0, column=0, padx=5, pady=5)
+        self.folder_entry = ttk.Entry(folder_frame, textvariable=self.current_folder_var, width=30)
+        self.folder_entry.grid(row=0, column=0, padx=5, pady=5, sticky="ew") # Use grid for better control within labelframe
+        folder_frame.grid_columnconfigure(0, weight=1) # Make entry expand
         self.folder_entry.bind("<Return>", self._load_folder_from_entry)
         self.folder_entry.bind("<FocusOut>", self._load_folder_from_entry)
 
@@ -117,71 +124,104 @@ class SidecarEditTool:
 
         ttk.Label(file_info_frame, text="Filename:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(file_info_frame, textvariable=self.current_filename_var, wraplength=400).grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        file_info_frame.grid_columnconfigure(1, weight=1) # Make filename label expand
         ttk.Label(file_info_frame, text="File Status:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(file_info_frame, textvariable=self.file_status_var).grid(row=1, column=1, sticky="w", padx=5, pady=2)
 
         clipboard_frame = ttk.LabelFrame(self.root, text="Fusion Node Clipboard")
         clipboard_frame.pack(pady=5, padx=10, fill="x")
 
-        self.paste_button = ttk.Button(clipboard_frame, text="Paste Fusion Node Data", command=self._read_clipboard_and_process)
-        self.paste_button.pack(side="left", padx=5, pady=5)
+        # Container for buttons to keep them on one row
+        button_row_frame = ttk.Frame(clipboard_frame)
+        button_row_frame.pack(pady=(0,5), padx=5, fill="x") # Pack this first
+        
+        self.paste_button = ttk.Button(button_row_frame, text="Paste Fusion Node Data", command=self._read_clipboard_and_process)
+        self.paste_button.pack(side="left", padx=(0,5))
 
-        self.commit_paste_button = ttk.Button(clipboard_frame, text="Commit Pasted Values", command=self._commit_pasted_values)
-        self.commit_paste_button.pack(side="left", padx=5, pady=5)
+        self.commit_paste_button = ttk.Button(button_row_frame, text="Commit Pasted Values", command=self._commit_pasted_values)
+        self.commit_paste_button.pack(side="left", padx=5)
         self.commit_paste_button.config(state="disabled")
 
-        self.reset_paste_button = ttk.Button(clipboard_frame, text="Reset Paste", command=self._reset_paste)
-        self.reset_paste_button.pack(side="left", padx=5, pady=5)
+        self.reset_paste_button = ttk.Button(button_row_frame, text="Reset Paste", command=self._reset_paste)
+        self.reset_paste_button.pack(side="left", padx=(5,0))
         self.reset_paste_button.config(state="disabled")
 
+        # Text area now below the buttons
         self.info_text_area = tk.Text(clipboard_frame, height=5, wrap="word", state="disabled")
-        self.info_text_area.pack(pady=5, padx=5, fill="x", expand=True)
+        self.info_text_area.pack(pady=(5,0), padx=5, fill="x", expand=True)
 
-        max_disparity_frame = ttk.LabelFrame(self.root, text="Max Disparity (0-100)")
-        max_disparity_frame.pack(pady=5, padx=10, fill="x")
+        # NEW: Main container for Depth and Inpaint Parameters to sit side-by-side
+        params_outer_frame = ttk.Frame(self.root)
+        params_outer_frame.pack(pady=5, padx=10, fill="x", expand=True)
 
-        self.max_disparity_slider = ttk.Scale(
-            max_disparity_frame,
-            from_=0.0,
-            to=100.0,
-            orient=tk.HORIZONTAL,
-            variable=self.max_disparity_var
-        )
-        self.max_disparity_slider.pack(fill="x", padx=5, pady=5)
+        # NEW: Combined Depth Parameters LabelFrame (left side)
+        depth_params_frame = ttk.LabelFrame(params_outer_frame, text="Depth Parameters")
+        depth_params_frame.pack(side="left", padx=(0, 5), fill="both", expand=True) # Fill both vertically and expand
+        depth_params_frame.grid_columnconfigure(1, weight=1) # Allow parameter entry to expand
 
+        # Max Disparity (now directly in depth_params_frame)
+        ttk.Label(depth_params_frame, text="Max Disparity (0-100, float):").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         vcmd_disparity = (self.root.register(self._validate_max_disparity_input), '%P')
         self.max_disparity_entry = ttk.Entry(
-            max_disparity_frame,
+            depth_params_frame, # Reparented to depth_params_frame
             textvariable=self.max_disparity_var,
             width=10,
             validate="focusout",
             validatecommand=vcmd_disparity
         )
-        self.max_disparity_entry.pack(padx=5, pady=2)
-        self.max_disparity_entry.bind("<Return>", self._sync_max_disparity_slider_from_entry)
+        self.max_disparity_entry.grid(row=0, column=1, sticky="w", padx=5, pady=2) # Using grid
+        self.max_disparity_entry.bind("<Return>", lambda e: self._validate_max_disparity_input(self.max_disparity_var.get()))
 
-        convergence_frame = ttk.LabelFrame(self.root, text="Convergence Plane (0.0=Nearest, 1.0=Furthest)")
-        convergence_frame.pack(pady=5, padx=10, fill="x")
-
-        self.convergence_slider = ttk.Scale(
-            convergence_frame,
-            from_=0.0,
-            to=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.convergence_var
-        )
-        self.convergence_slider.pack(fill="x", padx=5, pady=5)
-
+        # Convergence Plane (now directly in depth_params_frame)
+        ttk.Label(depth_params_frame, text="Convergence Plane (0.0-1.0, float):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         vcmd = (self.root.register(self._validate_convergence_input), '%P')
         self.convergence_entry = ttk.Entry(
-            convergence_frame,
+            depth_params_frame, # Reparented to depth_params_frame
             textvariable=self.convergence_var,
             width=10,
             validate="focusout",
             validatecommand=vcmd
         )
-        self.convergence_entry.pack(padx=5, pady=2)
-        self.convergence_entry.bind("<Return>", self._sync_convergence_slider_from_entry)
+        self.convergence_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2) # Using grid
+        self.convergence_entry.bind("<Return>", lambda e: self._validate_convergence_input(self.convergence_var.get()))
+
+        # Existing Inpaint Parameters section (right side) - now also child of params_outer_frame
+        inpaint_frame = ttk.LabelFrame(params_outer_frame, text="Inpaint Parameters (Optional)") # Reparented
+        inpaint_frame.pack(side="left", padx=(5, 0), fill="both", expand=True) # Fill both vertically and expand
+
+        self.enable_inpaint_check = ttk.Checkbutton(
+            inpaint_frame,
+            text="Enable Inpaint Parameters for this video",
+            variable=self.inpaint_enabled_var,
+            command=self._update_inpaint_controls_state # Call on click
+        )
+        self.enable_inpaint_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        inpaint_frame.grid_columnconfigure(1, weight=1) # Allow parameter entry to expand
+
+        ttk.Label(inpaint_frame, text="Frame Overlap (integer, >=0):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        vcmd_overlap = (self.root.register(self._validate_frame_overlap_input), '%P')
+        self.frame_overlap_entry = ttk.Entry(
+            inpaint_frame,
+            textvariable=self.frame_overlap_var,
+            width=10,
+            validate="focusout",
+            validatecommand=vcmd_overlap
+        )
+        self.frame_overlap_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        self.frame_overlap_entry.bind("<Return>", self._validate_frame_overlap_input_wrapper)
+
+        ttk.Label(inpaint_frame, text="Input Bias (0.0-1.0, float):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        vcmd_bias = (self.root.register(self._validate_input_bias_input), '%P')
+        self.input_bias_entry = ttk.Entry(
+            inpaint_frame,
+            textvariable=self.input_bias_var,
+            width=10,
+            validate="focusout",
+            validatecommand=vcmd_bias
+        )
+        self.input_bias_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+        self.input_bias_entry.bind("<Return>", self._validate_input_bias_input_wrapper)
+        # END Inpaint Parameters Section
 
         nav_frame = ttk.Frame(self.root)
         nav_frame.pack(pady=10, padx=10, fill="x")
@@ -306,6 +346,9 @@ class SidecarEditTool:
         # Initialize last known values for carry-forward logic
         last_conv_val = 0.5
         last_disp_val = 35.0
+        last_overlap_val = 5
+        last_bias_val = 0.8
+        last_inpaint_enabled = False # Default disabled
 
         for i, full_path in enumerate(sorted_files_paths):
             basename = os.path.basename(full_path)
@@ -315,19 +358,32 @@ class SidecarEditTool:
             
             conv_val = last_conv_val
             disp_val = last_disp_val
+            overlap_val = last_overlap_val
+            bias_val = last_bias_val
+            inpaint_enabled_val = last_inpaint_enabled
             
             if saved_data:
                 # If saved data exists, use it
                 if isinstance(saved_data, dict):
                     conv_val = saved_data.get("convergence_plane", 0.5)
                     disp_val = saved_data.get("max_disparity", 35.0)
+                    overlap_val = saved_data.get("frame_overlap", 5)
+                    bias_val = saved_data.get("input_bias", 0.8)
+                    inpaint_enabled_val = saved_data.get("inpaint_enabled", False)
+                    # ADD END
                 elif isinstance(saved_data, (float, int)): # Old format compatibility
                     conv_val = float(saved_data)
                     disp_val = 35.0 # Default for old format
+                    overlap_val = 5
+                    bias_val = 0.8
+                    inpaint_enabled_val = False
             else:
                 # If NO saved data, use the last determined values (carry-forward)
                 conv_val = last_conv_val
                 disp_val = last_disp_val
+                overlap_val = last_overlap_val
+                bias_val = last_bias_val
+                inpaint_enabled_val = last_inpaint_enabled
             
             file_info = {
                 "full_path": full_path,
@@ -336,7 +392,10 @@ class SidecarEditTool:
                 "timeline_start_frame": cumulative_frames,
                 "timeline_end_frame": cumulative_frames + total_frames - 1,
                 "current_convergence": conv_val,
-                "current_max_disparity": disp_val
+                "current_max_disparity": disp_val,
+                "current_frame_overlap": overlap_val,
+                "current_input_bias": bias_val,
+                "inpaint_enabled": inpaint_enabled_val
             }
             self.all_depth_map_files.append(file_info)
             cumulative_frames += total_frames
@@ -344,6 +403,9 @@ class SidecarEditTool:
             # Update last_conv_val and last_disp_val for the next iteration
             last_conv_val = conv_val
             last_disp_val = disp_val
+            last_overlap_val = overlap_val
+            last_bias_val = bias_val
+            last_inpaint_enabled = inpaint_enabled_val
 
             self.status_message_var.set(f"Loading file {i+1}/{total_files}: {basename} ({total_frames} frames)...")
             self.root.update_idletasks()
@@ -381,8 +443,12 @@ class SidecarEditTool:
         self.jump_to_file_var.set(str(self.current_file_index + 1))
         
         # Update DoubleVar widgets, ensuring rounding for display consistency
-        self.convergence_var.set(round(current_file_data["current_convergence"], 2)) # Round to 2 decimals
-        self.max_disparity_var.set(round(current_file_data["current_max_disparity"], 1)) # Round to 1 decimal
+        self.convergence_var.set(round(current_file_data["current_convergence"], 2))
+        self.max_disparity_var.set(round(current_file_data["current_max_disparity"], 1))
+        self.frame_overlap_var.set(current_file_data.get("current_frame_overlap", 5))
+        self.input_bias_var.set(round(current_file_data.get("current_input_bias", 0.8), 2))
+        self.inpaint_enabled_var.set(current_file_data.get("inpaint_enabled", False))
+        self._update_inpaint_controls_state()
 
         # Update button states based on current file and paste status
         self._update_navigation_buttons()
@@ -399,10 +465,14 @@ class SidecarEditTool:
         self.next_button.config(state="normal" if self.current_file_index < total_files - 1 else "disabled")
         
         self.jump_entry.config(state=state)
-        self.convergence_slider.config(state=state)
         self.convergence_entry.config(state=state)
-        self.max_disparity_slider.config(state=state)
         self.max_disparity_entry.config(state=state)
+        self.frame_overlap_entry.config(state=state)
+        self.input_bias_entry.config(state=state)
+        self.enable_inpaint_check.config(state=state) # Temporarily set based on file presence
+        
+        # This call will then apply the specific inpaint enable/disable logic based on self.inpaint_enabled_var
+        self._update_inpaint_controls_state() 
         
     def _update_paste_buttons_state(self):
         if not self.all_depth_map_files:
@@ -420,40 +490,6 @@ class SidecarEditTool:
             self.commit_paste_button.config(state="disabled")
             self.reset_paste_button.config(state="disabled")
 
-    def _sync_convergence_entry_from_slider(self, *args):
-        # This method is triggered when the DoubleVar changes (e.g., slider move)
-        try:
-            val = self.convergence_var.get()
-            self.convergence_entry.delete(0, tk.END)
-            self.convergence_entry.insert(0, f"{val:.2f}") # Changed to 2 decimal places
-        except _tkinter.TclError:
-            pass
-        except ValueError:
-            pass
-
-    def _sync_convergence_slider_from_entry(self, event=None):
-        try:
-            val_str = self.convergence_entry.get()
-            # The validation function will now also handle setting the DoubleVar and internal data
-            if not self._validate_convergence_input(val_str, is_sync_attempt=True):
-                return # Validation failed, value was not set
-            # If validation passed, _validate_convergence_input already updated self.convergence_var and internal data
-        except ValueError:
-            # Error message is already set by _validate_convergence_input
-            pass
-
-    def _sync_max_disparity_entry_from_slider(self, *args):
-        # This method is triggered when the DoubleVar changes (e.g., slider move)
-        try:
-            val = self.max_disparity_var.get()
-            self.max_disparity_entry.delete(0, tk.END)
-            self.max_disparity_entry.insert(0, f"{val:.1f}") # Changed to 1 decimal place
-        except _tkinter.TclError:
-            pass
-        except ValueError:
-            pass
-
-    def _sync_max_disparity_slider_from_entry(self, event=None):
         try:
             val_str = self.max_disparity_entry.get()
             # The validation function will now also handle setting the DoubleVar and internal data
@@ -464,10 +500,26 @@ class SidecarEditTool:
             # Error message is already set by _validate_max_disparity_input
             pass
 
-    def _validate_convergence_input(self, p, is_sync_attempt=False):
+    def _update_inpaint_controls_state(self, *args):
+        # Determine the state based on whether files are loaded AND the checkbox state
+        if not self.all_depth_map_files or self.current_file_index == -1:
+            # If no files are loaded, disable everything
+            entry_state = "disabled"
+            checkbox_state = "disabled"
+        else:
+            # Files are loaded, checkbox can always be toggled
+            checkbox_state = "normal"
+            if self.inpaint_enabled_var.get():
+                entry_state = "normal"
+            else:
+                entry_state = "disabled"
+
+        self.frame_overlap_entry.config(state=entry_state)
+        self.input_bias_entry.config(state=entry_state)
+        self.enable_inpaint_check.config(state=checkbox_state)
+    
+    def _validate_convergence_input(self, p):
         if p == "":
-            if not is_sync_attempt:
-                self.status_message_var.set("Error: Convergence cannot be empty.")
             return False
         try:
             val = float(p)
@@ -485,10 +537,8 @@ class SidecarEditTool:
             self.status_message_var.set("Error: Invalid number for convergence.")
             return False
 
-    def _validate_max_disparity_input(self, p, is_sync_attempt=False):
+    def _validate_max_disparity_input(self, p):
         if p == "":
-            if not is_sync_attempt:
-                self.status_message_var.set("Error: Max Disparity cannot be empty.")
             return False
         try:
             val = float(p)
@@ -521,6 +571,65 @@ class SidecarEditTool:
             self.status_message_var.set("Error: Invalid number for file jump.")
             return False
 
+    def _validate_frame_overlap_input_wrapper(self, event=None):
+        # Called when <Return> is pressed in the entry.
+        # It triggers the focusout validation implicitly if the content changed,
+        # but this ensures explicit validation on Enter.
+        self._validate_frame_overlap_input(self.frame_overlap_var.get())
+
+    def _validate_input_bias_input_wrapper(self, event=None):
+        # Called when <Return> is pressed in the entry.
+        self._validate_input_bias_input(self.input_bias_var.get())
+    
+    def _validate_frame_overlap_input(self, p):
+        if not self.inpaint_enabled_var.get():
+            # If inpaint is not enabled, we don't strictly validate the input field
+            # as its value won't be used/saved.
+            self.status_message_var.set("Ready (Inpaint disabled).")
+            return True
+        if p == "":
+            self.status_message_var.set("Error: Frame Overlap cannot be empty.")
+            return False
+        try:
+            val = int(p)
+            if val >= 0:
+                self.status_message_var.set("Ready.")
+                self.frame_overlap_var.set(val)
+                if self.current_file_index != -1 and self.all_depth_map_files:
+                    self.all_depth_map_files[self.current_file_index]["current_frame_overlap"] = val
+                return True
+            else:
+                self.status_message_var.set("Error: Frame Overlap must be 0 or greater.")
+                return False
+        except ValueError:
+            self.status_message_var.set("Error: Invalid integer for Frame Overlap.")
+            return False
+
+    def _validate_input_bias_input(self, p):
+        if not self.inpaint_enabled_var.get():
+            # If inpaint is not enabled, we don't strictly validate the input field
+            # as its value won't be used/saved.
+            self.status_message_var.set("Ready (Inpaint disabled).")
+            return True
+        if p == "":
+            self.status_message_var.set("Error: Input Bias cannot be empty.")
+            return False
+        try:
+            val = float(p)
+            if 0.0 <= val <= 1.0:
+                self.status_message_var.set("Ready.")
+                rounded_val = round(val, 2) # Often 2 decimal places for bias
+                self.input_bias_var.set(rounded_val)
+                if self.current_file_index != -1 and self.all_depth_map_files:
+                    self.all_depth_map_files[self.current_file_index]["current_input_bias"] = rounded_val
+                return True
+            else:
+                self.status_message_var.set("Error: Input Bias must be between 0.0 and 1.0.")
+                return False
+        except ValueError:
+            self.status_message_var.set("Error: Invalid number for Input Bias.")
+            return False
+    
     def _nav_file(self, direction):
         if not self.all_depth_map_files:
             return
@@ -558,6 +667,9 @@ class SidecarEditTool:
             # Ensure the values are correctly read from the DoubleVars, not just what was last set
             current_data["current_convergence"] = self.convergence_var.get()
             current_data["current_max_disparity"] = self.max_disparity_var.get()
+            current_data["current_frame_overlap"] = self.frame_overlap_var.get()
+            current_data["current_input_bias"] = self.input_bias_var.get()
+            current_data["inpaint_enabled"] = self.inpaint_enabled_var.get()
             # print(f"DEBUG: Saved GUI values for {current_data['basename']} (Conv: {current_data['current_convergence']:.4f}, Disp: {current_data['current_max_disparity']:.2f})")
 
     def _log_info(self, message):
@@ -993,7 +1105,10 @@ class SidecarEditTool:
         for file_data in self.all_depth_map_files:
             self.progress_save_data[file_data["basename"]] = {
                 "convergence_plane": file_data["current_convergence"],
-                "max_disparity": file_data["current_max_disparity"]
+                "max_disparity": file_data["current_max_disparity"],
+                "frame_overlap": file_data["current_frame_overlap"],
+                "input_bias": file_data["current_input_bias"],
+                "inpaint_enabled": file_data["inpaint_enabled"]
             }
         
         try:
@@ -1020,10 +1135,16 @@ class SidecarEditTool:
                     for key, value in loaded_data.items():
                         if isinstance(value, dict):
                             self.progress_save_data[key] = value
+                            self.progress_save_data[key].setdefault("frame_overlap", 5)
+                            self.progress_save_data[key].setdefault("input_bias", 0.8)
+                            self.progress_save_data[key].setdefault("inpaint_enabled", False)
                         else:
                             self.progress_save_data[key] = {
                                 "convergence_plane": float(value),
-                                "max_disparity": 35.0
+                                "max_disparity": 35.0,
+                                "frame_overlap": 5,
+                                "input_bias": 0.8,
+                                "inpaint_enabled": False
                             }
                 self.status_message_var.set(f"Loaded progress from {os.path.basename(self.progress_file_path)}")
                 self._log_info(f"Loaded progress from {os.path.basename(self.progress_file_path)}")
@@ -1064,6 +1185,10 @@ class SidecarEditTool:
                 "convergence_plane": convergence_value,
                 "max_disparity": max_disparity_value
             }
+
+            if file_data.get("inpaint_enabled", False):
+                json_data["frame_overlap"] = file_data.get("current_frame_overlap", 5)
+                json_data["input_bias"] = file_data.get("current_input_bias", 0.8)
             
             base_name_without_ext = os.path.splitext(file_data["full_path"])[0]
             json_filename = base_name_without_ext + ".json"
