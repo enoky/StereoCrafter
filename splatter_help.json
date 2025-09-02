@@ -21,5 +21,7 @@
     "full_res_batch_size": "The number of frames to process simultaneously when generating the full-resolution output. A higher value uses more VRAM but can be faster. Adjust based on your GPU's memory.",
 
     "enable_low_res": "When checked, the script will generate an additional splatted video at the specified Low Resolution. Uses 'Low Res Batch Size'.",
-    "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements."
+    "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements.",
+    "retain_color_space": "When checked, the script will attempt to detect the color primaries, transfer characteristics, and color space from the input video and apply this metadata to the output video using FFmpeg. Requires FFmpeg to be installed and in your system's PATH. If unchecked or FFmpeg fails, the output will use default color settings (often BT.601 or BT.709).",
+    "reencode_for_metadata": "When checked, the output video will be encoded with 'smart' settings:\n\nIf HDR is detected in the source, it targets HEVC (x265) 10-bit output with HDR metadata. \nIf SDR is detected, it targets H.264 (x264) 8-bit output with higher quality (lower CRF).\n\nThis ensures robust embedding of color space metadata and appropriate bit-depth/codec for the content. This process is slower due to re-encoding."
 }

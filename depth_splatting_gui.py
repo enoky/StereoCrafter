@@ -16,6 +16,7 @@ import threading
 import queue
 import subprocess
 import time
+from typing import Optional
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
@@ -61,6 +62,64 @@ def create_hover_tooltip(widget, key):
 def round_to_nearest_64(value):
     return max(64, round(value / 64) * 64)
 
+def get_video_stream_info(video_path): # RENAMED FUNCTION
+    """
+    Uses ffprobe to extract comprehensive video stream information, including
+    color space, codec, pixel format, and HDR mastering metadata.
+    Returns a dictionary or None if ffprobe fails/info not found.
+    Requires ffprobe to be installed and in PATH.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0", # Select the first video stream
+        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,mastering_display_metadata,max_content_light_level", # ADDED entries
+        "-of", "json",
+        video_path
+    ]
+    print(f"==> Running ffprobe command: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8')
+        ffprobe_stdout = result.stdout.strip()
+        ffprobe_stderr = result.stderr.strip()
+
+        if ffprobe_stdout:
+            print(f"==> ffprobe stdout: {ffprobe_stdout}")
+            output = json.loads(ffprobe_stdout)
+            if "streams" in output and len(output["streams"]) > 0:
+                # Store all stream info, then filter out 'N/A'/'und'
+                stream_info = output["streams"][0]
+                filtered_stream_info = {k: v for k, v in stream_info.items() if v not in ["N/A", "und", ""] and v is not None}
+                if filtered_stream_info:
+                    print(f"==> Detected video stream info for '{os.path.basename(video_path)}': {filtered_stream_info}")
+                    return filtered_stream_info
+                else:
+                    print(f"==> ffprobe found stream but no specific video metadata for '{os.path.basename(video_path)}'.")
+                    return None
+            else:
+                print(f"==> ffprobe output had no 'streams' or no video stream detected for '{os.path.basename(video_path)}'.")
+                return None
+        else:
+            print(f"==> ffprobe returned empty stdout for '{os.path.basename(video_path)}'.")
+            if ffprobe_stderr:
+                print(f"==> ffprobe stderr: {ffprobe_stderr}")
+            return None
+    except FileNotFoundError:
+        print("==> Error: ffprobe not found. Please ensure FFmpeg is installed and in your system's PATH.")
+        messagebox.showerror("FFprobe Error", "ffprobe not found. Please install FFmpeg and ensure it's in your system's PATH to detect video stream information.")
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"==> Error running ffprobe for '{os.path.basename(video_path)}': {e.returncode}")
+        print(f"==> ffprobe stderr: {e.stderr}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"==> Error decoding ffprobe JSON output for '{os.path.basename(video_path)}': {e}")
+        print(f"==> Raw ffprobe stdout that failed JSON decoding: {ffprobe_stdout}")
+        return None
+    except Exception as e:
+        print(f"==> An unexpected error occurred during ffprobe execution: {e}")
+        return None
+    
 def read_video_frames(video_path, process_length, target_fps,
                       set_pre_res, pre_res_width, pre_res_height, dataset="open"):
     """
@@ -104,7 +163,9 @@ def read_video_frames(video_path, process_length, target_fps,
 
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
 
-    return frames, fps, original_height, original_width, actual_processed_height, actual_processed_width
+    video_stream_info = get_video_stream_info(video_path)
+
+    return frames, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info
 
 class ForwardWarpStereo(nn.Module):
     def __init__(self, eps=1e-6, occlu_map=False):
@@ -118,8 +179,6 @@ class ForwardWarpStereo(nn.Module):
         disp = disp.contiguous()
         weights_map = disp - disp.min()
         weights_map = (1.414) ** weights_map
-        # Reverted to original flow calculation with negative sign for standard right-eye view.
-        # If inverting is desired, this line is the one to change from -disp to disp.
         flow = -disp.squeeze(1)
         dummy_flow = torch.zeros_like(flow, requires_grad=False)
         flow = torch.stack((flow, dummy_flow), dim=-1)
@@ -137,8 +196,7 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool, zero_disparity_anchor_val: float): # Added zero_disparity_anchor_val
-
+                   dual_output: bool, zero_disparity_anchor_val: float, video_stream_info: Optional[dict], retain_color_space: bool, reencode_for_metadata: bool):
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
 
@@ -149,28 +207,24 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     # Determine output video suffix and dimensions
     if dual_output:
         suffix = "_splatted2"
-        output_video_width = width * 2 # Mask + Warped
-        output_video_height = height
+        # The actual output width/height for the grid will be determined by concatenation,
+        # but these are the base frame dimensions.
+        # output_video_width = width * 2 # Mask + Warped
+        # output_video_height = height
     else: # Quad output
         suffix = "_splatted4"
-        output_video_width = width * 2
-        output_video_height = height * 2
+        # output_video_width = width * 2
+        # output_video_height = height * 2
 
     res_suffix = f"_{width}"
 
-    # Update the main output path
-    base_output_name = os.path.splitext(output_video_path)[0]
-    main_output_video_path = f"{base_output_name}{res_suffix}{suffix}.mp4"
+    # Construct the final output path that ffmpeg will write to
+    final_output_video_path = f"{os.path.splitext(output_video_path)[0]}{res_suffix}{suffix}.mp4"
 
-    # Initialize the main video writer
-    main_out = cv2.VideoWriter(
-        main_output_video_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        processed_fps, # Use the fps of the processed video
-        (output_video_width, output_video_height),
-        True
-    )
-    print(f"==> Writing main output video to: {main_output_video_path}")
+    # NEW: Use a temporary directory for PNG sequences
+    temp_png_dir = os.path.join(os.path.dirname(final_output_video_path), "temp_splat_pngs_" + os.path.basename(os.path.splitext(output_video_path)[0]))
+    os.makedirs(temp_png_dir, exist_ok=True)
+    print(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
 
     # Process only up to process_length if specified, for consistency
     if process_length != -1 and process_length < num_frames:
@@ -180,13 +234,16 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         num_frames = process_length
 
 
+    frame_count = 0 # To name PNGs sequentially
     for i in range(0, num_frames, batch_size):
         if stop_event.is_set():
             print("==> Stopping DepthSplatting due to user request")
             del stereo_projector
             torch.cuda.empty_cache()
             gc.collect()
-            main_out.release()
+            # Clean up temp PNGs if stopped
+            if os.path.exists(temp_png_dir):
+                shutil.rmtree(temp_png_dir) # Remove the whole directory
             return
 
         batch_frames = input_frames_processed[i:i+batch_size]
@@ -196,16 +253,13 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
         disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
 
-        # REMOVED: disp_map = disp_map * 2.0 - 1.0
-        
-        # MODIFIED: Use the passed anchor value
-        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0 # Use the anchor value passed to the function
-
-        disp_map = disp_map * max_disp # This line scales the adjusted disparity and remains.
+        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0
+        disp_map = disp_map * max_disp
         with torch.no_grad():
             right_video, occlusion_mask = stereo_projector(left_video, disp_map)
         right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
         occlusion_mask = occlusion_mask.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
+
         for j in range(len(batch_frames)):
             # Determine the video grid based on dual_output setting
             if dual_output:
@@ -217,18 +271,138 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
                 video_grid_bottom = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
                 video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
 
-            video_grid_uint8 = np.clip(video_grid * 255.0, 0, 255).astype(np.uint8)
-            video_grid_bgr = cv2.cvtColor(video_grid_uint8, cv2.COLOR_RGB2BGR)
+            # Convert to 16-bit for lossless saving, scaling float32 (0-1) to uint16 (0-65535)
+            # Clip to 0-1 range before scaling to prevent overflow if values slightly exceed 1.
+            video_grid_uint16 = np.clip(video_grid, 0.0, 1.0) * 65535.0
+            video_grid_uint16 = video_grid_uint16.astype(np.uint16)
 
-            # Write to main output video
-            main_out.write(video_grid_bgr)
+            # Convert to BGR for OpenCV
+            video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
+
+            png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png") # 05d for 5-digit padding (e.g., 00000.png)
+            cv2.imwrite(png_filename, video_grid_bgr) # Save as 16-bit PNG
+
+            frame_count += 1 # Increment frame counter
 
         del left_video, disp_map, right_video, occlusion_mask
         torch.cuda.empty_cache()
         gc.collect()
-        print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)}")
-    main_out.release()
-    print("==> Output video writing completed.")
+        print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)} (PNGs written: {frame_count})")
+
+    print(f"==> Temporary PNG sequence writing completed ({frame_count} frames).")
+    del stereo_projector # Release GPU resources for the forward warper
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # --- FFmpeg encoding from PNG sequence to final MP4 ---
+    print(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y", # Overwrite output files without asking
+        "-framerate", str(processed_fps), # Input framerate for the PNG sequence
+        "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
+    ]
+
+    # --- Determine Output Codec, Bit-Depth, and Quality ---
+    output_codec = "libx264" # Default to H.264
+    output_pix_fmt = "yuv420p" # Default to 8-bit
+    output_crf = "23" # Default CRF for H.264
+    output_profile = "main" # Default H.264 profile
+    x265_params = [] # For specific x265 parameters
+
+    is_hdr_source = False
+    if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
+       video_stream_info.get("transfer_characteristics") == "smpte2084":
+        is_hdr_source = True
+
+    if reencode_for_metadata:
+        print("==> Smart encoding mode activated (Re-encode for Full Color Metadata).")
+
+        if is_hdr_source:
+            print("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
+            output_codec = "libx265"
+            output_pix_fmt = "yuv420p10le" # Force 10-bit
+            output_crf = "28" # Common CRF for x265 HDR, adjust as needed for quality/size
+            output_profile = "main10" # HDR profile for HEVC
+
+            # Add HDR mastering display and light level metadata if available
+            if video_stream_info.get("mastering_display_metadata"):
+                md_meta = video_stream_info["mastering_display_metadata"]
+                # FFmpeg's -mastering-display argument format:
+                # G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)
+                # Example: G(0.1700,0.7970)B(0.1310,0.0460)R(0.6800,0.3200)WP(0.3127,0.3290)L(1000.0000,0.0050)
+                x265_params.append(f"mastering-display={md_meta}")
+                print(f"==> Adding mastering display metadata: {md_meta}")
+
+            if video_stream_info.get("max_content_light_level"):
+                max_cll_meta = video_stream_info["max_content_light_level"]
+                x265_params.append(f"max-cll={max_cll_meta}")
+                print(f"==> Adding max content light level: {max_cll_meta}")
+
+        else: # Not HDR, use H.264 SDR with higher quality CRF
+            print("==> Detected SDR source. Targeting H.264 (x264) 8-bit SDR output with higher quality.")
+            output_codec = "libx264"
+            output_pix_fmt = "yuv420p"
+            output_crf = "18" # Higher quality CRF for x264 SDR
+            output_profile = "main"
+
+    else: # reencode_for_metadata is False, use base H.264 settings (CRF 23)
+        print("==> Base encoding mode (Re-encode for Full Color Metadata is unchecked). Targeting H.264 (x264) 8-bit SDR.")
+        # Defaults already set above (libx264, yuv420p, CRF 23, profile main)
+
+
+    ffmpeg_cmd.extend(["-c:v", output_codec])
+    ffmpeg_cmd.extend(["-crf", output_crf])
+    ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
+    if output_profile: # Only add profile if explicitly set
+        ffmpeg_cmd.extend(["-profile:v", output_profile])
+
+    if x265_params: # Add x265-params if any HDR metadata was collected
+        ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
+
+
+    # --- Add general color space flags (primaries, transfer, space) ---
+    if retain_color_space and video_stream_info: # Only if user wants to retain AND info is available
+        if video_stream_info.get("color_primaries") and video_stream_info["color_primaries"] not in ["N/A", "und", "unknown"]:
+            ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
+        if video_stream_info.get("transfer_characteristics") and video_stream_info["transfer_characteristics"] not in ["N/A", "und", "unknown"]:
+            ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
+        if video_stream_info.get("color_space") and video_stream_info["color_space"] not in ["N/A", "und", "unknown"]:
+            ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
+    elif retain_color_space and not video_stream_info:
+        print("==> Warning: Retain Color Space is enabled but no color info detected. Output will use default color settings.")
+
+    ffmpeg_cmd.append(final_output_video_path)
+
+    print(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
+
+    try:
+        ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24 hour timeout
+        print(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
+        print(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
+        print(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
+    except FileNotFoundError:
+        print("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
+        messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
+    except subprocess.CalledProcessError as e:
+        print(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
+        print(f"==> FFmpeg stdout: {e.stdout}")
+        print(f"==> FFmpeg stderr: {e.stderr}")
+        print("==> Final video encoding failed due to ffmpeg error.")
+    except subprocess.TimeoutExpired:
+        print(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
+    except Exception as e:
+        print(f"==> An unexpected error occurred during ffmpeg execution: {e}")
+
+    # Clean up temporary PNG directory
+    if os.path.exists(temp_png_dir):
+        try:
+            shutil.rmtree(temp_png_dir)
+            print(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
+        except Exception as e:
+            print(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
+
+    print(f"==> Final output video written to: {final_output_video_path}")
 
 def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True, enable_autogain=True):
     """
@@ -353,6 +527,8 @@ def main(settings):
     low_res_width = settings["low_res_width"]
     low_res_height = settings["low_res_height"]
     low_res_batch_size = settings["low_res_batch_size"]
+    retain_color_space_setting = settings["retain_color_space"]
+    reencode_for_metadata_setting = settings["reencode_for_metadata"]
 
 
     is_single_file_mode = False
@@ -525,12 +701,13 @@ def main(settings):
             processed_fps = None
             current_processed_height = None
             current_processed_width = None
+            video_stream_info = None
 
             try:
                 # 1. Read input video frames at the determined resolution for this pass
-                input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width = read_video_frames(
-                    video_path, process_length, target_fps=-1,
-                    set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
+                input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width, video_stream_info = read_video_frames(
+                video_path, process_length, target_fps=-1,
+                set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
                 )
             except Exception as e:
                 print(f"==> Error reading input video {video_path} for {task['name']} pass: {e}. Skipping this pass.")
@@ -589,9 +766,12 @@ def main(settings):
                 depth_vis=depth_vis,
                 max_disp=actual_max_disp_pixels,
                 process_length=process_length,
-                batch_size=task["batch_size"], # Use task-specific batch size
+                batch_size=task["batch_size"],
                 dual_output=dual_output,
-                zero_disparity_anchor_val=current_zero_disparity_anchor
+                zero_disparity_anchor_val=current_zero_disparity_anchor,
+                video_stream_info=video_stream_info,
+                retain_color_space=retain_color_space_setting,
+                reencode_for_metadata=reencode_for_metadata_setting # <--- ADD THIS LINE
             )
             if stop_event.is_set():
                 print(f"==> Stopping {task['name']} pass for {video_name} due to user request")
@@ -740,7 +920,9 @@ def start_processing():
         "dual_output": dual_output_var.get(),
         "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
         "enable_autogain": True,
-        "match_depth_res": True, # Permanently set to True (handled by load_pre_rendered_depth)
+        "match_depth_res": True,
+        "retain_color_space": retain_color_space_var.get(),
+        "reencode_for_metadata": reencode_for_metadata_var.get(),
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -841,8 +1023,9 @@ def reset_to_defaults():
     low_res_batch_size_var.set("50") # Low Res Batch Size
     dual_output_var.set(False)
     zero_disparity_anchor_var.set("0.5")
+    retain_color_space_var.set(True)
     
-    toggle_pre_res_fields() # Update UI state for pre-res fields
+    toggle_processing_settings_fields()
     save_config() # Save the reset defaults
     status_label.config(text="Settings reset to defaults.")
 
@@ -937,6 +1120,7 @@ def save_config():
         "pre_res_height": pre_res_height_var.get(),
         "low_res_batch_size": low_res_batch_size_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
+        "retain_color_space": retain_color_space_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -958,6 +1142,7 @@ def load_config():
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
             low_res_batch_size_var.set(config.get("low_res_batch_size", "25")) # NEW
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
+            retain_color_space_var.set(config.get("retain_color_space", True))
 
 # Load help texts at the start
 load_help_texts()
@@ -965,7 +1150,7 @@ load_help_texts()
 # GUI Setup
 root = tk.Tk()
 root.title("Batch Depth Splatting")
-root.geometry("600x600")
+root.geometry("620x620")
 
 # Create a menu bar
 menubar = tk.Menu(root)
@@ -993,6 +1178,8 @@ pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
 low_res_batch_size_var = tk.StringVar(value="25")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
+retain_color_space_var = tk.BooleanVar(value=True)
+reencode_for_metadata_var = tk.BooleanVar(value=False)
 
 # Load configuration
 load_config()
@@ -1160,6 +1347,12 @@ create_hover_tooltip(entry_process_length, "process_length")
 dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
+
+
+# NEW: Retain Source Color Space Checkbox
+retain_color_space_checkbox = tk.Checkbutton(output_settings_frame, text="Retain Source Color Space", variable=retain_color_space_var)
+retain_color_space_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2) # NEW ROW
+create_hover_tooltip(retain_color_space_checkbox, "retain_color_space")
 
 # Progress frame
 progress_frame = tk.LabelFrame(root, text="Progress")
