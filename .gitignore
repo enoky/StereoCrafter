@@ -94,3 +94,4 @@ config_auto_conv.json
 models/res10_300x300_ssd_iter_140000.caffemodel
 models/deploy.prototxt.txt
 convergence_tool_config.json
+sidecaredit_config.json
