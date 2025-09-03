@@ -62,6 +62,38 @@ def create_hover_tooltip(widget, key):
 def round_to_nearest_64(value):
     return max(64, round(value / 64) * 64)
 
+def draw_progress_bar(current_progress, total_progress, bar_length=50, prefix='Progress:', suffix=''): # Changed default suffix
+    """
+    Draws an ASCII progress bar in the console, overwriting the same line.
+    Adds a newline only when 100% complete.
+    """
+    if total_progress == 0:
+        percent = 100
+    else:
+        percent = 100 * (current_progress / float(total_progress))
+    filled_length = int(round(bar_length * current_progress / float(total_progress)))
+    bar = '█' * filled_length + '-' * (bar_length - filled_length)
+    
+    # Format the suffix for completion
+    actual_suffix = suffix
+    if current_progress == total_progress:
+        actual_suffix = "Complete"
+
+    print(f'\r{prefix} |{bar}| {percent:.1f}% {actual_suffix}', end='\r')
+
+    # Add a final newline only when the progress is 100% to ensure subsequent prints are on a new line
+    if current_progress == total_progress:
+        print()
+
+def clear_processing_info():
+    """Resets all 'Current Processing Information' labels to default 'N/A'."""
+    processing_filename_var.set("N/A")
+    processing_resolution_var.set("N/A")
+    processing_frames_var.set("N/A")
+    processing_disparity_var.set("N/A")
+    processing_convergence_var.set("N/A")
+    processing_task_name_var.set("N/A")
+
 def get_video_stream_info(video_path): # RENAMED FUNCTION
     """
     Uses ffprobe to extract comprehensive video stream information, including
@@ -77,14 +109,14 @@ def get_video_stream_info(video_path): # RENAMED FUNCTION
         "-of", "json",
         video_path
     ]
-    print(f"==> Running ffprobe command: {' '.join(cmd)}")
+    # print(f"==> Running ffprobe command: {' '.join(cmd)}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8')
         ffprobe_stdout = result.stdout.strip()
         ffprobe_stderr = result.stderr.strip()
 
         if ffprobe_stdout:
-            print(f"==> ffprobe stdout: {ffprobe_stdout}")
+            # print(f"==> ffprobe stdout: {ffprobe_stdout}")
             output = json.loads(ffprobe_stdout)
             if "streams" in output and len(output["streams"]) > 0:
                 # Store all stream info, then filter out 'N/A'/'und'
@@ -94,7 +126,7 @@ def get_video_stream_info(video_path): # RENAMED FUNCTION
                     print(f"==> Detected video stream info for '{os.path.basename(video_path)}': {filtered_stream_info}")
                     return filtered_stream_info
                 else:
-                    print(f"==> ffprobe found stream but no specific video metadata for '{os.path.basename(video_path)}'.")
+                    # print(f"==> ffprobe found stream but no specific video metadata for '{os.path.basename(video_path)}'.")
                     return None
             else:
                 print(f"==> ffprobe output had no 'streams' or no video stream detected for '{os.path.basename(video_path)}'.")
@@ -110,11 +142,11 @@ def get_video_stream_info(video_path): # RENAMED FUNCTION
         return None
     except subprocess.CalledProcessError as e:
         print(f"==> Error running ffprobe for '{os.path.basename(video_path)}': {e.returncode}")
-        print(f"==> ffprobe stderr: {e.stderr}")
+        # print(f"==> ffprobe stderr: {e.stderr}")
         return None
     except json.JSONDecodeError as e:
         print(f"==> Error decoding ffprobe JSON output for '{os.path.basename(video_path)}': {e}")
-        print(f"==> Raw ffprobe stdout that failed JSON decoding: {ffprobe_stdout}")
+        # print(f"==> Raw ffprobe stdout that failed JSON decoding: {ffprobe_stdout}")
         return None
     except Exception as e:
         print(f"==> An unexpected error occurred during ffprobe execution: {e}")
@@ -196,7 +228,7 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool, zero_disparity_anchor_val: float, video_stream_info: Optional[dict], retain_color_space: bool, reencode_for_metadata: bool):
+                   dual_output: bool, zero_disparity_anchor_val: float, video_stream_info: Optional[dict]):
     print("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
 
@@ -235,15 +267,21 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
 
 
     frame_count = 0 # To name PNGs sequentially
+    
+    # Add a single startup message
+    print(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
+    # Initial draw of the progress bar
+    draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:") # Indent slightly
+    
     for i in range(0, num_frames, batch_size):
         if stop_event.is_set():
-            print("==> Stopping DepthSplatting due to user request")
-            del stereo_projector
+            draw_progress_bar(frame_count, num_frames, suffix='Stopped')
+            print() # Ensure a newline after stopping
+            del stereo_projector # Added for early exit cleanup
             torch.cuda.empty_cache()
             gc.collect()
-            # Clean up temp PNGs if stopped
             if os.path.exists(temp_png_dir):
-                shutil.rmtree(temp_png_dir) # Remove the whole directory
+                shutil.rmtree(temp_png_dir)
             return
 
         batch_frames = input_frames_processed[i:i+batch_size]
@@ -279,18 +317,21 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
             # Convert to BGR for OpenCV
             video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
 
-            png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png") # 05d for 5-digit padding (e.g., 00000.png)
-            cv2.imwrite(png_filename, video_grid_bgr) # Save as 16-bit PNG
+            png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png")
+            cv2.imwrite(png_filename, video_grid_bgr)
 
-            frame_count += 1 # Increment frame counter
+            frame_count += 1
 
         del left_video, disp_map, right_video, occlusion_mask
         torch.cuda.empty_cache()
         gc.collect()
-        print(f"==> Processed frames {i+1} to {min(i+batch_size, num_frames)} (PNGs written: {frame_count})")
+        
+        draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
 
-    print(f"==> Temporary PNG sequence writing completed ({frame_count} frames).")
-    del stereo_projector # Release GPU resources for the forward warper
+    # <--- THESE TWO LINES MUST BE OUTSIDE THE 'for i' loop
+    print(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
+    
+    del stereo_projector
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -303,10 +344,25 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
     ]
 
+    # --- Extract original video properties if available ---
+    original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
+    original_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
+
+    is_original_10bit_or_higher = False
+    if original_pix_fmt:
+        if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
+            is_original_10bit_or_higher = True
+            print(f"==> Detected original video pixel format: {original_pix_fmt} (>= 10-bit)")
+        else:
+            print(f"==> Detected original video pixel format: {original_pix_fmt} (< 10-bit)")
+    else:
+        print("==> Could not detect original video pixel format.")
+
     # --- Determine Output Codec, Bit-Depth, and Quality ---
+    # Set sensible defaults first
     output_codec = "libx264" # Default to H.264
     output_pix_fmt = "yuv420p" # Default to 8-bit
-    output_crf = "23" # Default CRF for H.264
+    output_crf = "23" # Default CRF for H.264 (medium quality)
     output_profile = "main" # Default H.264 profile
     x265_params = [] # For specific x265 parameters
 
@@ -314,63 +370,68 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
        video_stream_info.get("transfer_characteristics") == "smpte2084":
         is_hdr_source = True
+        print("==> Source detected as HDR.")
+    else:
+        print("==> Source detected as SDR.")
 
-    if reencode_for_metadata:
-        print("==> Smart encoding mode activated (Re-encode for Full Color Metadata).")
+
+    # Main logic for choosing output format based on "Retain Source Color Space" and detected info
+    if video_stream_info: # Only proceed with smart matching if info is detected
+        print("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
 
         if is_hdr_source:
             print("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
             output_codec = "libx265"
-            output_pix_fmt = "yuv420p10le" # Force 10-bit
-            output_crf = "28" # Common CRF for x265 HDR, adjust as needed for quality/size
-            output_profile = "main10" # HDR profile for HEVC
-
+            output_pix_fmt = "yuv420p10le"
+            output_crf = "28" # Common CRF for x265 HDR
+            output_profile = "main10"
             # Add HDR mastering display and light level metadata if available
             if video_stream_info.get("mastering_display_metadata"):
                 md_meta = video_stream_info["mastering_display_metadata"]
-                # FFmpeg's -mastering-display argument format:
-                # G(x,y)B(x,y)R(x,y)WP(x,y)L(max,min)
-                # Example: G(0.1700,0.7970)B(0.1310,0.0460)R(0.6800,0.3200)WP(0.3127,0.3290)L(1000.0000,0.0050)
                 x265_params.append(f"mastering-display={md_meta}")
                 print(f"==> Adding mastering display metadata: {md_meta}")
-
             if video_stream_info.get("max_content_light_level"):
                 max_cll_meta = video_stream_info["max_content_light_level"]
                 x265_params.append(f"max-cll={max_cll_meta}")
                 print(f"==> Adding max content light level: {max_cll_meta}")
 
-        else: # Not HDR, use H.264 SDR with higher quality CRF
-            print("==> Detected SDR source. Targeting H.264 (x264) 8-bit SDR output with higher quality.")
+        elif original_codec_name == "hevc" and is_original_10bit_or_higher:
+            print("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
+            output_codec = "libx265"
+            output_pix_fmt = "yuv420p10le"
+            output_crf = "24" # A good quality for x265 SDR 10-bit
+            output_profile = "main10"
+
+        else: # If not HDR or HEVC 10-bit, default to H.264 high quality for any detected info
+            print("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
             output_codec = "libx264"
             output_pix_fmt = "yuv420p"
             output_crf = "18" # Higher quality CRF for x264 SDR
             output_profile = "main"
 
-    else: # reencode_for_metadata is False, use base H.264 settings (CRF 23)
-        print("==> Base encoding mode (Re-encode for Full Color Metadata is unchecked). Targeting H.264 (x264) 8-bit SDR.")
-        # Defaults already set above (libx264, yuv420p, CRF 23, profile main)
-
+    else: # video_stream_info is None (fallback behavior if no info detected)
+        print("==> No source video stream info detected. FFmpeg will use defaults for color metadata (e.g., BT.709 for SDR).")
+        # Defaults already set at the top of this block (libx264, yuv420p, CRF 23, profile main)
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
     ffmpeg_cmd.extend(["-crf", output_crf])
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-    if output_profile: # Only add profile if explicitly set
+    if output_profile:
         ffmpeg_cmd.extend(["-profile:v", output_profile])
 
-    if x265_params: # Add x265-params if any HDR metadata was collected
+    if x265_params:
         ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
 
 
     # --- Add general color space flags (primaries, transfer, space) ---
-    if retain_color_space and video_stream_info: # Only if user wants to retain AND info is available
+    # This block remains, but now only applies if retain_color_space is true AND info exists
+    if video_stream_info:
         if video_stream_info.get("color_primaries") and video_stream_info["color_primaries"] not in ["N/A", "und", "unknown"]:
             ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
         if video_stream_info.get("transfer_characteristics") and video_stream_info["transfer_characteristics"] not in ["N/A", "und", "unknown"]:
             ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
         if video_stream_info.get("color_space") and video_stream_info["color_space"] not in ["N/A", "und", "unknown"]:
             ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
-    elif retain_color_space and not video_stream_info:
-        print("==> Warning: Retain Color Space is enabled but no color info detected. Output will use default color settings.")
 
     ffmpeg_cmd.append(final_output_video_path)
 
@@ -378,16 +439,16 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
 
     try:
         ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24 hour timeout
-        print(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
-        print(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
+        # print(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
+        # print(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
         print(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
     except FileNotFoundError:
         print("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
         messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
     except subprocess.CalledProcessError as e:
         print(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
-        print(f"==> FFmpeg stdout: {e.stdout}")
-        print(f"==> FFmpeg stderr: {e.stderr}")
+        # print(f"==> FFmpeg stdout: {e.stdout}")
+        # print(f"==> FFmpeg stderr: {e.stderr}")
         print("==> Final video encoding failed due to ffmpeg error.")
     except subprocess.TimeoutExpired:
         print(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
@@ -527,19 +588,20 @@ def main(settings):
     low_res_width = settings["low_res_width"]
     low_res_height = settings["low_res_height"]
     low_res_batch_size = settings["low_res_batch_size"]
-    retain_color_space_setting = settings["retain_color_space"]
-    reencode_for_metadata_setting = settings["reencode_for_metadata"]
 
 
     is_single_file_mode = False
     input_videos = []
     finished_source_folder = None
     finished_depth_folder = None
+    
 
     is_source_file = os.path.isfile(input_source_clips_path_setting)
     is_source_dir = os.path.isdir(input_source_clips_path_setting)
     is_depth_file = os.path.isfile(input_depth_maps_path_setting)
     is_depth_dir = os.path.isdir(input_depth_maps_path_setting)
+
+    root.after(0, clear_processing_info)
 
     if is_source_file and is_depth_file:
         is_single_file_mode = True
@@ -591,10 +653,15 @@ def main(settings):
             print("==> Stopping processing due to user request")
             release_resources()
             progress_queue.put("finished")
+            root.after(0, clear_processing_info) # Clear on stop
             return
 
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\n==> Processing Video: {video_name}")
+
+        
+        # NEW: Update filename immediately
+        progress_queue.put(("update_info", {"filename": video_name}))
 
         current_zero_disparity_anchor = default_zero_disparity_anchor
         current_max_disparity_percentage = gui_max_disp
@@ -644,18 +711,17 @@ def main(settings):
                         print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
                         max_disp_source = "GUI (Invalid JSON)"
 
-                    # Update status message for sidecar detection
-                    progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: ({anchor_source}:{current_zero_disparity_anchor:.2f}, {max_disp_source}:{current_max_disparity_percentage:.1f}%)"))
+                    # Do NOT put detailed info into "status", put into "update_info" later
 
                 except json.JSONDecodeError:
                     print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                    progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
+                    # Do NOT put detailed info into "status"
                 except Exception as e:
                     print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
                     progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
             else:
                 print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
-                progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
+                # Do NOT put detailed info into "status"
         else:
             print(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
             progress_queue.put(("processed", overall_task_counter))
@@ -692,10 +758,20 @@ def main(settings):
                 print(f"==> Stopping {task['name']} processing for {video_name} due to user request")
                 release_resources()
                 progress_queue.put("finished")
+                root.after(0, clear_processing_info) # Clear on stop
                 return
 
             print(f"\n==> Starting {task['name']} pass for {video_name}")
-            progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)} [{task['name']}] ({anchor_source}:{current_zero_disparity_anchor:.2f}, {max_disp_source}:{current_max_disparity_percentage:.1f}%)"))
+
+            # NEW: Set a general status message for the GUI progress bar
+            progress_queue.put(("status", f"Processing {task['name']} for {video_name}"))
+            
+            # NEW: Update task name and static convergence/disparity
+            progress_queue.put(("update_info", {
+                "task_name": task['name'],
+                "convergence": f"{current_zero_disparity_anchor:.2f} ({anchor_source})",
+                "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})"
+            }))
 
             input_frames_processed = None
             processed_fps = None
@@ -714,6 +790,12 @@ def main(settings):
                 overall_task_counter += 1
                 progress_queue.put(("processed", overall_task_counter))
                 continue # Skip to next task
+
+            # NEW: Update resolution and frames after reading video
+            progress_queue.put(("update_info", {
+                "resolution": f"{current_processed_width}x{current_processed_height}",
+                "frames": len(input_frames_processed)
+            }))
 
             video_depth = None
             depth_vis = None
@@ -752,6 +834,10 @@ def main(settings):
             actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_processed_width
             print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels")
 
+            
+            # NEW: Update disparity display with calculated pixel value
+            progress_queue.put(("update_info", {"disparity": f"{actual_max_disp_pixels:.2f} pixels ({current_max_disparity_percentage:.1f}%)"}))
+
             # 3. Create output directory and construct video path
             current_output_subdir = os.path.join(output_splatted, task["output_subdir"])
             os.makedirs(current_output_subdir, exist_ok=True)
@@ -769,9 +855,7 @@ def main(settings):
                 batch_size=task["batch_size"],
                 dual_output=dual_output,
                 zero_disparity_anchor_val=current_zero_disparity_anchor,
-                video_stream_info=video_stream_info,
-                retain_color_space=retain_color_space_setting,
-                reencode_for_metadata=reencode_for_metadata_setting # <--- ADD THIS LINE
+                video_stream_info=video_stream_info
             )
             if stop_event.is_set():
                 print(f"==> Stopping {task['name']} pass for {video_name} due to user request")
@@ -826,6 +910,7 @@ def main(settings):
             print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
 
     release_resources()
+    root.after(0, clear_processing_info) # NEW: Clear info labels when all processing finished
     progress_queue.put("finished")
     print("\n==> Batch Depth Splatting Process Completed Successfully")
 
@@ -921,8 +1006,6 @@ def start_processing():
         "zero_disparity_anchor": float(zero_disparity_anchor_var.get()),
         "enable_autogain": True,
         "match_depth_res": True,
-        "retain_color_space": retain_color_space_var.get(),
-        "reencode_for_metadata": reencode_for_metadata_var.get(),
     }
     processing_thread = threading.Thread(target=main, args=(settings,))
     processing_thread.start()
@@ -957,50 +1040,39 @@ def check_queue():
                 progress_var.set(0) # Reset progress bar
                 break
             elif message[0] == "total":
-                total_videos = message[1]
-                progress_bar.config(maximum=total_videos)
+                total_tasks = message[1] # <--- total_tasks is defined here
+                progress_bar.config(maximum=total_tasks)
                 progress_var.set(0) # Start from 0
-                status_label.config(text=f"Processing 0 of {total_videos}")
+                status_label.config(text=f"Processing 0 of {total_tasks} tasks") # Initial status
             elif message[0] == "processed":
-                processed = message[1]
-                total = progress_bar["maximum"]
-                progress_var.set(processed)
-                # Update status label to show progress, but don't overwrite custom status
-                current_status_text = status_label.cget("text")
-                if not current_status_text.startswith(f"Processing {processed}/{total}") and not "finished" in current_status_text:
-                    # If it's a custom anchor/max_disp message, just update progress part
-                    parts = current_status_text.split("(", 1) # Split only on the first '('
-                    if len(parts) > 1: # If it has an anchor/max_disp part
-                        status_label.config(text=f"Processing {processed}/{total} ({parts[1]}")
-                    else: # If it's a basic processing message
-                        status_label.config(text=f"Processing {processed} of {total}")
-                else: # Default behavior if no custom status or if it's already "Processing X of Y"
-                    status_label.config(text=f"Processing {processed} of {total}")
-            elif message[0] == "status":
-                # Custom status messages are now more detailed, just display them directly
-                status_label.config(text=message[1])
-            elif message[0] == "processed":
-                # This needs to be smarter now that "processed" means a task, not a whole video
-                processed_tasks = message[1]
-                total_tasks = progress_bar["maximum"]
-                progress_var.set(processed_tasks)
+                processed_tasks = message[1] # <--- processed_tasks is defined here
+                total_tasks = progress_bar["maximum"] # Get total from configured bar
 
-                # The status_label will usually be set by a "status" message before this,
-                # but we can provide a fallback if needed or update just the numbers.
-                current_status_text = status_label.cget("text")
-                # Try to update only the numerical part if a detailed message is present
-                import re
-                match = re.search(r"Video (\d+)/(\d+) \[([^\]]+)\]", current_status_text)
-                if match:
-                    video_idx = int(match.group(1))
-                    total_videos = int(match.group(2))
-                    resolution_name = match.group(3)
-                    # We can't easily get which video corresponds to which task number
-                    # so for now, we'll just update the overall task count if the message is too generic.
-                    # For more granular video-specific progress, the "status" message is key.
-                    status_label.config(text=f"Processed tasks: {processed_tasks}/{total_tasks}. Currently: {current_status_text}")
-                else: # Fallback for generic or initial "processed" messages
-                    status_label.config(text=f"Processed tasks: {processed_tasks}/{total_tasks}")
+                progress_var.set(processed_tasks) # Update GUI progress bar
+
+                # Update the GUI status_label.
+                # The detailed message is set by "status", this just updates the count.
+                status_label.config(text=f"Processed tasks: {processed_tasks}/{total_tasks} (overall)")
+
+            elif message[0] == "status": # This is for detailed text updates (e.g., sidecar info, current video/task)
+                # NEW: Make this very minimal, as detailed info is in the new info_frame
+                status_label.config(text=f"Overall: {progress_var.get()}/{progress_bar['maximum']} - {message[1].split(':', 1)[-1].strip()}") # Only show the action part
+
+            elif message[0] == "update_info": # NEW: Handle updates for the dedicated info frame
+                info_data = message[1]
+                if "filename" in info_data:
+                    processing_filename_var.set(info_data["filename"])
+                if "resolution" in info_data:
+                    processing_resolution_var.set(info_data["resolution"])
+                if "frames" in info_data:
+                    processing_frames_var.set(str(info_data["frames"]))
+                if "disparity" in info_data:
+                    processing_disparity_var.set(info_data["disparity"])
+                if "convergence" in info_data:
+                    processing_convergence_var.set(info_data["convergence"])
+                if "task_name" in info_data:
+                    processing_task_name_var.set(info_data["task_name"])
+
     except queue.Empty:
         pass
     root.after(100, check_queue)
@@ -1023,10 +1095,10 @@ def reset_to_defaults():
     low_res_batch_size_var.set("50") # Low Res Batch Size
     dual_output_var.set(False)
     zero_disparity_anchor_var.set("0.5")
-    retain_color_space_var.set(True)
     
     toggle_processing_settings_fields()
     save_config() # Save the reset defaults
+    clear_processing_info() # NEW: Clear info display on reset
     status_label.config(text="Settings reset to defaults.")
 
 def restore_finished_files():
@@ -1062,7 +1134,7 @@ def restore_finished_files():
                 try:
                     shutil.move(src_path, dest_path)
                     restored_count += 1
-                    print(f"Moved '{filename}' to '{source_clip_dir}'")
+                    # print(f"Moved '{filename}' to '{source_clip_dir}'")
                 except Exception as e:
                     errors_count += 1
                     print(f"Error moving source clip '{filename}': {e}")
@@ -1079,7 +1151,7 @@ def restore_finished_files():
                 try:
                     shutil.move(src_path, dest_path)
                     restored_count += 1
-                    print(f"Moved '{filename}' to '{depth_map_dir}'")
+                    # print(f"Moved '{filename}' to '{depth_map_dir}'")
                 except Exception as e:
                     errors_count += 1
                     print(f"Error moving depth map/sidecar '{filename}': {e}")
@@ -1087,9 +1159,11 @@ def restore_finished_files():
         print(f"==> Finished depth folder not found: {finished_depth_folder}")
 
     if restored_count > 0 or errors_count > 0:
+        clear_processing_info() # NEW: Clear info display on restore completion
         status_label.config(text=f"Restore complete: {restored_count} files moved, {errors_count} errors.")
         messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
     else:
+        clear_processing_info() # NEW: Clear info display even if nothing to restore
         status_label.config(text="No files found to restore.")
         messagebox.showinfo("Restore Complete", "No files found in 'finished' folders to restore.")
 
@@ -1120,7 +1194,6 @@ def save_config():
         "pre_res_height": pre_res_height_var.get(),
         "low_res_batch_size": low_res_batch_size_var.get(),
         "convergence_point": zero_disparity_anchor_var.get(),
-        "retain_color_space": retain_color_space_var.get(),
     }
     with open("config_splat.json", "w") as f:
         json.dump(config, f, indent=4)
@@ -1142,7 +1215,6 @@ def load_config():
             pre_res_height_var.set(config.get("pre_res_height", "1080"))
             low_res_batch_size_var.set(config.get("low_res_batch_size", "25")) # NEW
             zero_disparity_anchor_var.set(config.get("convergence_point", "0.5"))
-            retain_color_space_var.set(config.get("retain_color_space", True))
 
 # Load help texts at the start
 load_help_texts()
@@ -1150,7 +1222,7 @@ load_help_texts()
 # GUI Setup
 root = tk.Tk()
 root.title("Batch Depth Splatting")
-root.geometry("620x620")
+root.geometry("620x770")
 
 # Create a menu bar
 menubar = tk.Menu(root)
@@ -1178,8 +1250,13 @@ pre_res_width_var = tk.StringVar(value="1920")
 pre_res_height_var = tk.StringVar(value="1080")
 low_res_batch_size_var = tk.StringVar(value="25")
 zero_disparity_anchor_var = tk.StringVar(value="0.5") # NEW: Default to 0.5 (mid-ground anchor)
-retain_color_space_var = tk.BooleanVar(value=True)
-reencode_for_metadata_var = tk.BooleanVar(value=False)
+# NEW: Variables for "Current Processing Information" display
+processing_filename_var = tk.StringVar(value="N/A")
+processing_resolution_var = tk.StringVar(value="N/A")
+processing_frames_var = tk.StringVar(value="N/A")
+processing_disparity_var = tk.StringVar(value="N/A")
+processing_convergence_var = tk.StringVar(value="N/A")
+processing_task_name_var = tk.StringVar(value="N/A") # To show Full-Res/Low-Res
 
 # Load configuration
 load_config()
@@ -1348,12 +1425,6 @@ dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
 
-
-# NEW: Retain Source Color Space Checkbox
-retain_color_space_checkbox = tk.Checkbutton(output_settings_frame, text="Retain Source Color Space", variable=retain_color_space_var)
-retain_color_space_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2) # NEW ROW
-create_hover_tooltip(retain_color_space_checkbox, "retain_color_space")
-
 # Progress frame
 progress_frame = tk.LabelFrame(root, text="Progress")
 progress_frame.pack(pady=10, padx=10, fill="x")
@@ -1378,6 +1449,34 @@ exit_button = tk.Button(button_frame, text="EXIT", command=exit_app)
 exit_button.pack(side="left", padx=5)
 create_hover_tooltip(exit_button, "exit_button")
 
+# NEW: Current Processing Information frame
+info_frame = tk.LabelFrame(root, text="Current Processing Information")
+info_frame.pack(pady=10, padx=10, fill="x")
+info_frame.grid_columnconfigure(1, weight=1) # Makes value columns expand
+
+# Row 0: Filename
+tk.Label(info_frame, text="Filename:").grid(row=0, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_filename_var, anchor="w").grid(row=0, column=1, sticky="ew", padx=5, pady=1)
+
+# Row 1: Task Name (e.g., Full-Resolution, Low-Resolution)
+tk.Label(info_frame, text="Task:").grid(row=1, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_task_name_var, anchor="w").grid(row=1, column=1, sticky="ew", padx=5, pady=1)
+
+# Row 2: Resolution
+tk.Label(info_frame, text="Resolution:").grid(row=2, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_resolution_var, anchor="w").grid(row=2, column=1, sticky="ew", padx=5, pady=1)
+
+# Row 3: Total Frames for current task
+tk.Label(info_frame, text="Frames:").grid(row=3, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_frames_var, anchor="w").grid(row=3, column=1, sticky="ew", padx=5, pady=1)
+
+# Row 4: Max Disparity
+tk.Label(info_frame, text="Max Disparity:").grid(row=4, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_disparity_var, anchor="w").grid(row=4, column=1, sticky="ew", padx=5, pady=1)
+
+# Row 5: Convergence Point
+tk.Label(info_frame, text="Convergence:").grid(row=5, column=0, sticky="e", padx=5, pady=1)
+tk.Label(info_frame, textvariable=processing_convergence_var, anchor="w").grid(row=5, column=1, sticky="ew", padx=5, pady=1)
 
 # Initial calls to set the correct state based on loaded config
 root.after(10, toggle_processing_settings_fields) # UPDATED CALL
