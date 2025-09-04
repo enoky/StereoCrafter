@@ -490,16 +490,6 @@ class SidecarEditTool:
             self.commit_paste_button.config(state="disabled")
             self.reset_paste_button.config(state="disabled")
 
-        try:
-            val_str = self.max_disparity_entry.get()
-            # The validation function will now also handle setting the DoubleVar and internal data
-            if not self._validate_max_disparity_input(val_str, is_sync_attempt=True):
-                return # Validation failed, value was not set
-            # If validation passed, _validate_max_disparity_input already updated self.max_disparity_var and internal data
-        except ValueError:
-            # Error message is already set by _validate_max_disparity_input
-            pass
-
     def _update_inpaint_controls_state(self, *args):
         # Determine the state based on whether files are loaded AND the checkbox state
         if not self.all_depth_map_files or self.current_file_index == -1:
@@ -539,6 +529,7 @@ class SidecarEditTool:
 
     def _validate_max_disparity_input(self, p):
         if p == "":
+            self.status_message_var.set("Error: Max Disparity cannot be empty.")
             return False
         try:
             val = float(p)
