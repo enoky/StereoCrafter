@@ -28,6 +28,7 @@ stop_event = threading.Event()
 progress_queue = queue.Queue()
 processing_thread = None
 help_texts = {} # Dictionary to store help texts
+CUDA_AVAILABLE = False # NEW: Global flag for CUDA availability
 
 class Tooltip:
     def __init__(self, widget, text):
@@ -93,6 +94,35 @@ def clear_processing_info():
     processing_disparity_var.set("N/A")
     processing_convergence_var.set("N/A")
     processing_task_name_var.set("N/A")
+
+def check_cuda_availability():
+    """
+    Checks if CUDA is available via PyTorch and if nvidia-smi can run.
+    Sets the global CUDA_AVAILABLE flag.
+    """
+    global CUDA_AVAILABLE
+    if torch.cuda.is_available():
+        print("==> PyTorch reports CUDA is available.")
+        # Further check with nvidia-smi for robustness, though torch.cuda.is_available is often enough.
+        try:
+            subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding='utf-8')
+            print("==> CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
+            CUDA_AVAILABLE = True
+        except FileNotFoundError:
+            print("==> Warning: nvidia-smi not found. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
+            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi not found
+        except subprocess.CalledProcessError:
+            print("==> Warning: nvidia-smi failed. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
+            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi fails
+        except subprocess.TimeoutExpired:
+            print("==> Warning: nvidia-smi timed out. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
+            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi times out
+        except Exception as e:
+            print(f"==> Unexpected error during nvidia-smi check: {e}. Relying on PyTorch's report for CUDA.")
+            CUDA_AVAILABLE = True # Rely on PyTorch as a fallback
+    else:
+        print("==> PyTorch reports CUDA is NOT available. NVENC will not be used.")
+        CUDA_AVAILABLE = False
 
 def get_video_stream_info(video_path): # RENAMED FUNCTION
     """
@@ -366,6 +396,12 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     output_profile = "main" # Default H.264 profile
     x265_params = [] # For specific x265 parameters
 
+    
+    # NEW: NVENC specific parameters
+    nvenc_preset = "medium" # Default NVENC preset (e.g., fast, medium, slow, quality, etc.)
+    # Note: NVENC uses CQP/VBR/CBR not CRF. We'll map CRF to a CQ value or just use a fixed quality.
+    nvenc_cq = "23" # Constant Quality value for NVENC (lower is better quality)
+
     is_hdr_source = False
     if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
        video_stream_info.get("transfer_characteristics") == "smpte2084":
@@ -375,51 +411,82 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         print("==> Source detected as SDR.")
 
 
-    # Main logic for choosing output format based on "Retain Source Color Space" and detected info
+    # Main logic for choosing output format based on detected info (always attempt smart matching)
     if video_stream_info: # Only proceed with smart matching if info is detected
         print("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
 
         if is_hdr_source:
             print("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
-            output_codec = "libx265"
+            output_codec = "libx265" # Default to CPU x265
+            if CUDA_AVAILABLE:
+                output_codec = "hevc_nvenc" # Use NVENC if available
+                print("    (Using hevc_nvenc for hardware acceleration)")
+            
             output_pix_fmt = "yuv420p10le"
-            output_crf = "28" # Common CRF for x265 HDR
+            output_crf = "28" # This CRF value is for CPU x265, will use nvenc_cq for NVENC
             output_profile = "main10"
             # Add HDR mastering display and light level metadata if available
             if video_stream_info.get("mastering_display_metadata"):
                 md_meta = video_stream_info["mastering_display_metadata"]
-                x265_params.append(f"mastering-display={md_meta}")
+                x265_params.append(f"mastering-display={md_meta}") # These are for x265, not nvenc directly.
                 print(f"==> Adding mastering display metadata: {md_meta}")
             if video_stream_info.get("max_content_light_level"):
                 max_cll_meta = video_stream_info["max_content_light_level"]
-                x265_params.append(f"max-cll={max_cll_meta}")
+                x265_params.append(f"max-cll={max_cll_meta}") # These are for x265, not nvenc directly.
                 print(f"==> Adding max content light level: {max_cll_meta}")
 
         elif original_codec_name == "hevc" and is_original_10bit_or_higher:
             print("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
-            output_codec = "libx265"
+            output_codec = "libx265" # Default to CPU x265
+            if CUDA_AVAILABLE:
+                output_codec = "hevc_nvenc" # Use NVENC if available
+                print("    (Using hevc_nvenc for hardware acceleration)")
+            
             output_pix_fmt = "yuv420p10le"
-            output_crf = "24" # A good quality for x265 SDR 10-bit
+            output_crf = "24" # For CPU x265
             output_profile = "main10"
 
-        else: # If not HDR or HEVC 10-bit, default to H.264 high quality for any detected info
+        else: # If not HDR/HEVC 10-bit, default to H.264 high quality
             print("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
-            output_codec = "libx264"
+            output_codec = "libx264" # Default to CPU x264
+            if CUDA_AVAILABLE:
+                output_codec = "h264_nvenc" # Use NVENC if available
+                print("    (Using h264_nvenc for hardware acceleration)")
+            
             output_pix_fmt = "yuv420p"
-            output_crf = "18" # Higher quality CRF for x264 SDR
+            output_crf = "18" # For CPU x264
             output_profile = "main"
 
     else: # video_stream_info is None (fallback behavior if no info detected)
-        print("==> No source video stream info detected. FFmpeg will use defaults for color metadata (e.g., BT.709 for SDR).")
+        print("==> No source video stream info detected. Falling back to default H.264 (x264) 8-bit SDR (medium quality).")
         # Defaults already set at the top of this block (libx264, yuv420p, CRF 23, profile main)
+        if CUDA_AVAILABLE:
+            output_codec = "h264_nvenc" # Use NVENC if CUDA available for default H.264
+            print("    (Using h264_nvenc for hardware acceleration for default output)")
+
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
-    ffmpeg_cmd.extend(["-crf", output_crf])
+    # NEW: Add NVENC specific parameters
+    if "nvenc" in output_codec: # Check if an NVENC codec is chosen
+        ffmpeg_cmd.extend(["-preset", nvenc_preset])
+        ffmpeg_cmd.extend(["-cq", nvenc_cq]) # Constant Quality for NVENC
+        # Remove CRF if NVENC is used, as it's not applicable
+        if "-crf" in ffmpeg_cmd:
+            crf_index = ffmpeg_cmd.index("-crf")
+            del ffmpeg_cmd[crf_index:crf_index+2] # Delete -crf and its value
+    else: # Only add CRF if not NVENC
+        ffmpeg_cmd.extend(["-crf", output_crf])
+    
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
     if output_profile:
+        # NVENC profiles might differ slightly, but main/main10 generally work.
         ffmpeg_cmd.extend(["-profile:v", output_profile])
 
-    if x265_params:
+    # NVENC doesn't use -x265-params directly for HDR.
+    # HDR metadata for NVENC is usually passed via -mastering-display and -max-cll
+    # directly as FFmpeg main flags, which we already handle outside -x265-params.
+    # The -x265-params block is only relevant if using libx265.
+    if output_codec == "libx265" and x265_params:
         ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
 
 
@@ -1480,6 +1547,9 @@ tk.Label(info_frame, textvariable=processing_convergence_var, anchor="w").grid(r
 
 # Initial calls to set the correct state based on loaded config
 root.after(10, toggle_processing_settings_fields) # UPDATED CALL
+
+# NEW: Check CUDA availability once at script start
+check_cuda_availability()
 
 # Run the GUI
 root.mainloop()
