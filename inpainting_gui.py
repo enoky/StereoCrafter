@@ -676,10 +676,10 @@ class InpaintingGUI(tk.Tk):
             num_inference_steps = int(self.num_inference_steps_var.get())
             tile_num = int(self.tile_num_var.get())
             frames_chunk = int(self.frames_chunk_var.get())
-            overlap = int(self.overlap_var.get()) # Use self.overlap_var
-            original_input_blend_strength = float(self.original_input_blend_strength_var.get()) # NEW LINE
-            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or overlap < 0 or \
-               not (0.0 <= original_input_blend_strength <= 1.0): # NEW VALIDATION
+            gui_overlap = int(self.overlap_var.get()) # Renamed for clarity
+            gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
+            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
+               not (0.0 <= gui_original_input_blend_strength  <= 1.0): # NEW VALIDATION
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
@@ -700,10 +700,10 @@ class InpaintingGUI(tk.Tk):
         self.update_video_info_display("N/A", "N/A", "N/A") # Clear info on start
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap, original_input_blend_strength),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength),
                          daemon=True).start()
 
-    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, overlap, original_input_blend_strength):
+    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength):
         try:
             self.pipeline = load_inpainting_pipeline(
                 pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
@@ -726,6 +726,40 @@ class InpaintingGUI(tk.Tk):
             for idx, video_path in enumerate(input_videos):
                 if self.stop_event.is_set():
                     break
+
+                # Initialize current video's parameters with GUI fallbacks
+                current_overlap = gui_overlap
+                current_original_input_blend_strength = gui_original_input_blend_strength
+
+                json_path = os.path.splitext(video_path)[0] + ".json"
+                if os.path.exists(json_path):
+                    logger.info(f"Found sidecar JSON for {os.path.basename(video_path)} at {json_path}")
+                    try:
+                        with open(json_path, 'r') as f:
+                            sidecar_data = json.load(f)
+                        
+                        if "frame_overlap" in sidecar_data:
+                            # Validate and use the sidecar value
+                            sidecar_overlap = int(sidecar_data["frame_overlap"])
+                            if sidecar_overlap >= 0:
+                                current_overlap = sidecar_overlap
+                                logger.info(f"Using frame_overlap from sidecar: {current_overlap}")
+                            else:
+                                logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
+
+                        if "input_bias" in sidecar_data:
+                            # Validate and use the sidecar value
+                            sidecar_input_bias = float(sidecar_data["input_bias"])
+                            if 0.0 <= sidecar_input_bias <= 1.0:
+                                current_original_input_blend_strength = sidecar_input_bias
+                                logger.info(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
+                            else:
+                                logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
+
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
+                else:
+                    logger.info(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
                 
                 # Get video info for display before processing
                 temp_frames, _ = read_video_frames(video_path)
@@ -756,13 +790,13 @@ class InpaintingGUI(tk.Tk):
                     input_video_path=video_path,
                     save_dir=output_folder,
                     frames_chunk=frames_chunk,
-                    overlap=overlap,
+                    overlap=current_overlap,
+                    original_input_blend_strength=current_original_input_blend_strength,
                     tile_num=tile_num,
                     vf=None,
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
-                    update_info_callback=None, # Info updated by run_batch_process directly
-                    original_input_blend_strength=original_input_blend_strength # NEW LINE: Pass the 
+                    update_info_callback=None
                 )
                 if completed:
                     try:
@@ -846,7 +880,6 @@ class InpaintingGUI(tk.Tk):
         except FileNotFoundError:
             return {}
 
-    # NEW: Method to load help data from renamed file
     def load_help_data(self):
         try:
             with open("inpaint_help.json", "r", encoding="utf-8") as f:
@@ -858,7 +891,6 @@ class InpaintingGUI(tk.Tk):
             logger.error(f"Error decoding inpaint_help.json: {e}")
             return {}
 
-    # NEW: Method to show general help
     def show_general_help(self):
         help_text = self.help_data.get("general_help", "No general help information available.")
         messagebox.showinfo("Help", help_text)
