@@ -13,9 +13,11 @@ import torch
 from decord import VideoReader, cpu
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-import imageio_ffmpeg
+import imageio_ffmpeg # This might still be used for other things, keep it.
 import torch.nn.functional as F
 import time
+import subprocess # NEW: For running ffprobe and ffmpeg
+import cv2 # NEW: For saving 16-bit PNGs
 
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
@@ -115,58 +117,40 @@ def load_inpainting_pipeline(
 
     return pipeline
 
-def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor, float]:
+def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor, float, Optional[dict]]:
     """
-    Reads a video using decord and returns frames as a 4D float tensor [T, C, H, W] and the FPS.
+    Reads a video using decord and returns frames as a 4D float tensor [T, C, H, W], the FPS,
+    and video stream metadata.
     """
+    video_stream_info = get_video_stream_info(video_path)
+
     video_reader = VideoReader(video_path, ctx=decord_ctx)
     num_frames = len(video_reader)
 
     if num_frames == 0:
-        return torch.empty(0), 0.0
+        return torch.empty(0), 0.0, video_stream_info
 
-    fps = video_reader.get_avg_fps()
+    # Use ffprobe's detected FPS if available and reliable, otherwise decord's
+    fps = 0.0
+    if video_stream_info and "r_frame_rate" in video_stream_info:
+        try:
+            r_frame_rate_str = video_stream_info["r_frame_rate"].split('/')
+            if len(r_frame_rate_str) == 2:
+                fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
+            else:
+                fps = float(r_frame_rate_str[0])
+            logger.info(f"Using ffprobe FPS: {fps:.2f} for {os.path.basename(video_path)}")
+        except (ValueError, ZeroDivisionError):
+            fps = video_reader.get_avg_fps()
+            logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord FPS: {fps:.2f}")
+    else:
+        fps = video_reader.get_avg_fps()
+        logger.info(f"Using Decord FPS: {fps:.2f} for {os.path.basename(video_path)}")
+
     frames = video_reader.get_batch(range(num_frames))
     frames = torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
 
-    return frames, fps
-
-def write_video_ffmpeg(
-    frames: np.ndarray,
-    fps: float,
-    output_path: str,
-    vf: Optional[str] = None,
-    codec: str = "libx264",
-    crf: int = 16,
-    preset: str = "ultrafast"
-) -> None:
-    """
-    Writes a sequence of frames (uint8) to a video file using imageio-ffmpeg.
-    """
-    if frames.dtype != np.uint8:
-        frames = (frames * 255).astype(np.uint8)
-
-    frames = np.ascontiguousarray(frames)
-    height, width = frames.shape[1:3]
-
-    output_params = ["-crf", str(crf), "-preset", preset]
-    if vf:
-        output_params += ["-vf", vf]
-
-    writer = imageio_ffmpeg.write_frames(
-        output_path,
-        (width, height),
-        fps=fps,
-        codec=codec,
-        quality=None,
-        bitrate=None,
-        macro_block_size=1,  # Set to 1 to avoid resizing
-        output_params=output_params
-    )
-    writer.send(None)
-    for frame in frames:
-        writer.send(frame)
-    writer.close()
+    return frames, fps, video_stream_info
 
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     """
@@ -198,19 +182,23 @@ def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128))
     T, C, H, W = frames.shape
     overlap_y, overlap_x = tile_overlap
 
-    size_y = (H + overlap_y * (tile_num - 1)) // tile_num
-    size_x = (W + overlap_x * (tile_num - 1)) // tile_num
+    # Calculate ideal tile dimensions and strides
+    # Ensure stride is at least 1 to avoid infinite loops or zero-sized tiles with small inputs
+    stride_y = max(1, (H + overlap_y * (tile_num - 1)) // tile_num - overlap_y)
+    stride_x = max(1, (W + overlap_x * (tile_num - 1)) // tile_num - overlap_x)
+    
+    # Recalculate size_y and size_x based on minimum stride
+    size_y = stride_y + overlap_y
+    size_x = stride_x + overlap_x
 
-    stride_y = size_y - overlap_y
-    stride_x = size_x - overlap_x
-
-    ideal_H = stride_y * tile_num + overlap_y * (tile_num - 1)
-    ideal_W = stride_x * tile_num + overlap_x * (tile_num - 1)
+    ideal_H = stride_y * tile_num + overlap_y
+    ideal_W = stride_x * tile_num + overlap_x
 
     pad_bottom = max(0, ideal_H - H)
     pad_right = max(0, ideal_W - W)
 
     if pad_bottom > 0 or pad_right > 0:
+        logger.info(f"Padding frames from ({H}x{W}) to ({H+pad_bottom}x{W+pad_right}) for tiling.")
         frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
     return frames
 
@@ -232,11 +220,12 @@ def spatial_tiled_process(
     tile_overlap = (128, 128)
     overlap_y, overlap_x = tile_overlap
 
+    # Calculate tile sizes and strides, ensuring minimum stride
     size_y = (height + overlap_y * (tile_num - 1)) // tile_num
     size_x = (width + overlap_x * (tile_num - 1)) // tile_num
     tile_size = (size_y, size_x)
 
-    tile_stride = (size_y - overlap_y, size_x - overlap_x)
+    tile_stride = (max(1, size_y - overlap_y), max(1, size_x - overlap_x)) # Ensure stride is at least 1
 
     cols = []
     for i in range(tile_num):
@@ -247,11 +236,21 @@ def spatial_tiled_process(
             y_end = y_start + tile_size[0]
             x_end = x_start + tile_size[1]
 
+            # Ensure bounds do not exceed original image dimensions if padding was used
             y_end = min(y_end, height)
             x_end = min(x_end, width)
 
             cond_tile = cond_frames[:, :, y_start:y_end, x_start:x_end]
             mask_tile = mask_frames[:, :, y_start:y_end, x_start:x_end]
+
+            if cond_tile.numel() == 0 or mask_tile.numel() == 0:
+                logger.warning(f"Skipping empty tile: y_start={y_start}, y_end={y_end}, x_start={x_start}, x_end={x_end}")
+                # Append a zero tensor of expected latent output size to keep structure consistent
+                # This needs careful consideration if `tile_output` becomes empty, it could break blending.
+                # A better approach for empty tiles might be to just skip and fill later, or ensure valid tiles.
+                # For simplicity, assuming pipeline handles small/empty inputs gracefully or valid tiles are always generated.
+                # Here, we'll try to let the pipeline handle it, or it will error out if it can't.
+                pass # Let the process_func handle if it gets an empty tile.
 
             with torch.no_grad():
                 tile_output = process_func(
@@ -282,21 +281,47 @@ def spatial_tiled_process(
         row_result = []
         for j, tile in enumerate(row_tiles):
             if i > 0:
-                tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
+                # Ensure the previous tile exists for blending
+                if len(cols[i - 1]) > j and cols[i - 1][j] is not None:
+                    tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
             if j > 0:
-                tile = blend_h(row_result[j - 1], tile, latent_overlap[1])
+                # Ensure the previous tile in the row exists for blending
+                if len(row_result) > j - 1 and row_result[j - 1] is not None:
+                    tile = blend_h(row_result[j - 1], tile, latent_overlap[1])
             row_result.append(tile)
         blended_rows.append(row_result)
 
     final_rows = []
     for i, row_tiles in enumerate(blended_rows):
         for j, tile in enumerate(row_tiles):
+            if tile is None:
+                logger.warning(f"Skipping None tile during final row concatenation at ({i}, {j})")
+                continue # Skip None tiles, this might cause dimension mismatch later if not handled
+
+            # Ensure the slice is valid and does not result in empty tensor
             if i < len(blended_rows) - 1:
-                tile = tile[:, :, :latent_stride[0], :]
+                if latent_stride[0] > 0:
+                    tile = tile[:, :, :latent_stride[0], :]
+                else:
+                    logger.warning(f"latent_stride[0] is zero, skipping vertical crop for tile ({i}, {j}).")
             if j < len(row_tiles) - 1:
-                tile = tile[:, :, :, :latent_stride[1]]
+                if latent_stride[1] > 0:
+                    tile = tile[:, :, :, :latent_stride[1]]
+                else:
+                    logger.warning(f"latent_stride[1] is zero, skipping horizontal crop for tile ({i}, {j}).")
             row_tiles[j] = tile
-        final_rows.append(torch.cat(row_tiles, dim=3))
+        
+        # Filter out None tiles before concatenation
+        valid_row_tiles = [t for t in row_tiles if t is not None]
+        if valid_row_tiles:
+            final_rows.append(torch.cat(valid_row_tiles, dim=3))
+        else:
+            logger.warning(f"Row {i} ended up empty after filtering None tiles.")
+
+    if not final_rows:
+        logger.error("No final rows to concatenate after spatial tiling. This indicates a major issue with tile processing or blending.")
+        raise ValueError("Spatial tiling failed to produce any valid output rows.")
+
     x = torch.cat(final_rows, dim=2)
 
     return x
@@ -308,11 +333,11 @@ def process_single_video(
     frames_chunk: int = 23,
     overlap: int = 3,
     tile_num: int = 1,
-    vf: Optional[str] = None,
+    vf: Optional[str] = None, # This vf parameter is no longer directly used by new FFmpeg logic
     num_inference_steps: int = 5,
     stop_event: threading.Event = None,
-    update_info_callback=None, # Callback to update GUI info
-    original_input_blend_strength: float = 0.8, # NEW PARAMETER WITH DEFAULT
+    update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
+    original_input_blend_strength: float = 0.8,
 ) -> bool:
     """
     Processes a single input video.
@@ -326,7 +351,6 @@ def process_single_video(
     base_video_name = os.path.basename(input_video_path)
     video_name_without_ext = os.path.splitext(base_video_name)[0]
 
-    # Determine if input is dual splatted based on suffix
     is_dual_input = video_name_without_ext.endswith("_splatted2")
     if is_dual_input:
         logger.info(f"Dual Splat detected for '{base_video_name}'. Processing and outputting Inpainted Right Eye only.")
@@ -334,101 +358,107 @@ def process_single_video(
         logger.info(f"Quad Splat (or default) detected for '{base_video_name}'. Processing and outputting Inpainted SBS video.")
 
     output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
-
     video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
     output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
     output_video_path = os.path.join(save_dir, output_video_filename)
 
-
-    frames, fps = read_video_frames(input_video_path)
+    # Read video frames and stream info
+    frames, fps, video_stream_info = read_video_frames(input_video_path)
     num_frames = frames.shape[0]
 
     if num_frames == 0:
         logger.warning(f"No frames found in {input_video_path}, skipping.")
         if update_info_callback:
-            update_info_callback(base_video_name, "N/A", "0 (skipped)")
+            update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength)
         return False
 
-    _, _, num_h, num_w = frames.shape
-    if num_h < 2 or num_w < 2:
-        logger.warning(f"Video {input_video_path} is too small ({num_h}x{num_w}), skipping.")
+    _, _, total_h_raw_input, total_w_raw_input = frames.shape
+    if total_h_raw_input < 2 or total_w_raw_input < 2:
+        logger.warning(f"Video {input_video_path} is too small ({total_h_raw_input}x{total_w_raw_input}), skipping.")
         if update_info_callback:
-            update_info_callback(base_video_name, f"{num_w}x{num_h}", num_frames)
+            update_info_callback(base_video_name, f"{total_w_raw_input}x{total_h_raw_input}", num_frames, overlap, original_input_blend_strength)
         return False
 
+    # Determine output resolution for GUI display (after splitting/inpainting)
+    output_display_w = total_w_raw_input // 2
+    output_display_h = total_h_raw_input // 2 if not is_dual_input else total_h_raw_input
+    current_display_res_str = f"{output_display_w}x{output_display_h}"
+    
     # Update GUI with video info before processing
     if update_info_callback:
-        update_info_callback(base_video_name, f"{num_w}x{num_h}", num_frames)
+        update_info_callback(base_video_name, current_display_res_str, num_frames, overlap, original_input_blend_strength)
 
     # Frame chunking and mask extraction based on input type
+    frames_left_original: Optional[torch.Tensor] = None # Initialize outside if/else
     if is_dual_input:
-        # Input is (Mask | Warped) from _splatted2
-        half_w_input = num_w // 2 # Half width of the _splatted2 video
+        half_w_input = total_w_raw_input // 2
         frames_mask_raw = frames[:, :, :, :half_w_input]  # Left half is mask
         frames_warpped_raw = frames[:, :, :, half_w_input:] # Right half is warped
-        frames_left_original = None # No original left eye in dual input
         
-        # Ensure the warped frame for inpainting has correct dimensions (height, half_w_input)
         frames_warpped = frames_warpped_raw
         frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
         
-        # The target dimensions for the *single* inpainted output frame
         target_output_h = frames_warpped.shape[2]
         target_output_w = frames_warpped.shape[3]
 
     else:
-        # Input is (Original | DepthVis (Top), Mask | Warped (Bottom)) from _splatted4 or other
-        half_h_input = num_h // 2 # Half height of the quad video
-        half_w_input = num_w // 2 # Half width of the quad video
+        half_h_input = total_h_raw_input // 2
+        half_w_input = total_w_raw_input // 2
 
         frames_left_original = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
         frames_mask_raw = frames[:, :, half_h_input:, :half_w_input]  # Bottom-Left is mask
         frames_warpped_raw = frames[:, :, half_h_input:, half_w_input:] # Bottom-Right is warped
 
-        # The warped frames are the input for inpainting
         frames_warpped = frames_warpped_raw
         frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
 
-        # The target dimensions for the *single* inpainted output frame (which is half of the full output)
         target_output_h = frames_warpped.shape[2]
         target_output_w = frames_warpped.shape[3]
 
     # Pre-process frames for inpainting pipeline
     frames_warpped = frames_warpped / 255.0 # Normalize to 0-1
-    # frames_mask is already normalized and grayscale after mean(dim=1) and is 0-1 from read_video_frames
 
-    frames_warpped = pad_for_tiling(frames_warpped, tile_num, tile_overlap=(128, 128))
-    frames_mask = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
+    # Pad for tiling before processing
+    frames_warpped_padded = pad_for_tiling(frames_warpped, tile_num, tile_overlap=(128, 128))
+    frames_mask_padded = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
+    
+    padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
+
 
     stride = max(1, frames_chunk - overlap)
     results = [] # Stores chunks to be concatenated in final video
-    previous_chunk_output_frames = None # Will hold the *full* generated output of the previous chunk
+    previous_chunk_output_frames = None
 
-    for i in range(0, num_frames, stride):
+    for i in range(0, num_frames, stride): # Loop over original num_frames
         if stop_event and stop_event.is_set():
             logger.info(f"Stopping processing of {input_video_path}")
             return False
+        
+        # Adjust end_idx to use the original number of frames, not padded
         end_idx = min(i + frames_chunk, num_frames)
         chunk_size = end_idx - i
         if chunk_size <= 0:
             break
 
-        # Get the original input for the current chunk
-        original_input_frames_for_chunk = frames_warpped[i:end_idx].clone()
-        mask_frames_i = frames_mask[i:end_idx].clone()
+        # Get the original input for the current chunk (from padded frames)
+        # We need to slice the padded frames for inference, but the logic for
+        # `previous_chunk_output_frames` and `input_frames_to_pipeline` handles
+        # the blending of *actual* generated content.
+        # It's important that `frames_warpped_padded` and `frames_mask_padded`
+        # are used here.
+        original_input_frames_for_chunk = frames_warpped_padded[i:end_idx].clone()
+        mask_frames_i = frames_mask_padded[i:end_idx].clone()
 
-        input_frames_to_pipeline = original_input_frames_for_chunk.clone() # Start with original, modify if blending
+        input_frames_to_pipeline = original_input_frames_for_chunk.clone()
 
-        # --- Input-level blending for overlapping frames ---
+        # Input-level blending for overlapping frames
         if previous_chunk_output_frames is not None and overlap > 0:
-            # Determine actual number of frames to overlap, limited by available frames
             overlap_actual = min(overlap, len(previous_chunk_output_frames), len(original_input_frames_for_chunk))
 
             if overlap_actual > 0:
                 prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
                 
                 if original_input_blend_strength > 0:
-                    # Only create and use orig_input_overlap_frames if there's an actual blend
                     orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
                     original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
                     
@@ -436,22 +466,20 @@ def process_single_video(
                                                     original_weights_scaled * orig_input_overlap_frames
                     
                     input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
-                    # Explicitly delete the temporary tensor if it's large and no longer needed
-                    del orig_input_overlap_frames # This helps reclaim VRAM immediately
+                    del orig_input_overlap_frames
                     del original_weights_scaled
                     del blended_input_overlap_frames
                 else:
-                    # If blend strength is 0, we simply use the previous generated frames for the overlap
                     input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
                 
-                del prev_gen_overlap_frames # Clean up temporary tensor
+                del prev_gen_overlap_frames
 
-        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx}...")
+        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx} (padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
         start_time = time.time()
 
         with torch.no_grad():
             video_latents = spatial_tiled_process(
-                input_frames_to_pipeline, # Use the potentially blended input frames
+                input_frames_to_pipeline,
                 mask_frames_i,
                 pipeline,
                 tile_num,
@@ -485,52 +513,293 @@ def process_single_video(
 
         current_chunk_generated = torch.stack(current_chunk_generated_frames)
 
-        # --- CRITICAL FIX: Append only the non-overlapping part for subsequent chunks ---
         if i == 0:
-            # For the first chunk, append the full generated output.
             results.append(current_chunk_generated)
         else:
-            # For subsequent chunks, append only the portion beyond the overlap.
-            # The overlap frames from this chunk's output are already accounted for (or blended into)
-            # by the previous chunk's output.
             results.append(current_chunk_generated[overlap:])
         
-        # Always store the full generated chunk for the *next* iteration's input blend
         previous_chunk_output_frames = current_chunk_generated 
 
-        if end_idx == num_frames:
-            break
+        # The loop condition `end_idx == num_frames` is good for breaking.
+
+    # --- START CRITICAL FIXES FOR NAMEERROR AND ROBUSTNESS ---
+
+    # Check if any frames were successfully generated and collected in `results`.
+    if not results:
+        logger.warning(f"No frames were successfully generated for {input_video_path} after inference. Skipping video output.")
+        if update_info_callback:
+            update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength)
+        return False
 
     frames_output = torch.cat(results, dim=0).cpu()
 
-    # Crop the output to the original dimensions before tiling
-    # This assumes pad_for_tiling added padding at the bottom/right.
-    # The dimensions here should match `frames_warpped_raw` or `frames_left_original` for the height/width.
-    frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
+    # Initialize frames_output_final defensively.
+    frames_output_final: Optional[torch.Tensor] = None
+
+    # Check for valid dimensions before cropping
+    # frames_output.shape[0] will be the number of frames from `torch.cat(results)`
+    if frames_output.numel() > 0 and frames_output.shape[2] >= target_output_h and frames_output.shape[3] >= target_output_w:
+        # Crop the output to the original, unpadded dimensions for this section
+        frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
+    else:
+        logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {target_output_h}x{target_output_w}) for {input_video_path}. Skipping video output.")
+        if update_info_callback:
+            update_info_callback(base_video_name, "N/A", "0 (Crop Error)", overlap, original_input_blend_strength)
+        return False
+
+    # Initialize final_output_frames_for_encoding defensively
+    final_output_frames_for_encoding: Optional[torch.Tensor] = None
 
     if is_dual_input:
-        # Output only the inpainted right eye
-        final_video_frames_np = (frames_output_final * 255).permute(0, 2, 3, 1).byte().numpy()
+        final_output_frames_for_encoding = frames_output_final # (T, C, H, W) float 0-1
     else:
-        # Output SBS: Original Left | Inpainted Right
-        # Ensure frames_left_original is in the correct format (0-1 float)
+        # Ensure frames_left_original is valid for SBS concatenation
+        if frames_left_original is None or frames_left_original.numel() == 0:
+            logger.error(f"Original left frames are missing or empty for non-dual input {input_video_path}. Cannot create SBS output. Skipping video output.")
+            if update_info_callback:
+                update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
+            return False
+        
         frames_left_original_normalized = frames_left_original.float() / 255.0
+        
+        # Ensure dimensions match for concatenation (time, channel, height should match)
+        if frames_left_original_normalized.shape[0] != frames_output_final.shape[0] or \
+           frames_left_original_normalized.shape[1] != frames_output_final.shape[1] or \
+           frames_left_original_normalized.shape[2] != frames_output_final.shape[2]:
+            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_normalized.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
+            if update_info_callback:
+                update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
+            return False
 
         sbs_frames = torch.cat([frames_left_original_normalized, frames_output_final], dim=3)
-        final_video_frames_np = (sbs_frames * 255).permute(0, 2, 3, 1).byte().numpy()
+        final_output_frames_for_encoding = sbs_frames
 
-    write_video_ffmpeg(
-        frames=final_video_frames_np,
-        fps=fps,
-        output_path=output_video_path,
-        vf=vf if vf else None,
-        codec="libx264",
-        crf=16,
-        preset="ultrafast",
-    )
+    # Final check: ensure the tensor to be encoded is actually populated
+    if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
+        logger.error(f"Final output frames for encoding are empty or None after preparation for {input_video_path}. Skipping video output.")
+        if update_info_callback:
+            update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength)
+        return False
+
+    # --- END CRITICAL FIXES ---
+
+    # --- START NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding ---
+    temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
+    os.makedirs(temp_png_dir, exist_ok=True)
+    logger.info(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
+
+    total_output_frames = final_output_frames_for_encoding.shape[0]
+    try:
+        for frame_idx in range(total_output_frames):
+            if stop_event and stop_event.is_set():
+                logger.info(f"Stopping PNG sequence saving for {input_video_path}")
+                return False
+
+            frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
+            frame_np = frame_tensor.permute(1, 2, 0).numpy() # (H, W, C) float 0-1
+
+            # Convert to 16-bit
+            frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
+            
+            # Convert to BGR for OpenCV (OpenCV uses BGR by default for imwrite)
+            # Assuming the pipeline output is RGB (common for image models)
+            frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
+
+            png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
+            cv2.imwrite(png_path, frame_bgr)
+            draw_progress_bar(frame_idx + 1, total_output_frames)
+        logger.info(f"\nFinished saving {total_output_frames} PNG frames.")
+
+        # --- Construct FFmpeg Command ---
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y", # Overwrite output files without asking
+            "-framerate", str(fps), # Use the detected FPS
+            "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence
+        ]
+
+        # Default output parameters
+        output_codec = "libx264"
+        output_pix_fmt = "yuv420p"
+        output_crf = "23" # Default CRF for SDR x264 (lower is better quality)
+        output_profile = "main"
+        x265_params = [] # For HDR metadata
+
+        if video_stream_info:
+            logger.info(f"Applying color metadata from source: {video_stream_info}")
+            input_pix_fmt = video_stream_info.get("pix_fmt", "")
+            color_primaries = video_stream_info.get("color_primaries")
+            transfer_characteristics = video_stream_info.get("transfer_characteristics")
+            color_space = video_stream_info.get("color_space")
+
+            # Determine HDR status
+            is_hdr_source = (color_primaries == "bt2020" and transfer_characteristics == "smpte2084")
+
+            # Determine if original source was 10-bit or higher
+            is_original_10bit_or_higher = "10" in input_pix_fmt or "12" in input_pix_fmt or "16" in input_pix_fmt
+
+            if is_hdr_source:
+                logger.info("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
+                output_codec = "libx265"
+                output_pix_fmt = "yuv420p10le"
+                output_crf = "28" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
+                output_profile = "main10"
+                
+                # Add HDR mastering display and CLL metadata
+                mastering_display = video_stream_info.get("mastering_display_metadata")
+                max_cll = video_stream_info.get("max_content_light_level")
+                if mastering_display:
+                    x265_params.append(f"master-display={mastering_display}")
+                if max_cll:
+                    x265_params.append(f"max-cll={max_cll}")
+            elif is_original_10bit_or_higher and video_stream_info.get("codec_name") == "hevc":
+                logger.info("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
+                output_codec = "libx265"
+                output_pix_fmt = "yuv420p10le"
+                output_crf = "24" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
+                output_profile = "main10"
+            else: # SDR 8-bit, or other source codecs
+                logger.info("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
+                output_codec = "libx264"
+                output_pix_fmt = "yuv420p"
+                output_crf = "18" # Higher quality CRF for SDR H.264 (lower is better quality)
+                output_profile = "main"
+
+            # Apply general color flags if present
+            if color_primaries:
+                ffmpeg_cmd.extend(["-color_primaries", color_primaries])
+            if transfer_characteristics:
+                ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
+            if color_space:
+                ffmpeg_cmd.extend(["-colorspace", color_space])
+
+        # Add codec, profile, pix_fmt, and CRF
+        ffmpeg_cmd.extend([
+            "-c:v", output_codec,
+            "-profile:v", output_profile,
+            "-pix_fmt", output_pix_fmt,
+            "-crf", output_crf,
+        ])
+        
+        if x265_params:
+            ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
+
+        # Final output path
+        ffmpeg_cmd.append(output_video_path)
+
+        logger.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        # Update GUI status for encoding phase
+        if update_info_callback:
+            update_info_callback(base_video_name, f"Encoding {output_codec}...", total_output_frames, overlap, original_input_blend_strength)
+
+        subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24h timeout
+        logger.info(f"Successfully encoded video to {output_video_path}")
+
+    except FileNotFoundError:
+        messagebox.showerror("Error", "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
+        logger.error("FFmpeg not found in PATH.")
+        return False
+    except subprocess.CalledProcessError as e:
+        messagebox.showerror("Error", f"FFmpeg encoding failed for {base_video_name}:\n{e.stderr}\n{e.stdout}")
+        logger.error(f"FFmpeg encoding failed for {base_video_name}: {e.stderr}\n{e.stdout}")
+        return False
+    except subprocess.TimeoutExpired as e:
+        messagebox.showerror("Error", f"FFmpeg encoding timed out for {base_video_name}:\n{e.stderr}")
+        logger.error(f"FFmpeg encoding timed out for {base_video_name}: {e.stderr}")
+        return False
+    except Exception as e:
+        messagebox.showerror("Error", f"An unexpected error occurred during encoding for {base_video_name}: {str(e)}")
+        logger.error(f"Unexpected error during encoding for {base_video_name}: {e}", exc_info=True)
+        return False
+    finally:
+        # Cleanup temporary PNGs
+        if os.path.exists(temp_png_dir):
+            try:
+                shutil.rmtree(temp_png_dir)
+                logger.info(f"Cleaned up temporary directory: {temp_png_dir}")
+            except Exception as e:
+                logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
+    # --- END NEW ---
 
     logger.info(f"Done processing {input_video_path} -> {output_video_path}")
     return True
+
+def get_video_stream_info(video_path: str) -> Optional[dict]:
+    """
+    Extracts video stream metadata using ffprobe.
+    Returns a dict with relevant color properties or None if not found/error.
+    """
+    try:
+        # Check if ffprobe is available
+        subprocess.run(["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
+    except FileNotFoundError:
+        messagebox.showerror("Error", "ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running ffprobe check: {e.stderr}")
+        messagebox.showerror("Error", "ffprobe failed to run. Please check your FFmpeg installation.")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("ffprobe check timed out.")
+        messagebox.showerror("Error", "ffprobe check timed out. Please ensure FFmpeg is installed and responsive.")
+        return None
+
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+        "-show_entries", "side_data=mastering_display_metadata,max_content_light_level",
+        "-of", "json",
+        video_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
+        data = json.loads(result.stdout)
+        
+        stream_info = {}
+        if "streams" in data and len(data["streams"]) > 0:
+            s = data["streams"][0]
+            for key in ["codec_name", "profile", "pix_fmt", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
+                if key in s:
+                    stream_info[key] = s[key]
+
+        if "side_data_list" in data:
+            for sd in data["side_data_list"]:
+                if "mastering_display_metadata" in sd:
+                    stream_info["mastering_display_metadata"] = sd["mastering_display_metadata"]
+                if "max_content_light_level" in sd:
+                    stream_info["max_content_light_level"] = sd["max_content_light_level"]
+
+        # Filter out empty strings/None values and return
+        filtered_info = {k: v for k, v in stream_info.items() if v}
+        return filtered_info if filtered_info else None
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"ffprobe failed for {video_path}:\n{e.stderr}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error(f"ffprobe timed out for {video_path}.")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
+        return None
+
+def draw_progress_bar(current, total, bar_length=50):
+    """Draws an ASCII progress bar."""
+    if total == 0: # Avoid division by zero
+        print(f"Progress: [Skipped (Total 0)]", end='\r')
+        return
+
+    fraction = current / total
+    arrow = int(fraction * bar_length - 1) * '-' + '>'
+    padding = int(bar_length - len(arrow)) * ' '
+    print(f"Progress: [{arrow + padding}] {int(fraction*100)}%", end='\r')
+    if current == total:
+        print() 
 
 class InpaintingGUI(tk.Tk):
     def __init__(self):
@@ -651,6 +920,12 @@ class InpaintingGUI(tk.Tk):
         self.video_frames_label = ttk.Label(info_frame, text="Frames: N/A")
         self.video_frames_label.pack(anchor="w", padx=5, pady=1)
 
+        self.video_overlap_label = ttk.Label(info_frame, text="Overlap: N/A")
+        self.video_overlap_label.pack(anchor="w", padx=5, pady=1)
+
+        self.video_bias_label = ttk.Label(info_frame, text="Input Bias: N/A")
+        self.video_bias_label.pack(anchor="w", padx=5, pady=1)
+
     def browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
         if folder:
@@ -664,10 +939,12 @@ class InpaintingGUI(tk.Tk):
     def update_status_label(self, message):
         self.status_label.config(text=message)
 
-    def update_video_info_display(self, name, resolution, frames):
+    def update_video_info_display(self, name, resolution, frames, overlap_val="N/A", bias_val="N/A"):
         self.video_name_label.config(text=f"Name: {name}")
         self.video_res_label.config(text=f"Resolution: {resolution}")
         self.video_frames_label.config(text=f"Frames: {frames}")
+        self.video_overlap_label.config(text=f"Overlap: {overlap_val}")
+        self.video_bias_label.config(text=f"Input Bias: {bias_val}")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
@@ -697,13 +974,17 @@ class InpaintingGUI(tk.Tk):
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.update_status_label("Starting processing...")
-        self.update_video_info_display("N/A", "N/A", "N/A") # Clear info on start
+        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
                          args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength),
                          daemon=True).start()
 
     def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength):
+        """
+        Orchestrates the batch processing of videos, handling sidecar JSON,
+        thread-safe GUI updates, and error management.
+        """
         try:
             self.pipeline = load_inpainting_pipeline(
                 pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
@@ -723,10 +1004,16 @@ class InpaintingGUI(tk.Tk):
             os.makedirs(finished_folder, exist_ok=True)
             os.makedirs(output_folder, exist_ok=True)
 
+            # Define a thread-safe wrapper for GUI updates
+            # This ensures that calls from the processing thread are marshaled back to the main Tkinter thread.
+            def _threaded_update_info_callback(name, resolution, frames, overlap_val, bias_val):
+                self.after(0, self.update_video_info_display, name, resolution, frames, overlap_val, bias_val)
+
             for idx, video_path in enumerate(input_videos):
                 if self.stop_event.is_set():
+                    logger.info("Processing stopped by user.")
                     break
-
+                
                 # Initialize current video's parameters with GUI fallbacks
                 current_overlap = gui_overlap
                 current_original_input_blend_strength = gui_original_input_blend_strength
@@ -739,7 +1026,6 @@ class InpaintingGUI(tk.Tk):
                             sidecar_data = json.load(f)
                         
                         if "frame_overlap" in sidecar_data:
-                            # Validate and use the sidecar value
                             sidecar_overlap = int(sidecar_data["frame_overlap"])
                             if sidecar_overlap >= 0:
                                 current_overlap = sidecar_overlap
@@ -748,7 +1034,6 @@ class InpaintingGUI(tk.Tk):
                                 logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
 
                         if "input_bias" in sidecar_data:
-                            # Validate and use the sidecar value
                             sidecar_input_bias = float(sidecar_data["input_bias"])
                             if 0.0 <= sidecar_input_bias <= 1.0:
                                 current_original_input_blend_strength = sidecar_input_bias
@@ -760,44 +1045,25 @@ class InpaintingGUI(tk.Tk):
                         logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
                 else:
                     logger.info(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
-                
-                # Get video info for display before processing
-                temp_frames, _ = read_video_frames(video_path)
-                current_video_name = os.path.basename(video_path)
-                current_num_frames = temp_frames.shape[0] if temp_frames.numel() > 0 else 0
-                current_display_res = "N/A"
-                if current_num_frames > 0:
-                    _, _, total_h, total_w = temp_frames.shape # Get total dimensions of the raw input video
-                    video_name_without_ext = os.path.splitext(current_video_name)[0]
-                    is_dual_input = video_name_without_ext.endswith("_splatted2")
 
-                    if is_dual_input:
-                        # For dual input (Mask | Warped), the output is the size of the warped half
-                        display_h = total_h
-                        display_w = total_w // 2
-                    else:
-                        # For quad input (Original, Depth, Mask, Warped), the output is the size of one of the quarters (e.g., warped)
-                        display_h = total_h // 2
-                        display_w = total_w // 2
-                    current_display_res = f"{display_w}x{display_h}"
-
-                self.after(0, self.update_video_info_display, current_video_name, current_display_res, current_num_frames)
+                # Update status label to indicate which video is starting processing
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
 
-                logger.info(f"Processing {video_path}")
+                logger.info(f"Starting processing of {video_path}")
                 completed = process_single_video(
                     pipeline=self.pipeline,
                     input_video_path=video_path,
                     save_dir=output_folder,
                     frames_chunk=frames_chunk,
-                    overlap=current_overlap,
-                    original_input_blend_strength=current_original_input_blend_strength,
+                    overlap=current_overlap, # Pass the (potentially overridden) overlap
                     tile_num=tile_num,
-                    vf=None,
+                    vf=None, # Keep as None, not actively used with new FFmpeg logic
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
-                    update_info_callback=None
+                    update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
+                    original_input_blend_strength=current_original_input_blend_strength # Pass the (potentially overridden) bias
                 )
+                
                 if completed:
                     try:
                         shutil.move(video_path, finished_folder)
@@ -805,13 +1071,16 @@ class InpaintingGUI(tk.Tk):
                     except Exception as e:
                         logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
                 else:
-                    logger.info(f"Processing of {video_path} was stopped")
+                    logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
+                
                 self.processed_count.set(idx + 1)
                 
             stopped = self.stop_event.is_set()
             self.after(0, lambda: self.processing_done(stopped))
+
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Error", f"An error occurred: {str(e)}"))
+            logger.exception("An unhandled error occurred during batch processing.") # Log full traceback
+            self.after(0, lambda: messagebox.showerror("Error", f"An error occurred during batch processing: {str(e)}"))
             self.after(0, self.processing_done)
 
     def stop_processing(self):
@@ -852,7 +1121,7 @@ class InpaintingGUI(tk.Tk):
         else:
             self.update_status_label("Processing completed.")
             
-        self.update_video_info_display("N/A", "N/A", "N/A") # Clear info after completion
+        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
     def exit_application(self):
         config = {
