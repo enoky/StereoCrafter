@@ -1,7 +1,6 @@
 import os
 import glob
 import json
-import logging
 import shutil
 import threading
 import tkinter as tk
@@ -13,55 +12,18 @@ import torch
 from decord import VideoReader, cpu
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-import imageio_ffmpeg # This might still be used for other things, keep it.
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid
 )
 
 # torch.backends.cudnn.benchmark = True
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- Tooltip Class ---
-class Tooltip:
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tooltip_window = None
-        self.widget.bind("<Enter>", self.show_tooltip)
-        self.widget.bind("<Leave>", self.hide_tooltip)
-        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
-
-    def show_tooltip(self, event=None):
-        if self.tooltip_window or not self.text:
-            return
-        # Adjust position slightly for better visibility
-        x, y, _, _ = self.widget.bbox("insert")
-        x += self.widget.winfo_rootx() + 25
-        y += self.widget.winfo_rooty() + 20
-
-        self.tooltip_window = Toplevel(self.widget)
-        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
-        self.tooltip_window.wm_geometry(f"+{x}+{y}")
-
-        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
-                      font=("tahoma", "8", "normal"), justify="left", wraplength=250)
-        label.pack(ipadx=1)
-
-    def hide_tooltip(self, event=None):
-        if self.tooltip_window:
-            self.tooltip_window.destroy()
-        self.tooltip_window = None
-# --- END Tooltip Class ---
-
 
 def load_inpainting_pipeline(
     pre_trained_path: str,
@@ -139,13 +101,13 @@ def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor,
                 fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
             else:
                 fps = float(r_frame_rate_str[0])
-            logger.info(f"Using ffprobe FPS: {fps:.2f} for {os.path.basename(video_path)}")
+            logger.debug(f"Using ffprobe FPS: {fps:.2f} for {os.path.basename(video_path)}")
         except (ValueError, ZeroDivisionError):
             fps = video_reader.get_avg_fps()
             logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord FPS: {fps:.2f}")
     else:
         fps = video_reader.get_avg_fps()
-        logger.info(f"Using Decord FPS: {fps:.2f} for {os.path.basename(video_path)}")
+        logger.debug(f"Using Decord FPS: {fps:.2f} for {os.path.basename(video_path)}")
 
     frames = video_reader.get_batch(range(num_frames))
     frames = torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
@@ -198,7 +160,7 @@ def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128))
     pad_right = max(0, ideal_W - W)
 
     if pad_bottom > 0 or pad_right > 0:
-        logger.info(f"Padding frames from ({H}x{W}) to ({H+pad_bottom}x{W+pad_right}) for tiling.")
+        logger.debug(f"Padding frames from ({H}x{W}) to ({H+pad_bottom}x{W+pad_right}) for tiling.")
         frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
     return frames
 
@@ -474,7 +436,7 @@ def process_single_video(
                 
                 del prev_gen_overlap_frames
 
-        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting inference for chunk {i}-{end_idx} (padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
+        logger.info(f"Starting inference for chunk {i}-{end_idx} (padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
         start_time = time.time()
 
         with torch.no_grad():
@@ -503,7 +465,7 @@ def process_single_video(
 
         end_time = time.time()
         inference_duration = end_time - start_time
-        logger.info(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
+        logger.debug(f"Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
         
         video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
         current_chunk_generated_frames = []
@@ -586,13 +548,13 @@ def process_single_video(
     # --- START NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding ---
     temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
     os.makedirs(temp_png_dir, exist_ok=True)
-    logger.info(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
+    logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
 
     total_output_frames = final_output_frames_for_encoding.shape[0]
     try:
         for frame_idx in range(total_output_frames):
             if stop_event and stop_event.is_set():
-                logger.info(f"Stopping PNG sequence saving for {input_video_path}")
+                logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
                 return False
 
             frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
@@ -608,7 +570,7 @@ def process_single_video(
             png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
             cv2.imwrite(png_path, frame_bgr)
             draw_progress_bar(frame_idx + 1, total_output_frames)
-        logger.info(f"\nFinished saving {total_output_frames} PNG frames.")
+        logger.debug(f"\nFinished saving {total_output_frames} PNG frames.")
 
         # --- Construct FFmpeg Command ---
         ffmpeg_cmd = [
@@ -626,7 +588,7 @@ def process_single_video(
         x265_params = [] # For HDR metadata
 
         if video_stream_info:
-            logger.info(f"Applying color metadata from source: {video_stream_info}")
+            logger.debug(f"Applying color metadata from source: {video_stream_info}")
             input_pix_fmt = video_stream_info.get("pix_fmt", "")
             color_primaries = video_stream_info.get("color_primaries")
             transfer_characteristics = video_stream_info.get("transfer_characteristics")
@@ -639,7 +601,7 @@ def process_single_video(
             is_original_10bit_or_higher = "10" in input_pix_fmt or "12" in input_pix_fmt or "16" in input_pix_fmt
 
             if is_hdr_source:
-                logger.info("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
+                logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
                 output_crf = "28" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
@@ -653,13 +615,13 @@ def process_single_video(
                 if max_cll:
                     x265_params.append(f"max-cll={max_cll}")
             elif is_original_10bit_or_higher and video_stream_info.get("codec_name") == "hevc":
-                logger.info("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
+                logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
                 output_crf = "24" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
                 output_profile = "main10"
             else: # SDR 8-bit, or other source codecs
-                logger.info("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
+                logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
                 output_codec = "libx264"
                 output_pix_fmt = "yuv420p"
                 output_crf = "18" # Higher quality CRF for SDR H.264 (lower is better quality)
@@ -687,13 +649,13 @@ def process_single_video(
         # Final output path
         ffmpeg_cmd.append(output_video_path)
 
-        logger.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
         # Update GUI status for encoding phase
         if update_info_callback:
             update_info_callback(base_video_name, f"Encoding {output_codec}...", total_output_frames, overlap, original_input_blend_strength)
 
         subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24h timeout
-        logger.info(f"Successfully encoded video to {output_video_path}")
+        logger.debug(f"Successfully encoded video to {output_video_path}")
 
     except FileNotFoundError:
         messagebox.showerror("Error", "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
@@ -716,7 +678,7 @@ def process_single_video(
         if os.path.exists(temp_png_dir):
             try:
                 shutil.rmtree(temp_png_dir)
-                logger.info(f"Cleaned up temporary directory: {temp_png_dir}")
+                logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
             except Exception as e:
                 logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
     # --- END NEW ---
@@ -724,102 +686,26 @@ def process_single_video(
     logger.info(f"Done processing {input_video_path} -> {output_video_path}")
     return True
 
-def get_video_stream_info(video_path: str) -> Optional[dict]:
-    """
-    Extracts video stream metadata using ffprobe.
-    Returns a dict with relevant color properties or None if not found/error.
-    """
-    try:
-        # Check if ffprobe is available
-        subprocess.run(["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
-    except FileNotFoundError:
-        messagebox.showerror("Error", "ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error running ffprobe check: {e.stderr}")
-        messagebox.showerror("Error", "ffprobe failed to run. Please check your FFmpeg installation.")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("ffprobe check timed out.")
-        messagebox.showerror("Error", "ffprobe check timed out. Please ensure FFmpeg is installed and responsive.")
-        return None
-
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,r_frame_rate",
-        "-show_entries", "side_data=mastering_display_metadata,max_content_light_level",
-        "-of", "json",
-        video_path
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
-        data = json.loads(result.stdout)
-        
-        stream_info = {}
-        if "streams" in data and len(data["streams"]) > 0:
-            s = data["streams"][0]
-            for key in ["codec_name", "profile", "pix_fmt", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
-                if key in s:
-                    stream_info[key] = s[key]
-
-        if "side_data_list" in data:
-            for sd in data["side_data_list"]:
-                if "mastering_display_metadata" in sd:
-                    stream_info["mastering_display_metadata"] = sd["mastering_display_metadata"]
-                if "max_content_light_level" in sd:
-                    stream_info["max_content_light_level"] = sd["max_content_light_level"]
-
-        # Filter out empty strings/None values and return
-        filtered_info = {k: v for k, v in stream_info.items() if v}
-        return filtered_info if filtered_info else None
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffprobe failed for {video_path}:\n{e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error(f"ffprobe timed out for {video_path}.")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
-        return None
-
-def draw_progress_bar(current, total, bar_length=50):
-    """Draws an ASCII progress bar."""
-    if total == 0: # Avoid division by zero
-        print(f"Progress: [Skipped (Total 0)]", end='\r')
-        return
-
-    fraction = current / total
-    arrow = int(fraction * bar_length - 1) * '-' + '>'
-    padding = int(bar_length - len(arrow)) * ' '
-    print(f"Progress: [{arrow + padding}] {int(fraction*100)}%", end='\r')
-    if current == total:
-        print() 
-
 class InpaintingGUI(tk.Tk):
+    
     def __init__(self):
         super().__init__()
-        self.title("Batch Video Inpainting")
+        self.title("Batch Video Inpainting")   
         # Adjusted geometry to accommodate new widgets
-        self.geometry("600x550") # Increased height from 400 to 550
-        self.config = self.load_config()
+        self.geometry("600x590") # Increased height from 400 to 550
+        self.app_config = self.load_config()
         # NEW: Load help data from renamed file
         self.help_data = self.load_help_data()
 
-        self.input_folder_var = tk.StringVar(value=self.config.get("input_folder", "./output_splatted"))
-        self.output_folder_var = tk.StringVar(value=self.config.get("output_folder", "./completed_output"))
-        self.num_inference_steps_var = tk.StringVar(value=str(self.config.get("num_inference_steps", 5)))
-        self.tile_num_var = tk.StringVar(value=str(self.config.get("tile_num", 2)))
-        self.frames_chunk_var = tk.StringVar(value=str(self.config.get("frames_chunk", 23)))
+        self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
+        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
+        self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
+        self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
+        self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
         # Renamed variable key for consistency
-        self.overlap_var = tk.StringVar(value=str(self.config.get("frame_overlap", 3)))
-        self.original_input_blend_strength_var = tk.StringVar(value=str(self.config.get("original_input_blend_strength", 0.5))) # Default to 0.5
-        self.offload_type_var = tk.StringVar(value=self.config.get("offload_type", "model"))
+        self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
+        self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5))) # Default to 0.5
+        self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
         self.stop_event = threading.Event()
@@ -830,6 +716,15 @@ class InpaintingGUI(tk.Tk):
         self.update_status_label("Ready")
 
     def create_widgets(self):
+        
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+
+        option_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Option", menu=option_menu)
+        option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
+        option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+
         folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
         folder_frame.pack(fill="x", padx=10, pady=5)
         folder_frame.grid_columnconfigure(1, weight=1)
@@ -925,6 +820,65 @@ class InpaintingGUI(tk.Tk):
 
         self.video_bias_label = ttk.Label(info_frame, text="Input Bias: N/A")
         self.video_bias_label.pack(anchor="w", padx=5, pady=1)
+
+    def reset_to_defaults(self):
+        if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
+            return
+
+        # Set default values for all your configuration variables
+        self.input_folder_var.set("./output_splatted")
+        self.output_folder_var.set("./completed_output")
+        self.num_inference_steps_var.set("5")
+        self.tile_num_var.set("2")
+        self.frames_chunk_var.set("23")
+        self.overlap_var.set("3")
+        self.original_input_blend_strength_var.set("0.5")
+        self.offload_type_var.set("model")
+
+        self.save_config() # Save these new default settings
+        messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
+        logger.info("GUI settings reset to defaults.")
+
+    def restore_finished_files(self):
+        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folder back to the input directory?"):
+            return
+
+        input_folder = self.input_folder_var.get()
+        finished_folder = os.path.join(input_folder, "finished")
+
+        if not os.path.isdir(finished_folder):
+            messagebox.showinfo("Restore Info", f"The 'finished' folder does not exist at '{finished_folder}'. No files to restore.")
+            logger.info(f"Restore finished: 'finished' folder not found at {finished_folder}")
+            return
+
+        restored_count = 0
+        errors_count = 0
+        
+        # Collect files to move first, to avoid issues if the directory changes during iteration
+        files_to_move = [f for f in os.listdir(finished_folder) if os.path.isfile(os.path.join(finished_folder, f))]
+
+        if not files_to_move:
+            messagebox.showinfo("Restore Info", "No files found in the 'finished' folder to restore.")
+            logger.info(f"Restore finished: No files found in {finished_folder}")
+            return
+
+        for filename in files_to_move:
+            src_path = os.path.join(finished_folder, filename)
+            dest_path = os.path.join(input_folder, filename)
+            try:
+                shutil.move(src_path, dest_path)
+                restored_count += 1
+                logger.info(f"Moved '{filename}' from '{finished_folder}' to '{input_folder}'")
+            except Exception as e:
+                errors_count += 1
+                logger.error(f"Error moving file '{filename}' during restore: {e}")
+
+        if restored_count > 0 or errors_count > 0:
+            messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
+            logger.info(f"Restore complete: {restored_count} files moved, {errors_count} errors.")
+        else:
+            messagebox.showinfo("Restore Complete", "No files found to restore.")
+            logger.info("Restore complete: No files found to restore.")
 
     def browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
@@ -1029,7 +983,7 @@ class InpaintingGUI(tk.Tk):
                             sidecar_overlap = int(sidecar_data["frame_overlap"])
                             if sidecar_overlap >= 0:
                                 current_overlap = sidecar_overlap
-                                logger.info(f"Using frame_overlap from sidecar: {current_overlap}")
+                                logger.debug(f"Using frame_overlap from sidecar: {current_overlap}")
                             else:
                                 logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
 
@@ -1037,14 +991,14 @@ class InpaintingGUI(tk.Tk):
                             sidecar_input_bias = float(sidecar_data["input_bias"])
                             if 0.0 <= sidecar_input_bias <= 1.0:
                                 current_original_input_blend_strength = sidecar_input_bias
-                                logger.info(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
+                                logger.debug(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
                             else:
                                 logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
 
                     except (json.JSONDecodeError, ValueError) as e:
                         logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
                 else:
-                    logger.info(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
+                    logger.debug(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
 
                 # Update status label to indicate which video is starting processing
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
@@ -1067,7 +1021,7 @@ class InpaintingGUI(tk.Tk):
                 if completed:
                     try:
                         shutil.move(video_path, finished_folder)
-                        logger.info(f"Moved {video_path} to {finished_folder}")
+                        logger.debug(f"Moved {video_path} to {finished_folder}")
                     except Exception as e:
                         logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
                 else:
@@ -1088,7 +1042,7 @@ class InpaintingGUI(tk.Tk):
         if self.pipeline:
             # Attempt to clear CUDA cache if pipeline exists
             try:
-                torch.cuda.empty_cache()
+                release_cuda_memory()
             except RuntimeError as e:
                 logger.warning(f"Failed to clear CUDA cache: {e}")
         self.update_status_label("Stopping...")
@@ -1109,7 +1063,7 @@ class InpaintingGUI(tk.Tk):
             # Ensure pipeline is properly released and cache cleared
             try:
                 del self.pipeline
-                torch.cuda.empty_cache()
+                release_cuda_memory()
             except RuntimeError as e:
                 logger.warning(f"Failed to clear CUDA cache during cleanup: {e}")
             self.pipeline = None
@@ -1124,22 +1078,7 @@ class InpaintingGUI(tk.Tk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
     def exit_application(self):
-        config = {
-            "input_folder": self.input_folder_var.get(),
-            "output_folder": self.output_folder_var.get(),
-            "num_inference_steps": self.num_inference_steps_var.get(),
-            "tile_num": self.tile_num_var.get(),
-            "offload_type": self.offload_type_var.get(),
-            "frames_chunk": self.frames_chunk_var.get(),
-            # Renamed config key to match GUI and help file
-            "frame_overlap": self.overlap_var.get(),
-            "original_input_blend_strength": self.original_input_blend_strength_var.get()             
-        }
-        try:
-            with open("config_inpaint.json", "w") as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            messagebox.showwarning("Warning", f"Failed to save config: {str(e)}")
+        self.save_config() 
         self.destroy()
 
     def load_config(self):
@@ -1159,6 +1098,24 @@ class InpaintingGUI(tk.Tk):
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding inpaint_help.json: {e}")
             return {}
+
+    def save_config(self):
+        config = {
+            "input_folder": self.input_folder_var.get(),
+            "output_folder": self.output_folder_var.get(),
+            "num_inference_steps": self.num_inference_steps_var.get(),
+            "tile_num": self.tile_num_var.get(),
+            "offload_type": self.offload_type_var.get(),
+            "frames_chunk": self.frames_chunk_var.get(),
+            "frame_overlap": self.overlap_var.get(),
+            "original_input_blend_strength": self.original_input_blend_strength_var.get()             
+        }
+        try:
+            with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
+                json.dump(config, f, indent=4)
+            logger.info("Configuration saved successfully.")
+        except Exception as e:
+            logger.warning(f"Failed to save config: {e}", exc_info=True)
 
     def show_general_help(self):
         help_text = self.help_data.get("general_help", "No general help information available.")

@@ -15,11 +15,13 @@ import json
 import threading
 import queue
 import subprocess
-import time
 from typing import Optional
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
+from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
+                                           check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE
+                                           )
 
 # torch.backends.cudnn.benchmark = True
 
@@ -30,61 +32,12 @@ processing_thread = None
 help_texts = {} # Dictionary to store help texts
 CUDA_AVAILABLE = False # NEW: Global flag for CUDA availability
 
-class Tooltip:
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tip_window = None
-        self.widget.bind("<Enter>", self.show_tip)
-        self.widget.bind("<Leave>", self.hide_tip)
-
-    def show_tip(self, event=None):
-        if self.tip_window or not self.text:
-            return
-        x, y, _, _ = self.widget.bbox("insert")
-        x += self.widget.winfo_rootx() + 25
-        y += self.widget.winfo_rooty() + self.widget.winfo_height() + 1
-        self.tip_window = tk.Toplevel(self.widget)
-        self.tip_window.wm_overrideredirect(True)
-        self.tip_window.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(self.tip_window, text=self.text, background="#ffffe0", relief=tk.SOLID, borderwidth=1,
-                         font=("tahoma", "8", "normal"), wraplength=300)
-        label.pack(ipadx=1)
-
-    def hide_tip(self, event=None):
-        if self.tip_window:
-            self.tip_window.destroy()
-        self.tip_window = None
-
 def create_hover_tooltip(widget, key):
     if key in help_texts:
         Tooltip(widget, help_texts[key])
 
 def round_to_nearest_64(value):
     return max(64, round(value / 64) * 64)
-
-def draw_progress_bar(current_progress, total_progress, bar_length=50, prefix='Progress:', suffix=''): # Changed default suffix
-    """
-    Draws an ASCII progress bar in the console, overwriting the same line.
-    Adds a newline only when 100% complete.
-    """
-    if total_progress == 0:
-        percent = 100
-    else:
-        percent = 100 * (current_progress / float(total_progress))
-    filled_length = int(round(bar_length * current_progress / float(total_progress)))
-    bar = '█' * filled_length + '-' * (bar_length - filled_length)
-    
-    # Format the suffix for completion
-    actual_suffix = suffix
-    if current_progress == total_progress:
-        actual_suffix = "Complete"
-
-    print(f'\r{prefix} |{bar}| {percent:.1f}% {actual_suffix}', end='\r')
-
-    # Add a final newline only when the progress is 100% to ensure subsequent prints are on a new line
-    if current_progress == total_progress:
-        print()
 
 def clear_processing_info():
     """Resets all 'Current Processing Information' labels to default 'N/A'."""
@@ -95,93 +48,6 @@ def clear_processing_info():
     processing_convergence_var.set("N/A")
     processing_task_name_var.set("N/A")
 
-def check_cuda_availability():
-    """
-    Checks if CUDA is available via PyTorch and if nvidia-smi can run.
-    Sets the global CUDA_AVAILABLE flag.
-    """
-    global CUDA_AVAILABLE
-    if torch.cuda.is_available():
-        print("==> PyTorch reports CUDA is available.")
-        # Further check with nvidia-smi for robustness, though torch.cuda.is_available is often enough.
-        try:
-            subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding='utf-8')
-            # print("==> CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
-            CUDA_AVAILABLE = True
-        except FileNotFoundError:
-            # print("==> Warning: nvidia-smi not found. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
-            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi not found
-        except subprocess.CalledProcessError:
-            # print("==> Warning: nvidia-smi failed. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
-            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi fails
-        except subprocess.TimeoutExpired:
-            # print("==> Warning: nvidia-smi timed out. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
-            CUDA_AVAILABLE = True # Rely on PyTorch if nvidia-smi times out
-        except Exception as e:
-            print(f"==> Unexpected error during nvidia-smi check: {e}. Relying on PyTorch's report for CUDA.")
-            CUDA_AVAILABLE = True # Rely on PyTorch as a fallback
-    else:
-        # print("==> PyTorch reports CUDA is NOT available. NVENC will not be used.")
-        CUDA_AVAILABLE = False
-
-def get_video_stream_info(video_path): # RENAMED FUNCTION
-    """
-    Uses ffprobe to extract comprehensive video stream information, including
-    color space, codec, pixel format, and HDR mastering metadata.
-    Returns a dictionary or None if ffprobe fails/info not found.
-    Requires ffprobe to be installed and in PATH.
-    """
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0", # Select the first video stream
-        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,mastering_display_metadata,max_content_light_level", # ADDED entries
-        "-of", "json",
-        video_path
-    ]
-    # print(f"==> Running ffprobe command: {' '.join(cmd)}")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8')
-        ffprobe_stdout = result.stdout.strip()
-        ffprobe_stderr = result.stderr.strip()
-
-        if ffprobe_stdout:
-            # print(f"==> ffprobe stdout: {ffprobe_stdout}")
-            output = json.loads(ffprobe_stdout)
-            if "streams" in output and len(output["streams"]) > 0:
-                # Store all stream info, then filter out 'N/A'/'und'
-                stream_info = output["streams"][0]
-                filtered_stream_info = {k: v for k, v in stream_info.items() if v not in ["N/A", "und", ""] and v is not None}
-                if filtered_stream_info:
-                    # print(f"==> Detected video stream info for '{os.path.basename(video_path)}': {filtered_stream_info}")
-                    return filtered_stream_info
-                else:
-                    # print(f"==> ffprobe found stream but no specific video metadata for '{os.path.basename(video_path)}'.")
-                    return None
-            else:
-                print(f"==> ffprobe output had no 'streams' or no video stream detected for '{os.path.basename(video_path)}'.")
-                return None
-        else:
-            print(f"==> ffprobe returned empty stdout for '{os.path.basename(video_path)}'.")
-            if ffprobe_stderr:
-                print(f"==> ffprobe stderr: {ffprobe_stderr}")
-            return None
-    except FileNotFoundError:
-        print("==> Error: ffprobe not found. Please ensure FFmpeg is installed and in your system's PATH.")
-        messagebox.showerror("FFprobe Error", "ffprobe not found. Please install FFmpeg and ensure it's in your system's PATH to detect video stream information.")
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"==> Error running ffprobe for '{os.path.basename(video_path)}': {e.returncode}")
-        # print(f"==> ffprobe stderr: {e.stderr}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"==> Error decoding ffprobe JSON output for '{os.path.basename(video_path)}': {e}")
-        # print(f"==> Raw ffprobe stdout that failed JSON decoding: {ffprobe_stdout}")
-        return None
-    except Exception as e:
-        print(f"==> An unexpected error occurred during ffprobe execution: {e}")
-        return None
-    
 def read_video_frames(video_path, process_length, target_fps,
                       set_pre_res, pre_res_width, pre_res_height, dataset="open"):
     """
@@ -189,10 +55,10 @@ def read_video_frames(video_path, process_length, target_fps,
     Resolution is determined by set_pre_res, otherwise original resolution is used.
     """
     if dataset == "open":
-        # print(f"==> Processing video: {video_path}")
+        logger.debug(f"==> Processing video: {video_path}")
         vid_info = VideoReader(video_path, ctx=cpu(0))
         original_height, original_width = vid_info.get_batch([0]).shape[1:3]
-        # print(f"==> Original video shape: {len(vid_info)} frames, {original_height}x{original_width} per frame")
+        logger.debug(f"==> Original video shape: {len(vid_info)} frames, {original_height}x{original_width} per frame")
 
         height_for_processing = original_height
         width_for_processing = original_width
@@ -201,10 +67,10 @@ def read_video_frames(video_path, process_length, target_fps,
             # User specified pre-processing resolution
             height_for_processing = pre_res_height
             width_for_processing = pre_res_width
-            # print(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
+            logger.debug(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
         else:
             # If set_pre_res is False, use original resolution.
-            print(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
+            logger.debug(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
 
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
@@ -214,14 +80,14 @@ def read_video_frames(video_path, process_length, target_fps,
     fps = vid.get_avg_fps() if target_fps == -1 else target_fps
     stride = max(round(vid.get_avg_fps() / fps), 1)
     frames_idx = list(range(0, len(vid), stride))
-    # print(f"==> Downsampled to {len(frames_idx)} frames with stride {stride}")
+    logger.debug(f"==> Downsampled to {len(frames_idx)} frames with stride {stride}")
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
 
     # Verify the actual shape after Decord processing
     first_frame_shape = vid.get_batch([0]).shape
     actual_processed_height, actual_processed_width = first_frame_shape[1:3]
-    # print(f"==> Final processing shape: {len(frames_idx)} frames, {actual_processed_height}x{actual_processed_width} per frame")
+    logger.debug(f"==> Final processing shape: {len(frames_idx)} frames, {actual_processed_height}x{actual_processed_width} per frame")
 
     frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
 
@@ -259,7 +125,7 @@ class ForwardWarpStereo(nn.Module):
 
 def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
                    dual_output: bool, zero_disparity_anchor_val: float, video_stream_info: Optional[dict],frame_overlap: Optional[int], input_bias: Optional[float]):
-    # print("==> Initializing ForwardWarpStereo module")
+    logger.debug("==> Initializing ForwardWarpStereo module")
     stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
 
     num_frames = len(input_frames_processed)
@@ -286,7 +152,7 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     # NEW: Use a temporary directory for PNG sequences
     temp_png_dir = os.path.join(os.path.dirname(final_output_video_path), "temp_splat_pngs_" + os.path.basename(os.path.splitext(output_video_path)[0]))
     os.makedirs(temp_png_dir, exist_ok=True)
-    # print(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
+    logger.debug(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
 
     # Process only up to process_length if specified, for consistency
     if process_length != -1 and process_length < num_frames:
@@ -299,7 +165,7 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     frame_count = 0 # To name PNGs sequentially
     
     # Add a single startup message
-    # print(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
+    logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
     # Initial draw of the progress bar
     draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:") # Indent slightly
     
@@ -359,14 +225,14 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
 
     # <--- THESE TWO LINES MUST BE OUTSIDE THE 'for i' loop
-    # print(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
+    logger.debug(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
     
     del stereo_projector
     torch.cuda.empty_cache()
     gc.collect()
 
     # --- FFmpeg encoding from PNG sequence to final MP4 ---
-    # print(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
+    logger.debug(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
     ffmpeg_cmd = [
         "ffmpeg",
         "-y", # Overwrite output files without asking
@@ -382,11 +248,11 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     if original_pix_fmt:
         if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
             is_original_10bit_or_higher = True
-            # print(f"==> Detected original video pixel format: {original_pix_fmt} (>= 10-bit)")
+            logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (>= 10-bit)")
         else:
-            print(f"==> Detected original video pixel format: {original_pix_fmt} (< 10-bit)")
+            logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (< 10-bit)")
     else:
-        print("==> Could not detect original video pixel format.")
+        logger.debug("==> Could not detect original video pixel format.")
 
     # --- Determine Output Codec, Bit-Depth, and Quality ---
     # Set sensible defaults first
@@ -406,18 +272,18 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
     if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
        video_stream_info.get("transfer_characteristics") == "smpte2084":
         is_hdr_source = True
-        # print("==> Source detected as HDR.")
+        logger.debug("==> Source detected as HDR.")
 
     # Main logic for choosing output format based on detected info (always attempt smart matching)
     if video_stream_info: # Only proceed with smart matching if info is detected
-        # print("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
+        logger.debug("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
 
         if is_hdr_source:
-            # print("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
+            logger.debug("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
             output_codec = "libx265" # Default to CPU x265
             if CUDA_AVAILABLE:
                 output_codec = "hevc_nvenc" # Use NVENC if available
-                # print("    (Using hevc_nvenc for hardware acceleration)")
+                logger.debug("    (Using hevc_nvenc for hardware acceleration)")
             
             output_pix_fmt = "yuv420p10le"
             output_crf = "28" # This CRF value is for CPU x265, will use nvenc_cq for NVENC
@@ -426,40 +292,40 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
             if video_stream_info.get("mastering_display_metadata"):
                 md_meta = video_stream_info["mastering_display_metadata"]
                 x265_params.append(f"mastering-display={md_meta}") # These are for x265, not nvenc directly.
-                # print(f"==> Adding mastering display metadata: {md_meta}")
+                logger.debug(f"==> Adding mastering display metadata: {md_meta}")
             if video_stream_info.get("max_content_light_level"):
                 max_cll_meta = video_stream_info["max_content_light_level"]
                 x265_params.append(f"max-cll={max_cll_meta}") # These are for x265, not nvenc directly.
-                # print(f"==> Adding max content light level: {max_cll_meta}")
+                logger.debug(f"==> Adding max content light level: {max_cll_meta}")
 
         elif original_codec_name == "hevc" and is_original_10bit_or_higher:
-            print("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
+            logger.debug("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
             output_codec = "libx265" # Default to CPU x265
             if CUDA_AVAILABLE:
                 output_codec = "hevc_nvenc" # Use NVENC if available
-                # print("    (Using hevc_nvenc for hardware acceleration)")
+                logger.debug("    (Using hevc_nvenc for hardware acceleration)")
             
             output_pix_fmt = "yuv420p10le"
             output_crf = "24" # For CPU x265
             output_profile = "main10"
 
         else: # If not HDR/HEVC 10-bit, default to H.264 high quality
-            print("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
+            logger.debug("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
             output_codec = "libx264" # Default to CPU x264
             if CUDA_AVAILABLE:
                 output_codec = "h264_nvenc" # Use NVENC if available
-                print("    (Using h264_nvenc for hardware acceleration)")
+                logger.debug("    (Using h264_nvenc for hardware acceleration)")
             
             output_pix_fmt = "yuv420p"
             output_crf = "18" # For CPU x264
             output_profile = "main"
 
     else: # video_stream_info is None (fallback behavior if no info detected)
-        print("==> No source video stream info detected. Falling back to default H.264 (x264) 8-bit SDR (medium quality).")
+        logger.debug("==> No source video stream info detected. Falling back to default H.264 (x264) 8-bit SDR (medium quality).")
         # Defaults already set at the top of this block (libx264, yuv420p, CRF 23, profile main)
         if CUDA_AVAILABLE:
             output_codec = "h264_nvenc" # Use NVENC if CUDA available for default H.264
-            print("    (Using h264_nvenc for hardware acceleration for default output)")
+            logger.debug("    (Using h264_nvenc for hardware acceleration for default output)")
 
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
@@ -499,27 +365,27 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
 
     ffmpeg_cmd.append(final_output_video_path)
 
-    # print(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
+    logger.debug(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
 
     try:
         ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24 hour timeout
-        # print(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
-        # print(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
-        # print(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
+        logger.debug(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
+        logger.debug(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
+        logger.debug(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
     except FileNotFoundError:
-        print("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
+        logger.error("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
         messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
     except subprocess.CalledProcessError as e:
-        print(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
-        # print(f"==> FFmpeg stdout: {e.stdout}")
-        # print(f"==> FFmpeg stderr: {e.stderr}")
-        print("==> Final video encoding failed due to ffmpeg error.")
+        logger.error(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
+        logger.error(f"==> FFmpeg stdout: {e.stdout}")
+        logger.error(f"==> FFmpeg stderr: {e.stderr}")
+        logger.error("==> Final video encoding failed due to ffmpeg error.")
     except subprocess.TimeoutExpired:
-        print(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
+        logger.error(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
     except Exception as e:
-        print(f"==> An unexpected error occurred during ffmpeg execution: {e}")
+        logger.error(f"==> An unexpected error occurred during ffmpeg execution: {e}")
 
-    # print(f"==> Final output video written to: {final_output_video_path}")
+    logger.debug(f"==> Final output video written to: {final_output_video_path}")
 
     # NEW: Create a sidecar JSON for the splatted output
     output_sidecar_data = {}
@@ -540,19 +406,19 @@ def DepthSplatting(input_frames_processed, processed_fps, output_video_path, vid
         try:
             with open(output_sidecar_path, 'w') as f:
                 json.dump(output_sidecar_data, f, indent=4)
-            print(f"==> Created output sidecar JSON: {output_sidecar_path}")
+            logger.debug(f"==> Created output sidecar JSON: {output_sidecar_path}")
         except Exception as e:
-            print(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
+            logger.error(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
 
     # Clean up temporary PNG directory
     if os.path.exists(temp_png_dir):
         try:
             shutil.rmtree(temp_png_dir)
-            # print(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
+            logger.debug(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
         except Exception as e:
-            print(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
+            logger.error(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
 
-    # print(f"==> Final output video written to: {final_output_video_path}")
+    logger.debug(f"==> Final output video written to: {final_output_video_path}")
 
 def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True, enable_autogain=True):
     """
@@ -562,7 +428,7 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
     If autogain is disabled, MP4 depth maps are scaled to 0-1 based on their detected bit depth (8-bit -> /255, 10-bit -> /1023).
     For NPZ with autogain disabled, it assumes the data is already in the desired absolute range (e.g., 0-1).
     """
-    # print(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
+    logger.debug(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
 
     video_depth_working_range = None # This will hold the float32 array before final normalization/scaling
 
@@ -573,7 +439,7 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
         raw_frames_data = vid[:].asnumpy().astype("float32")
 
         if raw_frames_data.shape[-1] == 3:
-            # print("==> Converting RGB depth frames to grayscale")
+            logger.debug("==> Converting RGB depth frames to grayscale")
             raw_frames_data = raw_frames_data.mean(axis=-1)
         else:
             raw_frames_data = raw_frames_data.squeeze(-1)
@@ -587,10 +453,10 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
             # This logic assumes common bit-depth ranges for MP4 depth maps.
             max_raw_value_in_content = np.max(raw_frames_data)
             if max_raw_value_in_content > 255 and max_raw_value_in_content <= 1023: # Heuristic for 10-bit range
-                print(f"==> Autogain disabled. Detected potential 10-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 1023.0.")
+                logger.debug(f"==> Autogain disabled. Detected potential 10-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 1023.0.")
                 video_depth_working_range = raw_frames_data / 1023.0
             else: # Assume 8-bit or standard 0-255 range
-                print(f"==> Autogain disabled. Detected potential 8-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 255.0.")
+                logger.debug(f"==> Autogain disabled. Detected potential 8-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 255.0.")
                 video_depth_working_range = raw_frames_data / 255.0
 
     elif depth_map_path.lower().endswith('.npz'):
@@ -601,7 +467,7 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
                 # For NPZ, if autogain is off, we *assume* it's already 0-1 or has an absolute meaning.
                 # If NPZ data is NOT already 0-1 and needs a fixed scaling (e.g., from 0-1000 to 0-1),
                 # the user would need to preprocess the NPZ or a new GUI setting for NPZ absolute scaling factor would be required.
-                print("==> Autogain disabled for NPZ. Assuming depth data is already in desired absolute range (e.g., 0-1).")
+                logger.debug("==> Autogain disabled for NPZ. Assuming depth data is already in desired absolute range (e.g., 0-1).")
         else:
             raise ValueError("NPZ file does not contain a 'depth' array.")
     else:
@@ -616,19 +482,19 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
         video_depth_max = video_depth_working_range.max()
         if video_depth_max - video_depth_min > 1e-5:
             video_depth_normalized = (video_depth_working_range - video_depth_min) / (video_depth_max - video_depth_min)
-            # print(f"==> Depth maps autogained (min-max scaled) from observed range [{video_depth_min:.3f}, {video_depth_max:.3f}] to [0, 1].")
+            logger.debug(f"==> Depth maps autogained (min-max scaled) from observed range [{video_depth_min:.3f}, {video_depth_max:.3f}] to [0, 1].")
         else:
             video_depth_normalized = np.zeros_like(video_depth_working_range)
-            print("==> Depth map range too small, setting to zeros after autogain.")
+            logger.debug("==> Depth map range too small, setting to zeros after autogain.")
     else:
         # Autogain is disabled; video_depth_working_range already contains absolute 0-1 for MP4, or assumed for NPZ.
         video_depth_normalized = video_depth_working_range
-        # print("==> Autogain (min-max scaling) disabled. Depth maps are used with their absolute scaling.")
+        logger.debug("==> Autogain (min-max scaling) disabled. Depth maps are used with their absolute scaling.")
 
 
     # Resize logic remains the same as before
     if match_resolution_to_target and target_height > 0 and target_width > 0:
-        # print(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
+        logger.debug(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
         resized_depths = []
         resized_viss = []
         for i in range(video_depth_normalized.shape[0]):
@@ -645,21 +511,13 @@ def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1,
         video_depth = np.stack(resized_depths, axis=0)
         depth_vis = np.stack(resized_viss, axis=0)
     else:
-        print(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
+        logger.debug(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
         video_depth = video_depth_normalized
         # Visualization: Ensure 0-1 range for colormap if autogain is off and values might naturally exceed 1.
         depth_vis = np.stack([cv2.applyColorMap((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
 
-    # print("==> Depth maps and visualizations loaded successfully")
+    logger.debug("==> Depth maps and visualizations loaded successfully")
     return video_depth, depth_vis
-
-def release_resources():
-    try:
-        torch.cuda.empty_cache()
-        gc.collect()
-        print("==> VRAM and resources released")
-    except Exception as e:
-        print(f"==> Error releasing VRAM: {e}")
 
 def main(settings):
     input_source_clips_path_setting = settings["input_source_clips"]
@@ -694,11 +552,11 @@ def main(settings):
 
     if is_source_file and is_depth_file:
         is_single_file_mode = True
-        print("==> Running in single file mode. Files will not be moved to 'finished' folders.")
+        logger.debug("==> Running in single file mode. Files will not be moved to 'finished' folders.")
         input_videos.append(input_source_clips_path_setting)
         os.makedirs(output_splatted, exist_ok=True)
     elif is_source_dir and is_depth_dir:
-        print("==> Running in batch (folder) mode.")
+        logger.debug("==> Running in batch (folder) mode.")
         finished_source_folder = os.path.join(input_source_clips_path_setting, "finished")
         finished_depth_folder = os.path.join(input_depth_maps_path_setting, "finished")
         os.makedirs(finished_source_folder, exist_ok=True)
@@ -710,15 +568,15 @@ def main(settings):
             input_videos.extend(glob.glob(os.path.join(input_source_clips_path_setting, ext)))
         input_videos = sorted(input_videos)
     else:
-        print("==> Error: Input Source Clips and Input Depth Maps must both be either files or directories. Skipping processing.")
+        logger.error("==> Error: Input Source Clips and Input Depth Maps must both be either files or directories. Skipping processing.")
         progress_queue.put("finished")
-        release_resources()
+        release_cuda_memory()
         return
 
     if not input_videos:
-        print(f"No video files found in {input_source_clips_path_setting}")
+        logger.error(f"No video files found in {input_source_clips_path_setting}")
         progress_queue.put("finished")
-        release_resources()
+        release_cuda_memory()
         return
 
     # Determine total tasks for the progress bar
@@ -729,9 +587,9 @@ def main(settings):
         total_processing_tasks_count += len(input_videos)
 
     if total_processing_tasks_count == 0:
-        print("==> Error: No resolution output enabled. Processing stopped.")
+        logger.error("==> Error: No resolution output enabled. Processing stopped.")
         progress_queue.put("finished")
-        release_resources()
+        release_cuda_memory()
         return
 
     progress_queue.put(("total", total_processing_tasks_count))
@@ -739,14 +597,14 @@ def main(settings):
 
     for idx, video_path in enumerate(input_videos):
         if stop_event.is_set():
-            print("==> Stopping processing due to user request")
-            release_resources()
+            logger.info("==> Stopping processing due to user request")
+            release_cuda_memory()
             progress_queue.put("finished")
             root.after(0, clear_processing_info) # Clear on stop
             return
 
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        # print(f"\n==> Processing Video: {video_name}")
+        logger.info(f"==> Processing Video: {video_name}")
 
         
         # NEW: Update filename immediately
@@ -763,7 +621,7 @@ def main(settings):
         if is_single_file_mode:
             actual_depth_map_path = input_depth_maps_path_setting
             if not os.path.exists(actual_depth_map_path):
-                 print(f"==> Error: Single depth map file '{actual_depth_map_path}' not found. Skipping this video.")
+                 logger.error(f"==> Error: Single depth map file '{actual_depth_map_path}' not found. Skipping this video.")
                  progress_queue.put(("processed", overall_task_counter)) # Still update to indicate skipping
                  continue
         else: # Batch mode
@@ -790,40 +648,40 @@ def main(settings):
 
                     if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
                         current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                        # print(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
+                        logger.debug(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
                         anchor_source = "JSON"
                     else:
-                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                        logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
                         anchor_source = "GUI (Invalid JSON)"
 
                     if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
                         current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                        # print(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
+                        logger.debug(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
                         max_disp_source = "JSON"
                     else:
-                        print(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
+                        logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
                         max_disp_source = "GUI (Invalid JSON)"
 
                     # NEW: Retrieve frame_overlap and input_bias
                     if "frame_overlap" in sidecar_data and isinstance(sidecar_data["frame_overlap"], (int, float)):
                         current_frame_overlap = int(sidecar_data["frame_overlap"])
-                        # print(f"==> Using frame_overlap from sidecar JSON '{json_sidecar_path}': {current_frame_overlap}")
+                        logger.debug(f"==> Using frame_overlap from sidecar JSON '{json_sidecar_path}': {current_frame_overlap}")
 
                     if "input_bias" in sidecar_data and isinstance(sidecar_data["input_bias"], (int, float)):
                         current_input_bias = float(sidecar_data["input_bias"])
-                        # print(f"==> Using input_bias from sidecar JSON '{json_sidecar_path}': {current_input_bias:.2f}")
+                        logger.debug(f"==> Using input_bias from sidecar JSON '{json_sidecar_path}': {current_input_bias:.2f}")
 
                 except json.JSONDecodeError:
-                    print(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                    logger.error(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
                     # Do NOT put detailed info into "status"
                 except Exception as e:
-                    print(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                    logger.error(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
                     # progress_queue.put(("status", f"Video {idx+1}/{len(input_videos)}: (GUI Anchor:{current_zero_disparity_anchor:.2f}, GUI MaxDisp:{current_max_disparity_percentage:.1f}%)"))
             else:
-                print(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.debug(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
                 # Do NOT put detailed info into "status"
         else:
-            print(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
+            logger.error(f"==> Error: No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz' in folder mode. Skipping this video.")
             progress_queue.put(("processed", overall_task_counter))
             continue
 
@@ -849,19 +707,19 @@ def main(settings):
             })
 
         if not processing_tasks:
-            print(f"==> No processing tasks configured for {video_name}. Skipping.")
+            logger.debug(f"==> No processing tasks configured for {video_name}. Skipping.")
             progress_queue.put(("processed", overall_task_counter))
             continue
 
         for task_num, task in enumerate(processing_tasks):
             if stop_event.is_set():
-                print(f"==> Stopping {task['name']} processing for {video_name} due to user request")
-                release_resources()
+                logger.info(f"==> Stopping {task['name']} processing for {video_name} due to user request")
+                release_cuda_memory()
                 progress_queue.put("finished")
                 root.after(0, clear_processing_info) # Clear on stop
                 return
 
-            print(f"\n==> Starting {task['name']} pass for {video_name}")
+            logger.debug(f"\n==> Starting {task['name']} pass for {video_name}")
 
             # NEW: Set a general status message for the GUI progress bar
             progress_queue.put(("status", f"Processing {task['name']} for {video_name}"))
@@ -886,7 +744,7 @@ def main(settings):
                 set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
                 )
             except Exception as e:
-                print(f"==> Error reading input video {video_path} for {task['name']} pass: {e}. Skipping this pass.")
+                logger.error(f"==> Error reading input video {video_path} for {task['name']} pass: {e}. Skipping this pass.")
                 overall_task_counter += 1
                 progress_queue.put(("processed", overall_task_counter))
                 continue # Skip to next task
@@ -910,20 +768,20 @@ def main(settings):
                     enable_autogain=settings["enable_autogain"]
                 )
             except Exception as e:
-                print(f"==> Error loading depth map for {video_name} {task['name']} pass: {e}. Skipping this pass.")
+                logger.error(f"==> Error loading depth map for {video_name} {task['name']} pass: {e}. Skipping this pass.")
                 overall_task_counter += 1
                 progress_queue.put(("processed", overall_task_counter))
                 continue
 
             if video_depth is None or depth_vis is None:
-                print(f"==> Skipping {video_name} {task['name']} pass due to depth load failure or stop request.")
+                logger.info(f"==> Skipping {video_name} {task['name']} pass due to depth load failure or stop request.")
                 overall_task_counter += 1
                 progress_queue.put(("processed", overall_task_counter))
                 continue
 
             # Ensure depth map matches current processed video frames (safeguard)
             if not (video_depth.shape[1] == current_processed_height and video_depth.shape[2] == current_processed_width):
-                print(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. Attempting final resize as safeguard.")
+                logger.warning(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. Attempting final resize as safeguard.")
                 resized_video_depth = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
                 resized_depth_vis = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
                 video_depth = resized_video_depth
@@ -932,7 +790,7 @@ def main(settings):
             # Use the (potentially overridden) current_max_disparity_percentage
             actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
             actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_processed_width
-            print(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels")
+            logger.debug(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels")
 
             
             # NEW: Update disparity display with calculated pixel value
@@ -961,18 +819,18 @@ def main(settings):
                 input_bias=current_input_bias
             )
             if stop_event.is_set():
-                print(f"==> Stopping {task['name']} pass for {video_name} due to user request")
-                release_resources()
+                logger.info(f"==> Stopping {task['name']} pass for {video_name} due to user request")
+                release_cuda_memory()
                 progress_queue.put("finished")
                 return
 
-            # print(f"==> Splatted {task['name']} video saved for {video_name}.")
+            logger.debug(f"==> Splatted {task['name']} video saved for {video_name}.")
 
             # Release resources after EACH pass to manage VRAM
-            release_resources()
+            release_cuda_memory()
             overall_task_counter += 1
             progress_queue.put(("processed", overall_task_counter))
-            print(f"==> Completed {task['name']} pass for {video_name}.")
+            logger.debug(f"==> Completed {task['name']} pass for {video_name}.")
 
         # --- End of all tasks for a single video. Now move files if not single file mode. ---
         if not stop_event.is_set() and not is_single_file_mode:
@@ -980,17 +838,17 @@ def main(settings):
             if finished_source_folder is not None:
                 try:
                     shutil.move(video_path, finished_source_folder)
-                    # print(f"==> Moved processed video to: {finished_source_folder}")
+                    logger.debug(f"==> Moved processed video to: {finished_source_folder}")
                 except Exception as e:
-                    print(f"==> Failed to move video {video_path}: {e}")
+                    logger.error(f"==> Failed to move video {video_path}: {e}")
             else:
-                print(f"==> Cannot move source video: 'finished_source_folder' is not set.")
+                logger.warning(f"==> Cannot move source video: 'finished_source_folder' is not set.")
 
             # Move depth map and its sidecar JSON
             if actual_depth_map_path and os.path.exists(actual_depth_map_path) and finished_depth_folder is not None:
                 try:
                     shutil.move(actual_depth_map_path, finished_depth_folder)
-                    # print(f"==> Moved depth map to: {finished_depth_folder}")
+                    logger.debug(f"==> Moved depth map to: {finished_depth_folder}")
 
                     # Logic to move the sidecar JSON file
                     # Reconstruct the sidecar path based on the depth map's original location
@@ -1001,21 +859,21 @@ def main(settings):
 
                     if os.path.exists(json_sidecar_path_to_move):
                         shutil.move(json_sidecar_path_to_move, finished_depth_folder)
-                        # print(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
+                        logger.debug(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
                     else:
-                        print(f"==> No sidecar JSON '{json_sidecar_path_to_move}' found to move.")
+                        logger.debug(f"==> No sidecar JSON '{json_sidecar_path_to_move}' found to move.")
 
                 except Exception as e:
-                    print(f"==> Failed to move depth map {actual_depth_map_path} or its sidecar: {e}")
+                    logger.error(f"==> Failed to move depth map {actual_depth_map_path} or its sidecar: {e}")
             elif actual_depth_map_path and finished_depth_folder is None:
-                print(f"==> Cannot move depth map: 'finished_depth_folder' is not set.")
+                logger.info(f"==> Cannot move depth map: 'finished_depth_folder' is not set.")
         elif is_single_file_mode:
-            print(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
+            logger.debug(f"==> Single file mode for {video_name}: Skipping moving files to 'finished' folder.")
 
-    release_resources()
+    release_cuda_memory()
     root.after(0, clear_processing_info) # NEW: Clear info labels when all processing finished
     progress_queue.put("finished")
-    print("\n==> Batch Depth Splatting Process Completed Successfully")
+    logger.info("==> Batch Depth Splatting Process Completed Successfully")
 
 def browse_folder(var):
     current_path = var.get()
@@ -1125,11 +983,11 @@ def exit_app():
     save_config()
     stop_event.set()
     if processing_thread and processing_thread.is_alive():
-        print("==> Waiting for processing thread to finish...")
+        logger.info("==> Waiting for processing thread to finish...")
         processing_thread.join(timeout=5.0)  # Give thread a chance to terminate
         if processing_thread.is_alive():
-            print("==> Thread did not terminate gracefully within timeout.")
-    release_resources()
+            logger.debug("==> Thread did not terminate gracefully within timeout.")
+    release_cuda_memory()
     root.destroy()
 
 def check_queue():
@@ -1229,7 +1087,7 @@ def restore_finished_files():
     
     # Restore Source Clips
     if os.path.isdir(finished_source_folder):
-        print(f"==> Restoring source clips from: {finished_source_folder}")
+        logger.info(f"==> Restoring source clips from: {finished_source_folder}")
         for filename in os.listdir(finished_source_folder):
             src_path = os.path.join(finished_source_folder, filename)
             dest_path = os.path.join(source_clip_dir, filename)
@@ -1237,16 +1095,16 @@ def restore_finished_files():
                 try:
                     shutil.move(src_path, dest_path)
                     restored_count += 1
-                    # print(f"Moved '{filename}' to '{source_clip_dir}'")
+                    logger.debug(f"Moved '{filename}' to '{source_clip_dir}'")
                 except Exception as e:
                     errors_count += 1
-                    print(f"Error moving source clip '{filename}': {e}")
+                    logger.error(f"Error moving source clip '{filename}': {e}")
     else:
-        print(f"==> Finished source folder not found: {finished_source_folder}")
+        logger.info(f"==> Finished source folder not found: {finished_source_folder}")
 
     # Restore Depth Maps and Sidecar JSONs
     if os.path.isdir(finished_depth_folder):
-        print(f"==> Restoring depth maps and sidecars from: {finished_depth_folder}")
+        logger.info(f"==> Restoring depth maps and sidecars from: {finished_depth_folder}")
         for filename in os.listdir(finished_depth_folder):
             src_path = os.path.join(finished_depth_folder, filename)
             dest_path = os.path.join(depth_map_dir, filename)
@@ -1254,12 +1112,12 @@ def restore_finished_files():
                 try:
                     shutil.move(src_path, dest_path)
                     restored_count += 1
-                    # print(f"Moved '{filename}' to '{depth_map_dir}'")
+                    logger.debug(f"Moved '{filename}' to '{depth_map_dir}'")
                 except Exception as e:
                     errors_count += 1
-                    print(f"Error moving depth map/sidecar '{filename}': {e}")
+                    logger.error(f"Error moving depth map/sidecar '{filename}': {e}")
     else:
-        print(f"==> Finished depth folder not found: {finished_depth_folder}")
+        logger.info(f"==> Finished depth folder not found: {finished_depth_folder}")
 
     if restored_count > 0 or errors_count > 0:
         clear_processing_info() # NEW: Clear info display on restore completion
@@ -1276,10 +1134,10 @@ def load_help_texts():
         with open(os.path.join("dependency", "splatter_help.json"), "r") as f:
             help_texts = json.load(f)
     except FileNotFoundError:
-        print("Error: splatter_help.json not found. Tooltips will not be available.")
+        logger.error("Error: splatter_help.json not found. Tooltips will not be available.")
         help_texts = {}
     except json.JSONDecodeError:
-        print("Error: Could not decode splatter_help.json. Check file format.")
+        logger.error("Error: Could not decode splatter_help.json. Check file format.")
         help_texts = {}
 
 def save_config():
