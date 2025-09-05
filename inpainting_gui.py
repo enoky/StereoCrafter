@@ -1151,10 +1151,10 @@ class InpaintingGUI(tk.Tk):
 
     def load_help_data(self):
         try:
-            with open("inpaint_help.json", "r", encoding="utf-8") as f:
+            with open(os.path.join("dependency", "inpaint_help.json"), "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
-            logger.warning("inpaint_help.json not found. No help tips will be available.")
+            logger.warning("dependency/inpaint_help.json not found. No help tips will be available.")
             return {}
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding inpaint_help.json: {e}")
