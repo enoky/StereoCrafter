@@ -1273,7 +1273,7 @@ def restore_finished_files():
 def load_help_texts():
     global help_texts
     try:
-        with open("splatter_help.json", "r") as f:
+        with open(os.path.join("dependency", "splatter_help.json"), "r") as f:
             help_texts = json.load(f)
     except FileNotFoundError:
         print("Error: splatter_help.json not found. Tooltips will not be available.")
