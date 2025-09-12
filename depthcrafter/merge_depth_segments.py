@@ -1,20 +1,14 @@
 import argparse
-import json # Keep for direct use if utils.load_json_file is not used everywhere (it is, mostly)
+import json
 import os
 import numpy as np
 import shutil 
 import sys
 import time 
-import message_catalog
-from typing import Optional
+import logging # Import standard logging
 
-# Import from the new message catalog
-from message_catalog import (
-    log_message,
-    set_console_verbosity, # For __main__
-    INFO, DEBUG, WARNING, ERROR, CRITICAL, # Severity levels
-    VERBOSITY_LEVEL_INFO, VERBOSITY_LEVEL_DEBUG, VERBOSITY_LEVEL_SILENT # Verbosity levels for __main__
-)
+# Configure a logger for this module
+_logger = logging.getLogger(__name__)
 
 from depthcrafter import dav_util as util
 from depthcrafter import utils as dc_utils
@@ -22,9 +16,10 @@ from depthcrafter.utils import (
     normalize_video_data,
     apply_gamma_correction_to_video,
     apply_dithering_to_video,
-    load_json_file, # Uses global log_message
+    load_json_file,
 )
 import imageio
+from typing import Optional
 
 _HAS_OPENEXR = False
 try:
@@ -32,15 +27,15 @@ try:
     import Imath
     _HAS_OPENEXR = True
 except ImportError:
-    log_message("OPENEXR_UNAVAILABLE", context="merge_depth_segments.py")
+    _logger.warning("OpenEXR/Imath libraries not found. EXR features will be limited/unavailable. Context: merge_depth_segments.py")
 
 
 def save_single_frame_exr(frame_data: np.ndarray, output_path: str):
     if not _HAS_OPENEXR:
-        log_message("MERGE_SAVE_EXR_NO_LIB_ERROR") # New ID
+        _logger.error("OpenEXR/Imath libraries not found by save_single_frame_exr. Cannot save EXR.")
         raise RuntimeError("OpenEXR/Imath libraries not found. Cannot save EXR.")
     if frame_data.ndim != 2:
-        log_message("MERGE_SAVE_EXR_INVALID_DIMS_ERROR", shape=frame_data.shape) # New ID
+        _logger.error(f"Frame data for EXR must be 2D (H, W). Got shape: {frame_data.shape}")
         raise ValueError(f"Frame data must be 2D (H, W) for EXR saving. Got shape: {frame_data.shape}")
     
     height, width = frame_data.shape
@@ -54,34 +49,33 @@ def save_single_frame_exr(frame_data: np.ndarray, output_path: str):
         exr_file.close()
 
 def _load_and_validate_metadata(master_meta_path: str):
-    log_message("MERGE_METADATA_LOAD_ATTEMPT", path=master_meta_path) # New ID
-    meta_data = load_json_file(master_meta_path) # Uses global log_message
+    _logger.debug(f"Loading merge metadata from: {master_meta_path}")
+    meta_data = load_json_file(master_meta_path)
     if not meta_data:
-        # Error logged by load_json_file or a generic error if it raised something else
         raise FileNotFoundError(f"Failed to load or parse master metadata file: {master_meta_path}")
 
     if not meta_data.get("global_processing_settings", {}).get("processed_as_segments"):
-        log_message("MERGE_METADATA_NOT_SEGMENTED_ERROR", path=master_meta_path) # New ID
+        _logger.critical(f"'processed_as_segments' is not true in metadata: {master_meta_path}. Aborting merge.")
         raise ValueError("'processed_as_segments' is not true in metadata.")
 
     global_settings = meta_data.get("global_processing_settings", {})
     N_overlap_from_meta = global_settings.get("segment_definition_output_overlap_frames")
     if N_overlap_from_meta is None:
-        log_message("MERGE_METADATA_NO_OVERLAP_ERROR", path=master_meta_path) # New ID
+        _logger.critical(f"'segment_definition_output_overlap_frames' not found in metadata: {master_meta_path}. Aborting merge.")
         raise ValueError("'segment_definition_output_overlap_frames' not found.")
-    log_message("MERGE_METADATA_OVERLAP_INFO", overlap=N_overlap_from_meta) # New ID
+    _logger.debug(f"Defined overlap frames (N_overlap) from metadata: {N_overlap_from_meta}")
 
     jobs_info = meta_data.get("jobs_info", [])
     if not jobs_info:
-        log_message("MERGE_METADATA_NO_JOBS_WARN", path=master_meta_path) # New ID
+        _logger.warning(f"Warning: No job segments found in metadata: {master_meta_path}.")
     
     successful_jobs_info = [job for job in jobs_info if job.get("status") == "success" and job.get("output_segment_filename")]
     if not successful_jobs_info:
-        log_message("MERGE_METADATA_NO_SUCCESSFUL_JOBS_ERROR", path=master_meta_path) # New ID
+        _logger.critical(f"No successful segments found in metadata to merge: {master_meta_path}.")
         raise ValueError("No successful segments found in metadata to merge.")
         
     sorted_jobs_info = sorted(successful_jobs_info, key=lambda x: x.get("segment_id", -1))
-    log_message("MERGE_METADATA_SUCCESSFUL_JOBS_COUNT", count=len(sorted_jobs_info)) # New ID
+    _logger.debug(f"Found {len(sorted_jobs_info)} successful segments to process from metadata.")
     base_dir = os.path.dirname(master_meta_path) if master_meta_path and os.path.dirname(master_meta_path) else "."
     return meta_data, N_overlap_from_meta, sorted_jobs_info, base_dir
 
@@ -92,33 +86,33 @@ def _load_single_segment_frames(job_meta: dict, base_dir: str):
     segment_path = os.path.join(base_dir, segment_filename)
 
     if not os.path.exists(segment_path):
-        log_message("FILE_NOT_FOUND", filepath=segment_path)
+        _logger.error(f"File not found: {segment_path}")
         raise FileNotFoundError(f"Segment file not found: {segment_path}.")
 
     if input_segment_format != "npz":
-        log_message("MERGE_SEGMENT_UNSUPPORTED_FORMAT_ERROR", format=input_segment_format, filename=segment_filename) # New ID
+        _logger.critical(f"Unsupported segment format '{input_segment_format}' for {segment_filename}. Expecting NPZ.")
         raise ValueError(f"Unsupported segment format '{input_segment_format}'. Expecting NPZ.")
     
     try:
         with np.load(segment_path) as data:
             if 'frames' not in data.files:
-                log_message("NPZ_LOAD_KEY_ERROR", key='frames', filepath=segment_path)
+                _logger.error(f"Key 'frames' not found in NPZ: {segment_path}")
                 raise KeyError(f"Key 'frames' not found in NPZ: {segment_path}.")
             frames = data['frames']
     except Exception as e:
-        log_message("MERGE_SEGMENT_LOAD_NPZ_ERROR", filepath=segment_path, error=str(e)) # New ID
+        _logger.critical(f"Could not load frames from NPZ {segment_path}: {e}")
         raise
 
     if frames is None or frames.size == 0:
-        log_message("MERGE_SEGMENT_EMPTY_ERROR", filename=segment_filename) # New ID
+        _logger.critical(f"Segment {segment_filename} is empty.")
         raise ValueError(f"Segment {segment_filename} is empty.")
 
     fps = float(processed_fps_from_meta) if processed_fps_from_meta else 30.0
-    log_message("MERGE_SINGLE_SEGMENT_LOAD_INFO", filename=segment_filename, shape=frames.shape, fps=fps) # New ID
+    _logger.debug(f"Single segment {segment_filename} loaded. Shape: {frames.shape}, FPS: {fps:.2f}")
     return frames.astype(np.float32), fps
 
 def _load_multiple_segments_data(sorted_jobs_info: list, base_dir: str):
-    log_message("MERGE_PASS_LOAD_SEGMENTS_START") # New ID
+    _logger.debug("\n--- Pass 1: Loading Segments ---")
     all_loaded_segments_frames = []
     segment_job_meta_map = []
     determined_fps = None
@@ -131,42 +125,40 @@ def _load_multiple_segments_data(sorted_jobs_info: list, base_dir: str):
         processed_fps_from_meta = job_meta.get("processed_at_fps")
 
         if processed_fps_from_meta is None:
-            log_message("MERGE_SEGMENT_MISSING_FPS_ERROR", segment_id=segment_id) # New ID
+            _logger.critical(f"'processed_at_fps' missing for segment ID {segment_id}.")
             raise ValueError(f"'processed_at_fps' missing for segment ID {segment_id}.")
         
         current_fps = float(processed_fps_from_meta)
         if determined_fps is None:
             determined_fps = current_fps
         elif abs(determined_fps - current_fps) > 1e-3:
-            log_message("MERGE_SEGMENT_INCONSISTENT_FPS_WARN", 
-                        expected_fps=determined_fps, segment_id=segment_id, actual_fps=current_fps) # New ID
+            _logger.warning(f"Warning: Inconsistent FPS. Using {determined_fps:.2f}. Segment {segment_id} has {current_fps:.2f}.")
 
-        log_message("MERGE_SEGMENT_LOADING_PROGRESS", segment_id=segment_id, current=idx+1, 
-                    total=len(sorted_jobs_info), filename=segment_filename) # New ID
+        _logger.debug(f"Loading segment {segment_id} ({idx+1}/{len(sorted_jobs_info)}): {segment_filename}")
         if input_segment_format != "npz":
-            log_message("MERGE_SEGMENT_UNSUPPORTED_FORMAT_ERROR", format=input_segment_format, filename=segment_filename)
+            _logger.critical(f"Unsupported segment format '{input_segment_format}' for {segment_filename}. Expecting NPZ.")
             raise ValueError(f"Unsupported segment format '{input_segment_format}' for {segment_filename}.")
         
         try:
             with np.load(segment_path) as data:
                 if 'frames' not in data.files:
-                    log_message("NPZ_LOAD_KEY_ERROR", key='frames', filepath=segment_path)
+                    _logger.error(f"Key 'frames' not found in NPZ: {segment_path}")
                     raise KeyError(f"Key 'frames' not found in NPZ: {segment_path}.")
                 frames = data['frames']
         except Exception as e:
-            log_message("MERGE_SEGMENT_LOAD_NPZ_ERROR", filepath=segment_path, error=str(e))
+            _logger.critical(f"Could not load frames from NPZ {segment_path}: {e}")
             raise
 
         if frames is None or frames.size == 0:
-            log_message("MERGE_SEGMENT_DATA_EMPTY_WARN", segment_id=segment_id, filename=segment_filename) # New ID
+            _logger.warning(f"Warning: Segment {segment_id} ({segment_filename}) data is empty. Skipping.")
             continue
         
         all_loaded_segments_frames.append(frames.astype(np.float32).copy())
         segment_job_meta_map.append(job_meta)
-        log_message("MERGE_SEGMENT_LOADED_FRAMES_INFO", num_frames=frames.shape[0], shape=frames.shape) # New ID
+        _logger.debug(f"  Loaded {frames.shape[0]} frames. Shape: {frames.shape}")
 
     if not all_loaded_segments_frames:
-        log_message("MERGE_NO_VALID_SEGMENTS_LOADED_ERROR") # New ID
+        _logger.critical("No valid segments loaded after filtering/loading.")
         raise ValueError("No valid segments loaded after filtering/loading.")
     
     return all_loaded_segments_frames, segment_job_meta_map, determined_fps
@@ -176,9 +168,9 @@ def _align_segments_data(all_loaded_segments_frames: list, segment_job_meta_map:
     if not all_loaded_segments_frames: return [] 
     if len(all_loaded_segments_frames) == 1: return all_loaded_segments_frames 
 
-    log_message("MERGE_PASS_ALIGN_SEGMENTS_START") # New ID
+    _logger.debug("\n--- Pass 1.5: Aligning Segments ---")
     all_aligned_segments_frames = [all_loaded_segments_frames[0].astype(np.float32)] 
-    log_message("MERGE_ALIGN_BASELINE_INFO", segment_id=segment_job_meta_map[0]['segment_id']) # New ID
+    _logger.debug(f"Segment 0 (ID {segment_job_meta_map[0]['segment_id']}) is baseline for alignment.")
 
     for idx in range(1, len(all_loaded_segments_frames)):
         current_raw = all_loaded_segments_frames[idx].astype(np.float32)
@@ -186,7 +178,7 @@ def _align_segments_data(all_loaded_segments_frames: list, segment_job_meta_map:
         current_id = segment_job_meta_map[idx]['segment_id']
         prev_id = segment_job_meta_map[idx-1]['segment_id']
         
-        log_message("MERGE_ALIGN_PROGRESS", current_id=current_id, prev_id=prev_id, method=merge_alignment_method) # New ID
+        _logger.debug(f"Aligning segment (ID {current_id}) to previous (ID {prev_id}). Method: {merge_alignment_method}")
         aligned_current = current_raw.copy()
 
         if N_overlap > 0:
@@ -204,51 +196,47 @@ def _align_segments_data(all_loaded_segments_frames: list, segment_job_meta_map:
                         target_align_frames.reshape(-1), 
                         mask
                     )
-                    log_message("MERGE_ALIGN_INFO", current_id=current_id, prev_id=prev_id, method="shift_scale", scale=s, t=t) # Using existing ID
+                    _logger.debug(f"Aligning segment {current_id} to {prev_id}. Method: shift_scale. Scale: {s:.4f}, Shift: {t:.4f}")
                     aligned_current = s * current_raw + t
                 elif merge_alignment_method.lower() == "linear_blend":
-                    log_message("MERGE_ALIGN_LINEAR_BLEND_SKIP_S_S", segment_id=current_id) # New ID
+                    _logger.debug(f"  Linear Blend: No explicit S&S alignment for segment ID {current_id}. Blending will occur in stitching.")
                 else:
-                    log_message("MERGE_ALIGN_UNKNOWN_METHOD_WARN", method=merge_alignment_method, segment_id=current_id) # New ID
+                    _logger.warning(f"CRITICAL WARNING: Unknown alignment method '{merge_alignment_method}'. No alignment performed on segment ID {current_id}.")
             else:
-                log_message("MERGE_NO_OVERLAP_ALIGN", prev_id=prev_id, current_id=current_id) # Using existing ID
+                _logger.debug(f"Warning: No actual overlap for alignment between {prev_id} and {current_id}. No S&S alignment performed.")
         else:
-            log_message("MERGE_ALIGN_NO_OVERLAP_SPECIFIED", segment_id=current_id) # New ID
+            _logger.debug(f"  N_overlap is 0. No explicit alignment for segment ID {current_id}.")
         all_aligned_segments_frames.append(aligned_current)
     return all_aligned_segments_frames
 
 
 def _stitch_and_blend_segments_data(all_aligned_segments: list, segment_job_meta_map: list, N_overlap: int):
     if not all_aligned_segments: 
-        log_message("MERGE_STITCH_NO_ALIGNED_SEGMENTS_ERROR") # New ID
+        _logger.critical("No aligned segments for stitching.")
         raise ValueError("No aligned segments for stitching.")
 
-    log_message("MERGE_PASS_STITCH_BLEND_START") # New ID
+    _logger.debug("\n--- Pass 2: Stitching and Blending Segments ---")
     final_frames_list = []
 
     if N_overlap == 0:
-        log_message("MERGE_STITCH_CONCATENATING_INFO") # New ID
+        _logger.debug("  N_overlap is 0. Concatenating segments.")
         for i, segment_frames in enumerate(all_aligned_segments):
             seg_id = segment_job_meta_map[i]['segment_id']
-            log_message("MERGE_STITCH_INFO", idx=i, seg_id=seg_id, count=len(segment_frames)) # Using existing ID
+            _logger.debug(f"Stitching segment {i} (ID: {seg_id}). Adding {len(segment_frames)} frames.")
             if len(segment_frames) > 0: final_frames_list.extend(list(segment_frames))
     else:
         for idx, current_segment_aligned in enumerate(all_aligned_segments):
             seg_id = segment_job_meta_map[idx]['segment_id']
-            log_message("MERGE_STITCH_PROGRESS", 
-                        current_segment_idx=idx, 
-                        current_segment_idx_plus_1=idx + 1, # <<< ADD THIS LINE
-                        total_segments=len(all_aligned_segments), 
-                        segment_id=seg_id)
+            _logger.debug(f"Stitching segment {idx} (ID {seg_id}; {idx + 1}/{len(all_aligned_segments)})")
             
             if len(current_segment_aligned) == 0:
-                log_message("MERGE_STITCH_SEGMENT_EMPTY_WARN", segment_idx=idx, segment_id=seg_id) # New ID
+                _logger.warning(f"  Segment {idx} (ID {seg_id}) is empty after alignment. Skipping.")
                 continue
             
             if idx == 0:
                 frames_to_add_count = len(current_segment_aligned) - N_overlap if len(all_aligned_segments) > 1 else len(current_segment_aligned)
                 frames_to_add_count = max(0, frames_to_add_count)
-                log_message("MERGE_STITCH_FIRST_SEGMENT_INFO", count=frames_to_add_count) # New ID
+                _logger.debug(f"  First segment: adding {frames_to_add_count} non-overlapping frames.")
                 if frames_to_add_count > 0:
                     final_frames_list.extend(list(current_segment_aligned[:frames_to_add_count]))
             else:
@@ -259,13 +247,13 @@ def _stitch_and_blend_segments_data(all_aligned_segments: list, segment_job_meta
                 eff_blend_len = min(len(blend_pre_raw), len(blend_post_raw))
 
                 if eff_blend_len <= 0:
-                    log_message("MERGE_STITCH_NO_BLEND_FRAMES_WARN", prev_id=prev_seg_id, current_id=seg_id) # New ID
+                    _logger.warning(f"  Warning: No frames for blending between {prev_seg_id} and {seg_id}. Hard cut implies adding all of current.")
                     if len(current_segment_aligned) > 0:
                         final_frames_list.extend(list(current_segment_aligned))
                 else:
                     blend_pre_frames = list(blend_pre_raw[-eff_blend_len:])
                     blend_post_frames = list(blend_post_raw[:eff_blend_len])
-                    log_message("MERGE_STITCH_BLENDING_INFO", count=eff_blend_len, prev_id=prev_seg_id) # New ID
+                    _logger.debug(f"  Blending {eff_blend_len} frames with previous (ID {prev_seg_id}).")
                     
                     blended_frames = util.get_interpolate_frames(blend_pre_frames, blend_post_frames) if eff_blend_len > 1 else \
                                      [(0.5 * blend_pre_frames[0] + 0.5 * blend_post_frames[0])] if eff_blend_len == 1 else []
@@ -283,12 +271,12 @@ def _stitch_and_blend_segments_data(all_aligned_segments: list, segment_job_meta
                         frames_after_blend = current_segment_aligned[start_idx_for_remainder:end_idx_for_remainder] if start_idx_for_remainder < end_idx_for_remainder else []
                         frames_after_blend_desc = "intermediate segment middle"
                     
-                    log_message("MERGE_STITCH_ADDING_REMAINDER", description=frames_after_blend_desc, count=len(frames_after_blend)) # New ID
+                    _logger.debug(f"    Adding {len(frames_after_blend)} {frames_after_blend_desc} frames after blend.")
                     if len(frames_after_blend) > 0:
                         final_frames_list.extend(list(frames_after_blend))
             
     if not final_frames_list:
-        log_message("MERGE_STITCH_NO_FINAL_FRAMES_ERROR") # New ID
+        _logger.critical("No frames in final list after stitching.")
         raise ValueError("No frames in final list after stitching.")
     return np.array(final_frames_list, dtype=np.float32)
 
@@ -297,18 +285,17 @@ def _apply_mp4_postprocessing_refactored(
     video_normalized: np.ndarray, 
     apply_gamma: bool, 
     gamma_val: float, 
-    do_dither: bool, 
+    do_dithering: bool, 
     dither_strength: float
 ):
     video_processed = video_normalized.copy()
     if apply_gamma:
-        video_processed = apply_gamma_correction_to_video(video_processed, gamma_val) # log_func removed from util
+        video_processed = apply_gamma_correction_to_video(video_processed, gamma_val)
     else:
-        log_message("MERGE_POSTPROC_GAMMA_DISABLED") # New ID
+        _logger.debug("Gamma correction disabled for MP4 output.")
 
-    if do_dither:
-        video_processed = apply_dithering_to_video(video_processed, dither_strength) # log_func removed from util
-    # else not needed as util handles logging for application
+    if do_dithering:
+        video_processed = apply_dithering_to_video(video_processed, dither_strength)
     return video_processed
 
 
@@ -337,7 +324,7 @@ def _determine_output_path(
                     ts = time.strftime("_%Y%m%d-%H%M%S")
                     subfolder_name = f"{current_base_for_naming}_{seq_suffix}{ts}"
                 output_path_final = os.path.join(base_dir_for_sequence, subfolder_name)
-            log_message("MERGE_OUTPUT_PATH_SEQ_RESOLVED", path=output_path_final) # New ID
+            _logger.debug(f"  Sequence output resolved to: {output_path_final}")
             os.makedirs(output_path_final, exist_ok=True)
         else: # Single file formats
             if path_is_dir:
@@ -348,9 +335,9 @@ def _determine_output_path(
                 output_path_final = out_path_arg
                 parent_dir = os.path.dirname(output_path_final)
                 if parent_dir: os.makedirs(parent_dir, exist_ok=True)
-            log_message("MERGE_OUTPUT_PATH_FILE_RESOLVED", path=output_path_final) # New ID
+            _logger.debug(f"  Single file output resolved to: {output_path_final}")
             if os.path.exists(output_path_final) and not path_is_dir:
-                 log_message("MERGE_OUTPUT_PATH_FILE_OVERWRITE_WARN", path=output_path_final) # New ID
+                 _logger.warning(f"  Output file {output_path_final} exists and will be overwritten.")
     else: # Auto-generate path
         meta_dir = os.path.dirname(master_meta_p) if master_meta_p and os.path.dirname(master_meta_p) else "."
         os.makedirs(meta_dir, exist_ok=True)
@@ -365,18 +352,18 @@ def _determine_output_path(
         else: # Single file
             output_path_final = os.path.join(meta_dir, f"{current_base_for_naming}.{out_format}")
             if os.path.exists(output_path_final):
-                log_message("MERGE_OUTPUT_PATH_AUTOGEN_OVERWRITE_WARN", path=output_path_final) # New ID
-        log_message("MERGE_OUTPUT_PATH_AUTOGEN_INFO", path=output_path_final) # New ID
+                _logger.warning(f"  Auto-generated output file {output_path_final} exists, will overwrite.")
+        _logger.debug(f"  Auto-generated output path: {output_path_final}")
     
     if output_path_final is None:
-        log_message("MERGE_OUTPUT_PATH_DETERMINE_ERROR") # New ID
+        _logger.critical("Could not determine a valid output path.")
         raise ValueError("Could not determine a valid output path.")
     return output_path_final
 
 def _save_output_to_disk(video_data: np.ndarray, save_path: str, out_format: str, fps_val: float):
-    log_message("MERGE_SAVING_TO_DISK_START", path=save_path, format=out_format, fps=fps_val)
+    _logger.info(f"Saving merged output to: {save_path} (Format: {out_format}) FPS: {fps_val:.2f}")
     if video_data is None or video_data.size == 0:
-        log_message("MERGE_SAVE_EMPTY_DATA_ERROR")
+        _logger.critical("Video data for saving is empty.")
         raise ValueError("Video data for saving is empty.")
 
     try:
@@ -384,10 +371,10 @@ def _save_output_to_disk(video_data: np.ndarray, save_path: str, out_format: str
             for i, frame_f in enumerate(video_data):
                 frame_u16 = (np.clip(frame_f, 0, 1) * 65535.0).astype(np.uint16)
                 imageio.imwrite(os.path.join(save_path, f"frame_{i:05d}.png"), frame_u16)
-            log_message("MERGE_SAVE_PNG_SEQ_SUCCESS", count=len(video_data), path=save_path)
+            _logger.debug(f"Successfully saved {len(video_data)} PNGs in {save_path}")
         elif out_format == "exr_sequence":
             if not _HAS_OPENEXR:
-                log_message("OPENEXR_UNAVAILABLE", context="_save_output_to_disk (exr_sequence)")
+                _logger.warning("OpenEXR/Imath libraries not found. EXR sequence save skipped.")
                 raise ImportError("OpenEXR/Imath missing for EXR sequence.")
             saved_count, failed_count = 0,0
             for i, frame_f in enumerate(video_data):
@@ -395,34 +382,31 @@ def _save_output_to_disk(video_data: np.ndarray, save_path: str, out_format: str
                     save_single_frame_exr(frame_f.astype(np.float32), os.path.join(save_path, f"frame_{i:05d}.exr"))
                     saved_count +=1
                 except Exception as e_exr_frame:
-                    log_message("MERGE_SAVE_EXR_FRAME_ERROR", frame_num=i, error=str(e_exr_frame))
+                    _logger.error(f"  ERROR saving EXR frame {i}: {e_exr_frame}. Skipping.")
                     failed_count +=1
-            log_message("MERGE_SAVE_EXR_SEQ_SUMMARY", saved=saved_count, total=len(video_data), path=save_path)
+            _logger.info(f"Saved {saved_count}/{len(video_data)} EXRs in {save_path}")
             if failed_count > 0:
-                log_message("MERGE_SAVE_EXR_SEQ_FAILURES_WARN", failed_count=failed_count)
+                _logger.warning(f"Warning: {failed_count} EXR frames failed to save.")
         elif out_format == "exr":
             if not _HAS_OPENEXR:
-                log_message("OPENEXR_UNAVAILABLE", context="_save_output_to_disk (single exr)")
+                _logger.warning("OpenEXR/Imath libraries not found. Single EXR save skipped.")
                 raise ImportError("OpenEXR/Imath missing for single EXR.")
             if len(video_data) > 0:
                 save_single_frame_exr(video_data[0].astype(np.float32), save_path)
-                log_message("MERGE_SAVE_SINGLE_EXR_SUCCESS", path=save_path)
+                _logger.info(f"Saved first frame as single EXR: {save_path}")
             else:
-                log_message("MERGE_SAVE_SINGLE_EXR_NO_FRAMES_WARN")
-        # START MODIFICATION for _save_output_to_disk
-        elif out_format == "mp4": # Standard H.264 8-bit MP4
-            dc_utils.save_video(video_data, save_path, fps=fps_val, output_format="mp4") # Pass explicit format
-            log_message("MERGE_SAVE_MP4_SUCCESS", path=save_path)
-        elif out_format == "main10_mp4": # HEVC (H.265) 10-bit MP4
-            # Ensure the save_path has .mp4 extension, _determine_output_path should handle this.
+                _logger.warning("No frames available to save as single EXR.")
+        elif out_format == "mp4":
+            dc_utils.save_video(video_data, save_path, fps=fps_val, output_format="mp4")
+            _logger.debug(f"Successfully saved MP4: {save_path}")
+        elif out_format == "main10_mp4":
             dc_utils.save_video(video_data, save_path, fps=fps_val, output_format="main10_mp4")
-            log_message("MERGE_SAVE_HEVC_MAIN10_MP4_SUCCESS", path=save_path) # New specific log ID
-        # END MODIFICATION
+            _logger.debug(f"Successfully saved HEVC Main10 MP4: {save_path}")
         else:
-            log_message("MERGE_SAVE_UNKNOWN_FORMAT_ERROR", format=out_format)
-            raise ValueError(f"Unknown output format for saving: {out_format}") # This was your error point
+            _logger.error(f"Unknown output format for saving: {out_format}")
+            raise ValueError(f"Unknown output format for saving: {out_format}")
     except Exception as e_save_disk:
-        log_message("MERGE_SAVE_DISK_ERROR_CRITICAL", error=str(e_save_disk), traceback_info=sys.exc_info()) # Use traceback_info for new catalog
+        _logger.critical(f"CRITICAL ERROR during final disk save: {e_save_disk}", exc_info=True)
         raise
 
 def merge_depth_segments(
@@ -437,17 +421,13 @@ def merge_depth_segments(
     norm_high_percentile: float = 99.9,
     output_format: str = "mp4",
     merge_alignment_method: str = "shift_scale",
-    # script_caller_silence_level: int = None, # Removed
     output_filename_override_base: Optional[str] = None
 ) -> Optional[str]:
     
-    # Verbosity is now set globally via message_catalog.set_console_verbosity (e.g. in __main__)
-    # or message_catalog.set_gui_verbosity (e.g. from GUI code)
-
-    log_message("MERGE_PROCESS_START", format=output_format, alignment=merge_alignment_method) # New ID
-    log_message("MERGE_PROCESS_SETTINGS_DITHER", enabled=do_dithering, strength=dither_strength_factor) # New ID
-    log_message("MERGE_PROCESS_SETTINGS_GAMMA", enabled=apply_gamma_correction, value=gamma_value) # New ID
-    log_message("MERGE_PROCESS_SETTINGS_NORM", enabled=use_percentile_norm, low=norm_low_percentile, high=norm_high_percentile) # New ID
+    _logger.info(f"Starting depth segment merging process... Format: {output_format}, Alignment: {merge_alignment_method}")
+    _logger.debug(f"Merge Settings - Dithering: {do_dithering}, Strength: {dither_strength_factor}")
+    _logger.debug(f"Merge Settings - Gamma: {apply_gamma_correction}, Value: {gamma_value}")
+    _logger.debug(f"Merge Settings - Percentile Norm: {use_percentile_norm}, Low: {norm_low_percentile}%, High: {norm_high_percentile}%")
 
     final_video_unclipped = None
     final_fps = 30.0
@@ -457,28 +437,28 @@ def merge_depth_segments(
         meta_data, N_overlap, sorted_jobs, base_dir = _load_and_validate_metadata(master_meta_path)
 
         if len(sorted_jobs) == 1:
-            log_message("MERGE_PROCESSING_SINGLE_SEGMENT_INFO") # New ID
+            _logger.debug("Processing as single segment (only one valid segment found).")
             final_video_unclipped, final_fps = _load_single_segment_frames(sorted_jobs[0], base_dir)
         else:
-            log_message("MERGE_PROCESSING_MULTIPLE_SEGMENTS_INFO", count=len(sorted_jobs)) # New ID
+            _logger.debug(f"Processing {len(sorted_jobs)} segments.")
             loaded_frames_list, job_meta_map, initial_fps = _load_multiple_segments_data(sorted_jobs, base_dir)
             final_fps = initial_fps 
 
             if len(loaded_frames_list) == 1:
-                 log_message("MERGE_ONE_VALID_SEGMENT_REMAINED_INFO") # New ID
+                 _logger.debug("Only one valid segment remained after loading. Using its frames directly.")
                  final_video_unclipped = loaded_frames_list[0]
             elif len(loaded_frames_list) > 1:
                 aligned_segments = _align_segments_data(loaded_frames_list, job_meta_map, N_overlap, merge_alignment_method)
                 final_video_unclipped = _stitch_and_blend_segments_data(aligned_segments, job_meta_map, N_overlap)
             else: 
-                log_message("MERGE_NO_VALID_SEGMENTS_FOR_STITCH_ERROR") # New ID
+                _logger.critical("No valid segments to process after loading stage.")
                 raise ValueError("No valid segments to process after loading stage.")
 
         if final_video_unclipped is None or final_video_unclipped.size == 0:
-            log_message("MERGE_FINAL_VIDEO_EMPTY_PRE_NORM_ERROR") # New ID
+            _logger.critical("Resulting video array is empty before normalization.")
             raise ValueError("Resulting video array is empty before normalization.")
         if final_fps is None or final_fps <= 0: 
-            log_message("MERGE_INVALID_FPS_WARN", fps=final_fps) # New ID
+            _logger.warning(f"Warning: Invalid FPS {final_fps}. Defaulting to 30.0.")
             final_fps = 30.0
 
         normalized_video = normalize_video_data(
@@ -486,7 +466,6 @@ def merge_depth_segments(
             use_percentile_norm, 
             norm_low_percentile, 
             norm_high_percentile
-            # log_func removed from util
         )
         
         video_to_save = normalized_video
@@ -499,37 +478,34 @@ def merge_depth_segments(
                 dither_strength_factor
             )
         else:
-            log_message("MERGE_POSTPROC_SKIPPED_NON_MP4", format=output_format)
+            _logger.debug(f"Post-processing (gamma/dither) skipped for non-MP4 output format: {output_format}.")
         
-        log_message("MERGE_FINAL_VIDEO_STATS_INFO", shape=video_to_save.shape, dtype=str(video_to_save.dtype), 
-                    min_val=video_to_save.min(), max_val=video_to_save.max()) # New ID
+        _logger.debug(f"Final video array for saving: Shape {video_to_save.shape}, Dtype {str(video_to_save.dtype)}, Min {video_to_save.min():.4f}, Max {video_to_save.max():.4f}")
 
         original_basename_from_meta = meta_data.get("original_video_basename", "merged_video")
-        file_extension_for_path = "mp4" # Default for our video formats
+        file_extension_for_path = "mp4"
         if output_format == "png_sequence":
-            file_extension_for_path = "png_sequence" # Special case for _determine_output_path
+            file_extension_for_path = "png_sequence"
         elif output_format == "exr_sequence":
-            file_extension_for_path = "exr_sequence" # Special case for _determine_output_path
+            file_extension_for_path = "exr_sequence"
         elif output_format == "exr":
             file_extension_for_path = "exr"
-        # For "mp4", "mp4_main10", "main10_mp4", the file_extension_for_path remains "mp4"
 
         actual_saved_output_path = _determine_output_path(
             output_path_arg,
             master_meta_path,
             original_basename_from_meta,
-            file_extension_for_path, # Pass the simple, standard extension here
+            file_extension_for_path,
             output_filename_override_base
         )
         
         _save_output_to_disk(video_to_save, actual_saved_output_path, output_format, final_fps)
 
     except Exception as e:
-        # Log with CRITICAL and ensure the exception is re-raised for __main__ or GUI to handle
-        log_message("MERGE_PROCESS_CRITICAL_ERROR", error=str(e), traceback=sys.exc_info()) # New ID
+        _logger.critical(f"CRITICAL ERROR during merge process: {e}", exc_info=True)
         raise
     
-    log_message("MERGE_PROCESS_FINISHED_SUCCESS") # New ID
+    _logger.info("Depth segment merging process finished successfully.")
     return actual_saved_output_path
 
 
@@ -549,26 +525,24 @@ if __name__ == "__main__":
     parser.add_argument("--gamma_value", type=float, default=1.5, help="Gamma value for MP4.")
     parser.add_argument("--merge_alignment_method", type=str, default="shift_scale", choices=["shift_scale", "linear_blend"], help="Segment alignment method.")
     
-    # Map verbosity levels from message_catalog to choices
-    verbosity_choices_map = {
-        "debug": message_catalog.VERBOSITY_LEVEL_DEBUG,      # 10
-        "detail": message_catalog.VERBOSITY_LEVEL_DETAIL,    # 15
-        "info": message_catalog.VERBOSITY_LEVEL_INFO,        # 20 (Normal)
-        "warning": message_catalog.VERBOSITY_LEVEL_WARNING,  # 30
-        "error": message_catalog.VERBOSITY_LEVEL_ERROR,      # 40
-        "critical": message_catalog.VERBOSITY_LEVEL_CRITICAL,# 50
-        "silent": message_catalog.VERBOSITY_LEVEL_SILENT     # 100
+    # Map verbosity levels to logging module levels
+    verbosity_choices = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+        "critical": logging.CRITICAL,
+        "silent": logging.CRITICAL + 1 # Higher than critical to suppress all
     }
     parser.add_argument("--verbosity", type=str, default="info", choices=list(verbosity_choices.keys()), 
-                        help=f"Console verbosity level. Default: info.")
+                        help=f"Console verbosity level. Default: info. Choices: {', '.join(verbosity_choices.keys())}")
 
     args = parser.parse_args()
     
-    # Set console verbosity using the new system
-    message_catalog.set_console_verbosity(verbosity_choices[args.verbosity])
-    
-    # No GUI logger callback when run as a script
-    # message_catalog.set_gui_logger_callback(None) # Already default
+    # Set console verbosity using logging.basicConfig
+    logging.basicConfig(level=verbosity_choices[args.verbosity],
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%H:%M:%S')
 
     try:
         merge_depth_segments(
@@ -583,13 +557,8 @@ if __name__ == "__main__":
             norm_high_percentile=args.norm_high_perc,
             output_format=args.output_format,
             merge_alignment_method=args.merge_alignment_method,
-            # script_caller_silence_level removed
             output_filename_override_base=args.output_filename_override_base
         )
     except Exception as e_main_call:
-        # The critical error should have been logged by merge_depth_segments itself.
-        # This is a fallback print if it wasn't or for truly unhandled cases.
-        print(f"Unhandled script-level error: {e_main_call}", file=sys.stderr)
-        # import traceback # Already imported in merge_depth_segments exception handler
-        # traceback.print_exc()
+        _logger.critical(f"Unhandled script-level error: {e_main_call}", exc_info=True)
         sys.exit(1)

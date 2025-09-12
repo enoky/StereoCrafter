@@ -1,2 +1,2 @@
 call venv\scripts\activate.bat
-python dc_gui_seg.py
+python depthcrafter_gui_seg.py

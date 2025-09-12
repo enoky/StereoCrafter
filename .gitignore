@@ -85,6 +85,7 @@ weights/
 
 
 config.json
+config_depthcrafter.json
 config_inpaint.json
 config_splat.json
 yolo12s.pt
