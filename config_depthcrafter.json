@@ -3,7 +3,6 @@
     "output_dir": "output_depthmaps",
     "guidance_scale": 1.0,
     "inference_steps": 5,
-    "max_res": 960,
     "seed": 42,
     "cpu_offload": "model",
     "use_cudnn_benchmark": false,
@@ -26,7 +25,9 @@
     "min_frames_to_keep_npz_var": 0,
     "keep_intermediate_segment_visual_format_var": "mp4",
     "merge_output_suffix_var": "_depth",
-    "merge_script_gui_silence_level_var": "Normal (Info)",
+    "use_local_models_only_var": false,
+    "target_height": 384,
+    "target_width": 640,
     "last_settings_dir": "C:\\AI2\\StereoCrafter",
     "current_input_mode": "batch_folder",
     "single_file_mode_active": false
