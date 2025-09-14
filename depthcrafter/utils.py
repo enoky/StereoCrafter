@@ -710,7 +710,6 @@ class ColorMapper:
                 self._cmap_data = torch.stack([ramp, ramp, ramp], dim=1) # (N, 3)
         return self._cmap_data
 
-
     def apply(self, image: torch.Tensor, v_min=None, v_max=None):
         if image.ndim not in [2,3]:
             _logger.error(f"ColorMapper.apply: Image must be 2D or 3D, got {image.ndim}D")

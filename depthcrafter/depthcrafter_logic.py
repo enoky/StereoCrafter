@@ -139,7 +139,7 @@ class DepthCrafterDemo:
                      user_target_width: int,
                      segment_job_info: Optional[dict],
                      job_specific_metadata: dict
-                     ) -> Tuple[Optional[np.ndarray], float]:
+                     ) -> Tuple[Optional[np.ndarray], float, int, int]:
         actual_frames_to_process = None
         actual_fps_for_save = 30.0
         original_h_loaded, original_w_loaded = None, None
@@ -251,7 +251,7 @@ class DepthCrafterDemo:
             job_specific_metadata["original_height_loaded"] = original_h_loaded
             job_specific_metadata["original_width_loaded"] = original_w_loaded
 
-        return actual_frames_to_process, actual_fps_for_save
+        return actual_frames_to_process, actual_fps_for_save, job_specific_metadata["processed_height"], job_specific_metadata["processed_width"]
 
     def _handle_no_frames_failure(self, job_specific_metadata: dict, full_save_path: str,
                                   infer_start_time: float, actual_fps_for_save: float,
@@ -287,7 +287,8 @@ class DepthCrafterDemo:
                            guidance_scale: float, num_denoising_steps: int,
                            pipe_call_window_size: int, pipe_call_overlap: int,
                            segment_job_info: Optional[dict],
-                           user_target_height: int, user_target_width: int) -> np.ndarray:
+                           actual_processed_height: int, actual_processed_width: int # <--- RENAMED
+                           ) -> np.ndarray:
         current_pipe_window_for_call = pipe_call_window_size
         current_pipe_overlap_for_call = pipe_call_overlap
         if segment_job_info: 
@@ -298,8 +299,8 @@ class DepthCrafterDemo:
         with torch.inference_mode():
             res = self.pipe(
                 actual_frames_to_process,
-                height=user_target_height,
-                width=user_target_width,
+                height=actual_processed_height, # <--- USE RENAMED PARAM
+                width=actual_processed_width,   # <--- USE RENAMED PARAM
                 output_type="np",
                 guidance_scale=guidance_scale,
                 num_inference_steps=num_denoising_steps,
@@ -478,7 +479,7 @@ class DepthCrafterDemo:
             pipe_call_window_size, pipe_call_overlap, original_video_basename
         )
 
-        actual_frames_to_process, actual_fps_for_save = self._load_frames(
+        actual_frames_to_process, actual_fps_for_save, actual_processed_h, actual_processed_w = self._load_frames(
             video_path_or_job_info=video_path_or_job_info_dict,
             frames_array_if_provided=frames_array_if_provided,
             process_length_for_read=process_length_for_read,
@@ -487,6 +488,9 @@ class DepthCrafterDemo:
             segment_job_info=segment_job_info,
             job_specific_metadata=job_specific_metadata
         )
+        # Update job_specific_metadata with the *actual* processed H/W if not already set (e.g. from np.array input)
+        job_specific_metadata["processed_height"] = actual_processed_h
+        job_specific_metadata["processed_width"] = actual_processed_w
 
         if job_specific_metadata["status"] == "failure_no_input_source":
             self._finalize_job_metadata_and_save_json(
@@ -506,7 +510,7 @@ class DepthCrafterDemo:
         inference_result = self._perform_inference(
             actual_frames_to_process, guidance_scale, num_denoising_steps,
             pipe_call_window_size, pipe_call_overlap, segment_job_info,
-            user_target_height, user_target_width
+            actual_processed_h, actual_processed_w
             )
 
         if inference_result is not None and inference_result.ndim >= 3: # Should be (T, H, W)
