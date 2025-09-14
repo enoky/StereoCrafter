@@ -499,25 +499,23 @@ def read_video_frames(
     # --- REPLACEMENT BLOCK START ---
     # Get video stream info: first try cached, then call ffprobe if not cached.
     video_stream_info_actual = None
-    ffprobe_raw_stdout = None # Initialize to None
+    ffprobe_raw_stdout_safe = "" # Initialize to empty string for safety
 
     if cached_ffprobe_info:
-        # If cached, it's a dict. We assume it doesn't contain raw stdout.
         video_stream_info_actual = cached_ffprobe_info 
         _logger.debug(f"Reusing cached ffprobe info for {os.path.basename(video_path)} (skipping ffprobe call).")
     else:
-        # If not cached, call get_video_stream_info which returns (dict, str)
         ffprobe_result_tuple = get_video_stream_info(video_path)
         if ffprobe_result_tuple:
-            video_stream_info_actual, ffprobe_raw_stdout = ffprobe_result_tuple
+            video_stream_info_actual, raw_stdout_from_func = ffprobe_result_tuple
+            ffprobe_raw_stdout_safe = raw_stdout_from_func if raw_stdout_from_func is not None else "" # Ensure it's a string
             _logger.debug(f"FFprobe called for {os.path.basename(video_path)} (no cached info available).")
-            _logger.debug(f"DEBUG: Raw ffprobe stdout for {os.path.basename(video_path)}:\n{ffprobe_raw_stdout}") # <-- PRINT RAW STDOUT HERE, ONLY ONCE
+            _logger.debug(f"DEBUG: Raw ffprobe stdout for {os.path.basename(video_path)}:\n{ffprobe_raw_stdout_safe}")
         else:
             _logger.warning(f"Failed to get video stream info for {os.path.basename(video_path)}.")
-            # video_stream_info_actual remains None
     
-    # Now use video_stream_info_actual for all subsequent logic in read_video_frames
-    video_stream_info = video_stream_info_actual # Renaming for consistency with existing code
+    video_stream_info = video_stream_info_actual
+    ffprobe_raw_stdout = ffprobe_raw_stdout_safe # Assign to the variable returned by the function
 
     original_height_detected = 0
     original_width_detected = 0
@@ -555,11 +553,11 @@ def read_video_frames(
             _logger.debug(f"Decord fallback detected: {original_width_detected}x{original_height_detected} @ {original_fps_detected:.2f} FPS, {num_total_frames_detected} frames.")
         except Exception as e:
             _logger.error(f"Failed to get initial metadata from Decord for {os.path.basename(video_path)}: {e}", exc_info=True)
-            return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, 0, 0, 0, 0, None
+            return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, 0, 0, 0, 0, None, None
 
     if num_total_frames_detected == 0:
         _logger.warning(f"No frames detected in {os.path.basename(video_path)}.")
-        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, 0, 0, video_stream_info
+        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, 0, 0, video_stream_info, None
 
     if original_height_detected == 0 or original_width_detected == 0:
         _logger.warning(f"Original dimensions could not be detected for {os.path.basename(video_path)}. Setting to default 128x128.")
@@ -577,7 +575,7 @@ def read_video_frames(
         vid_reader = VideoReader(video_path, ctx=cpu(0), width=final_width_for_decord, height=final_height_for_decord)
     except Exception as e:
         _logger.error(f"Failed to initialize Decord VideoReader for {os.path.basename(video_path)} with target resolution {final_width_for_decord}x{final_height_for_decord}: {e}", exc_info=True)
-        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, 0, 0, video_stream_info
+        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, 0, 0, video_stream_info, None
 
     # Determine output FPS: prioritize GUI target, then ffprobe, then decord
     actual_output_fps = original_fps_detected if target_fps == -1.0 else target_fps
@@ -610,7 +608,7 @@ def read_video_frames(
     
     if not frames_idx:
         _logger.warning(f"No frames selected for processing after stride and process_length filters for {os.path.basename(video_path)}.")
-        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, final_height_for_decord, final_width_for_decord, video_stream_info
+        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, final_height_for_decord, final_width_for_decord, video_stream_info, None
 
     _logger.debug(f"Loading {len(frames_idx)} frames using Decord for {os.path.basename(video_path)}.")
     frames_batch = vid_reader.get_batch(frames_idx)
