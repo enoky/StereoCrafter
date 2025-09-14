@@ -10,8 +10,17 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from decord import VideoReader, cpu
+# FlashAttention requires optional dependency; attempt safe imports
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+try:
+    from diffusers.models.attention_processor import (
+        FlashAttnProcessor,
+        XFormersAttnProcessor,
+    )
+except Exception:  # diffusers may not provide these processors
+    FlashAttnProcessor = None  # type: ignore
+    XFormersAttnProcessor = None  # type: ignore
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
@@ -67,6 +76,26 @@ def load_inpainting_pipeline(
         unet=unet,
         torch_dtype=dtype,
     ).to(device)
+
+    # Try enabling FlashAttention for faster and more memory-efficient inference.
+    # Fallback to xFormers if FlashAttention isn't available.
+    attention_set = False
+    if FlashAttnProcessor is not None:
+        try:
+            pipeline.unet.set_attn_processor(FlashAttnProcessor())
+            logger.info("FlashAttention enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable FlashAttention: {e}")
+    if not attention_set and XFormersAttnProcessor is not None:
+        try:
+            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
+            logger.info("xFormers attention enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable xFormers attention: {e}")
+    if not attention_set:
+        logger.info("Using default attention processor")
 
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()
