@@ -19,6 +19,9 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
        `python --version`
    - CUDA ToolKit: Ensure CUDA 12.8 is installed and added to your PATH.<br>
      Download here: https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64<br>
+     
+   - FFMPEGt: Ensure FFMpeg is installed and added to your PATH.<br>
+     See Tutorial Here: [https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/)<br>
 
 #### INSTALL:
    - Run <a href="https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
