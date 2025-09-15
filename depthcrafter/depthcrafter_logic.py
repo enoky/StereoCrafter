@@ -45,8 +45,11 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="diffusers.mode
 
 from typing import Optional, Tuple, List, Dict, Union
 
+# --- Global Configuration Flags ---
+_ENABLE_XFORMERS_ATTENTION = True # Set to True or False to enable/disable xFormers.
+
 class DepthCrafterDemo:
-    def __init__(self, unet_path: str, pre_train_path: str, cpu_offload: str = "model", use_cudnn_benchmark: bool = True, local_files_only: bool = False):
+    def __init__(self, unet_path: str, pre_train_path: str, cpu_offload: str = "model", use_cudnn_benchmark: bool = False, local_files_only: bool = False):
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
@@ -71,6 +74,26 @@ class DepthCrafterDemo:
                 self.pipe.enable_model_cpu_offload() # Defaulting
             self.pipe.enable_attention_slicing()
             _logger.debug("DepthCrafterPipeline initialized successfully.")
+
+            if _ENABLE_XFORMERS_ATTENTION:
+                try:
+                    from diffusers.utils.logging import set_verbosity_info # For xFormers init messages
+                    set_verbosity_info() # Temporarily set to INFO to catch xFormers messages
+
+                    self.pipe.enable_xformers_memory_efficient_attention()
+                    _logger.info("xFormers memory-efficient attention enabled successfully.")
+                except ImportError:
+                    _logger.warning("xFormers library not found. Memory-efficient attention cannot be enabled. Please install 'xformers' for potential VRAM reduction and speedup.")
+                except Exception as e:
+                    _logger.warning(f"Failed to enable xFormers memory-efficient attention due to an unexpected error: {e}. Falling back to standard attention.")
+                finally:
+                    # Restore logging verbosity if needed (though our logger is independent)
+                    pass # No explicit reset needed if our logger is independent.
+            else:
+                _logger.info("xFormers memory-efficient attention disabled by user setting.")
+            # --- END XFORMERS INTEGRATION BLOCK ---
+
+            _logger.info("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
         except Exception as e:
             _logger.critical(f"CRITICAL: Failed to initialize DepthCrafterPipeline: {e}", exc_info=True)
             raise # Re-raise after logging

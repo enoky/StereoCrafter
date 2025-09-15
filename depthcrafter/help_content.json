@@ -119,5 +119,8 @@
   },
   "current_frames": {
     "text": "The number of frames in the current job. For segments, this includes segment window/overlap info and the total frames of the original input. For full videos, it shows processed frames and total if limited."
+  },
+  "enable_debug_logging": {
+    "text": "Check to enable verbose debug logging in the console output. This provides much more detailed information about internal processes, which is useful for troubleshooting. Uncheck to revert to standard information-level logging."
   }
 }

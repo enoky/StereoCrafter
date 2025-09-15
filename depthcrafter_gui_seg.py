@@ -279,6 +279,7 @@ class DepthCrafterGUI:
         self.current_frames_var = tk.StringVar(value="N/A")
         self.target_height = tk.IntVar(value=384) # Initial default height
         self.target_width = tk.IntVar(value=640)  # Initial default width
+        self.debug_logging_enabled = tk.BooleanVar(value=False) # Default to OFF (INFO level)
 
         self.all_tk_vars = {
             "input_dir_or_file_var": self.input_dir_or_file_var,
@@ -326,6 +327,14 @@ class DepthCrafterGUI:
         self.stop_event = threading.Event()
         self.processing_thread = None
         self._load_help_content()
+        # --- ADD THIS INITIAL LOGGING SETUP ---
+        # Set initial logging level based on the default value of debug_logging_enabled
+        if self.debug_logging_enabled.get():
+            logging.getLogger().setLevel(logging.DEBUG)
+        else:
+            logging.getLogger().setLevel(logging.INFO)
+        _logger.info(f"Initial logging level set to {'DEBUG' if self.debug_logging_enabled.get() else 'INFO'}.")
+        # --------------------------------------
         self._create_menubar()
         self.create_widgets() 
         # self.root.after(100, self.process_queue) # Removed GUI log update
@@ -881,9 +890,13 @@ class DepthCrafterGUI:
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.on_close)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="GUI Overview", command=lambda: self._show_help_for("general_gui_overview"))
+        self.help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_command(label="GUI Overview", command=lambda: self._show_help_for("general_gui_overview"))
+        # --- ADD THIS CHECKBUTTON TO HELP MENU ---
+        self.help_menu.add_separator() # Optional separator for clarity
+        self.help_menu.add_checkbutton(label="Enable Debug Logging", variable=self.debug_logging_enabled, command=self._toggle_debug_logging)
+        # -----------------------------------------
 
     def create_widgets(self):
         self.widgets_to_disable_during_processing = []
@@ -1243,6 +1256,11 @@ class DepthCrafterGUI:
                     if isinstance(widget, ttk.Combobox): widget.configure(state='disabled' if is_processing else 'readonly')
                     else: widget.configure(state=new_state)
                 except tk.TclError: pass 
+                
+        if hasattr(self, 'help_menu') and self.help_menu:
+            try:
+                self.help_menu.entryconfig("Enable Debug Logging", state=new_state)
+            except tk.TclError: pass
         
         if hasattr(self, 'cancel_button') and self.cancel_button:
              try: self.cancel_button.configure(state=cancel_state)
@@ -1334,6 +1352,14 @@ class DepthCrafterGUI:
         self.toggle_gamma_options_active_state()
         self.toggle_percentile_norm_options_active_state()
 
+    def _toggle_debug_logging(self):
+        if self.debug_logging_enabled.get():
+            logging.getLogger().setLevel(logging.DEBUG) # Set root logger to DEBUG
+            _logger.info("Debug logging ENABLED.")
+        else:
+            logging.getLogger().setLevel(logging.INFO)  # Set root logger back to INFO
+            _logger.info("Debug logging DISABLED (set to INFO level).")
+            
     def add_param(self, parent, label, var, row):
         tk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
         entry = tk.Entry(parent, textvariable=var, width=20)
