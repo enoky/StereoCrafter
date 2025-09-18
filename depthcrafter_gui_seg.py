@@ -1460,6 +1460,12 @@ class DepthCrafterGUI:
             messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
             return
         
+        # --- ADD THESE LINES HERE ---
+        _logger.info("Scanning input folder: Please wait...")
+        self.status_message_var.set("Scanning input folder...")
+        self.root.update_idletasks() # Force GUI update to show "Scanning..." immediately
+        # ----------------------------
+
         determined_mode, determined_single_source = self._determine_input_mode_from_path(input_path_str)
         
         self.current_input_mode = determined_mode
@@ -1651,8 +1657,6 @@ class DepthCrafterGUI:
             return 
 
         all_videos_master_metadata = {} 
-
-        _logger.info("Scanning input folder: Please wait...")
         
         for i, job_info_to_run in enumerate(video_processing_jobs):
             if self.stop_event.is_set():
@@ -2137,7 +2141,7 @@ class DepthCrafterGUI:
 
 if __name__ == "__main__":
     # Configure basic logging for console output
-    logging.basicConfig(level=logging.INFO, # Default to INFO level
+    logging.basicConfig(level=logging.DEBUG, # Default to INFO level
                         format='%(asctime)s - %(message)s',
                         datefmt='%H:%M:%S')
 
