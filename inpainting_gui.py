@@ -10,8 +10,17 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from decord import VideoReader, cpu
+# FlashAttention requires optional dependency; attempt safe imports
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+try:
+    from diffusers.models.attention_processor import (
+        AttnProcessor2_0,
+        XFormersAttnProcessor,
+    )
+except Exception:  # diffusers may not provide these processors
+    AttnProcessor2_0 = None  # type: ignore
+    XFormersAttnProcessor = None  # type: ignore
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
@@ -68,6 +77,26 @@ def load_inpainting_pipeline(
         torch_dtype=dtype,
     ).to(device)
 
+    # Try enabling efficient attention (AttnProcessor2_0) for faster and more memory-efficient inference.
+    # This leverages PyTorch's scaled_dot_product_attention, which uses Flash Attention if available.
+    # Fallback to xFormers if AttnProcessor2_0 isn't available.
+    attention_set = False
+    if AttnProcessor2_0 is not None:
+        try:
+            pipeline.unet.set_attn_processor(AttnProcessor2_0())
+            logger.info("Efficient attention (AttnProcessor2_0) enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable AttnProcessor2_0: {e}")
+    if not attention_set and XFormersAttnProcessor is not None:
+        try:
+            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
+            logger.info("xFormers attention enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable xFormers attention: {e}")
+    if not attention_set:
+        logger.info("Using default attention processor")
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()
     elif offload_type == "sequential":
@@ -326,13 +355,31 @@ def process_single_video(
 
     # Read video frames and stream info
     frames, fps, video_stream_info = read_video_frames(input_video_path)
-    num_frames = frames.shape[0]
+    num_frames_original  = frames.shape[0]
 
-    if num_frames == 0:
+    if num_frames_original  == 0:
         logger.warning(f"No frames found in {input_video_path}, skipping.")
         if update_info_callback:
             update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength)
         return False
+    
+    # NEW: Determine padding frames count
+    # A reasonable amount, e.g., frames_chunk // 2 or more, to give temporal context
+    padding_frames_count = frames_chunk # Example: pad with a full chunk's worth of the last frame
+
+    # NEW: Create padding frames by repeating the last frame
+    # Ensure there's at least one frame to repeat
+    if num_frames_original > 0:
+        last_frame_to_repeat = frames[-1:].clone() # Shape [1, C, H, W]
+        repeated_frames = last_frame_to_repeat.repeat(padding_frames_count, 1, 1, 1)
+        frames = torch.cat([frames, repeated_frames], dim=0) # NEW: Concatenate padding to main frames tensor
+        logger.debug(f"Padded video frames from {num_frames_original} to {frames.shape[0]} by repeating the last frame.")
+    else:
+        # If num_frames_original is 0, this block won't be reached due to the earlier check.
+        # But for safety, handle the case where it might slip through.
+        logger.warning("Attempted to pad an empty video; padding skipped.")
+    
+    num_frames = frames.shape[0] # NEW: Update num_frames to include padding
 
     _, _, total_h_raw_input, total_w_raw_input = frames.shape
     if total_h_raw_input < 2 or total_w_raw_input < 2:
@@ -367,7 +414,17 @@ def process_single_video(
         half_h_input = total_h_raw_input // 2
         half_w_input = total_w_raw_input // 2
 
-        frames_left_original = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
+        frames_left_original_before_padding = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
+
+        # NEW: Apply padding to frames_left_original as well
+        if num_frames_original > 0: # Ensure original video had frames
+            last_frame_left = frames_left_original_before_padding[-1:].clone()
+            repeated_frames_left = last_frame_left.repeat(padding_frames_count, 1, 1, 1)
+            frames_left_original = torch.cat([frames_left_original_before_padding, repeated_frames_left], dim=0)
+            logger.debug(f"Padded frames_left_original from {num_frames_original} to {frames_left_original.shape[0]}.")
+        else:
+            frames_left_original = frames_left_original_before_padding # Should be empty anyway
+
         frames_mask_raw = frames[:, :, half_h_input:, :half_w_input]  # Bottom-Left is mask
         frames_warpped_raw = frames[:, :, half_h_input:, half_w_input:] # Bottom-Right is warped
 
@@ -503,6 +560,9 @@ def process_single_video(
     if frames_output.numel() > 0 and frames_output.shape[2] >= target_output_h and frames_output.shape[3] >= target_output_w:
         # Crop the output to the original, unpadded dimensions for this section
         frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
+        # NEW: Temporally crop the output back to the original video length
+        frames_output_final = frames_output_final[:num_frames_original]
+        logger.debug(f"Temporally cropped generated frames from {frames_output.shape[0]} to {frames_output_final.shape[0]} (original length).")
     else:
         logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {target_output_h}x{target_output_w}) for {input_video_path}. Skipping video output.")
         if update_info_callback:
@@ -522,18 +582,19 @@ def process_single_video(
                 update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
             return False
         
-        frames_left_original_normalized = frames_left_original.float() / 255.0
+        # NEW: frames_left_original was already padded, now crop it back
+        frames_left_original_cropped = frames_left_original[:num_frames_original].float() / 255.0
         
         # Ensure dimensions match for concatenation (time, channel, height should match)
-        if frames_left_original_normalized.shape[0] != frames_output_final.shape[0] or \
-           frames_left_original_normalized.shape[1] != frames_output_final.shape[1] or \
-           frames_left_original_normalized.shape[2] != frames_output_final.shape[2]:
-            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_normalized.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
+        if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
+           frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
+           frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
+            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
             if update_info_callback:
                 update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
             return False
 
-        sbs_frames = torch.cat([frames_left_original_normalized, frames_output_final], dim=3)
+        sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
         final_output_frames_for_encoding = sbs_frames
 
     # Final check: ensure the tensor to be encoded is actually populated
@@ -583,7 +644,7 @@ def process_single_video(
         # Default output parameters
         output_codec = "libx264"
         output_pix_fmt = "yuv420p"
-        output_crf = "23" # Default CRF for SDR x264 (lower is better quality)
+        output_crf = "18" # Default CRF for SDR x264 (lower is better quality)
         output_profile = "main"
         x265_params = [] # For HDR metadata
 
@@ -604,7 +665,7 @@ def process_single_video(
                 logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
-                output_crf = "28" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
+                output_crf = "20" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
                 output_profile = "main10"
                 
                 # Add HDR mastering display and CLL metadata
@@ -618,7 +679,7 @@ def process_single_video(
                 logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
-                output_crf = "24" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
+                output_crf = "20" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
                 output_profile = "main10"
             else: # SDR 8-bit, or other source codecs
                 logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
@@ -691,10 +752,8 @@ class InpaintingGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Batch Video Inpainting")   
-        # Adjusted geometry to accommodate new widgets
-        self.geometry("600x590") # Increased height from 400 to 550
+        self.geometry("600x590")
         self.app_config = self.load_config()
-        # NEW: Load help data from renamed file
         self.help_data = self.load_help_data()
 
         self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
@@ -702,7 +761,6 @@ class InpaintingGUI(tk.Tk):
         self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
         self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
         self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
-        # Renamed variable key for consistency
         self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5))) # Default to 0.5
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
@@ -712,8 +770,9 @@ class InpaintingGUI(tk.Tk):
         self.pipeline = None
 
         self.create_widgets()
-        self.update_progress() # Start the progress bar and status updates
+        self.update_progress()
         self.update_status_label("Ready")
+        self.protocol("WM_DELETE_WINDOW", self.exit_application)
 
     def create_widgets(self):
         
