@@ -10,8 +10,17 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from decord import VideoReader, cpu
+# FlashAttention requires optional dependency; attempt safe imports
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+try:
+    from diffusers.models.attention_processor import (
+        AttnProcessor2_0,
+        XFormersAttnProcessor,
+    )
+except Exception:  # diffusers may not provide these processors
+    AttnProcessor2_0 = None  # type: ignore
+    XFormersAttnProcessor = None  # type: ignore
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
@@ -68,6 +77,26 @@ def load_inpainting_pipeline(
         torch_dtype=dtype,
     ).to(device)
 
+    # Try enabling efficient attention (AttnProcessor2_0) for faster and more memory-efficient inference.
+    # This leverages PyTorch's scaled_dot_product_attention, which uses Flash Attention if available.
+    # Fallback to xFormers if AttnProcessor2_0 isn't available.
+    attention_set = False
+    if AttnProcessor2_0 is not None:
+        try:
+            pipeline.unet.set_attn_processor(AttnProcessor2_0())
+            logger.info("Efficient attention (AttnProcessor2_0) enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable AttnProcessor2_0: {e}")
+    if not attention_set and XFormersAttnProcessor is not None:
+        try:
+            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
+            logger.info("xFormers attention enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable xFormers attention: {e}")
+    if not attention_set:
+        logger.info("Using default attention processor")
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()
     elif offload_type == "sequential":
@@ -300,6 +329,7 @@ def process_single_video(
     stop_event: threading.Event = None,
     update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
     original_input_blend_strength: float = 0.8,
+    output_crf: int = 23, # NEW: Accept output_crf
 ) -> bool:
     """
     Processes a single input video.
@@ -326,13 +356,31 @@ def process_single_video(
 
     # Read video frames and stream info
     frames, fps, video_stream_info = read_video_frames(input_video_path)
-    num_frames = frames.shape[0]
+    num_frames_original  = frames.shape[0]
 
-    if num_frames == 0:
+    if num_frames_original  == 0:
         logger.warning(f"No frames found in {input_video_path}, skipping.")
         if update_info_callback:
             update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength)
         return False
+    
+    # NEW: Determine padding frames count
+    # A reasonable amount, e.g., frames_chunk // 2 or more, to give temporal context
+    padding_frames_count = frames_chunk # Example: pad with a full chunk's worth of the last frame
+
+    # NEW: Create padding frames by repeating the last frame
+    # Ensure there's at least one frame to repeat
+    if num_frames_original > 0:
+        last_frame_to_repeat = frames[-1:].clone() # Shape [1, C, H, W]
+        repeated_frames = last_frame_to_repeat.repeat(padding_frames_count, 1, 1, 1)
+        frames = torch.cat([frames, repeated_frames], dim=0) # NEW: Concatenate padding to main frames tensor
+        logger.debug(f"Padded video frames from {num_frames_original} to {frames.shape[0]} by repeating the last frame.")
+    else:
+        # If num_frames_original is 0, this block won't be reached due to the earlier check.
+        # But for safety, handle the case where it might slip through.
+        logger.warning("Attempted to pad an empty video; padding skipped.")
+    
+    num_frames = frames.shape[0] # NEW: Update num_frames to include padding
 
     _, _, total_h_raw_input, total_w_raw_input = frames.shape
     if total_h_raw_input < 2 or total_w_raw_input < 2:
@@ -367,7 +415,17 @@ def process_single_video(
         half_h_input = total_h_raw_input // 2
         half_w_input = total_w_raw_input // 2
 
-        frames_left_original = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
+        frames_left_original_before_padding = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
+
+        # NEW: Apply padding to frames_left_original as well
+        if num_frames_original > 0: # Ensure original video had frames
+            last_frame_left = frames_left_original_before_padding[-1:].clone()
+            repeated_frames_left = last_frame_left.repeat(padding_frames_count, 1, 1, 1)
+            frames_left_original = torch.cat([frames_left_original_before_padding, repeated_frames_left], dim=0)
+            logger.debug(f"Padded frames_left_original from {num_frames_original} to {frames_left_original.shape[0]}.")
+        else:
+            frames_left_original = frames_left_original_before_padding # Should be empty anyway
+
         frames_mask_raw = frames[:, :, half_h_input:, :half_w_input]  # Bottom-Left is mask
         frames_warpped_raw = frames[:, :, half_h_input:, half_w_input:] # Bottom-Right is warped
 
@@ -436,7 +494,7 @@ def process_single_video(
                 
                 del prev_gen_overlap_frames
 
-        logger.info(f"Starting inference for chunk {i}-{end_idx} (padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
+        logger.info(f"Starting inference for chunk {i}-{end_idx}...")
         start_time = time.time()
 
         with torch.no_grad():
@@ -503,6 +561,9 @@ def process_single_video(
     if frames_output.numel() > 0 and frames_output.shape[2] >= target_output_h and frames_output.shape[3] >= target_output_w:
         # Crop the output to the original, unpadded dimensions for this section
         frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
+        # NEW: Temporally crop the output back to the original video length
+        frames_output_final = frames_output_final[:num_frames_original]
+        logger.debug(f"Temporally cropped generated frames from {frames_output.shape[0]} to {frames_output_final.shape[0]} (original length).")
     else:
         logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {target_output_h}x{target_output_w}) for {input_video_path}. Skipping video output.")
         if update_info_callback:
@@ -522,18 +583,19 @@ def process_single_video(
                 update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
             return False
         
-        frames_left_original_normalized = frames_left_original.float() / 255.0
+        # NEW: frames_left_original was already padded, now crop it back
+        frames_left_original_cropped = frames_left_original[:num_frames_original].float() / 255.0
         
         # Ensure dimensions match for concatenation (time, channel, height should match)
-        if frames_left_original_normalized.shape[0] != frames_output_final.shape[0] or \
-           frames_left_original_normalized.shape[1] != frames_output_final.shape[1] or \
-           frames_left_original_normalized.shape[2] != frames_output_final.shape[2]:
-            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_normalized.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
+        if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
+           frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
+           frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
+            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
             if update_info_callback:
                 update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
             return False
 
-        sbs_frames = torch.cat([frames_left_original_normalized, frames_output_final], dim=3)
+        sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
         final_output_frames_for_encoding = sbs_frames
 
     # Final check: ensure the tensor to be encoded is actually populated
@@ -583,7 +645,6 @@ def process_single_video(
         # Default output parameters
         output_codec = "libx264"
         output_pix_fmt = "yuv420p"
-        output_crf = "23" # Default CRF for SDR x264 (lower is better quality)
         output_profile = "main"
         x265_params = [] # For HDR metadata
 
@@ -604,7 +665,6 @@ def process_single_video(
                 logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
-                output_crf = "28" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
                 output_profile = "main10"
                 
                 # Add HDR mastering display and CLL metadata
@@ -618,13 +678,11 @@ def process_single_video(
                 logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
                 output_codec = "libx265"
                 output_pix_fmt = "yuv420p10le"
-                output_crf = "24" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
                 output_profile = "main10"
             else: # SDR 8-bit, or other source codecs
                 logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
                 output_codec = "libx264"
                 output_pix_fmt = "yuv420p"
-                output_crf = "18" # Higher quality CRF for SDR H.264 (lower is better quality)
                 output_profile = "main"
 
             # Apply general color flags if present
@@ -640,7 +698,7 @@ def process_single_video(
             "-c:v", output_codec,
             "-profile:v", output_profile,
             "-pix_fmt", output_pix_fmt,
-            "-crf", output_crf,
+            "-crf", str(output_crf),
         ])
         
         if x265_params:
@@ -691,10 +749,8 @@ class InpaintingGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Batch Video Inpainting")   
-        # Adjusted geometry to accommodate new widgets
-        self.geometry("600x590") # Increased height from 400 to 550
+        self.geometry("550x590")
         self.app_config = self.load_config()
-        # NEW: Load help data from renamed file
         self.help_data = self.load_help_data()
 
         self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
@@ -702,9 +758,9 @@ class InpaintingGUI(tk.Tk):
         self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
         self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
         self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
-        # Renamed variable key for consistency
         self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
-        self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5))) # Default to 0.5
+        self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5)))
+        self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -712,8 +768,9 @@ class InpaintingGUI(tk.Tk):
         self.pipeline = None
 
         self.create_widgets()
-        self.update_progress() # Start the progress bar and status updates
+        self.update_progress()
         self.update_status_label("Ready")
+        self.protocol("WM_DELETE_WINDOW", self.exit_application)
 
     def create_widgets(self):
         
@@ -746,43 +803,55 @@ class InpaintingGUI(tk.Tk):
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
         param_frame.pack(fill="x", padx=10, pady=5)
         
+        # NEW: Configure 3 columns for param_frame to place CRF on the right
+        param_frame.grid_columnconfigure(0, weight=1) # Column for labels
+        param_frame.grid_columnconfigure(1, weight=1) # Column for entries (left side)
+        param_frame.grid_columnconfigure(2, weight=1) # Column for labels (right side)
+        param_frame.grid_columnconfigure(3, weight=1) # Column for entries (right side)        
+        
         # Inference Steps
         inference_steps_label = ttk.Label(param_frame, text="Inference Steps:")
         inference_steps_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inference_steps_label, self.help_data.get("num_inference_steps", ""))
-        ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=0, column=1, sticky="w")
-        
+        ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
+                    
+        # Output CRF (NEW)
+        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
+        output_crf_label.grid(row=0, column=2, sticky="e", padx=5, pady=2) # Placed in col 2
+        Tooltip(output_crf_label, self.help_data.get("output_crf", "")) # NEW Tooltip key
+        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=0, column=3, sticky="w", padx=5) # Placed in col 3, added padx
+
         # Tile Number
         tile_num_label = ttk.Label(param_frame, text="Tile Number:")
         tile_num_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
-        ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=1, column=1, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
         
         # Frames Chunk
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
-        ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=2, column=1, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
         
         # Frame Overlap (Renamed from Overlap)
         # Updated label text and tooltip key
         frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
         frame_overlap_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frame_overlap_label, self.help_data.get("frame_overlap", "")) 
-        ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=3, column=1, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
         
         # Original Input Bias (NEW PARAMETER)
         original_blend_label = ttk.Label(param_frame, text="Original Input Bias:") # Concise name for GUI
         original_blend_label.grid(row=4, column=0, sticky="e", padx=5, pady=2)
         Tooltip(original_blend_label, self.help_data.get("original_input_blend_strength", ""))
-        ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=4, column=1, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
 
         # CPU Offload
         offload_label = ttk.Label(param_frame, text="CPU Offload:")
         offload_label.grid(row=5, column=0, sticky="e", padx=5, pady=2)
         Tooltip(offload_label, self.help_data.get("offload_type", ""))
         offload_options = ["model", "sequential", "none"]
-        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=5, column=1, sticky="w")
+        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=5, column=1, sticky="w", padx=5)
 
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
@@ -907,14 +976,15 @@ class InpaintingGUI(tk.Tk):
             num_inference_steps = int(self.num_inference_steps_var.get())
             tile_num = int(self.tile_num_var.get())
             frames_chunk = int(self.frames_chunk_var.get())
-            gui_overlap = int(self.overlap_var.get()) # Renamed for clarity
+            gui_overlap = int(self.overlap_var.get())
             gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
+            gui_output_crf = int(self.output_crf_var.get()) # NEW: Get CRF
             if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
-               not (0.0 <= gui_original_input_blend_strength  <= 1.0): # NEW VALIDATION
+               not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
             return
         offload_type = self.offload_type_var.get()
 
@@ -931,10 +1001,10 @@ class InpaintingGUI(tk.Tk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf),
                          daemon=True).start()
 
-    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength):
+    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
         thread-safe GUI updates, and error management.
@@ -971,6 +1041,7 @@ class InpaintingGUI(tk.Tk):
                 # Initialize current video's parameters with GUI fallbacks
                 current_overlap = gui_overlap
                 current_original_input_blend_strength = gui_original_input_blend_strength
+                current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
 
                 json_path = os.path.splitext(video_path)[0] + ".json"
                 if os.path.exists(json_path):
@@ -994,6 +1065,15 @@ class InpaintingGUI(tk.Tk):
                                 logger.debug(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
                             else:
                                 logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
+                        
+                        # NEW: Load CRF from sidecar
+                        if "output_crf" in sidecar_data:
+                            sidecar_crf = int(sidecar_data["output_crf"])
+                            if sidecar_crf >= 0:
+                                current_output_crf = sidecar_crf
+                                logger.debug(f"Using output_crf from sidecar: {current_output_crf}")
+                            else:
+                                logger.warning(f"Invalid 'output_crf' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_output_crf}).")
 
                     except (json.JSONDecodeError, ValueError) as e:
                         logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
@@ -1015,7 +1095,8 @@ class InpaintingGUI(tk.Tk):
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
                     update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
-                    original_input_blend_strength=current_original_input_blend_strength # Pass the (potentially overridden) bias
+                    original_input_blend_strength=current_original_input_blend_strength,
+                    output_crf=current_output_crf # NEW: Pass current_output_crf
                 )
                 
                 if completed:
@@ -1108,7 +1189,8 @@ class InpaintingGUI(tk.Tk):
             "offload_type": self.offload_type_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frame_overlap": self.overlap_var.get(),
-            "original_input_blend_strength": self.original_input_blend_strength_var.get()             
+            "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
+            "output_crf": self.output_crf_var.get() # NEW: Save CRF
         }
         try:
             with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness

@@ -288,7 +288,8 @@ def encode_frames_to_mp4(
     total_output_frames: int,
     video_stream_info: Optional[dict],
     stop_event: threading.Event, # Added stop_event to allow early exit during encoding
-    sidecar_json_data: Optional[dict] = None
+    sidecar_json_data: Optional[dict] = None,
+    user_output_crf: Optional[int] = None # NEW: Add this parameter
 ) -> bool:
     """
     Encodes a sequence of 16-bit PNG frames from a temporary directory into an MP4 video
@@ -315,12 +316,20 @@ def encode_frames_to_mp4(
     # --- Determine Output Codec, Bit-Depth, and Quality ---
     output_codec = "libx264" # Default to H.264 CPU encoder
     output_pix_fmt = "yuv420p" # Default to 8-bit
-    output_crf = "23" # Default CRF for H.264 (lower is better quality)
+    default_cpu_crf = "23" # Default CRF for H.264 (lower is better quality)
     output_profile = "main"
     x265_params = [] # For specific x265 parameters
 
     nvenc_preset = "medium" # Default NVENC preset (e.g., fast, medium, slow, quality)
-    nvenc_cq = "23" # Constant Quality value for NVENC (lower is better quality)
+    default_nvenc_cq = "23" # Constant Quality value for NVENC (lower is better quality)
+
+    # NEW: Apply user-specified CRF if provided
+    if user_output_crf is not None and user_output_crf >= 0:
+        logger.info(f"Using user-specified output CRF: {user_output_crf}")
+        default_cpu_crf = str(user_output_crf)
+        default_nvenc_cq = str(user_output_crf) # Assume user CRF applies to NVENC CQ as well for simplicity
+    else:
+        logger.info("Using auto-determined output CRF.")
 
     is_hdr_source = False
     original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
@@ -343,7 +352,8 @@ def encode_frames_to_mp4(
             output_codec = "hevc_nvenc"
             logger.info("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
-        output_crf = "28" # For CPU x265 (HDR often needs higher CRF to look "good")
+        if user_output_crf is None:
+            default_cpu_crf = "28" # For CPU x265 (HDR often needs higher CRF to look "good")
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
             x265_params.append(f"master-display={video_stream_info['mastering_display_metadata']}")
@@ -356,7 +366,8 @@ def encode_frames_to_mp4(
             output_codec = "hevc_nvenc"
             logger.info("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
-        output_crf = "24" # For CPU x265 (SDR 10-bit)
+        if user_output_crf is None:
+            default_cpu_crf = "24" # For CPU x265 (SDR 10-bit)
         output_profile = "main10"
     else: # Default to H.264 8-bit, or if no info
         logger.info("Detected SDR (8-bit H.264 or other) source or no specific info. Targeting H.264 8-bit.")
@@ -365,16 +376,18 @@ def encode_frames_to_mp4(
             output_codec = "h264_nvenc"
             logger.info("    (Using h264_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p"
-        output_crf = "18" # For CPU x264 (SDR 8-bit, higher quality)
+        if user_output_crf is None:
+            default_cpu_crf = "18" # For CPU x264 (SDR 8-bit, higher quality)
         output_profile = "main"
 
+    logger.debug("default_cpu_crf = {default_cpu_crf}")
     # Add codec, profile, pix_fmt
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
         ffmpeg_cmd.extend(["-preset", nvenc_preset])
-        ffmpeg_cmd.extend(["-cq", nvenc_cq]) # NVENC uses CQ, not CRF
+        ffmpeg_cmd.extend(["-cq", default_nvenc_cq]) # NVENC uses CQ, not CRF
     else:
-        ffmpeg_cmd.extend(["-crf", output_crf])
+        ffmpeg_cmd.extend(["-crf", default_cpu_crf])
     
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
     if output_profile:

@@ -81,9 +81,9 @@ class DepthCrafterDemo:
                     set_verbosity_info() # Temporarily set to INFO to catch xFormers messages
 
                     self.pipe.enable_xformers_memory_efficient_attention()
-                    _logger.info("xFormers memory-efficient attention enabled successfully.")
+                    _logger.info("xFormers memory-efficient attention enabled successfully (controlled by global flag).")
                 except ImportError:
-                    _logger.warning("xFormers library not found. Memory-efficient attention cannot be enabled. Please install 'xformers' for potential VRAM reduction and speedup.")
+                    _logger.warning("xFormers library not found...")
                 except Exception as e:
                     _logger.warning(f"Failed to enable xFormers memory-efficient attention due to an unexpected error: {e}. Falling back to standard attention.")
                 finally:

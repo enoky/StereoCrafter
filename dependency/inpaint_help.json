@@ -2,6 +2,7 @@
   "input_folder": "Select the directory containing your input MP4 videos. The script expects '_splatted4' for quad inputs (Original, Depth, Mask, Warped) or '_splatted2' for dual inputs (Mask, Warped).",
   "output_folder": "Choose the directory where the processed (inpainted) videos will be saved. Output will be Side-by-Side (original | inpainted) for quad inputs, or only the inpainted right eye for dual inputs.",
   "num_inference_steps": "Number of denoising steps for the video generation process. Higher values generally lead to better quality but increase processing time. Default:5 ",
+	"output_crf": "Constant Rate Factor for video encoding (lower is higher quality). Adjust based on codec (H.264/H.265).",
   "tile_num": "Number of spatial tiles (e.g., 2 means 2x2 grid) to split each video frame into. Useful for processing high-resolution videos with limited GPU memory. Set to 1 to disable tiling. Default:1",
   "frames_chunk": "The number of frames processed together in a single temporal batch. Adjust based on your GPU memory. Larger chunks can be faster but require more VRAM. Hallucination is more likely with larger chunks. Default:23",
   "frame_overlap": "The number of frames that temporally overlap between consecutive processing chunks. These overlapping frames from the previous generated output and original input are smoothly blended to condition the start of the current chunk, reducing visual glitches. Default:3",
