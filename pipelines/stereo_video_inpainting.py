@@ -13,6 +13,7 @@ from diffusers.schedulers import EulerDiscreteScheduler
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor 
 
 
 logger = logging.get_logger(__name__)
@@ -605,7 +606,6 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
 
-
 # resizing utils
 # TODO: clean up later
 def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
@@ -635,7 +635,6 @@ def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corner
     output = torch.nn.functional.interpolate(input, size=size, mode=interpolation, align_corners=align_corners)
     return output
 
-
 def _compute_padding(kernel_size):
     """Compute padding tuple."""
     # 4 or 6 ints:  (padding_left, padding_right,padding_top,padding_bottom)
@@ -657,7 +656,6 @@ def _compute_padding(kernel_size):
         out_padding[2 * i + 1] = pad_rear
 
     return out_padding
-
 
 def _filter2d(input, kernel):
     # prepare kernel
@@ -681,7 +679,6 @@ def _filter2d(input, kernel):
     out = output.view(b, c, h, w)
     return out
 
-
 def _gaussian(window_size: int, sigma):
     if isinstance(sigma, float):
         sigma = torch.tensor([[sigma]])
@@ -697,7 +694,6 @@ def _gaussian(window_size: int, sigma):
 
     return gauss / gauss.sum(-1, keepdim=True)
 
-
 def _gaussian_blur2d(input, kernel_size, sigma):
     if isinstance(sigma, tuple):
         sigma = torch.tensor([sigma], dtype=input.dtype,device=input.device)
@@ -712,3 +708,26 @@ def _gaussian_blur2d(input, kernel_size, sigma):
     out = _filter2d(out_x, kernel_y[..., None])
 
     return out
+
+def configure_attention_processors(pipeline: StableVideoDiffusionInpaintingPipeline):
+    """
+    Attempts to enable efficient attention processors for the pipeline's UNet.
+    Prioritizes AttnProcessor2_0 (Flash Attention) then falls back to xFormers.
+    """
+    attention_set = False
+    if AttnProcessor2_0 is not None:
+        try:
+            pipeline.unet.set_attn_processor(AttnProcessor2_0())
+            logger.info("Efficient attention (AttnProcessor2_0) enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable AttnProcessor2_0: {e}")
+    if not attention_set and XFormersAttnProcessor is not None:
+        try:
+            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
+            logger.info("xFormers attention enabled for UNet")
+            attention_set = True
+        except Exception as e:
+            logger.warning(f"Failed to enable xFormers attention: {e}")
+    if not attention_set:
+        logger.info("Using default attention processor")
