@@ -11,16 +11,7 @@ import numpy as np
 import torch
 from decord import VideoReader, cpu
 # FlashAttention requires optional dependency; attempt safe imports
-from transformers import CLIPVisionModelWithProjection
-from diffusers.models import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-try:
-    from diffusers.models.attention_processor import (
-        AttnProcessor2_0,
-        XFormersAttnProcessor,
-    )
-except Exception:  # diffusers may not provide these processors
-    AttnProcessor2_0 = None  # type: ignore
-    XFormersAttnProcessor = None  # type: ignore
+
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
@@ -29,84 +20,11 @@ import cv2 # NEW: For saving 16-bit PNGs
 from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
-    tensor2vid
+    tensor2vid,
+    load_inpainting_pipeline
 )
 
 # torch.backends.cudnn.benchmark = True
-
-def load_inpainting_pipeline(
-    pre_trained_path: str,
-    unet_path: str,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.float16,
-    offload_type: str = "model"
-) -> StableVideoDiffusionInpaintingPipeline:
-    """
-    Loads the stable video diffusion inpainting pipeline components and returns the pipeline object.
-    """
-    logger.info("Loading pipeline components...")
-
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        pre_trained_path,
-        subfolder="image_encoder",
-        variant="fp16",
-        torch_dtype=dtype,
-    )
-    vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path,
-        subfolder="vae",
-        variant="fp16",
-        torch_dtype=dtype,
-    )
-    unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        unet_path,
-        subfolder="unet_diffusers",
-        low_cpu_mem_usage=True,
-        torch_dtype=dtype,
-    )
-
-    image_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
-
-    pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
-        pre_trained_path,
-        image_encoder=image_encoder,
-        vae=vae,
-        unet=unet,
-        torch_dtype=dtype,
-    ).to(device)
-
-    # Try enabling efficient attention (AttnProcessor2_0) for faster and more memory-efficient inference.
-    # This leverages PyTorch's scaled_dot_product_attention, which uses Flash Attention if available.
-    # Fallback to xFormers if AttnProcessor2_0 isn't available.
-    attention_set = False
-    if AttnProcessor2_0 is not None:
-        try:
-            pipeline.unet.set_attn_processor(AttnProcessor2_0())
-            logger.info("Efficient attention (AttnProcessor2_0) enabled for UNet")
-            attention_set = True
-        except Exception as e:
-            logger.warning(f"Failed to enable AttnProcessor2_0: {e}")
-    if not attention_set and XFormersAttnProcessor is not None:
-        try:
-            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
-            logger.info("xFormers attention enabled for UNet")
-            attention_set = True
-        except Exception as e:
-            logger.warning(f"Failed to enable xFormers attention: {e}")
-    if not attention_set:
-        logger.info("Using default attention processor")
-    if offload_type == "model":
-        pipeline.enable_model_cpu_offload()
-    elif offload_type == "sequential":
-        pipeline.enable_sequential_cpu_offload()
-    elif offload_type == "none":
-        pass  # No offloading
-    else:
-        raise ValueError("Invalid offload_type")
-
-    return pipeline
 
 def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor, float, Optional[dict]]:
     """
