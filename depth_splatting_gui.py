@@ -11,6 +11,7 @@ from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
+from ttkthemes import ThemedTk
 import json
 import threading
 import queue
@@ -1181,9 +1182,26 @@ def load_config():
 load_help_texts()
 
 # GUI Setup
-root = tk.Tk()
+# root = tk.Tk()
+root = ThemedTk(theme="black") # NEW: Use ThemedTk and specify a dark theme (e.g., "black", "equilux", "plastik-dark")
+                              # "black" is a good simple dark theme.
+                              # "equilux" is a modern, flat dark theme.
+                              # Other options: "arc", "breeze", "radiance", "scidgrey", etc. (some are light, some dark)
 root.title("Batch Depth Splatting")
 root.geometry("620x770")
+root.configure(bg="#2b2b2b") # NEW: Set a dark background color for the root window
+
+# style = ttk.Style()
+# # Option A: Try built-in themes
+# # Print available themes to see what your system offers:
+# print(style.theme_names())
+# # Then try one that might be darker or more neutral:
+# # style.theme_use("clam") # Often a good base
+# # style.theme_use("alt")
+# style.theme_use("default") # Some systems (e.g., modern Linux with specific themes) might have a 'dark' theme.
+                        # Windows often falls back to 'clam' or 'xpnative'.
+                        # This might not produce a true dark mode on Windows out-of-the-box.
+
 
 # Create a menu bar
 menubar = tk.Menu(root)
@@ -1223,18 +1241,18 @@ processing_task_name_var = tk.StringVar(value="N/A") # To show Full-Res/Low-Res
 load_config()
 
 # Folder selection frame
-folder_frame = tk.LabelFrame(root, text="Input/Output Folders")
+folder_frame = ttk.LabelFrame(root, text="Input/Output Folders")
 folder_frame.pack(pady=10, padx=10, fill="x")
 folder_frame.grid_columnconfigure(1, weight=1) # This makes column 1 expand horizontally
 
 # Input Source Clips Row
-lbl_source_clips = tk.Label(folder_frame, text="Input Source Clips:")
+lbl_source_clips = ttk.Label(folder_frame, text="Input Source Clips:")
 lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-entry_source_clips = tk.Entry(folder_frame, textvariable=input_source_clips_var) # Reduced width for more buttons
+entry_source_clips = ttk.Entry(folder_frame, textvariable=input_source_clips_var) # Reduced width for more buttons
 entry_source_clips.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-btn_browse_source_clips_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_source_clips_var))
+btn_browse_source_clips_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_source_clips_var))
 btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
-btn_select_source_clips_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
+btn_select_source_clips_file = ttk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
 btn_select_source_clips_file.grid(row=0, column=3, padx=2, pady=2)
 create_hover_tooltip(lbl_source_clips, "input_source_clips") # Existing
 create_hover_tooltip(entry_source_clips, "input_source_clips") # Existing
@@ -1243,13 +1261,13 @@ create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file") # 
 
 
 # Input Depth Maps Row
-lbl_input_depth_maps = tk.Label(folder_frame, text="Input Depth Maps:")
+lbl_input_depth_maps = ttk.Label(folder_frame, text="Input Depth Maps:")
 lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-entry_input_depth_maps = tk.Entry(folder_frame, textvariable=input_depth_maps_var) # Reduced width
+entry_input_depth_maps = ttk.Entry(folder_frame, textvariable=input_depth_maps_var) # Reduced width
 entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
-btn_browse_input_depth_maps_folder = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_depth_maps_var))
+btn_browse_input_depth_maps_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(input_depth_maps_var))
 btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
-btn_select_input_depth_maps_file = tk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
+btn_select_input_depth_maps_file = ttk.Button(folder_frame, text="Select File", command=lambda: browse_file(input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
 btn_select_input_depth_maps_file.grid(row=1, column=3, padx=2, pady=2)
 create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps") # Existing
 create_hover_tooltip(entry_input_depth_maps, "input_depth_maps") # Existing
@@ -1258,11 +1276,11 @@ create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file") 
 
 
 # Output Splatted Row
-lbl_output_splatted = tk.Label(folder_frame, text="Output Splatted:")
+lbl_output_splatted = ttk.Label(folder_frame, text="Output Splatted:")
 lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-entry_output_splatted = tk.Entry(folder_frame, textvariable=output_splatted_var) # Reduced width
+entry_output_splatted = ttk.Entry(folder_frame, textvariable=output_splatted_var) # Reduced width
 entry_output_splatted.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-btn_browse_output_splatted = tk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(output_splatted_var))
+btn_browse_output_splatted = ttk.Button(folder_frame, text="Browse Folder", command=lambda: browse_folder(output_splatted_var))
 btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2) # Spanning two columns
 create_hover_tooltip(lbl_output_splatted, "output_splatted")
 create_hover_tooltip(entry_output_splatted, "output_splatted")
@@ -1270,47 +1288,47 @@ create_hover_tooltip(btn_browse_output_splatted, "output_splatted")
 
 
 # Process Resolution and Settings Frame (RENAMED)
-preprocessing_frame = tk.LabelFrame(root, text="Process Resolution and Settings")
+preprocessing_frame = ttk.LabelFrame(root, text="Process Resolution and Settings")
 preprocessing_frame.pack(pady=10, padx=10, fill="x")
 preprocessing_frame.grid_columnconfigure(1, weight=1) # Makes column 1 expand
 preprocessing_frame.grid_columnconfigure(3, weight=1) # Makes column 3 expand (for horizontal spacing)
 
 
 # --- Enable Full Resolution Section ---
-enable_full_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Enable Full Resolution Output (Native Video Resolution)", variable=enable_full_res_var)
+enable_full_res_checkbox = ttk.Checkbutton(preprocessing_frame, text="Enable Full Resolution Output (Native Video Resolution)", variable=enable_full_res_var)
 enable_full_res_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 create_hover_tooltip(enable_full_res_checkbox, "enable_full_res")
 
-lbl_full_res_batch_size = tk.Label(preprocessing_frame, text="Full Res Batch Size:") # RENAMED LABEL
+lbl_full_res_batch_size = ttk.Label(preprocessing_frame, text="Full Res Batch Size:") # RENAMED LABEL
 lbl_full_res_batch_size.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-entry_full_res_batch_size = tk.Entry(preprocessing_frame, textvariable=batch_size_var, width=15) # Uses existing batch_size_var
+entry_full_res_batch_size = ttk.Entry(preprocessing_frame, textvariable=batch_size_var, width=15) # Uses existing batch_size_var
 entry_full_res_batch_size.grid(row=1, column=1, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_full_res_batch_size, "full_res_batch_size")
 create_hover_tooltip(entry_full_res_batch_size, "full_res_batch_size")
 
 
 # --- Enable Low Resolution Section ---
-enable_low_res_checkbox = tk.Checkbutton(preprocessing_frame, text="Enable Low Resolution Output (Pre-defined Below)", variable=enable_low_res_var) # RENAMED
+enable_low_res_checkbox = ttk.Checkbutton(preprocessing_frame, text="Enable Low Resolution Output (Pre-defined Below)", variable=enable_low_res_var) # RENAMED
 enable_low_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(10, 2)) # Use pady=(top, bottom) for desired separation
 create_hover_tooltip(enable_low_res_checkbox, "enable_low_res")
 
-pre_res_width_label = tk.Label(preprocessing_frame, text="Low Res Width:") # RENAMED LABEL
+pre_res_width_label = ttk.Label(preprocessing_frame, text="Low Res Width:") # RENAMED LABEL
 pre_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-pre_res_width_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_width_var, width=10)
+pre_res_width_entry = ttk.Entry(preprocessing_frame, textvariable=pre_res_width_var, width=10)
 pre_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
 create_hover_tooltip(pre_res_width_label, "low_res_width")
 create_hover_tooltip(pre_res_width_entry, "low_res_width")
 
-pre_res_height_label = tk.Label(preprocessing_frame, text="Low Res Height:") # RENAMED LABEL
+pre_res_height_label = ttk.Label(preprocessing_frame, text="Low Res Height:") # RENAMED LABEL
 pre_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
-pre_res_height_entry = tk.Entry(preprocessing_frame, textvariable=pre_res_height_var, width=10)
+pre_res_height_entry = ttk.Entry(preprocessing_frame, textvariable=pre_res_height_var, width=10)
 pre_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
 create_hover_tooltip(pre_res_height_label, "low_res_height")
 create_hover_tooltip(pre_res_height_entry, "low_res_height")
 
-lbl_low_res_batch_size = tk.Label(preprocessing_frame, text="Low Res Batch Size:") # NEW
+lbl_low_res_batch_size = ttk.Label(preprocessing_frame, text="Low Res Batch Size:") # NEW
 lbl_low_res_batch_size.grid(row=4, column=0, sticky="e", padx=5, pady=2)
-entry_low_res_batch_size = tk.Entry(preprocessing_frame, textvariable=low_res_batch_size_var, width=15) # NEW
+entry_low_res_batch_size = ttk.Entry(preprocessing_frame, textvariable=low_res_batch_size_var, width=15) # NEW
 entry_low_res_batch_size.grid(row=4, column=1, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_low_res_batch_size, "low_res_batch_size")
 create_hover_tooltip(entry_low_res_batch_size, "low_res_batch_size")
@@ -1354,64 +1372,64 @@ enable_full_res_var.trace_add("write", lambda *args: toggle_processing_settings_
 enable_low_res_var.trace_add("write", lambda *args: toggle_processing_settings_fields())
 
 # Output Settings Frame
-output_settings_frame = tk.LabelFrame(root, text="Splatting & Output Settings")
+output_settings_frame = ttk.LabelFrame(root, text="Splatting & Output Settings")
 output_settings_frame.pack(pady=10, padx=10, fill="x")
 
 # Max Disparity and Batch Size within Output Settings
-lbl_max_disp = tk.Label(output_settings_frame, text="Max Disparity %:")
+lbl_max_disp = ttk.Label(output_settings_frame, text="Max Disparity %:")
 lbl_max_disp.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-entry_max_disp = tk.Entry(output_settings_frame, textvariable=max_disp_var, width=15)
+entry_max_disp = ttk.Entry(output_settings_frame, textvariable=max_disp_var, width=15)
 entry_max_disp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
 create_hover_tooltip(lbl_max_disp, "max_disp")
 create_hover_tooltip(entry_max_disp, "max_disp")
 
 # NEW: Zero Disparity Anchor Point input (Moved to row 1)
-lbl_zero_disparity_anchor = tk.Label(output_settings_frame, text="Convergence Point (0-1):")
+lbl_zero_disparity_anchor = ttk.Label(output_settings_frame, text="Convergence Point (0-1):")
 lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=2 to row=1
-entry_zero_disparity_anchor = tk.Entry(output_settings_frame, textvariable=zero_disparity_anchor_var, width=15)
+entry_zero_disparity_anchor = ttk.Entry(output_settings_frame, textvariable=zero_disparity_anchor_var, width=15)
 entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=2 to row=1
 create_hover_tooltip(lbl_zero_disparity_anchor, "convergence_point")
 create_hover_tooltip(entry_zero_disparity_anchor, "convergence_point")
 
 # Process Length (Moved to row 2)
-lbl_process_length = tk.Label(output_settings_frame, text="Process Length (-1 for all):")
+lbl_process_length = ttk.Label(output_settings_frame, text="Process Length (-1 for all):")
 lbl_process_length.grid(row=2, column=0, sticky="e", padx=5, pady=2) # CHANGED FROM row=3 to row=2
-entry_process_length = tk.Entry(output_settings_frame, textvariable=process_length_var, width=15)
+entry_process_length = ttk.Entry(output_settings_frame, textvariable=process_length_var, width=15)
 entry_process_length.grid(row=2, column=1, sticky="w", padx=5, pady=2) # CHANGED FROM row=3 to row=2
 create_hover_tooltip(lbl_process_length, "process_length")
 create_hover_tooltip(entry_process_length, "process_length")
 
 # Dual Output Checkbox (Moved to row 3, now at the bottom of these settings)
-dual_output_checkbox = tk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
+dual_output_checkbox = ttk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=dual_output_var)
 dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2) # CHANGED FROM row=1 to row=3
 create_hover_tooltip(dual_output_checkbox, "dual_output")
 
 # Progress frame
-progress_frame = tk.LabelFrame(root, text="Progress")
+progress_frame = ttk.LabelFrame(root, text="Progress")
 progress_frame.pack(pady=10, padx=10, fill="x")
 progress_var = tk.DoubleVar()
 progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100)
 progress_bar.pack(fill="x", expand=True, padx=5, pady=2)
-status_label = tk.Label(progress_frame, text="Ready")
+status_label = ttk.Label(progress_frame, text="Ready")
 status_label.pack(padx=5, pady=2)
 
 # Button frame
-button_frame = tk.Frame(root)
+button_frame = ttk.Frame(root)
 button_frame.pack(pady=10)
-start_button = tk.Button(button_frame, text="START", command=start_processing)
+start_button = ttk.Button(button_frame, text="START", command=start_processing)
 start_button.pack(side="left", padx=5)
 create_hover_tooltip(start_button, "start_button")
 
-stop_button = tk.Button(button_frame, text="STOP", command=stop_processing, state="disabled")
+stop_button = ttk.Button(button_frame, text="STOP", command=stop_processing, state="disabled")
 stop_button.pack(side="left", padx=5)
 create_hover_tooltip(stop_button, "stop_button")
 
-exit_button = tk.Button(button_frame, text="EXIT", command=exit_app)
+exit_button = ttk.Button(button_frame, text="EXIT", command=exit_app)
 exit_button.pack(side="left", padx=5)
 create_hover_tooltip(exit_button, "exit_button")
 
 # NEW: Current Processing Information frame
-info_frame = tk.LabelFrame(root, text="Current Processing Information")
+info_frame = ttk.LabelFrame(root, text="Current Processing Information")
 info_frame.pack(pady=10, padx=10, fill="x")
 info_frame.grid_columnconfigure(1, weight=1) # Makes value columns expand
 
