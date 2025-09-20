@@ -92,7 +92,7 @@ def release_cuda_memory():
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            logger.info("CUDA cache cleared.")
+            logger.debug("CUDA cache cleared.")
         gc.collect()
         logger.debug("Python garbage collector invoked.")
     except Exception as e:
