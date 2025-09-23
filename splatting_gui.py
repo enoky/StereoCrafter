@@ -16,7 +16,7 @@ import json
 import threading
 import queue
 import subprocess
-from typing import Optional
+from typing import Optional, Tuple
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
@@ -456,6 +456,338 @@ class SplatterGUI(ThemedTk):
         self.processing_disparity_var.set("N/A")
         self.processing_convergence_var.set("N/A")
         self.processing_task_name_var.set("N/A")
+
+    def DepthSplatting(self: "SplatterGUI", # Added self and type hint for Pylance
+                        input_video_reader: VideoReader,
+                        depth_map_reader: VideoReader,
+                        total_frames_to_process: int,
+                        processed_fps: float,
+                        output_video_path_base: str, # This is the full path including name, without final suffix
+                        target_output_height: int, # The resolution the video readers were configured to output
+                        target_output_width: int,  # The resolution the video readers were configured to output
+                        max_disp: float,
+                        process_length: int, # Global limit from GUI
+                        batch_size: int, # This is now the chunk size for disk reading
+                        dual_output: bool,
+                        zero_disparity_anchor_val: float,
+                        video_stream_info: Optional[dict],
+                        frame_overlap: Optional[int],
+                        input_bias: Optional[float],
+                        enable_autogain: bool # NEW: Pass through autogain setting
+                        ):
+            logger.debug("==> Initializing ForwardWarpStereo module")
+            stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+
+            # `num_frames` now comes from the parameter `total_frames_to_process`
+            num_frames = total_frames_to_process
+            height, width = target_output_height, target_output_width # Use configured target output dimensions
+
+            os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
+
+            # Determine output video suffix
+            if dual_output:
+                suffix = "_splatted2"
+            else:
+                suffix = "_splatted4"
+
+            res_suffix = f"_{width}"
+            final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
+
+            temp_png_dir = os.path.join(os.path.dirname(final_output_video_path), "temp_splat_pngs_" + os.path.basename(os.path.splitext(output_video_path_base)[0]))
+            os.makedirs(temp_png_dir, exist_ok=True)
+            logger.debug(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
+
+            frame_count = 0
+            logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
+            draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
+
+            # For global normalization (placeholder for next step)
+            global_depth_min = 0.0
+            global_depth_max = 1.0
+            
+            # --- NEW: Global Depth Normalization Pre-pass (Placeholder) ---
+            # This is where the `compute_depth_stats` logic would go in the NEXT step.
+            # For now, if autogain is ENABLED, we will still apply local min/max.
+            # If autogain is DISABLED, we assume input is 0-1 (which will be wrong without global min/max)
+            # This will be fixed in the next iteration when we add global normalization.
+            if not enable_autogain:
+                logger.warning("Autogain is disabled, but global min/max for consistent depth normalization is not yet implemented. Depth values will be used as-is (assumed 0-1). This may cause alignment issues.")
+            else:
+                logger.info("Autogain is ENABLED. Depth maps will be normalized per-chunk, leading to potential brightness jumps between segments.")
+                # We'll calculate min/max per chunk for now if autogain is enabled,
+                # until global normalization is implemented.
+
+
+            for i in range(0, num_frames, batch_size): # batch_size is now chunk_size
+                if self.stop_event.is_set():
+                    draw_progress_bar(frame_count, num_frames, suffix='Stopped')
+                    print()
+                    del stereo_projector
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    if os.path.exists(temp_png_dir):
+                        shutil.rmtree(temp_png_dir)
+                    return
+
+                # Read frames directly from VideoReader objects for the current chunk
+                current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
+                if not current_frame_indices:
+                    break
+
+                batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
+                batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
+
+                # Process depth frames (grayscale conversion if needed)
+                if batch_depth_numpy_raw.ndim == 4: # If depth video is RGB
+                    batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
+                else: # If depth video is grayscale (ndim 3: T,H,W or T,H,W,1)
+                    batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1) if batch_depth_numpy_raw.ndim == 4 else batch_depth_numpy_raw
+
+                # Normalize depth frames (this is the local autogain part, or 0-1 scale if autogain disabled)
+                if enable_autogain:
+                    local_depth_min = batch_depth_numpy.min()
+                    local_depth_max = batch_depth_numpy.max()
+                    if local_depth_max - local_depth_min > 1e-5:
+                        batch_depth_normalized = (batch_depth_numpy - local_depth_min) / (local_depth_max - local_depth_min)
+                    else:
+                        batch_depth_normalized = np.zeros_like(batch_depth_numpy)
+                    logger.debug(f"Chunk {i}-{i+len(current_frame_indices)} depth autogained (min-max scaled) from [{local_depth_min:.3f}, {local_depth_max:.3f}] to [0, 1].")
+                else:
+                    # If autogain is disabled, assume 0-1 scale (e.g., if depth map was already processed globally)
+                    # For MP4 depth maps, this might mean raw values / 255.0 or / 1023.0 if no global min/max
+                    # This logic will be improved with global normalization in the next step.
+                    max_raw_val = np.max(batch_depth_numpy_raw)
+                    if max_raw_val > 255 and max_raw_val <= 1023: # Heuristic for 10-bit range
+                        batch_depth_normalized = batch_depth_numpy / 1023.0
+                        logger.debug(f"Autogain disabled. Scaling raw depth by 1023.0 for chunk {i}-{i+len(current_frame_indices)}.")
+                    else: # Assume 8-bit or standard 0-255 range
+                        batch_depth_normalized = batch_depth_numpy / 255.0
+                        logger.debug(f"Autogain disabled. Scaling raw depth by 255.0 for chunk {i}-{i+len(current_frame_indices)}.")
+                    batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1) # Ensure 0-1 range
+
+                # Convert original batch frames to float 0-1 for display in grid
+                batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
+
+                # Generate depth visualization for the current chunk
+                batch_depth_vis_list = []
+                for d_frame in batch_depth_normalized:
+                    vis_frame = cv2.applyColorMap((np.clip(d_frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+                    batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
+                batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) # [T, H, W, 3]
+
+                # Convert to tensors for GPU processing
+                left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
+                disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()
+
+                disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
+                disp_map_tensor = disp_map_tensor * max_disp
+
+                with torch.no_grad():
+                    right_video_tensor, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
+                
+                right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
+                occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
+
+                for j in range(len(batch_frames_numpy)):
+                    if dual_output:
+                        video_grid = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
+                    else:
+                        video_grid_top = np.concatenate([batch_frames_float[j], batch_depth_vis[j]], axis=1)
+                        video_grid_bottom = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
+                        video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
+
+                    video_grid_uint16 = np.clip(video_grid, 0.0, 1.0) * 65535.0
+                    video_grid_uint16 = video_grid_uint16.astype(np.uint16)
+                    video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
+
+                    png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png")
+                    cv2.imwrite(png_filename, video_grid_bgr)
+
+                    frame_count += 1
+
+                del left_video_tensor, disp_map_tensor, right_video_tensor, occlusion_mask_tensor
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
+
+            logger.debug(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
+            
+            del stereo_projector
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            # --- FFmpeg encoding (remains largely the same) ---
+            # ... (FFmpeg command construction logic, identical to previous version) ...
+            # This part will use final_output_video_path, video_stream_info, processed_fps etc.
+
+            # I'm omitting the FFmpeg and cleanup block here for brevity,
+            # but it should be kept as it was previously.
+            # Ensure final_output_video_path and temp_png_dir are correctly scoped.
+            
+            # Original FFmpeg block starts here:
+            logger.debug(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y", # Overwrite output files without asking
+                "-framerate", str(processed_fps), # Input framerate for the PNG sequence
+                "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
+            ]
+
+            original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
+            original_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
+
+            is_original_10bit_or_higher = False
+            if original_pix_fmt:
+                if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
+                    is_original_10bit_or_higher = True
+                    logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (>= 10-bit)")
+                else:
+                    logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (< 10-bit)")
+            else:
+                logger.debug("==> Could not detect original video pixel format.")
+
+            output_codec = "libx264"
+            output_pix_fmt = "yuv420p"
+            output_crf = "23" # Default CRF for H.264 (medium quality)
+            output_profile = "main"
+            x265_params = []
+
+            nvenc_preset = "medium"
+            nvenc_cq = "23"
+
+            is_hdr_source = False
+            if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
+            video_stream_info.get("transfer_characteristics") == "smpte2084":
+                is_hdr_source = True
+                logger.debug("==> Source detected as HDR.")
+
+            if video_stream_info:
+                logger.debug("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
+
+                if is_hdr_source:
+                    logger.debug("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
+                    output_codec = "libx265"
+                    if CUDA_AVAILABLE:
+                        output_codec = "hevc_nvenc"
+                        logger.debug("    (Using hevc_nvenc for hardware acceleration)")
+                    
+                    output_pix_fmt = "yuv420p10le"
+                    output_crf = "28"
+                    output_profile = "main10"
+                    if video_stream_info.get("mastering_display_metadata"):
+                        md_meta = video_stream_info["mastering_display_metadata"]
+                        x265_params.append(f"mastering-display={md_meta}")
+                        logger.debug(f"==> Adding mastering display metadata: {md_meta}")
+                    if video_stream_info.get("max_content_light_level"):
+                        max_cll_meta = video_stream_info["max_content_light_level"]
+                        x265_params.append(f"max-cll={max_cll_meta}")
+                        logger.debug(f"==> Adding max content light level: {max_cll_meta}")
+
+                elif original_codec_name == "hevc" and is_original_10bit_or_higher:
+                    logger.debug("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
+                    output_codec = "libx265"
+                    if CUDA_AVAILABLE:
+                        output_codec = "hevc_nvenc"
+                        logger.debug("    (Using hevc_nvenc for hardware acceleration)")
+                    
+                    output_pix_fmt = "yuv420p10le"
+                    output_crf = "24"
+                    output_profile = "main10"
+
+                else:
+                    logger.debug("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
+                    output_codec = "libx264"
+                    if CUDA_AVAILABLE:
+                        output_codec = "h264_nvenc"
+                        logger.debug("    (Using h264_nvenc for hardware acceleration)")
+                    
+                    output_pix_fmt = "yuv420p"
+                    output_crf = "18"
+                    output_profile = "main"
+
+            else:
+                logger.debug("==> No source video stream info detected. Falling back to default H.264 (x264) 8-bit SDR (medium quality).")
+                if CUDA_AVAILABLE:
+                    output_codec = "h264_nvenc"
+                    logger.debug("    (Using h264_nvenc for hardware acceleration for default output)")
+
+
+            ffmpeg_cmd.extend(["-c:v", output_codec])
+            if "nvenc" in output_codec:
+                ffmpeg_cmd.extend(["-preset", nvenc_preset])
+                ffmpeg_cmd.extend(["-cq", nvenc_cq])
+                if "-crf" in ffmpeg_cmd:
+                    crf_index = ffmpeg_cmd.index("-crf")
+                    del ffmpeg_cmd[crf_index:crf_index+2]
+            else:
+                ffmpeg_cmd.extend(["-crf", output_crf])
+            
+            ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
+            if output_profile:
+                ffmpeg_cmd.extend(["-profile:v", output_profile])
+
+            if output_codec == "libx265" and x265_params:
+                ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
+
+            if video_stream_info:
+                if video_stream_info.get("color_primaries") and video_stream_info["color_primaries"] not in ["N/A", "und", "unknown"]:
+                    ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
+                if video_stream_info.get("transfer_characteristics") and video_stream_info["transfer_characteristics"] not in ["N/A", "und", "unknown"]:
+                    ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
+                if video_stream_info.get("color_space") and video_stream_info["color_space"] not in ["N/A", "und", "unknown"]:
+                    ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
+
+            ffmpeg_cmd.append(final_output_video_path)
+
+            logger.debug(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
+
+            try:
+                ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24)
+                logger.debug(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
+                logger.debug(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
+                logger.debug(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
+            except FileNotFoundError:
+                logger.error("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
+                messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
+                logger.error(f"==> FFmpeg stdout: {e.stdout}")
+                logger.error(f"==> FFmpeg stderr: {e.stderr}")
+                logger.error("==> Final video encoding failed due to ffmpeg error.")
+            except subprocess.TimeoutExpired:
+                logger.error(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
+            except Exception as e:
+                logger.error(f"==> An unexpected error occurred during ffmpeg execution: {e}")
+
+            logger.debug(f"==> Final output video written to: {final_output_video_path}")
+
+            output_sidecar_data = {}
+            output_sidecar_data["convergence_plane"] = zero_disparity_anchor_val
+            output_sidecar_data["max_disparity"] = (max_disp / width) * 100.0
+            
+            if frame_overlap is not None:
+                output_sidecar_data["frame_overlap"] = frame_overlap
+            if input_bias is not None:
+                output_sidecar_data["input_bias"] = input_bias
+
+            if frame_overlap is not None or input_bias is not None:
+                output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.json"
+                try:
+                    with open(output_sidecar_path, 'w') as f:
+                        json.dump(output_sidecar_data, f, indent=4)
+                    logger.debug(f"==> Created output sidecar JSON: {output_sidecar_path}")
+                except Exception as e:
+                    logger.error(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
+
+            if os.path.exists(temp_png_dir):
+                try:
+                    shutil.rmtree(temp_png_dir)
+                    logger.debug(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
+                except Exception as e:
+                    logger.error(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
+
+            logger.debug(f"==> Final output video written to: {final_output_video_path}")
 
     def toggle_processing_settings_fields(self):
         """Enables/disables resolution input fields and the START button based on checkbox states."""
@@ -900,85 +1232,100 @@ class SplatterGUI(ThemedTk):
                     "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})"
                 }))
 
-                input_frames_processed = None
-                processed_fps = None
-                current_processed_height = None
-                current_processed_width = None
+                video_reader_input = None
+                processed_fps = 0.0
+                original_vid_h, original_vid_w = 0, 0
+                current_processed_height, current_processed_width = 0, 0
                 video_stream_info = None
+                total_frames_input = 0
+
+                depth_reader_input = None
+                total_frames_depth = 0
+                actual_depth_height, actual_depth_width = 0, 0
 
                 try:
-                    input_frames_processed, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width, video_stream_info = read_video_frames(
-                    video_path, process_length, target_fps=-1,
-                    set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
+                    # 1. Initialize input video reader
+                    video_reader_input, processed_fps, original_vid_h, original_vid_w, \
+                    current_processed_height, current_processed_width, video_stream_info, \
+                    total_frames_input = read_video_frames(
+                        video_path, process_length,
+                        set_pre_res=task["set_pre_res"], pre_res_width=task["target_width"], pre_res_height=task["target_height"]
                     )
                 except Exception as e:
-                    logger.error(f"==> Error reading input video {video_path} for {task['name']} pass: {e}. Skipping this pass.")
+                    logger.error(f"==> Error initializing input video reader for {video_path} {task['name']} pass: {e}. Skipping this pass.")
                     overall_task_counter += 1
                     self.progress_queue.put(("processed", overall_task_counter))
                     continue
 
                 self.progress_queue.put(("update_info", {
                     "resolution": f"{current_processed_width}x{current_processed_height}",
-                    "frames": len(input_frames_processed)
+                    "frames": total_frames_input # <--- NOW USES total_frames_input
                 }))
 
-                video_depth = None
-                depth_vis = None
                 try:
-                    video_depth, depth_vis = load_pre_rendered_depth(
+                    # 2. Initialize depth maps reader
+                    # Note: target_height/width are the processed dimensions of the input video for matching
+                    depth_reader_input, total_frames_depth, actual_depth_height, actual_depth_width = load_pre_rendered_depth(
                         actual_depth_map_path,
                         process_length=process_length,
                         target_height=current_processed_height,
                         target_width=current_processed_width,
                         match_resolution_to_target=settings["match_depth_res"],
-                        enable_autogain=settings["enable_autogain"]
+                        enable_autogain=settings["enable_autogain"] # This setting will control autogain within DepthSplatting
                     )
                 except Exception as e:
-                    logger.error(f"==> Error loading depth map for {video_name} {task['name']} pass: {e}. Skipping this pass.")
+                    logger.error(f"==> Error initializing depth map reader for {video_name} {task['name']} pass: {e}. Skipping this pass.")
                     overall_task_counter += 1
                     self.progress_queue.put(("processed", overall_task_counter))
                     continue
 
-                if video_depth is None or depth_vis is None:
-                    logger.info(f"==> Skipping {video_name} {task['name']} pass due to depth load failure or stop request.")
+                # CRITICAL CHECK: Ensure input video and depth map have consistent frame counts
+                if total_frames_input != total_frames_depth:
+                    logger.error(f"==> Frame count mismatch for {video_name} {task['name']} pass: Input video has {total_frames_input} frames, Depth map has {total_frames_depth} frames. Skipping.")
                     overall_task_counter += 1
                     self.progress_queue.put(("processed", overall_task_counter))
                     continue
 
-                if not (video_depth.shape[1] == current_processed_height and video_depth.shape[2] == current_processed_width):
-                    logger.warning(f"==> Warning: Depth map resolution ({video_depth.shape[2]}x{video_depth.shape[1]}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. Attempting final resize as safeguard.")
-                    resized_video_depth = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in video_depth], axis=0)
-                    resized_depth_vis = np.stack([cv2.resize(frame, (current_processed_width, current_processed_height), interpolation=cv2.INTER_LINEAR) for frame in depth_vis], axis=0)
-                    video_depth = resized_video_depth
-                    depth_vis = resized_depth_vis
+                # Ensure depth map's *actual* output resolution from VideoReader matches input video's processed resolution
+                if not (actual_depth_height == current_processed_height and actual_depth_width == current_processed_width):
+                    logger.warning(f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned.")
+                    # For now, we will proceed assuming the `VideoReader` itself handled the resize.
+                    # If further `cv2.resize` is needed, it would happen *within* DepthSplatting on the chunk.
 
+
+                # Use the (potentially overridden) current_max_disparity_percentage
                 actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
                 actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_processed_width
                 logger.debug(f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels")
 
+                # NEW: Update disparity display with calculated pixel value
                 self.progress_queue.put(("update_info", {"disparity": f"{actual_max_disp_pixels:.2f} pixels ({current_max_disparity_percentage:.1f}%)"}))
 
+                # Create output directory and construct video path base (without final suffix)
                 current_output_subdir = os.path.join(output_splatted, task["output_subdir"])
                 os.makedirs(current_output_subdir, exist_ok=True)
                 output_video_path_base = os.path.join(current_output_subdir, f"{video_name}.mp4")
 
-                DepthSplatting(
-                    input_frames_processed=input_frames_processed,
+                # 4. Perform Depth Splatting - Pass the readers and relevant metadata
+                self.DepthSplatting( # Note: `self.` is correct here as DepthSplatting is now an instance method
+                    input_video_reader=video_reader_input,
+                    depth_map_reader=depth_reader_input,
+                    total_frames_to_process=total_frames_input, # Use the consistent total
                     processed_fps=processed_fps,
-                    output_video_path=output_video_path_base,
-                    video_depth=video_depth,
-                    depth_vis=depth_vis,
+                    output_video_path_base=output_video_path_base, # This is the full path with name, without suffix
+                    target_output_height=current_processed_height, # Needed for drawing grid
+                    target_output_width=current_processed_width,   # Needed for drawing grid
                     max_disp=actual_max_disp_pixels,
-                    process_length=process_length,
-                    batch_size=task["batch_size"],
+                    process_length=process_length, # This is for global video length limit, not chunking
+                    batch_size=task["batch_size"], # This is now the chunk size for reading
                     dual_output=dual_output,
                     zero_disparity_anchor_val=current_zero_disparity_anchor,
                     video_stream_info=video_stream_info,
                     frame_overlap=current_frame_overlap,
                     input_bias=current_input_bias,
-                    progress_queue=self.progress_queue, # Pass the queue
-                    stop_event=self.stop_event # Pass the stop event
+                    enable_autogain=settings["enable_autogain"] # Pass through autogain setting
                 )
+
                 if self.stop_event.is_set():
                     logger.info(f"==> Stopping {task['name']} pass for {video_name} due to user request")
                     release_cuda_memory()
@@ -1034,443 +1381,91 @@ def round_to_nearest_64(value):
     """Rounds a given value up to the nearest multiple of 64, with a minimum of 64."""
     return max(64, round(value / 64) * 64)
 
-def read_video_frames(video_path, process_length, target_fps,
-                      set_pre_res, pre_res_width, pre_res_height, dataset="open"):
+def read_video_frames(video_path: str,
+                      process_length: int,
+                      set_pre_res: bool,
+                      pre_res_width: int,
+                      pre_res_height: int,
+                      dataset: str = "open") -> Tuple[VideoReader,float, int, int, int, int, Optional[dict], int]:
     """
-    Reads video frames and determines the processing resolution.
-    Resolution is determined by set_pre_res, otherwise original resolution is used.
+    Initializes a VideoReader for chunked reading.
+    Returns: (video_reader, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info, total_frames_to_process)
     """
     if dataset == "open":
-        logger.debug(f"==> Processing video: {video_path}")
-        vid_info = VideoReader(video_path, ctx=cpu(0))
-        original_height, original_width = vid_info.get_batch([0]).shape[1:3]
-        logger.debug(f"==> Original video shape: {len(vid_info)} frames, {original_height}x{original_width} per frame")
+        logger.debug(f"==> Initializing VideoReader for: {video_path}")
+        vid_info_only = VideoReader(video_path, ctx=cpu(0)) # Use separate reader for info
+        original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
+        total_frames_original = len(vid_info_only)
+        logger.debug(f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame")
 
-        height_for_processing = original_height
-        width_for_processing = original_width
+        height_for_reader = original_height
+        width_for_reader = original_width
 
         if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
-            # User specified pre-processing resolution
-            height_for_processing = pre_res_height
-            width_for_processing = pre_res_width
-            logger.debug(f"==> Pre-processing video to user-specified resolution: {width_for_processing}x{height_for_processing}")
+            height_for_reader = pre_res_height
+            width_for_reader = pre_res_width
+            logger.debug(f"==> Pre-processing resolution set to: {width_for_reader}x{height_for_reader}")
         else:
-            # If set_pre_res is False, use original resolution.
-            logger.debug(f"==> Using original video resolution for processing: {width_for_processing}x{height_for_processing}")
+            logger.debug(f"==> Using original video resolution for reading: {width_for_reader}x{height_for_reader}")
 
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
 
     # decord automatically resizes if width/height are passed to VideoReader
-    vid = VideoReader(video_path, ctx=cpu(0), width=width_for_processing, height=height_for_processing)
-    fps = vid.get_avg_fps() if target_fps == -1 else target_fps
-    stride = max(round(vid.get_avg_fps() / fps), 1)
-    frames_idx = list(range(0, len(vid), stride))
-    logger.debug(f"==> Downsampled to {len(frames_idx)} frames with stride {stride}")
-    if process_length != -1 and process_length < len(frames_idx):
-        frames_idx = frames_idx[:process_length]
-
-    # Verify the actual shape after Decord processing
-    first_frame_shape = vid.get_batch([0]).shape
+    video_reader = VideoReader(video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader)
+    
+    # Verify the actual shape after Decord processing, using the first frame
+    first_frame_shape = video_reader.get_batch([0]).shape
     actual_processed_height, actual_processed_width = first_frame_shape[1:3]
-    logger.debug(f"==> Final processing shape: {len(frames_idx)} frames, {actual_processed_height}x{actual_processed_width} per frame")
-
-    frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
-
-    video_stream_info = get_video_stream_info(video_path)
-
-    return frames, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info
-
-def DepthSplatting(input_frames_processed, processed_fps, output_video_path, video_depth, depth_vis, max_disp, process_length, batch_size,
-                   dual_output: bool, zero_disparity_anchor_val: float, video_stream_info: Optional[dict],frame_overlap: Optional[int], input_bias: Optional[float],
-                   progress_queue: queue.Queue, stop_event: threading.Event): # Added queue and stop_event
-    logger.debug("==> Initializing ForwardWarpStereo module")
-    stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-
-    num_frames = len(input_frames_processed)
-    height, width, _ = input_frames_processed[0].shape # Get dimensions from already processed frames
-    os.makedirs(os.path.dirname(output_video_path), exist_ok=True) # Ensure output directory exists
-
-    # Determine output video suffix and dimensions
-    if dual_output:
-        suffix = "_splatted2"
-    else: # Quad output
-        suffix = "_splatted4"
-
-    res_suffix = f"_{width}"
-
-    # Construct the final output path that ffmpeg will write to
-    final_output_video_path = f"{os.path.splitext(output_video_path)[0]}{res_suffix}{suffix}.mp4"
-
-    # NEW: Use a temporary directory for PNG sequences
-    temp_png_dir = os.path.join(os.path.dirname(final_output_video_path), "temp_splat_pngs_" + os.path.basename(os.path.splitext(output_video_path)[0]))
-    os.makedirs(temp_png_dir, exist_ok=True)
-    logger.debug(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
-
-    # Process only up to process_length if specified, for consistency
-    if process_length != -1 and process_length < num_frames:
-        input_frames_processed = input_frames_processed[:process_length]
-        video_depth = video_depth[:process_length]
-        depth_vis = depth_vis[:process_length]
-        num_frames = process_length
-
-
-    frame_count = 0 # To name PNGs sequentially
     
+    fps = video_reader.get_avg_fps() # Use actual FPS from the reader
+
+    total_frames_available = len(video_reader)
+    total_frames_to_process = total_frames_available # Use available frames directly
+    if process_length != -1 and process_length < total_frames_available:
+        total_frames_to_process = process_length
     
-    # Add a single startup message
-    logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
-    draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:") # Indent slightly
-    
-    for i in range(0, num_frames, batch_size):
-        if stop_event.is_set():
-            draw_progress_bar(frame_count, num_frames, suffix='Stopped')
-            print() # Ensure a newline after stopping
-            logger.info("==> Splatting stopped by user.")
-            del stereo_projector
-            torch.cuda.empty_cache()
-            gc.collect()
-            if os.path.exists(temp_png_dir):
-                shutil.rmtree(temp_png_dir)
-            return
+    logger.debug(f"==> VideoReader initialized. Final processing dimensions: {actual_processed_width}x{actual_processed_height}. Total frames for processing: {total_frames_to_process}")
 
-        batch_frames = input_frames_processed[i:i+batch_size]
-        batch_depth = video_depth[i:i+batch_size]
-        batch_depth_vis = depth_vis[i:i+batch_size]
+    video_stream_info = get_video_stream_info(video_path) # Get stream info for FFmpeg later
 
-        left_video = torch.from_numpy(batch_frames).permute(0, 3, 1, 2).float().cuda()
-        disp_map = torch.from_numpy(batch_depth).unsqueeze(1).float().cuda()
+    return video_reader, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info, total_frames_to_process
 
-        disp_map = (disp_map - zero_disparity_anchor_val) * 2.0
-        disp_map = disp_map * max_disp
-        with torch.no_grad():
-            right_video, occlusion_mask = stereo_projector(left_video, disp_map)
-        right_video = right_video.cpu().permute(0, 2, 3, 1).numpy()
-        occlusion_mask = occlusion_mask.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
-
-        for j in range(len(batch_frames)):
-            # Determine the video grid based on dual_output setting
-            if dual_output:
-                # Dual output: Mask | Warped
-                video_grid = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
-            else:
-                # Quad output: Original | DepthVis (Top), Mask | Warped (Bottom)
-                video_grid_top = np.concatenate([batch_frames[j], batch_depth_vis[j]], axis=1)
-                video_grid_bottom = np.concatenate([occlusion_mask[j], right_video[j]], axis=1)
-                video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
-
-            # Convert to 16-bit for lossless saving, scaling float32 (0-1) to uint16 (0-65535)
-            # Clip to 0-1 range before scaling to prevent overflow if values slightly exceed 1.
-            video_grid_uint16 = np.clip(video_grid, 0.0, 1.0) * 65535.0
-            video_grid_uint16 = video_grid_uint16.astype(np.uint16)
-
-            # Convert to BGR for OpenCV
-            video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
-
-            png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png")
-            cv2.imwrite(png_filename, video_grid_bgr)
-
-            frame_count += 1
-
-        del left_video, disp_map, right_video, occlusion_mask
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:") # [REQUIRED]
-        
-    logger.debug(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
-    
-    del stereo_projector
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # --- FFmpeg encoding from PNG sequence to final MP4 ---
-    logger.debug(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y", # Overwrite output files without asking
-        "-framerate", str(processed_fps), # Input framerate for the PNG sequence
-        "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
-    ]
-
-    # --- Extract original video properties if available ---
-    original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
-    original_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
-
-    is_original_10bit_or_higher = False
-    if original_pix_fmt:
-        if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
-            is_original_10bit_or_higher = True
-            logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (>= 10-bit)")
-        else:
-            logger.debug(f"==> Detected original video pixel format: {original_pix_fmt} (< 10-bit)")
-    else:
-        logger.debug("==> Could not detect original video pixel format.")
-
-    # --- Determine Output Codec, Bit-Depth, and Quality ---
-    # Set sensible defaults first
-    output_codec = "libx264" # Default to H.264
-    output_pix_fmt = "yuv420p" # Default to 8-bit
-    output_crf = "23" # Default CRF for H.264 (medium quality)
-    output_profile = "main" # Default H.264 profile
-    x265_params = [] # For specific x265 parameters
-
-    
-    # NEW: NVENC specific parameters
-    nvenc_preset = "medium" # Default NVENC preset (e.g., fast, medium, slow, quality, etc.)
-    # Note: NVENC uses CQP/VBR/CBR not CRF. We'll map CRF to a CQ value or just use a fixed quality.
-    nvenc_cq = "23" # Constant Quality value for NVENC (lower is better quality)
-
-    is_hdr_source = False
-    if video_stream_info and video_stream_info.get("color_primaries") == "bt2020" and \
-       video_stream_info.get("transfer_characteristics") == "smpte2084":
-        is_hdr_source = True
-        logger.debug("==> Source detected as HDR.")
-
-    # Main logic for choosing output format based on detected info (always attempt smart matching)
-    if video_stream_info: # Only proceed with smart matching if info is detected
-        logger.debug("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
-
-        if is_hdr_source:
-            logger.debug("==> Detected HDR source. Targeting HEVC (x265) 10-bit HDR output.")
-            output_codec = "libx265" # Default to CPU x265
-            if CUDA_AVAILABLE:
-                output_codec = "hevc_nvenc" # Use NVENC if available
-                logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-            
-            output_pix_fmt = "yuv420p10le"
-            output_crf = "28" # This CRF value is for CPU x265, will use nvenc_cq for NVENC
-            output_profile = "main10"
-            # Add HDR mastering display and light level metadata if available
-            if video_stream_info.get("mastering_display_metadata"):
-                md_meta = video_stream_info["mastering_display_metadata"]
-                x265_params.append(f"mastering-display={md_meta}") # These are for x265, not nvenc directly.
-                logger.debug(f"==> Adding mastering display metadata: {md_meta}")
-            if video_stream_info.get("max_content_light_level"):
-                max_cll_meta = video_stream_info["max_content_light_level"]
-                x265_params.append(f"max-cll={max_cll_meta}") # These are for x265, not nvenc directly.
-                logger.debug(f"==> Adding max content light level: {max_cll_meta}")
-
-        elif original_codec_name == "hevc" and is_original_10bit_or_higher:
-            logger.debug("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC (x265) 10-bit SDR output.")
-            output_codec = "libx265" # Default to CPU x265
-            if CUDA_AVAILABLE:
-                output_codec = "hevc_nvenc" # Use NVENC if available
-                logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-            
-            output_pix_fmt = "yuv420p10le"
-            output_crf = "24" # For CPU x265
-            output_profile = "main10"
-
-        else: # If not HDR/HEVC 10-bit, default to H.264 high quality
-            logger.debug("==> No specific HEVC/HDR source. Targeting H.264 (x264) 8-bit SDR high quality.")
-            output_codec = "libx264" # Default to CPU x264
-            if CUDA_AVAILABLE:
-                output_codec = "h264_nvenc" # Use NVENC if available
-                logger.debug("    (Using h264_nvenc for hardware acceleration)")
-            
-            output_pix_fmt = "yuv420p"
-            output_crf = "18" # For CPU x264
-            output_profile = "main"
-
-    else: # video_stream_info is None (fallback behavior if no info detected)
-        logger.debug("==> No source video stream info detected. Falling back to default H.264 (x264) 8-bit SDR (medium quality).")
-        # Defaults already set at the top of this block (libx264, yuv420p, CRF 23, profile main)
-        if CUDA_AVAILABLE:
-            output_codec = "h264_nvenc" # Use NVENC if CUDA available for default H.264
-            logger.debug("    (Using h264_nvenc for hardware acceleration for default output)")
-
-
-    ffmpeg_cmd.extend(["-c:v", output_codec])
-    # NEW: Add NVENC specific parameters
-    if "nvenc" in output_codec: # Check if an NVENC codec is chosen
-        ffmpeg_cmd.extend(["-preset", nvenc_preset])
-        ffmpeg_cmd.extend(["-cq", nvenc_cq]) # Constant Quality for NVENC
-        # Remove CRF if NVENC is used, as it's not applicable
-        if "-crf" in ffmpeg_cmd:
-            crf_index = ffmpeg_cmd.index("-crf")
-            del ffmpeg_cmd[crf_index:crf_index+2] # Delete -crf and its value
-    else: # Only add CRF if not NVENC
-        ffmpeg_cmd.extend(["-crf", output_crf])
-    
-    ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-    if output_profile:
-        # NVENC profiles might differ slightly, but main/main10 generally work.
-        ffmpeg_cmd.extend(["-profile:v", output_profile])
-
-    # NVENC doesn't use -x265-params directly for HDR.
-    # HDR metadata for NVENC is usually passed via -mastering-display and -max-cll
-    # directly as FFmpeg main flags, which we already handle outside -x265-params.
-    # The -x265-params block is only relevant if using libx265.
-    if output_codec == "libx265" and x265_params:
-        ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
-
-
-    # --- Add general color space flags (primaries, transfer, space) ---
-    # This block remains, but now only applies if retain_color_space is true AND info exists
-    if video_stream_info:
-        if video_stream_info.get("color_primaries") and video_stream_info["color_primaries"] not in ["N/A", "und", "unknown"]:
-            ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
-        if video_stream_info.get("transfer_characteristics") and video_stream_info["transfer_characteristics"] not in ["N/A", "und", "unknown"]:
-            ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
-        if video_stream_info.get("color_space") and video_stream_info["color_space"] not in ["N/A", "und", "unknown"]:
-            ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
-
-    ffmpeg_cmd.append(final_output_video_path)
-
-    logger.debug(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
-
-    try:
-        ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24 hour timeout
-        logger.debug(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
-        logger.debug(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
-        logger.debug(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
-    except FileNotFoundError:
-        logger.error("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
-        messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
-        logger.error(f"==> FFmpeg stdout: {e.stdout}")
-        logger.error(f"==> FFmpeg stderr: {e.stderr}")
-        logger.error("==> Final video encoding failed due to ffmpeg error.")
-    except subprocess.TimeoutExpired:
-        logger.error(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
-    except Exception as e:
-        logger.error(f"==> An unexpected error occurred during ffmpeg execution: {e}")
-
-    logger.debug(f"==> Final output video written to: {final_output_video_path}")
-
-    # NEW: Create a sidecar JSON for the splatted output
-    output_sidecar_data = {}
-    
-    # Always include convergence_plane and max_disparity if they were used for splatting
-    # We'll use the values that were actually passed into this function.
-    output_sidecar_data["convergence_plane"] = zero_disparity_anchor_val
-    output_sidecar_data["max_disparity"] = (max_disp / width) * 100.0 # Convert back to percentage relative to width
-    
-    # Add frame_overlap and input_bias if they were provided
-    if frame_overlap is not None:
-        output_sidecar_data["frame_overlap"] = frame_overlap
-    if input_bias is not None:
-        output_sidecar_data["input_bias"] = input_bias
-
-    if frame_overlap is not None or input_bias is not None:
-        output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.json"
-        try:
-            with open(output_sidecar_path, 'w') as f:
-                json.dump(output_sidecar_data, f, indent=4)
-            logger.debug(f"==> Created output sidecar JSON: {output_sidecar_path}")
-        except Exception as e:
-            logger.error(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
-
-    # Clean up temporary PNG directory
-    if os.path.exists(temp_png_dir):
-        try:
-            shutil.rmtree(temp_png_dir)
-            logger.debug(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
-        except Exception as e:
-            logger.error(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-
-    logger.debug(f"==> Final output video written to: {final_output_video_path}")
-
-def load_pre_rendered_depth(depth_map_path, process_length=-1, target_height=-1, target_width=-1, match_resolution_to_target=True, enable_autogain=True):
+def load_pre_rendered_depth(depth_map_path: str, process_length: int, target_height: int, target_width: int, match_resolution_to_target: bool, enable_autogain: bool) -> Tuple[VideoReader, int, int, int]:
     """
-    Loads pre-rendered depth maps from MP4 or NPZ.
-    If match_resolution_to_target is True, it resizes the depth maps to the target_height/width for compatibility.
-    Includes an option to enable/disable min-max normalization (autogain).
-    If autogain is disabled, MP4 depth maps are scaled to 0-1 based on their detected bit depth (8-bit -> /255, 10-bit -> /1023).
-    For NPZ with autogain disabled, it assumes the data is already in the desired absolute range (e.g., 0-1).
+    Initializes a VideoReader for chunked depth map reading.
+    No normalization or autogain is applied here.
+    Returns: (depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width)
     """
-    logger.debug(f"==> Loading pre-rendered depth maps from: {depth_map_path}")
-
-    video_depth_working_range = None # This will hold the float32 array before final normalization/scaling
+    logger.debug(f"==> Initializing VideoReader for depth maps from: {depth_map_path}")
 
     if depth_map_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        vid = VideoReader(depth_map_path, ctx=cpu(0))
-        # Read raw frames as float32, without any initial fixed scaling like /255.0
-        # This allows us to inspect the actual raw pixel values for bit depth detection.
-        raw_frames_data = vid[:].asnumpy().astype("float32")
+        # Decord automatically resizes if width/height are passed
+        # We need width and height to potentially resize depth to match video frames
+        depth_reader = VideoReader(depth_map_path, ctx=cpu(0), width=target_width, height=target_height)
+        
+        # Verify the actual shape after Decord processing
+        first_depth_frame_shape = depth_reader.get_batch([0]).shape
+        actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
+        
+        total_depth_frames_available = len(depth_reader)
+        total_depth_frames_to_process = total_depth_frames_available
+        if process_length != -1 and process_length < total_depth_frames_available:
+            total_depth_frames_to_process = process_length
 
-        if raw_frames_data.shape[-1] == 3:
-            logger.debug("==> Converting RGB depth frames to grayscale")
-            raw_frames_data = raw_frames_data.mean(axis=-1)
-        else:
-            raw_frames_data = raw_frames_data.squeeze(-1)
+        logger.debug(f"==> DepthReader initialized. Final depth dimensions: {actual_depth_width}x{actual_depth_height}. Total frames for processing: {total_depth_frames_to_process}")
 
-        if enable_autogain:
-            # If autogain is enabled, we work with the raw float data.
-            # The min-max normalization below will then scale this observed range to 0-1.
-            video_depth_working_range = raw_frames_data
-        else:
-            # Autogain disabled: Scale to 0-1 absolutely based on detected bit depth.
-            # This logic assumes common bit-depth ranges for MP4 depth maps.
-            max_raw_value_in_content = np.max(raw_frames_data)
-            if max_raw_value_in_content > 255 and max_raw_value_in_content <= 1023: # Heuristic for 10-bit range
-                logger.debug(f"==> Autogain disabled. Detected potential 10-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 1023.0.")
-                video_depth_working_range = raw_frames_data / 1023.0
-            else: # Assume 8-bit or standard 0-255 range
-                logger.debug(f"==> Autogain disabled. Detected potential 8-bit depth map (max raw value: {max_raw_value_in_content:.0f}). Scaling to absolute 0-1 by dividing by 255.0.")
-                video_depth_working_range = raw_frames_data / 255.0
-
+        # Note: autogain and normalization are explicitly NOT performed here now.
+        # This will be handled in the DepthSplatting loop if autogain is still desired,
+        # or globally if global normalization is implemented later.
+        
+        return depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width
+    
     elif depth_map_path.lower().endswith('.npz'):
-        loaded_data = np.load(depth_map_path)
-        if 'depth' in loaded_data:
-            video_depth_working_range = loaded_data['depth'].astype("float32")
-            if not enable_autogain:
-                # For NPZ, if autogain is off, we *assume* it's already 0-1 or has an absolute meaning.
-                # If NPZ data is NOT already 0-1 and needs a fixed scaling (e.g., from 0-1000 to 0-1),
-                # the user would need to preprocess the NPZ or a new GUI setting for NPZ absolute scaling factor would be required.
-                logger.debug("==> Autogain disabled for NPZ. Assuming depth data is already in desired absolute range (e.g., 0-1).")
-        else:
-            raise ValueError("NPZ file does not contain a 'depth' array.")
+        logger.error("NPZ support is temporarily disabled with disk chunking refactor. Please convert NPZ to MP4 depth video.")
+        raise NotImplementedError("NPZ depth map loading is not yet supported with disk chunking.")
     else:
-        raise ValueError(f"Unsupported depth map format: {os.path.basename(depth_map_path)}. Only MP4/NPZ are supported.")
-
-    if process_length != -1 and process_length < len(video_depth_working_range):
-        video_depth_working_range = video_depth_working_range[:process_length]
-
-    if enable_autogain:
-        # Perform Autogain (Min-Max Scaling) on the raw working range
-        video_depth_min = video_depth_working_range.min()
-        video_depth_max = video_depth_working_range.max()
-        if video_depth_max - video_depth_min > 1e-5:
-            video_depth_normalized = (video_depth_working_range - video_depth_min) / (video_depth_max - video_depth_min)
-            logger.debug(f"==> Depth maps autogained (min-max scaled) from observed range [{video_depth_min:.3f}, {video_depth_max:.3f}] to [0, 1].")
-        else:
-            video_depth_normalized = np.zeros_like(video_depth_working_range)
-            logger.debug("==> Depth map range too small, setting to zeros after autogain.")
-    else:
-        # Autogain is disabled; video_depth_working_range already contains absolute 0-1 for MP4, or assumed for NPZ.
-        video_depth_normalized = video_depth_working_range
-        logger.debug("==> Autogain (min-max scaling) disabled. Depth maps are used with their absolute scaling.")
-
-
-    # Resize logic remains the same as before
-    if match_resolution_to_target and target_height > 0 and target_width > 0:
-        logger.debug(f"==> Resizing loaded depth maps to target resolution: {target_width}x{target_height}")
-        resized_depths = []
-        resized_viss = []
-        for i in range(video_depth_normalized.shape[0]):
-            depth_frame = video_depth_normalized[i]
-            # OpenCV expects (width, height)
-            resized_depth_frame = cv2.resize(depth_frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            resized_depths.append(resized_depth_frame)
-
-            # Apply colormap to the resized depth for visualization.
-            # Clip to 0-1 range for reliable visualization, as the colormap expects this.
-            vis_frame = cv2.applyColorMap((np.clip(resized_depth_frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
-            resized_viss.append(vis_frame.astype("float32") / 255.0)
-
-        video_depth = np.stack(resized_depths, axis=0)
-        depth_vis = np.stack(resized_viss, axis=0)
-    else:
-        logger.debug(f"==> Not resizing loaded depth maps (match_resolution_to_target is False or target dimensions invalid). Current resolution: {video_depth_normalized.shape[2]}x{video_depth_normalized.shape[1]}")
-        video_depth = video_depth_normalized
-        # Visualization: Ensure 0-1 range for colormap if autogain is off and values might naturally exceed 1.
-        depth_vis = np.stack([cv2.applyColorMap((np.clip(frame, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO).astype("float32") / 255.0 for frame in video_depth_normalized], axis=0)
-
-    logger.debug("==> Depth maps and visualizations loaded successfully")
-    return video_depth, depth_vis
+        raise ValueError(f"Unsupported depth map format: {os.path.basename(depth_map_path)}. Only MP4 are supported with disk chunking.")
 
 if __name__ == "__main__":
     CUDA_AVAILABLE = check_cuda_availability() # Sets the global flag
