@@ -88,6 +88,7 @@ class SplatterGUI(ThemedTk):
         self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "1080"))
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", "25"))
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", "0.5"))
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", "23"))
 
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
@@ -312,6 +313,10 @@ class SplatterGUI(ThemedTk):
         # --- Output Settings Frame ---
         output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
         output_settings_frame.pack(pady=10, padx=10, fill="x")
+        # ADD THESE LINES for layout balancing
+        output_settings_frame.grid_columnconfigure(1, weight=1)
+        output_settings_frame.grid_columnconfigure(3, weight=1) # Allow right side to expand
+        # END ADDITION
 
         lbl_max_disp = ttk.Label(output_settings_frame, text="Max Disparity %:")
         lbl_max_disp.grid(row=0, column=0, sticky="e", padx=5, pady=2)
@@ -334,14 +339,21 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(lbl_process_length, "process_length")
         self._create_hover_tooltip(entry_process_length, "process_length")
 
+        # NEW: Output CRF setting, placed on the right side
+        lbl_output_crf = ttk.Label(output_settings_frame, text="Output CRF (0-51):")
+        lbl_output_crf.grid(row=2, column=2, sticky="e", padx=5, pady=2) # Place on the right side
+        entry_output_crf = ttk.Entry(output_settings_frame, textvariable=self.output_crf_var, width=15)
+        entry_output_crf.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(lbl_output_crf, "output_crf")
+        self._create_hover_tooltip(entry_output_crf, "output_crf")
+
         dual_output_checkbox = ttk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=self.dual_output_var)
         dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(dual_output_checkbox, "dual_output")
 
-        # Autogain Checkbox (MODIFIED)
         autogain_checkbox = ttk.Checkbutton(output_settings_frame, text="No Normalization (Assume Raw 0-1 Input)", variable=self.enable_autogain_var)
         autogain_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(autogain_checkbox, "no_normalization") # Updated tooltip key
+        self._create_hover_tooltip(autogain_checkbox, "no_normalization")
 
         # --- Progress frame ---
         progress_frame = ttk.LabelFrame(self, text="Progress")
@@ -896,6 +908,7 @@ class SplatterGUI(ThemedTk):
             "low_res_batch_size": self.low_res_batch_size_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
             "dark_mode_enabled": self.dark_mode_var.get(),
+            "output_crf": self.output_crf_var.get(),
         }
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
@@ -1019,7 +1032,8 @@ class SplatterGUI(ThemedTk):
             assume_raw_input: bool, 
             global_depth_min: float, 
             global_depth_max: float,  
-            depth_stream_info: Optional[dict] 
+            depth_stream_info: Optional[dict],
+            user_output_crf: Optional[int] = None
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1220,14 +1234,19 @@ class SplatterGUI(ThemedTk):
             "-i", os.path.join(temp_png_dir, "%05d.png"), 
         ]
 
-        output_codec = "libx265" 
-        output_pix_fmt = "yuv420p10le" 
-        output_crf = "24" 
+        output_crf_val = 24 # Default CRF for x265 10-bit SDR (lower is better quality)
         output_profile = "main10"
         x265_params = [] 
 
         nvenc_preset = "medium" 
-        nvenc_cq = "23" 
+        nvenc_cq_val = 23 # Constant Quality value for NVENC (lower is better quality)
+
+        if user_output_crf is not None and 0 <= user_output_crf <= 51:
+            output_crf_val = user_output_crf
+            nvenc_cq_val = user_output_crf # Use same value for CQ for consistency
+            logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
+        else:
+            logger.debug(f"Using auto-determined output CRF ({output_crf_val}) / CQ ({nvenc_cq_val}).")
 
         is_hdr_source = False
         original_source_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
@@ -1306,9 +1325,9 @@ class SplatterGUI(ThemedTk):
         ffmpeg_cmd.extend(["-c:v", output_codec])
         if "nvenc" in output_codec:
             ffmpeg_cmd.extend(["-preset", nvenc_preset])
-            ffmpeg_cmd.extend(["-cq", nvenc_cq]) 
+            ffmpeg_cmd.extend(["-cq", str(nvenc_cq_val)]) # Use the actual NVENC CQ value
         else:
-            ffmpeg_cmd.extend(["-crf", output_crf])
+            ffmpeg_cmd.extend(["-crf", str(output_crf_val)]) # Use the actual CRF value
         
         ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
         if output_profile:
@@ -1382,6 +1401,7 @@ class SplatterGUI(ThemedTk):
 
         logger.debug(f"==> Final output video written to: {final_output_video_path}")
         return True
+    
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
         self._save_config()
@@ -1450,6 +1470,7 @@ class SplatterGUI(ThemedTk):
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
+            "output_crf": int(self.output_crf_var.get()),
         }
         self.processing_thread = threading.Thread(target=self._run_batch_process, args=(settings,))
         self.processing_thread.start()
@@ -1512,6 +1533,7 @@ class SplatterGUI(ThemedTk):
         self.dual_output_var.set(False)
         self.enable_autogain_var.set(False) # Default: Global Depth Normalization
         self.zero_disparity_anchor_var.set("0.5")
+        self.output_crf_var.set("23")
         
         self.toggle_processing_settings_fields()
         self._save_config()
