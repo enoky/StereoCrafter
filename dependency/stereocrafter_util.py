@@ -20,7 +20,8 @@ import time
 # Only configure basic logging if no handlers are already set up.
 # This prevents duplicate log messages if a calling script configures logging independently.
 if not logging.root.handlers:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+    # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
 # --- Global Flags ---
@@ -92,7 +93,7 @@ def release_cuda_memory():
     try:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            logger.info("CUDA cache cleared.")
+            logger.debug("CUDA cache cleared.")
         gc.collect()
         logger.debug("Python garbage collector invoked.")
     except Exception as e:
