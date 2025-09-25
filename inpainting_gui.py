@@ -40,7 +40,6 @@ class InpaintingGUI(ThemedTk):
         self.window_x = self.app_config.get("window_x", None)
         self.window_y = self.app_config.get("window_y", None)
         self.window_width = self.app_config.get("window_width", 550) # Use loaded width, or default
-        # No need for self.current_window_width directly; we'll get it on the fly or use self.window_width
 
         self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
         self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
@@ -50,6 +49,7 @@ class InpaintingGUI(ThemedTk):
         self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5)))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
+        self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -59,20 +59,35 @@ class InpaintingGUI(ThemedTk):
         self.video_res_var = tk.StringVar(value="N/A")
         self.video_frames_var = tk.StringVar(value="N/A")
         self.video_overlap_var = tk.StringVar(value="N/A") # For consistency with update_video_info_display args
-        self.video_bias_var = tk.StringVar(value="N/A") # For consistency with update_video_info_display args
-        self.enable_mask_processing = tk.BooleanVar(value=self.app_config.get("enable_mask_processing", True))
-        self.mask_dilate_kernel_size_x_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size_x", 15)))
-        self.mask_dilate_kernel_size_y_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size_y", 15)))
-        self.mask_blur_kernel_size_x_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size_x", 15)))
-        self.mask_blur_kernel_size_y_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size_y", 15)))
-        self.mask_blur_sigma_x_var = tk.StringVar(value=str(self.app_config.get("mask_blur_sigma_x", 15.0)))
-        self.mask_blur_sigma_y_var = tk.StringVar(value=str(self.app_config.get("mask_blur_sigma_y", 15.0)))
+        self.video_bias_var = tk.StringVar(value="N/A") # For consistency with update_video_info_display args        
+        
+        self.enable_mask_dilation_toggle = tk.BooleanVar(value=self.app_config.get("enable_mask_dilation_toggle", True))
+
+        # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+        self.enable_mask_binarization_toggle = tk.BooleanVar(value=self.app_config.get("enable_mask_binarization_toggle", True))
+        self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.1))) # Good starting point for edge maps
+
+        self.enable_morphological_closing_toggle = tk.BooleanVar(value=self.app_config.get("enable_morphological_closing_toggle", True))
+        self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 5)))
+
+        self.enable_mask_dilation_toggle = tk.BooleanVar(value=self.app_config.get("enable_mask_dilation_toggle", True))
+        self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 15))) # ADD THIS
+        
+        self.enable_mask_blur_toggle = tk.BooleanVar(value=self.app_config.get("enable_mask_blur_toggle", True))        
+        self.mask_blur_sigma_var = tk.StringVar(value=str(self.app_config.get("mask_blur_sigma", 15.0))) # ADD THIS
+
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.enable_post_inpainting_blend = tk.BooleanVar(value=self.app_config.get("enable_post_inpainting_blend", True))
 
         self.create_widgets()
         self.style = ttk.Style()
+        
+        # 1. Force initial widget rendering for accurate reqheight calculation
+        self.update_idletasks() 
+        # 2. Apply theme colors/styles (without setting final geometry)
         self._apply_theme()
+        # 3. Apply saved width, calculated height, and saved position
+        self._set_saved_geometry()
 
         self.update_progress()
         self.update_status_label("Ready")
@@ -132,46 +147,48 @@ class InpaintingGUI(ThemedTk):
             logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
             return target_frame
     
-    def _apply_gaussian_blur(self, mask: torch.Tensor) -> torch.Tensor:
+    def _apply_gaussian_blur(self, mask: torch.Tensor, sigma: float) -> torch.Tensor:
         """
         Applies Gaussian blur to the mask using separate 1D convolutions for X and Y.
         Expects mask in [T, C, H, W] format, where C=1.
         """
-        if not self.enable_mask_processing.get():
-            return mask
+        # if not self.enable_mask_processing.get():
+        #     return mask
 
         try:
-            kernel_x_size = int(self.mask_blur_kernel_size_x_var.get())
-            kernel_y_size = int(self.mask_blur_kernel_size_y_var.get())
-            sigma_x = float(self.mask_blur_sigma_x_var.get())
-            sigma_y = float(self.mask_blur_sigma_y_var.get())
 
             # Ensure kernel sizes are odd for symmetric padding and > 0
-            if kernel_x_size <= 0 or kernel_y_size <= 0 or sigma_x <= 0 or sigma_y <= 0:
-                logger.warning(f"Invalid blur parameters (kernel_x_size={kernel_x_size}, kernel_y_size={kernel_y_size}, sigma_x={sigma_x}, sigma_y={sigma_y}). Skipping blur.")
+            if sigma <= 0:
+                logger.warning(f"Invalid blur sigma ({sigma}). Skipping blur.")
                 return mask
+            
+            derived_kernel_size_float = 6 * sigma # Rule of thumb
+            derived_kernel_size = int(derived_kernel_size_float)
+            
+            # Ensure kernel size is positive and odd, with a minimum of 3
+            if derived_kernel_size < 3: # Minimum kernel size of 3
+                derived_kernel_size = 3
+            elif derived_kernel_size % 2 == 0: # Ensure it's odd
+                derived_kernel_size += 1
+            
+            kernel_x_size = derived_kernel_size
+            kernel_y_size = derived_kernel_size
+            # --- END NEW ---
 
-            kernel_x_size = kernel_x_size if kernel_x_size % 2 == 1 else kernel_x_size + 1
-            kernel_y_size = kernel_y_size if kernel_y_size % 2 == 1 else kernel_y_size + 1
+            kernel_x = self._create_1d_gaussian_kernel(kernel_x_size, sigma).to(mask.device) # Use single sigma
+            kernel_y = self._create_1d_gaussian_kernel(kernel_y_size, sigma).to(mask.device) # Use single sigma
 
-            # Get 1D kernels
-            kernel_x = self._create_1d_gaussian_kernel(kernel_x_size, sigma_x).to(mask.device) # (kernel_size)
-            kernel_y = self._create_1d_gaussian_kernel(kernel_y_size, sigma_y).to(mask.device) # (kernel_size)
+            kernel_x = kernel_x.view(1, 1, 1, kernel_x_size)
+            kernel_y = kernel_y.view(1, 1, kernel_y_size, 1)
 
-            # Reshape for 2D convolution (1, 1, H, W)
-            kernel_x = kernel_x.view(1, 1, 1, kernel_x_size) # For horizontal conv
-            kernel_y = kernel_y.view(1, 1, kernel_y_size, 1) # For vertical conv
-
-            # Apply horizontal blur
             padding_x = kernel_x_size // 2
             blurred_mask = F.conv2d(mask, kernel_x, padding=(0, padding_x), groups=mask.shape[1])
             
-            # Apply vertical blur
             padding_y = kernel_y_size // 2
             blurred_mask = F.conv2d(blurred_mask, kernel_y, padding=(padding_y, 0), groups=mask.shape[1])
             
-            logger.debug(f"Applied Gaussian blur with kernel_x_size={kernel_x_size}, sigma_x={sigma_x}, kernel_y_size={kernel_y_size}, sigma_y={sigma_y}.")
-            return torch.clamp(blurred_mask, 0.0, 1.0) # Ensure values stay within [0, 1]
+            logger.debug(f"Applied Gaussian blur with sigma={sigma:.2f} (derived kernel {derived_kernel_size}x{derived_kernel_size}).") # Updated log message
+            return torch.clamp(blurred_mask, 0.0, 1.0)
         except ValueError:
             logger.error("Invalid input for mask blur parameters. Skipping blur.", exc_info=True)
             return mask
@@ -179,43 +196,77 @@ class InpaintingGUI(ThemedTk):
             logger.error(f"Error during mask blurring: {e}. Skipping blur.", exc_info=True)
             return mask
     
-    def _apply_mask_dilation(self, mask: torch.Tensor) -> torch.Tensor:
+    def _apply_mask_dilation(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
         """
         Applies dilation to the mask using max pooling.
         Expects mask in [T, C, H, W] format, where C=1.
-        """
-        if not self.enable_mask_processing.get():
-            return mask
+        # """
+        # if not self.enable_mask_processing.get():
+        #     return mask
 
         try:
-            kernel_x = int(self.mask_dilate_kernel_size_x_var.get())
-            kernel_y = int(self.mask_dilate_kernel_size_y_var.get())
             
-            # Ensure kernel sizes are odd for symmetric padding and > 0
-            if kernel_x <= 0 or kernel_y <= 0:
-                logger.warning(f"Invalid dilation kernel size ({kernel_x}, {kernel_y}). Skipping dilation.")
+            # Ensure kernel size is positive and odd for symmetry
+            if kernel_size <= 0:
+                logger.warning(f"Invalid dilation kernel size ({kernel_size}). Skipping dilation.")
                 return mask
             
-            kernel_x = kernel_x if kernel_x % 2 == 1 else kernel_x + 1
-            kernel_y = kernel_y if kernel_y % 2 == 1 else kernel_y + 1
-
-            # Max pooling kernel (effectively dilation for a binary mask)
-            # The kernel shape for F.max_pool2d is (kernel_height, kernel_width)
+            kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1 # Ensure odd
+            
             dilated_mask = F.max_pool2d(
                 mask,
-                kernel_size=(kernel_y, kernel_x),
+                kernel_size=(kernel_val, kernel_val), # Use single kernel_val for both dimensions
                 stride=1,
-                padding=(kernel_y // 2, kernel_x // 2)
+                padding=(kernel_val // 2, kernel_val // 2)
             )
-            logger.debug(f"Applied mask dilation with kernel ({kernel_y}, {kernel_x}).")
+            logger.debug(f"Applied mask dilation with kernel ({kernel_val}x{kernel_val}).") # Updated log message
             return dilated_mask
         except ValueError:
-            logger.error("Invalid input for mask dilation kernel sizes. Skipping dilation.", exc_info=True)
+            logger.error("Invalid input for mask dilation kernel size. Skipping dilation.", exc_info=True) # Updated log message
             return mask
         except Exception as e:
             logger.error(f"Error during mask dilation: {e}. Skipping dilation.", exc_info=True)
             return mask
     
+    def _apply_morphological_closing(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """
+        Applies morphological closing to fill small holes and smooth boundaries.
+        Expects mask in [T, C, H, W] float [0, 1] format (on CPU, or moved to CPU).
+        Returns processed mask in the same format.
+        """
+        # REMOVED THIS LINE: if not self.enable_morphological_closing_toggle.get():
+        # REMOVED THIS LINE:     return mask
+
+        try:
+
+            if kernel_size <= 0:
+                logger.warning(f"Invalid morphological closing kernel size ({kernel_size}). Skipping closing.")
+                return mask
+            
+            # Ensure kernel_size is odd for symmetry (OpenCV handles even, but odd is often preferred)
+            kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1 
+
+            processed_masks = []
+            for t in range(mask.shape[0]):
+                frame_mask_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+
+                # Create structuring element using a single kernel_val
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_val, kernel_val))
+
+                closed_mask_np = cv2.morphologyEx(frame_mask_np, cv2.MORPH_CLOSE, kernel)
+
+                closed_mask_tensor = torch.from_numpy(closed_mask_np).float() / 255.0
+                processed_masks.append(closed_mask_tensor.unsqueeze(0))
+
+            logger.debug(f"Applied morphological closing with kernel ({kernel_val}x{kernel_val}).") # Updated log message
+            return torch.stack(processed_masks).to(mask.device)
+        except ValueError:
+            logger.error("Invalid input for morphological closing kernel size. Skipping closing.", exc_info=True) # Updated log message
+            return mask
+        except Exception as e:
+            logger.error(f"Error during morphological closing: {e}. Skipping closing.", exc_info=True)
+            return mask
+        
     def _apply_post_inpainting_blend(
         self,
         inpainted_frames: torch.Tensor,       # Generated frames from pipeline
@@ -230,9 +281,18 @@ class InpaintingGUI(ThemedTk):
         if not self.enable_post_inpainting_blend.get():
             return inpainted_frames
 
-        if inpainted_frames.shape != original_warped_frames.shape or \
-           inpainted_frames.shape != mask.shape:
-            logger.error(f"Shape mismatch for post-inpainting blend. Inpainted: {inpainted_frames.shape}, Original Warped: {original_warped_frames.shape}, Mask: {mask.shape}. Skipping blend.")
+        # Check if temporal (T) and spatial (H, W) dimensions match
+        if (inpainted_frames.shape[0] != original_warped_frames.shape[0] or
+            inpainted_frames.shape[2] != original_warped_frames.shape[2] or
+            inpainted_frames.shape[3] != original_warped_frames.shape[3]):
+            logger.error(f"Temporal or Spatial shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Original Warped {original_warped_frames.shape}. Skipping blend.")
+            return inpainted_frames
+
+        if (inpainted_frames.shape[0] != mask.shape[0] or
+            inpainted_frames.shape[2] != mask.shape[2] or
+            inpainted_frames.shape[3] != mask.shape[3] or
+            mask.shape[1] != 1): # Explicitly check mask has 1 channel
+            logger.error(f"Mask shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Mask {mask.shape} (Mask must be 1-channel). Skipping blend.")
             return inpainted_frames
 
         try:
@@ -252,6 +312,26 @@ class InpaintingGUI(ThemedTk):
             blended_frames = original_warped_frames_cpu * (1 - mask_blend) + inpainted_frames_cpu * mask_blend
             
             logger.debug("Applied post-inpainting blending.")
+
+            # --- TEMPORARY DEBUG CODE START ---
+            debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_blend")
+            os.makedirs(debug_output_dir, exist_ok=True)
+            video_basename = os.path.splitext(os.path.basename(self.input_folder_var.get()))[0] # Using input_folder as a crude base, adjust as needed
+
+            for t in range(min(5, inpainted_frames_cpu.shape[0])): # Save first 5 frames
+                # Convert from [C, H, W] float [0,1] to [H, W, C] uint8
+                original_warped_img = (original_warped_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                inpainted_img = (inpainted_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                mask_img = (mask_blend[t].squeeze(0).numpy() * 255).astype(np.uint8) # Mask is 1-channel, squeeze
+                blended_img = (blended_frames[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+                cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename}_frame_{t:04d}_original_warped.png"), cv2.cvtColor(original_warped_img, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename}_frame_{t:04d}_inpainted.png"), cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename}_frame_{t:04d}_mask.png"), mask_img)
+                cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename}_frame_{t:04d}_blended.png"), cv2.cvtColor(blended_img, cv2.COLOR_RGB2BGR))
+            logger.debug(f"Saved debug blend frames to {debug_output_dir}")
+            # --- TEMPORARY DEBUG CODE END ---
+
             return blended_frames
         except Exception as e:
             logger.error(f"Error during post-inpainting blending: {e}. Returning original inpainted frames.", exc_info=True)
@@ -318,22 +398,7 @@ class InpaintingGUI(ThemedTk):
             # ttk.Label styling
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
 
-        # --- Dynamic Height Adjustment (always runs after theme change) ---
         self.update_idletasks() # Ensure all geometry calculations are up-to-date
-
-        # Get the current width from the window object itself, which reflects user resizing
-        current_actual_width = self.winfo_width()
-        # Fallback for very first call where winfo_width might be 1 (not yet rendered)
-        if current_actual_width <= 1: 
-            current_actual_width = self.window_width # Use the width from config (or default)
-
-        new_height = self.winfo_reqheight() # Get the new optimal height based on content and theme
-
-        # Apply the current (potentially user-adjusted) width and the new calculated height
-        self.geometry(f"{current_actual_width}x{new_height}")
-
-        # Update the stored width for next time. Position is handled by exit.
-        self.window_width = current_actual_width # <--- Update instance variable for save_config
 
     def _create_1d_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
         """
@@ -361,7 +426,8 @@ class InpaintingGUI(ThemedTk):
         tile_num: int,
         update_info_callback: Optional[Callable],
         overlap: int, # Needed for display, not logic here
-        original_input_blend_strength: float # Needed for display, not logic here
+        original_input_blend_strength: float,
+        process_length: int = -1
     ) -> Optional[Tuple[
         torch.Tensor,                  # frames_warpped_padded
         torch.Tensor,                  # frames_mask_padded
@@ -383,8 +449,24 @@ class InpaintingGUI(ThemedTk):
                  or None if an error occurs.
         """
         frames, fps, video_stream_info = read_video_frames(input_video_path)
-        num_frames_original = frames.shape[0]
 
+        # --- NEW: Implement Process Length Logic ---
+        total_frames_in_video = frames.shape[0]
+        actual_frames_to_process_count = total_frames_in_video
+
+        if process_length != -1 and process_length > 0:
+            actual_frames_to_process_count = min(total_frames_in_video, process_length)
+            logger.info(f"Limiting processing to first {actual_frames_to_process_count} frames (out of {total_frames_in_video}).")
+        
+        if actual_frames_to_process_count == 0:
+            logger.warning(f"No frames to process in {input_video_path} (after applying process_length), skipping.")
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", f"0 (out of {total_frames_in_video})", overlap, original_input_blend_strength))
+            return None
+
+        frames = frames[:actual_frames_to_process_count] # Slice frames early to save memory
+        num_frames_original = frames.shape[0] # This now reflects the *actual* frames being processed
+        
         if num_frames_original == 0:
             logger.warning(f"No frames found in {input_video_path}, skipping.")
             if update_info_callback:
@@ -400,9 +482,6 @@ class InpaintingGUI(ThemedTk):
             logger.debug(f"Padded video frames from {num_frames_original} to {frames.shape[0]} by repeating the last frame.")
         else:
             logger.warning("Attempted to pad an empty video; temporal padding skipped.")
-
-        num_frames_after_temporal_padding = frames.shape[0] # New total frame count
-
 
         # --- Dimension Divisibility Check and Resizing (if needed) ---
         _, _, total_h_raw_input_before_resize, total_w_raw_input_before_resize = frames.shape
@@ -426,7 +505,7 @@ class InpaintingGUI(ThemedTk):
             else:
                 logger.warning("Attempted to resize empty frames tensor. Skipping resize.")
         
-        # Update current dimensions after potential resize
+        # --- Update current dimensions after potential resize ---
         total_h_current, total_w_current = frames.shape[2], frames.shape[3]
 
         if total_h_current < required_divisor or total_w_current < required_divisor:
@@ -465,32 +544,80 @@ class InpaintingGUI(ThemedTk):
             output_display_h = half_h
             output_display_w = half_w
 
-        # --- Normalization and Mask Grayscale ---
-        # frames_warpped_raw comes from input splitting and potential initial resize.
-        # frames_mask_raw comes from input splitting and potential initial resize.
-        
+        # --- Normalization and Grayscale Conversion (Using OpenCV) ---
         frames_warpped_normalized = frames_warpped_raw / 255.0  # Normalize to 0-1
-        frames_mask_grayscale = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
 
-        # --- NEW: Store original-length, unpadded, normalized warped frames and processed mask for post-blending ---
-        # These are taken *before* any padding for tiling.
-        # frames_warpped_original_unpadded_normalized will be the original warped input, cropped to original length, normalized.
-        # frames_mask_processed_unpadded_original_length will be the mask, processed, cropped to original length.
+        processed_masks_grayscale = []
+        for t in range(frames_mask_raw.shape[0]):
+            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
+            frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
+            processed_masks_grayscale.append(frame_tensor_gray.unsqueeze(0))
+        current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
+        logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
 
-        # First, process the mask (dilation/blur) if enabled
-        current_processed_mask = frames_mask_grayscale.clone()
-        if self.enable_mask_processing.get():
-            logger.debug("Applying mask pre-processing (dilation + blur) for both pipeline input and blending reference...")
-            current_processed_mask = self._apply_mask_dilation(current_processed_mask)
-            current_processed_mask = self._apply_gaussian_blur(current_processed_mask)
-            logger.debug("Mask pre-processing complete.")
+        # --- Granular Mask Processing Steps (Direct Binarization Pipeline) ---
 
-        # Store the versions for post-blending (original length, unpadded)
+        # 1. Binarization (Direct Thresholding)
+        if self.enable_mask_binarization_toggle.get():
+            try:
+                binarize_threshold = float(self.mask_initial_threshold_var.get()) # Use mask_initial_threshold_var for binarization threshold
+                if not (0.0 <= binarize_threshold <= 1.0):
+                    logger.warning(f"Invalid binarize threshold ({binarize_threshold}). Using default 0.1.")
+                    binarize_threshold = 0.1
+                current_processed_mask = (current_processed_mask > binarize_threshold).float()
+                logger.debug(f"Mask: Binarized (threshold > {binarize_threshold}, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            except ValueError:
+                logger.error(f"Invalid value for binarize threshold: {self.mask_initial_threshold_var.get()}. Falling back to 0.1.", exc_info=True)
+                current_processed_mask = (current_processed_mask > 0.1).float()
+        else:
+            logger.debug("Mask: Binarization step skipped. Using grayscale (might be unsuitable for subsequent steps).")
+
+        ## 2. Morphological Closing (to fill small gaps in binary mask)
+        if self.enable_morphological_closing_toggle.get():
+            try:
+                morph_kernel_size = int(self.mask_morph_kernel_size_var.get()) # NEW: Parse single kernel size
+                current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size) # NEW: Pass kernel size
+                logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            except ValueError:
+                logger.error(f"Invalid value for mask_morph_kernel_size: {self.mask_morph_kernel_size_var.get()}. Skipping morphological closing.", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error during morphological closing step: {e}. Skipping.", exc_info=True)
+        else:
+            logger.debug("Mask: Morphological closing step skipped.")
+
+        # 3. Mask Dilation (to expand the hole mask slightly)
+        if self.enable_mask_dilation_toggle.get():
+            try:
+                dilate_kernel_size = int(self.mask_dilate_kernel_size_var.get()) # NEW: Parse single kernel size
+                current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size) # NEW: Pass kernel size
+                logger.debug(f"Mask: After dilation (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            except ValueError:
+                logger.error(f"Invalid value for mask_dilate_kernel_size: {self.mask_dilate_kernel_size_var.get()}. Skipping dilation.", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error during mask dilation step: {e}. Skipping.", exc_info=True)
+        else:
+            logger.debug("Mask: Dilation step skipped.")
+
+        # 4. Mask Gaussian Blur (to feather the edges of the hole mask)
+        if self.enable_mask_blur_toggle.get():
+            try:
+                blur_sigma = float(self.mask_blur_sigma_var.get()) # NEW: Parse single sigma
+                current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_sigma) # NEW: Pass sigma
+                logger.debug(f"Mask: After blur (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            except ValueError:
+                logger.error(f"Invalid value for mask_blur_sigma: {self.mask_blur_sigma_var.get()}. Skipping blur.", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error during mask blur step: {e}. Skipping.", exc_info=True)
+        else:
+            logger.debug("Mask: Gaussian blur step skipped.")
+        # --- END NEW Granular Mask Processing Steps ---
+
+        # --- Store original-length, unpadded versions for post-blending ---
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
         frames_mask_processed_unpadded_original_length = current_processed_mask[:num_frames_original].clone()
 
         # --- Pad for Tiling (for pipeline input) ---
-        # Now apply padding *only* to the versions going into the pipeline.
         frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
         frames_mask_padded = pad_for_tiling(current_processed_mask, tile_num, tile_overlap=(128, 128))
         
@@ -498,31 +625,44 @@ class InpaintingGUI(ThemedTk):
 
         # Update GUI with video info after processing initial dimensions
         if update_info_callback:
-            # Note: output_display_w and output_display_h should reflect the *original* resolution before padding,
-            # or the resolution of the *inpainted* output after any cropping to original extent.
-            # Your current logic for output_display_w/h is still valid for this.
-            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", num_frames_original, overlap, original_input_blend_strength))
+            display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
+            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
 
         return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
                 num_frames_original, padded_H, padded_W, video_stream_info, fps,
                 frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
 
     def _set_saved_geometry(self: "InpaintingGUI"):
-        """Applies the saved window size and position from config on startup."""
-        # Ensure the window is visible before trying to get or set geometry
+        """Applies the saved window width and position, with dynamic height."""
+        # Ensure the window is visible and all widgets are laid out for accurate height calculation
         self.update_idletasks() 
 
-        # Get the height as calculated by _apply_theme (or initial content fit)
-        current_calculated_height = self.winfo_height() 
-        if current_calculated_height < 100: # Fallback if winfo_height() returns tiny value
-            current_calculated_height = self.winfo_reqheight()
+        # 1. Get the optimal height for the current content
+        calculated_height = self.winfo_reqheight()
+        # Fallback in case winfo_reqheight returns a tiny value (shouldn't happen after update_idletasks)
+        if calculated_height < 100:
+            calculated_height = 500 # A reasonable fallback height if something goes wrong
 
-        geometry_string = f"{self.window_width}x{current_calculated_height}"
+        # 2. Use the saved/default width
+        current_width = self.window_width
+        # Fallback if saved width is invalid or too small
+        if current_width < 200: # Minimum sensible width
+            current_width = 550 # Use default width
+
+        # 3. Construct the geometry string
+        geometry_string = f"{current_width}x{calculated_height}"
         if self.window_x is not None and self.window_y is not None:
             geometry_string += f"+{self.window_x}+{self.window_y}"
-        
+        else:
+            # If no saved position, let Tkinter center it initially or place it at default
+            pass # No position appended, Tkinter will handle default placement
+
+        # 4. Apply the geometry
         self.geometry(geometry_string)
         logger.debug(f"Applied saved geometry: {geometry_string}")
+        
+        # Store the actual width that was applied (which is current_width) for save_config
+        self.window_width = current_width # Update instance variable for save_config
         
     def browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
@@ -570,70 +710,104 @@ class InpaintingGUI(ThemedTk):
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
         param_frame.pack(fill="x", padx=10, pady=5)
         
-        # NEW: Configure 3 columns for param_frame to place CRF on the right
-        param_frame.grid_columnconfigure(0, weight=1) # Column for labels
-        param_frame.grid_columnconfigure(1, weight=1) # Column for entries (left side)
-        param_frame.grid_columnconfigure(2, weight=1) # Column for labels (right side)
-        param_frame.grid_columnconfigure(3, weight=1) # Column for entries (right side)        
+        # Configure 4 columns for param_frame to place parameters side-by-side
+        param_frame.grid_columnconfigure(0, weight=1) # Column for left-side labels
+        param_frame.grid_columnconfigure(1, weight=1) # Column for left-side entries
+        param_frame.grid_columnconfigure(2, weight=1) # Column for right-side labels
+        param_frame.grid_columnconfigure(3, weight=1) # Column for right-side entries
         
-        # Inference Steps
+        # Row 0
+        # Inference Steps (Left)
         inference_steps_label = ttk.Label(param_frame, text="Inference Steps:")
         inference_steps_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inference_steps_label, self.help_data.get("num_inference_steps", ""))
         ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
                     
-        # Output CRF (NEW)
+        # Output CRF (Right)
         output_crf_label = ttk.Label(param_frame, text="Output CRF:")
-        output_crf_label.grid(row=0, column=2, sticky="e", padx=5, pady=2) # Placed in col 2
-        Tooltip(output_crf_label, self.help_data.get("output_crf", "")) # NEW Tooltip key
-        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=0, column=3, sticky="w", padx=5) # Placed in col 3, added padx
+        output_crf_label.grid(row=0, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
+        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=0, column=3, sticky="w", padx=5)
 
-        # Tile Number
+        # Row 1
+        # Tile Number (Left)
         tile_num_label = ttk.Label(param_frame, text="Tile Number:")
         tile_num_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
         ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
         
-        # Frames Chunk
+        # Process Length (Right)
+        process_length_label = ttk.Label(param_frame, text="Process Length:")
+        process_length_label.grid(row=1, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(process_length_label, self.help_data.get("process_length", "Number of frames to process. Use -1 for all frames."))
+        ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=1, column=3, sticky="w", padx=5)
+
+        # Row 2
+        # Frames Chunk (Left)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
         
-        # Frame Overlap (Renamed from Overlap)
-        # Updated label text and tooltip key
+        # Mask Binarization Threshold (Right)
+        bin_thresh_label = ttk.Label(param_frame, text="Mask Binarize Thresh:")
+        bin_thresh_label.grid(row=2, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(bin_thresh_label, self.help_data.get("mask_initial_threshold", "Threshold for binarizing the grayscale mask."))
+        ttk.Entry(param_frame, textvariable=self.mask_initial_threshold_var, width=10).grid(row=2, column=3, sticky="w", padx=5) # Corrected column to 3
+
+        # Row 3
+        # Frame Overlap (Left)
         frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
         frame_overlap_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frame_overlap_label, self.help_data.get("frame_overlap", "")) 
         ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
         
-        # Original Input Bias (NEW PARAMETER)
-        original_blend_label = ttk.Label(param_frame, text="Original Input Bias:") # Concise name for GUI
+        # Morphological Closing Kernel Size (Right)
+        morph_kernel_label = ttk.Label(param_frame, text="Morph Close Kernel:")
+        morph_kernel_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(morph_kernel_label, self.help_data.get("mask_morph_kernel_size", "Kernel size for morphological closing (e.g., 3, 5)."))
+        ttk.Entry(param_frame, textvariable=self.mask_morph_kernel_size_var, width=10).grid(row=3, column=3, sticky="w", padx=5)
+
+        # Row 4
+        # Original Input Bias (Left)
+        original_blend_label = ttk.Label(param_frame, text="Original Input Bias:")
         original_blend_label.grid(row=4, column=0, sticky="e", padx=5, pady=2)
         Tooltip(original_blend_label, self.help_data.get("original_input_blend_strength", ""))
         ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
 
-        # CPU Offload
+        # Mask Dilation Kernel Size (Right)
+        dilate_kernel_label = ttk.Label(param_frame, text="Mask Dilate Kernel:")
+        dilate_kernel_label.grid(row=4, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(dilate_kernel_label, self.help_data.get("mask_dilate_kernel_size", "Kernel size for mask dilation (e.g., 7, 15)."))
+        ttk.Entry(param_frame, textvariable=self.mask_dilate_kernel_size_var, width=10).grid(row=4, column=3, sticky="w", padx=5)
+
+        # Row 5
+        # CPU Offload (Left)
         offload_label = ttk.Label(param_frame, text="CPU Offload:")
         offload_label.grid(row=5, column=0, sticky="e", padx=5, pady=2)
         Tooltip(offload_label, self.help_data.get("offload_type", ""))
         offload_options = ["model", "sequential", "none"]
         ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=5, column=1, sticky="w", padx=5)
 
+        # Mask Blur Sigma (Right)
+        blur_sigma_label = ttk.Label(param_frame, text="Mask Blur Sigma:")
+        blur_sigma_label.grid(row=5, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(blur_sigma_label, self.help_data.get("mask_blur_sigma", "Strength of Gaussian blur (sigma). Kernel size is derived automatically."))
+        ttk.Entry(param_frame, textvariable=self.mask_blur_sigma_var, width=10).grid(row=5, column=3, sticky="w", padx=5)
+
+        # --- Remaining GUI elements (progress_frame, buttons_frame, info_frame) ... ---
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
         self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
         self.progress_bar.pack(fill="x")
-        # New: Progress count and status label
         self.status_label = ttk.Label(progress_frame, text="Ready")
         self.status_label.pack(pady=5)
 
         buttons_frame = ttk.Frame(self, padding=10)
-        buttons_frame.pack(fill="x", pady=10) # Centering this frame horizontally
+        buttons_frame.pack(fill="x", pady=10)
         
-        # Create an inner frame to hold the buttons, which we can then pack to center
         inner_buttons_frame = ttk.Frame(buttons_frame)
-        inner_buttons_frame.pack(anchor="center") # <--- Centering the inner frame within buttons_frame
+        inner_buttons_frame.pack(anchor="center")
 
         self.start_button = ttk.Button(inner_buttons_frame, text="Start", command=self.start_processing)
         self.start_button.pack(side="left", padx=5)
@@ -642,39 +816,30 @@ class InpaintingGUI(ThemedTk):
         ttk.Button(inner_buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
         ttk.Button(inner_buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
 
-        # New: Information window for current video
         self.info_frame = ttk.LabelFrame(self, text="Current Video Information", padding=10)
         self.info_frame.pack(fill="x", padx=10, pady=5)
         
-        # Configure grid columns for key-value alignment
-        self.info_frame.grid_columnconfigure(0, weight=0) # Column for static text (keys)
-        self.info_frame.grid_columnconfigure(1, weight=1) # Column for textvariable (values), expands
+        self.info_frame.grid_columnconfigure(0, weight=0)
+        self.info_frame.grid_columnconfigure(1, weight=1)
 
-        # Row 0: Name
-        # Create a static label for "Name:"
         ttk.Label(self.info_frame, text="Name:").grid(row=0, column=0, sticky="e", padx=(5, 2), pady=1)
-        # Place the value label (textvariable) in the next column
-        self.video_name_label = ttk.Label(self.info_frame, textvariable=self.video_name_var, anchor="w") # <--- Changed to textvariable
+        self.video_name_label = ttk.Label(self.info_frame, textvariable=self.video_name_var, anchor="w")
         self.video_name_label.grid(row=0, column=1, sticky="ew", padx=(2, 5), pady=1)
         
-        # Row 1: Resolution
         ttk.Label(self.info_frame, text="Resolution:").grid(row=1, column=0, sticky="e", padx=(5, 2), pady=1)
-        self.video_res_label = ttk.Label(self.info_frame, textvariable=self.video_res_var, anchor="w") # <--- Changed to textvariable
+        self.video_res_label = ttk.Label(self.info_frame, textvariable=self.video_res_var, anchor="w")
         self.video_res_label.grid(row=1, column=1, sticky="ew", padx=(2, 5), pady=1)
         
-        # Row 2: Frames
         ttk.Label(self.info_frame, text="Frames:").grid(row=2, column=0, sticky="e", padx=(5, 2), pady=1)
-        self.video_frames_label = ttk.Label(self.info_frame, textvariable=self.video_frames_var, anchor="w") # <--- Changed to textvariable
+        self.video_frames_label = ttk.Label(self.info_frame, textvariable=self.video_frames_var, anchor="w")
         self.video_frames_label.grid(row=2, column=1, sticky="ew", padx=(2, 5), pady=1)
 
-        # Row 3: Overlap
         ttk.Label(self.info_frame, text="Overlap:").grid(row=3, column=0, sticky="e", padx=(5, 2), pady=1)
-        self.video_overlap_label = ttk.Label(self.info_frame, textvariable=self.video_overlap_var, anchor="w") # <--- Changed to textvariable
+        self.video_overlap_label = ttk.Label(self.info_frame, textvariable=self.video_overlap_var, anchor="w")
         self.video_overlap_label.grid(row=3, column=1, sticky="ew", padx=(2, 5), pady=1)
 
-        # Row 4: Input Bias
         ttk.Label(self.info_frame, text="Input Bias:").grid(row=4, column=0, sticky="e", padx=(5, 2), pady=1)
-        self.video_bias_label = ttk.Label(self.info_frame, textvariable=self.video_bias_var, anchor="w") # <--- Changed to textvariable
+        self.video_bias_label = ttk.Label(self.info_frame, textvariable=self.video_bias_var, anchor="w")
         self.video_bias_label.grid(row=4, column=1, sticky="ew", padx=(2, 5), pady=1)
 
     def process_single_video(
@@ -690,7 +855,8 @@ class InpaintingGUI(ThemedTk):
         stop_event: Optional[threading.Event] = None,
         update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
         original_input_blend_strength: float = 0.8,
-        output_crf: int = 23, # NEW: Accept output_crf
+        output_crf: int = 23,
+        process_length: int = -1,
     ) -> bool:
         """
         Processes a single input video.
@@ -724,7 +890,8 @@ class InpaintingGUI(ThemedTk):
             tile_num=tile_num,
             update_info_callback=update_info_callback,
             overlap=overlap,
-            original_input_blend_strength=original_input_blend_strength
+            original_input_blend_strength=original_input_blend_strength,
+            process_length=process_length
         )
 
         if prepared_inputs is None:
@@ -1174,7 +1341,17 @@ class InpaintingGUI(ThemedTk):
             messagebox.showinfo("Restore Complete", "No files found to restore.")
             logger.info("Restore complete: No files found to restore.")
 
-    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf):
+    def run_batch_process(
+            self,
+            input_folder,
+            output_folder,
+            num_inference_steps,
+            tile_num, offload_type,
+            frames_chunk, gui_overlap,
+            gui_original_input_blend_strength,
+            gui_output_crf,
+            process_length
+        ):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
         thread-safe GUI updates, and error management.
@@ -1212,6 +1389,7 @@ class InpaintingGUI(ThemedTk):
                 current_overlap = gui_overlap
                 current_original_input_blend_strength = gui_original_input_blend_strength
                 current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
+                current_process_length = process_length # NEW: Current process_length (from GUI initially)
 
                 json_path = os.path.splitext(video_path)[0] + ".json"
                 if os.path.exists(json_path):
@@ -1245,6 +1423,15 @@ class InpaintingGUI(ThemedTk):
                             else:
                                 logger.warning(f"Invalid 'output_crf' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_output_crf}).")
 
+                         # --- NEW: Load Process Length from sidecar ---
+                        if "process_length" in sidecar_data:
+                            sidecar_process_length = int(sidecar_data["process_length"])
+                            if sidecar_process_length == -1 or sidecar_process_length > 0:
+                                current_process_length = sidecar_process_length
+                                logger.debug(f"Using process_length from sidecar: {current_process_length}")
+                            else:
+                                logger.warning(f"Invalid 'process_length' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({process_length}).")
+
                     except (json.JSONDecodeError, ValueError) as e:
                         logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
                 else:
@@ -1266,7 +1453,8 @@ class InpaintingGUI(ThemedTk):
                     stop_event=self.stop_event,
                     update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
                     original_input_blend_strength=current_original_input_blend_strength,
-                    output_crf=current_output_crf # NEW: Pass current_output_crf
+                    output_crf=current_output_crf,
+                    process_length=current_process_length
                 )
                 
                 if completed:
@@ -1298,6 +1486,11 @@ class InpaintingGUI(ThemedTk):
             gui_overlap = int(self.overlap_var.get())
             gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
             gui_output_crf = int(self.output_crf_var.get()) # NEW: Get CRF
+            # Get Process Length and Validate
+            process_length = int(self.process_length_var.get())
+            if process_length != -1 and process_length <= 0:
+                raise ValueError("Process Length must be -1 or a positive integer.")
+            
             if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
@@ -1320,7 +1513,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf, process_length),
                          daemon=True).start()
 
     def stop_processing(self):
@@ -1374,29 +1567,41 @@ class InpaintingGUI(ThemedTk):
 
     def save_config(self):
         config = {
+            # Folder Configurations
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
+
+            # Parameter Configurations
             "num_inference_steps": self.num_inference_steps_var.get(),
             "tile_num": self.tile_num_var.get(),
-            "offload_type": self.offload_type_var.get(),
+            "process_length": self.process_length_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frame_overlap": self.overlap_var.get(),
             "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
             "output_crf": self.output_crf_var.get(),
+            "offload_type": self.offload_type_var.get(),
+
+            # GUI State Configurations
             "dark_mode_enabled": self.dark_mode_var.get(),
             "window_width": self.winfo_width(),
-            "window_height": self.winfo_height(),
             "window_x": self.winfo_x(),
             "window_y": self.winfo_y(),
-            # "enable_mask_processing": self.enable_mask_processing.get(),
-            # "mask_dilate_kernel_size_x": self.mask_dilate_kernel_size_x_var.get(),
-            # "mask_dilate_kernel_size_y": self.mask_dilate_kernel_size_y_var.get(),
-            # "mask_blur_kernel_size_x": self.mask_blur_kernel_size_x_var.get(),
-            # "mask_blur_kernel_size_y": self.mask_blur_kernel_size_y_var.get(),
-            # "mask_blur_sigma_x": self.mask_blur_sigma_x_var.get(),
-            # "mask_blur_sigma_y": self.mask_blur_sigma_y_var.get(),
-            # "enable_color_transfer": self.enable_color_transfer.get(),
-            # "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
+            
+            # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+            "enable_mask_binarization_toggle": self.enable_mask_binarization_toggle.get(),
+            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
+
+            "enable_morphological_closing_toggle": self.enable_morphological_closing_toggle.get(),
+            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
+
+            "enable_mask_dilation_toggle": self.enable_mask_dilation_toggle.get(),
+            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
+
+            "enable_mask_blur_toggle": self.enable_mask_blur_toggle.get(),
+            "mask_blur_sigma": self.mask_blur_sigma_var.get(),
+            
+            "enable_color_transfer": self.enable_color_transfer.get(),
+            "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
         }
         try:
             with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
