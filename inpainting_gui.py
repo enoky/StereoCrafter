@@ -68,6 +68,7 @@ class InpaintingGUI(ThemedTk):
         self.mask_blur_sigma_x_var = tk.StringVar(value=str(self.app_config.get("mask_blur_sigma_x", 15.0)))
         self.mask_blur_sigma_y_var = tk.StringVar(value=str(self.app_config.get("mask_blur_sigma_y", 15.0)))
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        self.enable_post_inpainting_blend = tk.BooleanVar(value=self.app_config.get("enable_post_inpainting_blend", True))
 
         self.create_widgets()
         self.style = ttk.Style()
@@ -130,7 +131,7 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
             return target_frame
-        
+    
     def _apply_gaussian_blur(self, mask: torch.Tensor) -> torch.Tensor:
         """
         Applies Gaussian blur to the mask using separate 1D convolutions for X and Y.
@@ -177,7 +178,7 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error during mask blurring: {e}. Skipping blur.", exc_info=True)
             return mask
-        
+    
     def _apply_mask_dilation(self, mask: torch.Tensor) -> torch.Tensor:
         """
         Applies dilation to the mask using max pooling.
@@ -214,7 +215,48 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error during mask dilation: {e}. Skipping dilation.", exc_info=True)
             return mask
-        
+    
+    def _apply_post_inpainting_blend(
+        self,
+        inpainted_frames: torch.Tensor,       # Generated frames from pipeline
+        original_warped_frames: torch.Tensor, # Original warped frames (bottom-right)
+        mask: torch.Tensor                    # Processed mask (dilated, blurred)
+    ) -> torch.Tensor:
+        """
+        Blends the inpainted frames with the original warped frames using the mask.
+        Ensures all input tensors are on CPU and have matching shapes before blending.
+        Expected format: [T, C, H, W] float [0, 1].
+        """
+        if not self.enable_post_inpainting_blend.get():
+            return inpainted_frames
+
+        if inpainted_frames.shape != original_warped_frames.shape or \
+           inpainted_frames.shape != mask.shape:
+            logger.error(f"Shape mismatch for post-inpainting blend. Inpainted: {inpainted_frames.shape}, Original Warped: {original_warped_frames.shape}, Mask: {mask.shape}. Skipping blend.")
+            return inpainted_frames
+
+        try:
+            # Ensure tensors are on CPU for blending if not already (they should be after previous steps)
+            inpainted_frames_cpu = inpainted_frames.cpu()
+            original_warped_frames_cpu = original_warped_frames.cpu()
+            mask_cpu = mask.cpu()
+
+            # Ensure mask is single channel for broadcasting if needed (though it should be [T, 1, H, W])
+            if mask_cpu.shape[1] != 1:
+                logger.warning(f"Mask has {mask_cpu.shape[1]} channels for blending, expecting 1. Using mean for blending if necessary.")
+                mask_blend = mask_cpu.mean(dim=1, keepdim=True)
+            else:
+                mask_blend = mask_cpu
+            
+            # Blend: original content where mask is 0, inpainted content where mask is 1, smooth blend in between
+            blended_frames = original_warped_frames_cpu * (1 - mask_blend) + inpainted_frames_cpu * mask_blend
+            
+            logger.debug("Applied post-inpainting blending.")
+            return blended_frames
+        except Exception as e:
+            logger.error(f"Error during post-inpainting blending: {e}. Returning original inpainted frames.", exc_info=True)
+            return inpainted_frames
+    
     def _apply_theme(self: "InpaintingGUI"): # Use forward reference for type hint
         """Applies the selected theme (dark or light) to the GUI, and adjusts window height."""
         if self.dark_mode_var.get():
@@ -320,7 +362,18 @@ class InpaintingGUI(ThemedTk):
         update_info_callback: Optional[Callable],
         overlap: int, # Needed for display, not logic here
         original_input_blend_strength: float # Needed for display, not logic here
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int, int, Optional[dict], float]]:
+    ) -> Optional[Tuple[
+        torch.Tensor,                  # frames_warpped_padded
+        torch.Tensor,                  # frames_mask_padded
+        Optional[torch.Tensor],        # frames_left_original_cropped
+        int,                           # num_frames_original
+        int,                           # padded_H
+        int,                           # padded_W
+        Optional[dict],                # video_stream_info
+        float,                         # fps
+        torch.Tensor,                  # frames_warpped_original_unpadded_normalized
+        torch.Tensor                   # frames_mask_processed_unpadded_original_length
+    ]]:
         """
         Helper method to prepare video inputs: loads frames, applies padding,
         validates dimensions, splits views, normalizes, and prepares for tiling.
@@ -413,28 +466,46 @@ class InpaintingGUI(ThemedTk):
             output_display_w = half_w
 
         # --- Normalization and Mask Grayscale ---
-        frames_warpped = frames_warpped_raw / 255.0 # Normalize to 0-1
-        frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
+        # frames_warpped_raw comes from input splitting and potential initial resize.
+        # frames_mask_raw comes from input splitting and potential initial resize.
+        
+        frames_warpped_normalized = frames_warpped_raw / 255.0  # Normalize to 0-1
+        frames_mask_grayscale = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
 
-        # --- Pad for Tiling ---
-        frames_warpped_padded = pad_for_tiling(frames_warpped, tile_num, tile_overlap=(128, 128))
-        frames_mask_padded = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
+        # --- NEW: Store original-length, unpadded, normalized warped frames and processed mask for post-blending ---
+        # These are taken *before* any padding for tiling.
+        # frames_warpped_original_unpadded_normalized will be the original warped input, cropped to original length, normalized.
+        # frames_mask_processed_unpadded_original_length will be the mask, processed, cropped to original length.
 
-        # --- Mask Pre-processing (Dilation and Gaussian Blur) ---
+        # First, process the mask (dilation/blur) if enabled
+        current_processed_mask = frames_mask_grayscale.clone()
         if self.enable_mask_processing.get():
-            logger.debug("Applying mask pre-processing (dilation + blur)...")
-            frames_mask = self._apply_mask_dilation(frames_mask)
-            frames_mask = self._apply_gaussian_blur(frames_mask)
+            logger.debug("Applying mask pre-processing (dilation + blur) for both pipeline input and blending reference...")
+            current_processed_mask = self._apply_mask_dilation(current_processed_mask)
+            current_processed_mask = self._apply_gaussian_blur(current_processed_mask)
             logger.debug("Mask pre-processing complete.")
+
+        # Store the versions for post-blending (original length, unpadded)
+        frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
+        frames_mask_processed_unpadded_original_length = current_processed_mask[:num_frames_original].clone()
+
+        # --- Pad for Tiling (for pipeline input) ---
+        # Now apply padding *only* to the versions going into the pipeline.
+        frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
+        frames_mask_padded = pad_for_tiling(current_processed_mask, tile_num, tile_overlap=(128, 128))
         
         padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
 
         # Update GUI with video info after processing initial dimensions
         if update_info_callback:
+            # Note: output_display_w and output_display_h should reflect the *original* resolution before padding,
+            # or the resolution of the *inpainted* output after any cropping to original extent.
+            # Your current logic for output_display_w/h is still valid for this.
             self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", num_frames_original, overlap, original_input_blend_strength))
 
         return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
-                num_frames_original, padded_H, padded_W, video_stream_info, fps)
+                num_frames_original, padded_H, padded_W, video_stream_info, fps,
+                frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
 
     def _set_saved_geometry(self: "InpaintingGUI"):
         """Applies the saved window size and position from config on startup."""
@@ -660,7 +731,8 @@ class InpaintingGUI(ThemedTk):
             return False # Preparation failed, so stop processing this video
 
         (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
-        num_frames_original, padded_H, padded_W, video_stream_info, fps) = prepared_inputs
+        num_frames_original, padded_H, padded_W, video_stream_info, fps,
+        frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
 
         # Now, num_frames refers to the number of frames after temporal padding (if any)
         # The actual processing loop should ideally use num_frames_original for its range.
@@ -820,6 +892,38 @@ class InpaintingGUI(ThemedTk):
                 frames_output_final = torch.stack(adjusted_frames_output)
                 logger.debug("Color transfer complete.")
         # --- END NEW ---
+        # --- NEW: Apply Post-Inpainting Blending (if enabled) ---
+        if self.enable_post_inpainting_blend.get():
+            logger.debug("Applying post-inpainting blend...")
+            # frames_output_final is the inpainted result (potentially color-transferred)
+            # frames_warpped_original_unpadded_normalized is the original input bottom-right quadrant
+            # frames_mask_processed_unpadded_original_length is the processed mask
+            
+            # Ensure spatial dimensions match before calling blend
+            target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
+            
+            # Resample original_warped and mask to match the (potentially resized) inpainted output dimensions
+            # This is crucial if resize for divisibility was applied to the pipeline input but not the stored original.
+            # However, in the updated `_prepare_video_inputs`, `frames_warpped_original_unpadded_normalized` 
+            # and `frames_mask_processed_unpadded_original_length` should already match the H, W
+            # of `frames_output_final` (which is `padded_H` and `padded_W` before cropping,
+            # then cropped back to `num_frames_original`).
+            # Let's double check this. `frames_output_final` is `frames_output_spatially_cropped[:num_frames_original]`.
+            # `frames_output_spatially_cropped` comes from `frames_output[:, :, :padded_H, :padded_W]`.
+            # And `frames_warpped_original_unpadded_normalized` is from `frames_warpped[:num_frames_original].clone()`.
+            # So `frames_output_final` and `frames_warpped_original_unpadded_normalized` will have the same H, W
+            # IF no intermediate resizing occurred AFTER `_prepare_video_inputs`.
+            # The only thing that would differ is `_prepare_video_inputs` might have resized the raw input
+            # to be divisible by 8. This ensures `frames_output_final` has those new H, W.
+            # So, the original stored `frames_warpped_original_unpadded_normalized` should match the H, W.
+
+            frames_output_final = self._apply_post_inpainting_blend(
+                inpainted_frames=frames_output_final,
+                original_warped_frames=frames_warpped_original_unpadded_normalized,
+                mask=frames_mask_processed_unpadded_original_length
+            )
+            logger.debug("Post-inpainting blend complete.")
+            # --- END NEW ---
 
         # Initialize final_output_frames_for_encoding defensively
         final_output_frames_for_encoding: Optional[torch.Tensor] = None
@@ -1292,6 +1396,7 @@ class InpaintingGUI(ThemedTk):
             # "mask_blur_sigma_x": self.mask_blur_sigma_x_var.get(),
             # "mask_blur_sigma_y": self.mask_blur_sigma_y_var.get(),
             # "enable_color_transfer": self.enable_color_transfer.get(),
+            # "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
         }
         try:
             with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
