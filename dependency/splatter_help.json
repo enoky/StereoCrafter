@@ -19,6 +19,7 @@
     "dual_output": "If checked, the output video will show two panels: the generated occlusion mask on the left and the warped (right-eye view) video on the right. If unchecked, it will generate a 2x2 grid: Original | DepthVis (Top), Mask | Warped (Bottom).",
     "no_normalization": "If checked, input depth maps are assumed to be raw pixel values (e.g., 0-255 for 8-bit, 0-1023 for 10-bit) and are directly scaled to a 0-1 range for splatting, without min-max analysis. Use this if your depth maps are already normalized or have a known raw range. If unchecked (default), global min/max normalization is performed.",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality, and 28 for lower quality. Range is typically 0-51. Ignored if hardware encoder (NVENC) is used, which uses CQ instead (CQ is internally set to match target quality).",
+		"enable_post_inpainting_blend": "",
     "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
     "stop_button": "Stops the currently running processing task cleanly.",
     "exit_button": "Saves the current GUI settings to 'config_splat.json' and closes the application."

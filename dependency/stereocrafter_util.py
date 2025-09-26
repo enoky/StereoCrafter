@@ -24,6 +24,14 @@ if not logging.root.handlers:
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
+def set_util_logger_level(level):
+    """Sets the logging level for the 'stereocrafter_util' logger."""
+    logger.setLevel(level)
+    # If basicConfig was already called, its handlers might not update automatically.
+    # Ensure handlers also reflect the new level.
+    for handler in logger.handlers:
+        handler.setLevel(level)
+        
 # --- Global Flags ---
 CUDA_AVAILABLE = False
 
