@@ -532,6 +532,50 @@ class SplatterGUI(ThemedTk):
             "max_disp_source": max_disp_source
         }
     
+    def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, fill_width_pixels: int = 20) -> torch.Tensor:
+        """
+        Fills horizontal left-edge occlusions in the right-eye video by stretching
+        adjacent visible pixels from the right.
+
+        Args:
+            right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W],
+                                               values in [0, 1].
+            occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W],
+                                                  where 1 indicates occlusion.
+            fill_width_pixels (int): The maximum number of columns from the left edge to attempt to fill.
+
+        Returns:
+            torch.Tensor: The modified right-eye video tensor with left-edge occlusions filled.
+        """
+        B, C, H, W = right_video_tensor.shape
+
+        # Ensure fill_width_pixels is within valid bounds
+        fill_width_pixels = min(W - 1, fill_width_pixels) # W-1 because we access x+1
+
+        if fill_width_pixels <= 0:
+            logger.debug("Fill width for left-edge occlusions is 0 or less, skipping fill.")
+            return right_video_tensor # No filling needed
+
+        modified_right_video_tensor = right_video_tensor.clone()
+
+        # Iterate from the right-most column of the fill region (fill_width_pixels - 1)
+        # backwards to the left-most column (0).
+        for x in range(fill_width_pixels - 1, -1, -1):
+            # Create a condition mask for the current column 'x'.
+            # It's True where 'occlusion_mask_tensor' is > 0.5 (occluded)
+            # Unsqueeze and expand to match C dimension for torch.where
+            condition_is_occluded_at_x = (occlusion_mask_tensor[:, 0, :, x] > 0.5).unsqueeze(1).expand(-1, C, -1)
+
+            # Conditionally fill: if occluded, take value from x+1; otherwise, keep original.
+            modified_right_video_tensor[:, :, :, x] = torch.where(
+                condition_is_occluded_at_x,
+                modified_right_video_tensor[:, :, :, x+1], # Value from column to the right
+                modified_right_video_tensor[:, :, :, x]     # Keep original value
+            )
+        
+        logger.debug(f"Filled left-edge occlusions for {fill_width_pixels} columns.")
+        return modified_right_video_tensor
+
     def _initialize_video_and_depth_readers(self, video_path, actual_depth_map_path, process_length, task_settings, match_depth_res):
         """
         Initializes VideoReader objects for source video and depth map,
@@ -1191,7 +1235,18 @@ class SplatterGUI(ThemedTk):
             disp_map_tensor = disp_map_tensor * max_disp
 
             with torch.no_grad():
-                right_video_tensor, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
+                # Perform the forward warp to get the raw right-eye view and occlusion mask
+                right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
+                
+                # --- NEW: Apply left-edge occlusion filling ---
+                # You can adjust 'fill_width_pixels=20' here or in the function definition.
+                # '20' is an example, try values like 5, 10, 15, or more if your black band is wide.
+                right_video_tensor = self._fill_left_edge_occlusions(
+                    right_video_tensor_raw,
+                    occlusion_mask_tensor,
+                    fill_width_pixels=40 # <--- ADJUST THIS VALUE as needed
+                )
+                # --- END NEW ---
             
             right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
             occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
