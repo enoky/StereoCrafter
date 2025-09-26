@@ -351,7 +351,6 @@ class InpaintingGUI(ThemedTk):
 
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.theme_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             # ttk.Entry widget styling
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
@@ -380,7 +379,6 @@ class InpaintingGUI(ThemedTk):
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.theme_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
@@ -492,16 +490,6 @@ class InpaintingGUI(ThemedTk):
             if update_info_callback:
                 self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength))
             return None
-
-        # --- Temporal Padding (Repeat last frame) ---
-        padding_frames_count = frames_chunk # Use frames_chunk as a reasonable pad length
-        if num_frames_original > 0:
-            last_frame_to_repeat = frames[-1:].clone() # Shape [1, C, H, W]
-            repeated_frames = last_frame_to_repeat.repeat(padding_frames_count, 1, 1, 1)
-            frames = torch.cat([frames, repeated_frames], dim=0)
-            logger.debug(f"Padded video frames from {num_frames_original} to {frames.shape[0]} by repeating the last frame.")
-        else:
-            logger.warning("Attempted to pad an empty video; temporal padding skipped.")
 
         # --- Dimension Divisibility Check and Resizing (if needed) ---
         _, _, total_h_raw_input_before_resize, total_w_raw_input_before_resize = frames.shape
@@ -724,12 +712,10 @@ class InpaintingGUI(ThemedTk):
 
         self.option_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Option", menu=self.option_menu)
+        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.option_menu.add_separator()
         self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
-
-        self.theme_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
-        self.theme_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
 
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -998,41 +984,63 @@ class InpaintingGUI(ThemedTk):
         num_frames_original, padded_H, padded_W, video_stream_info, fps,
         frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
 
-        # Now, num_frames refers to the number of frames after temporal padding (if any)
-        # The actual processing loop should ideally use num_frames_original for its range.
-        # Let's use num_frames_original for the loop end and ensure slicing is from padded tensors.
-        num_frames_for_loop = frames_warpped_padded.shape[0] # Use the full padded length for the loop iteration
-
+        # The loop will now iterate over the actual number of original frames.
+        total_frames_to_process_actual = num_frames_original        
         stride = max(1, frames_chunk - overlap)
         results = [] # Stores chunks to be concatenated in final video
         previous_chunk_output_frames = None
 
         # Loop over the *padded* number of frames
-        for i in range(0, num_frames_for_loop, stride): # CHANGED: Loop over num_frames_for_loop
+        stride = max(1, frames_chunk - overlap)
+        results = [] # Stores chunks to be concatenated in final video
+        previous_chunk_output_frames = None
+
+        # Loop over the actual original frames (after process_length limit)
+        for i in range(0, total_frames_to_process_actual, stride):
             if stop_event and stop_event.is_set():
                 logger.info(f"Stopping processing of {input_video_path}")
                 return False
             
-            end_idx = min(i + frames_chunk, num_frames_for_loop) # CHANGED: Use num_frames_for_loop
-            chunk_size = end_idx - i
-            if chunk_size <= 0:
-                break
+            # Determine the end index for slicing actual original frames
+            end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
+            
+            # Slice the actual frames that exist in the video
+            original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
+            mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+            
+            # Calculate how many actual frames were sliced
+            actual_sliced_length = original_input_frames_slice.shape[0]
 
-            # Get the input for the current chunk from the already padded frames
-            original_input_frames_for_chunk = frames_warpped_padded[i:end_idx].clone()
-            mask_frames_i = frames_mask_padded[i:end_idx].clone()
+            # Dynamically add temporal padding if the current slice is shorter than frames_chunk
+            padding_needed_for_pipeline_input = frames_chunk - actual_sliced_length
+            if padding_needed_for_pipeline_input > 0:
+                logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
+                
+                # Get the *very last* frame of the original video for repetition
+                last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
 
-            input_frames_to_pipeline = original_input_frames_for_chunk.clone()
+                repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+                repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
 
-            # Input-level blending for overlapping frames
+                input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
+                mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
+            else:
+                # This chunk is a full frames_chunk length, no padding needed for its input
+                input_frames_to_pipeline = original_input_frames_slice
+                mask_frames_i = mask_frames_slice
+
+            # Input-level blending for overlapping frames (keep this logic as is)
             if previous_chunk_output_frames is not None and overlap > 0:
-                overlap_actual = min(overlap, len(previous_chunk_output_frames), len(original_input_frames_for_chunk))
-
+                # `previous_chunk_output_frames` will always be `frames_chunk` long (from pipeline output)
+                # `input_frames_to_pipeline` will also be `frames_chunk` long (due to dynamic padding if needed)
+                overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
+                
                 if overlap_actual > 0:
                     prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
                     
                     if original_input_blend_strength > 0:
-                        orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
+                        orig_input_overlap_frames = input_frames_to_pipeline[:overlap_actual]
                         original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
                         
                         blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
@@ -1046,24 +1054,25 @@ class InpaintingGUI(ThemedTk):
                         input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
                     
                     del prev_gen_overlap_frames
-            if tile_num > 1: # Check if tiling is enabled
-                logger.info(f"Starting inference for chunk {i}-{end_idx} (Padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
+            
+            if tile_num > 1:
+                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Padded input size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]}, Temporal length: {input_frames_to_pipeline.shape[0]})...")
             else:
-                logger.info(f"Starting inference for chunk {i}-{end_idx}...")
+                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
             
             start_time = time.time()
 
             with torch.no_grad():
                 video_latents = spatial_tiled_process(
-                    input_frames_to_pipeline,
-                    mask_frames_i,
-                    pipeline,
-                    tile_num,
+                    cond_frames=input_frames_to_pipeline, # Changed 'frames' to 'cond_frames'
+                    mask_frames=mask_frames_i,
+                    process_func=pipeline,             # Changed 'pipeline' to 'process_func'
+                    tile_num=tile_num,
                     spatial_n_compress=8,
                     min_guidance_scale=1.01,
                     max_guidance_scale=1.01,
-                    decode_chunk_size=8,
-                    fps=7, # Fixed FPS for pipeline, might not match video's original FPS
+                    decode_chunk_size=2,
+                    fps=7,
                     motion_bucket_id=127,
                     noise_aug_strength=0.0,
                     num_inference_steps=num_inference_steps,
@@ -1079,7 +1088,7 @@ class InpaintingGUI(ThemedTk):
 
             end_time = time.time()
             inference_duration = end_time - start_time
-            logger.debug(f"Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
+            logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
             
             video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
             current_chunk_generated_frames = []
@@ -1087,12 +1096,18 @@ class InpaintingGUI(ThemedTk):
                 img = video_frames[j]
                 current_chunk_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
 
-            current_chunk_generated = torch.stack(current_chunk_generated_frames)
+            current_chunk_generated = torch.stack(current_chunk_generated_frames) # This will be `frames_chunk` long
 
+            # Append only the "new" frames of the actual video content
             if i == 0:
-                results.append(current_chunk_generated)
+                # For the first chunk, append all `actual_sliced_length` frames.
+                results.append(current_chunk_generated[:actual_sliced_length])
             else:
-                results.append(current_chunk_generated[overlap:])
+                # For subsequent chunks, append frames from `overlap` up to `actual_sliced_length`.
+                # This correctly excludes the overlapping portion and any padding.
+                results.append(current_chunk_generated[overlap:actual_sliced_length])
+            
+            previous_chunk_output_frames = current_chunk_generated # Keep full generated chunk for next blend
             
             previous_chunk_output_frames = current_chunk_generated 
 

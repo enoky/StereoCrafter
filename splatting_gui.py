@@ -17,12 +17,13 @@ import threading
 import queue
 import subprocess
 import time
-from typing import Optional, Tuple
+import logging
+from typing import Optional, Tuple, Optional
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
 from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
-    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE
+    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level
 )
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
@@ -64,14 +65,19 @@ class SplatterGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
-        # self.geometry("620x750")
-        self.configure(bg="#2b2b2b") # Set a dark background color for the root window
 
         self.app_config = {}
         self.help_texts = {}
 
         self._load_config()
         self._load_help_texts()
+        
+        self._is_startup = True # NEW: for theme/geometry handling
+        self.debug_mode_var = tk.BooleanVar(value=self.app_config.get("debug_mode_enabled", False))
+        # NEW: Window size and position variables
+        self.window_x = self.app_config.get("window_x", None)
+        self.window_y = self.app_config.get("window_y", None)
+        self.window_width = self.app_config.get("window_width", 620)
 
         # --- Variables with defaults ---
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
@@ -103,14 +109,15 @@ class SplatterGUI(ThemedTk):
         self.stop_event = threading.Event()
         self.progress_queue = queue.Queue()
         self.processing_thread = None
-        self.fixed_window_width = 620 # <--- NEW: Define your desired fixed width here
 
         self._create_widgets()
-        # Initialize ttk.Style after the main Tk app has been created
-        # This ensures the style object is fully functional when _apply_theme is called.
-        self.style = ttk.Style() # <--- NEW LINE: Explicitly create ttk.Style instance
+        self.style = ttk.Style()
         
-        self._apply_theme()
+        self.update_idletasks() # Ensure widgets are rendered for correct reqheight
+        self._apply_theme(is_startup=True) # Pass is_startup=True here
+        self._set_saved_geometry() # NEW: Call to set initial geometry
+        self._is_startup = False # Set to false after initial startup geometry is handled
+        self._configure_logging() # Ensure this call is still present
 
         self.after(10, self.toggle_processing_settings_fields) # Set initial state
         self.after(100, self.check_queue) # Start checking progress queue
@@ -118,7 +125,7 @@ class SplatterGUI(ThemedTk):
         # Bind closing protocol
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
 
-    def _apply_theme(self: "SplatterGUI"):
+    def _apply_theme(self: "SplatterGUI", is_startup: bool = False):
         """Applies the selected theme (dark or light) to the GUI, and adjusts window height."""
         if self.dark_mode_var.get():
             # --- Dark Theme ---
@@ -136,7 +143,6 @@ class SplatterGUI(ThemedTk):
                 active_fg = "white"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.theme_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
             
@@ -160,7 +166,6 @@ class SplatterGUI(ThemedTk):
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.theme_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
             
@@ -168,15 +173,22 @@ class SplatterGUI(ThemedTk):
                 for label in self.info_labels:
                     label.config(bg=bg_color, fg=fg_color)
 
-        # --- Dynamic Height Adjustment (always runs after theme change) ---
-        # Force Tkinter to calculate the actual required size for the new theme
-        self.update_idletasks()
-        
-        # Get the new optimal height based on the current content and theme padding
-        new_height = self.winfo_reqheight() 
-        
-        # Apply the fixed width and the new calculated height
-        self.geometry(f"{self.fixed_window_width}x{new_height}")
+        self.update_idletasks() # Ensure all theme changes are rendered for accurate reqheight
+
+        # --- Apply geometry only if not during startup (NEW conditional block) ---
+        if not is_startup:
+            current_actual_width = self.winfo_width() # Get current width (including user resize)
+            if current_actual_width <= 1: # Fallback for very first call where winfo_width might be 1
+                current_actual_width = self.window_width # Use the saved/default width
+
+            new_height = self.winfo_reqheight() # Get the new optimal height based on content and theme
+
+            # Apply the current (potentially user-adjusted) width and the new calculated height
+            self.geometry(f"{current_actual_width}x{new_height}")
+            logger.debug(f"Theme change applied geometry: {current_actual_width}x{new_height}")
+
+            # Update the stored width for next time save_config is called.
+            self.window_width = current_actual_width
 
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
@@ -204,6 +216,25 @@ class SplatterGUI(ThemedTk):
         if file_path:
             var.set(file_path)
 
+    def _configure_logging(self):
+        """Sets the logging level for the stereocrafter_util logger based on debug_mode_var."""
+        if self.debug_mode_var.get():
+            level = logging.DEBUG
+            # Also set the root logger if it hasn't been configured to debug, to catch other messages
+            if logging.root.level > logging.DEBUG:
+                logging.root.setLevel(logging.DEBUG)
+        else:
+            level = logging.INFO
+            # Reset root logger if it was temporarily set to debug by this GUI
+            if logging.root.level == logging.DEBUG: # Check if this GUI set it
+                logging.root.setLevel(logging.INFO) # Reset to a less verbose default
+
+        # Make sure 'set_util_logger_level' is imported and available.
+        # It's already in dependency/stereocrafter_util, ensure it's imported at the top.
+        # Add 'import logging' at the top of splatting_gui.py if not already present.
+        set_util_logger_level(level) # Call the function from stereocrafter_util.py
+        logger.info(f"Logging level set to {logging.getLevelName(level)}.")
+        
     def _create_hover_tooltip(self, widget, key):
         """Creates a tooltip for a given widget based on a key from help_texts."""
         if key in self.help_texts:
@@ -217,11 +248,16 @@ class SplatterGUI(ThemedTk):
 
         self.option_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Option", menu=self.option_menu)
+        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.option_menu.add_separator()
         self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
-        self.theme_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
-        self.theme_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        
+        # NEW: Help Menu
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_checkbutton(label="Enable Debugging", variable=self.debug_mode_var, command=self._toggle_debug_mode)
+        self.help_menu.add_command(label="About", command=self.show_about_dialog)
 
         # --- Folder selection frame ---
         folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
@@ -439,7 +475,8 @@ class SplatterGUI(ThemedTk):
                 "set_pre_res": False,
                 "target_width": -1,
                 "target_height": -1,
-                "batch_size": settings["full_res_batch_size"]
+                "batch_size": settings["full_res_batch_size"],
+                "is_low_res": False
             })
         if settings["enable_low_resolution"]:
             processing_tasks.append({
@@ -448,7 +485,8 @@ class SplatterGUI(ThemedTk):
                 "set_pre_res": True,
                 "target_width": settings["low_res_width"],
                 "target_height": settings["low_res_height"],
-                "batch_size": settings["low_res_batch_size"]
+                "batch_size": settings["low_res_batch_size"],
+                "is_low_res": True
             })
         return processing_tasks
     
@@ -606,7 +644,7 @@ class SplatterGUI(ThemedTk):
             )
         except Exception as e:
             logger.error(f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
-            return None, None, 0, 0, 0, 0, None, 0, 0, 0, None # Return None for depth_stream_info
+            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
 
         self.progress_queue.put(("update_info", {
             "resolution": f"{current_processed_width}x{current_processed_height}",
@@ -625,14 +663,14 @@ class SplatterGUI(ThemedTk):
         except Exception as e:
             logger.error(f"==> Error initializing depth map reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
             if video_reader_input: del video_reader_input
-            return None, None, 0, 0, 0, 0, None, 0, 0, 0, None # Return None for depth_stream_info
+            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
 
         # CRITICAL CHECK: Ensure input video and depth map have consistent frame counts
         if total_frames_input != total_frames_depth:
             logger.error(f"==> Frame count mismatch for {os.path.basename(video_path)} {task_settings['name']} pass: Input video has {total_frames_input} frames, Depth map has {total_frames_depth} frames. Skipping.")
             if video_reader_input: del video_reader_input
             if depth_reader_input: del depth_reader_input
-            return None, None, 0, 0, 0, 0, None, 0, 0, 0, None # Return None for depth_stream_info
+            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
         
         return (video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width,
                 video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info)
@@ -830,8 +868,9 @@ class SplatterGUI(ThemedTk):
                             task, settings["match_depth_res"]
                         )
                     
-                    if video_reader_input is None or depth_reader_input is None:
-                        logger.error(f"Skipping {task['name']} pass for {video_name} due to reader initialization error or frame count mismatch.")
+                    # Explicitly check for None for critical components before proceeding
+                    if video_reader_input is None or depth_reader_input is None or video_stream_info is None: # <--- CHANGED HERE: Added check for video_stream_info
+                        logger.error(f"Skipping {task['name']} pass for {video_name} due to reader initialization error, frame count mismatch, or missing stream info.")
                         overall_task_counter += 1
                         self.progress_queue.put(("processed", overall_task_counter))
                         release_cuda_memory()
@@ -885,7 +924,8 @@ class SplatterGUI(ThemedTk):
                         assume_raw_input=assume_raw_input_mode,
                         global_depth_min=global_depth_min,
                         global_depth_max=global_depth_max,
-                        depth_stream_info=depth_stream_info
+                        depth_stream_info=depth_stream_info,
+                        is_low_res_task=task["is_low_res"]
                     )
 
                     if self.stop_event.is_set():
@@ -938,9 +978,18 @@ class SplatterGUI(ThemedTk):
     def _save_config(self):
         """Saves current GUI settings to config_splat.json."""
         config = {
+            # Folder Configurations
             "input_source_clips": self.input_source_clips_var.get(),
             "input_depth_maps": self.input_depth_maps_var.get(),
             "output_splatted": self.output_splatted_var.get(),
+            
+            # GUI State Configurations
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+            "debug_mode_enabled": self.debug_mode_var.get(),
+
             "max_disp": self.max_disp_var.get(),
             "process_length": self.process_length_var.get(),
             "batch_size": self.batch_size_var.get(),
@@ -957,6 +1006,38 @@ class SplatterGUI(ThemedTk):
         }
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
+
+    def _set_saved_geometry(self: "SplatterGUI"):
+        """Applies the saved window width and position, with dynamic height."""
+        # Ensure the window is visible and all widgets are laid out for accurate height calculation
+        self.update_idletasks()
+
+        # 1. Get the optimal height for the current content
+        calculated_height = self.winfo_reqheight()
+        # Fallback in case winfo_reqheight returns a tiny value (shouldn't happen after update_idletasks)
+        if calculated_height < 100:
+            calculated_height = 750 # A reasonable fallback height if something goes wrong
+
+        # 2. Use the saved/default width
+        current_width = self.window_width
+        # Fallback if saved width is invalid or too small
+        if current_width < 200: # Minimum sensible width
+            current_width = 620 # Use default width
+
+        # 3. Construct the geometry string
+        geometry_string = f"{current_width}x{calculated_height}"
+        if self.window_x is not None and self.window_y is not None:
+            geometry_string += f"+{self.window_x}+{self.window_y}"
+        else:
+            # If no saved position, let Tkinter center it initially or place it at default
+            pass # No position appended, Tkinter will handle default placement
+
+        # 4. Apply the geometry
+        self.geometry(geometry_string)
+        logger.debug(f"Applied saved geometry: {geometry_string}")
+
+        # Store the actual width that was applied (which is current_width) for save_config
+        self.window_width = current_width # Update instance variable for save_config
 
     def _setup_batch_processing(self, settings):
         """
@@ -1005,6 +1086,12 @@ class SplatterGUI(ThemedTk):
             return [], False, None, None
 
         return input_videos, is_single_file_mode, finished_source_folder, finished_depth_folder
+    
+    def _toggle_debug_mode(self):
+        """Toggles debug mode on/off and updates logging."""
+        self._configure_logging()
+        self._save_config() # Save the current debug mode state to config immediately
+        messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
     
     def check_queue(self):
         """Periodically checks the progress queue for updates to the GUI."""
@@ -1078,7 +1165,8 @@ class SplatterGUI(ThemedTk):
             global_depth_min: float, 
             global_depth_max: float,  
             depth_stream_info: Optional[dict],
-            user_output_crf: Optional[int] = None
+            user_output_crf: Optional[int] = None,
+            is_low_res_task: bool = False
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1238,15 +1326,21 @@ class SplatterGUI(ThemedTk):
                 # Perform the forward warp to get the raw right-eye view and occlusion mask
                 right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
                 
-                # --- NEW: Apply left-edge occlusion filling ---
-                # You can adjust 'fill_width_pixels=20' here or in the function definition.
-                # '20' is an example, try values like 5, 10, 15, or more if your black band is wide.
-                right_video_tensor = self._fill_left_edge_occlusions(
-                    right_video_tensor_raw,
-                    occlusion_mask_tensor,
-                    fill_width_pixels=40 # <--- ADJUST THIS VALUE as needed
-                )
-                # --- END NEW ---
+                # --- Conditional Left-Edge Occlusion Filling ---
+                if is_low_res_task:
+                    logger.debug("Applying left-edge occlusion filling for low-resolution output.")
+                    # You can adjust 'fill_width_pixels=20' here or in the function definition.
+                    # '20' is an example, try values like 5, 10, 15, or more if your black band is wide.
+                    right_video_tensor = self._fill_left_edge_occlusions(
+                        right_video_tensor_raw,
+                        occlusion_mask_tensor,
+                        fill_width_pixels=20 # <--- ADJUST THIS VALUE as needed
+                    )
+                else:
+                    logger.debug("Skipping left-edge occlusion filling for high-resolution output.")
+                    right_video_tensor = right_video_tensor_raw # Use the raw warped tensor
+
+                # --- END Conditional ---
             
             right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
             occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
@@ -1469,6 +1563,17 @@ class SplatterGUI(ThemedTk):
                 logger.debug("==> Thread did not terminate gracefully within timeout.")
         release_cuda_memory()
         self.destroy()
+
+    def show_about_dialog(self):
+        """Displays an 'About' dialog for the application."""
+        about_text = (
+            "Stereocrafter Splatting Application\n"
+            f"Version: {GUI_VERSION}\n"
+            "This tool generates right-eye views from source videos and depth maps through a process called depth splatting.\n"
+            "It supports different output resolutions, dual/quad output modes, and custom disparity settings.\n\n"
+            "Developed by [Your Name/Alias] for StereoCrafter projects." # Customize this!
+        )
+        messagebox.showinfo("About Batch Video Splatting", about_text)
 
     def start_processing(self):
         """Starts the video processing in a separate thread."""
@@ -1761,7 +1866,7 @@ def load_pre_rendered_depth(
         process_length: int,
         target_height: int,
         target_width: int,
-        match_resolution_to_target: bool) -> Tuple[VideoReader, int, int, int]:
+        match_resolution_to_target: bool) -> Tuple[VideoReader, int, int, int, Optional[dict]]:
     """
     Initializes a VideoReader for chunked depth map reading.
     No normalization or autogain is applied here.
