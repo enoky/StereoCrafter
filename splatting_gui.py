@@ -27,6 +27,7 @@ from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_in
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
+GUI_VERSION = "25.09.26"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -62,7 +63,7 @@ class ForwardWarpStereo(nn.Module):
 class SplatterGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="default")
-        self.title("Batch Depth Splatting")
+        self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
         # self.geometry("620x750")
         self.configure(bg="#2b2b2b") # Set a dark background color for the root window
 
