@@ -1688,6 +1688,13 @@ class InpaintingGUI(ThemedTk):
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
 
+            # GUI State Configurations
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+            "debug_mode_enabled": self.debug_mode_var.get(),
+            
             # Parameter Configurations
             "num_inference_steps": self.num_inference_steps_var.get(),
             "tile_num": self.tile_num_var.get(),
@@ -1698,13 +1705,6 @@ class InpaintingGUI(ThemedTk):
             "output_crf": self.output_crf_var.get(),
             "offload_type": self.offload_type_var.get(),
 
-            # GUI State Configurations
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "window_width": self.winfo_width(),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "debug_mode_enabled": self.debug_mode_var.get(),
-            
             # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
             "mask_initial_threshold": self.mask_initial_threshold_var.get(),
             "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
