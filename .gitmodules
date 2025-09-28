@@ -1,3 +1,0 @@
-[submodule "dependency/DepthCrafter"]
-	path = dependency/DepthCrafter
-	url = https://github.com/Tencent/DepthCrafter
