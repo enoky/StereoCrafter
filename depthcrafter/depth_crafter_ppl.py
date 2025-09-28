@@ -271,11 +271,11 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                         latent_model_input, t
                     )  # [1, t, c, h, w]
                     # --- AGGRESSIVE DEBUG PRINTS START ---
-                    logger.debug(f"DEBUG: Before concat:")
-                    logger.debug(f"DEBUG:   latent_model_input shape: {latent_model_input.shape}")
-                    logger.debug(f"DEBUG:   video_latents_current shape: {video_latents_current.shape}")
-                    logger.debug(f"DEBUG:   UNet in_channels: {self.unet.config.in_channels}")
-                    logger.debug(f"DEBUG:   VAE latent_channels (from config, if exists): {self.vae.config.get('latent_channels', 'N/A')}")
+                    # logger.debug(f"DEBUG: Before concat:")
+                    # logger.debug(f"DEBUG:   latent_model_input shape: {latent_model_input.shape}")
+                    # logger.debug(f"DEBUG:   video_latents_current shape: {video_latents_current.shape}")
+                    # logger.debug(f"DEBUG:   UNet in_channels: {self.unet.config.in_channels}")
+                    # logger.debug(f"DEBUG:   VAE latent_channels (from config, if exists): {self.vae.config.get('latent_channels', 'N/A')}")
                     # ------------------------------------
                     latent_model_input = torch.cat(
                         [latent_model_input, video_latents_current], dim=2

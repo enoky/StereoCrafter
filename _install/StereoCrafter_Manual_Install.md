@@ -12,7 +12,6 @@ Ensure the following tools are installed and available in your system's PATH:
 - [Python 3.12](https://www.python.org/)
 - [CUDA Toolkit 12.8 or 12.9](https://developer.nvidia.com/cuda-toolkit)
 - [FFMPEG](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/)
-- 
 
 ---
 
@@ -118,7 +117,7 @@ python -m pip install --upgrade -r requirements.txt
 
 ### 10. Download and install weights
 
-Download and extract [model](https://drive.google.com/file/d/1bKL7Hag8AG4WTEX3jFGJA69nO8_kZQLP/view?usp=drive_link) "weights" to StereoCrafter folder
+Download and extract [model](https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso) "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
 
 ---
 

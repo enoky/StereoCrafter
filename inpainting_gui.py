@@ -5,79 +5,1729 @@ import shutil
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Toplevel, Label
-from typing import Optional, Tuple
+from ttkthemes import ThemedTk
+from typing import Optional, Tuple, Callable 
 
 import numpy as np
 import torch
 from decord import VideoReader, cpu
-from transformers import CLIPVisionModelWithProjection
-from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
+# FlashAttention requires optional dependency; attempt safe imports
+
 import torch.nn.functional as F
 import time
 import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
+import logging
 
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
-    tensor2vid
+    tensor2vid,
+    load_inpainting_pipeline
 )
+
+GUI_VERSION = "25.09.26"
 
 # torch.backends.cudnn.benchmark = True
 
-def load_inpainting_pipeline(
-    pre_trained_path: str,
-    unet_path: str,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.float16,
-    offload_type: str = "model"
-) -> StableVideoDiffusionInpaintingPipeline:
-    """
-    Loads the stable video diffusion inpainting pipeline components and returns the pipeline object.
-    """
-    logger.info("Loading pipeline components...")
+class InpaintingGUI(ThemedTk):    
+    def __init__(self):
+        super().__init__(theme="clam")
+        self.title(f"Stereocrafter Inpainting (Batch) {GUI_VERSION}")   
+        self.app_config = self.load_config()
+        self.help_data = self.load_help_data()
 
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        pre_trained_path,
-        subfolder="image_encoder",
-        variant="fp16",
-        torch_dtype=dtype,
-    )
-    vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path,
-        subfolder="vae",
-        variant="fp16",
-        torch_dtype=dtype,
-    )
-    unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        unet_path,
-        subfolder="unet_diffusers",
-        low_cpu_mem_usage=True,
-        torch_dtype=dtype,
-    )
+        self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
+        # Window size and position variables
+        # Load from config or use defaults
+        self.window_x = self.app_config.get("window_x", None)
+        self.window_y = self.app_config.get("window_y", None)
+        self.window_width = self.app_config.get("window_width", 550)
+        
+        self._is_startup = True
+        self.debug_mode_var = tk.BooleanVar(value=self.app_config.get("debug_mode_enabled", False))
 
-    image_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
+        self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
+        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
+        self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
+        self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
+        self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
+        self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
+        self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.0)))
+        self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
+        self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
+        self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
+        
+        # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+        self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
+        self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 0.0)))
+        self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 5)))        
+        self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 10)))
 
-    pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
-        pre_trained_path,
-        image_encoder=image_encoder,
-        vae=vae,
-        unet=unet,
-        torch_dtype=dtype,
-    ).to(device)
+        self.enable_post_inpainting_blend = tk.BooleanVar(value=self.app_config.get("enable_post_inpainting_blend", False))
+        self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        
+        self.processed_count = tk.IntVar(value=0)
+        self.total_videos = tk.IntVar(value=0)
+        self.stop_event = threading.Event()
+        self.pipeline = None
+        self.video_name_var = tk.StringVar(value="N/A")
+        self.video_res_var = tk.StringVar(value="N/A")
+        self.video_frames_var = tk.StringVar(value="N/A")
+        self.video_overlap_var = tk.StringVar(value="N/A")
+        self.video_bias_var = tk.StringVar(value="N/A")
 
-    if offload_type == "model":
-        pipeline.enable_model_cpu_offload()
-    elif offload_type == "sequential":
-        pipeline.enable_sequential_cpu_offload()
-    elif offload_type == "none":
-        pass  # No offloading
-    else:
-        raise ValueError("Invalid offload_type")
+        self.mask_param_widgets = [] 
 
-    return pipeline
+        self.create_widgets()
+        self.style = ttk.Style()
+        
+        self.update_idletasks() 
+        self._apply_theme(is_startup=True) 
+        self._set_saved_geometry()
+        self._is_startup = False 
+        self._configure_logging() 
+
+        self.update_progress()
+        self.update_status_label("Ready")
+        self.protocol("WM_DELETE_WINDOW", self.exit_application)
+        self.after(0, self._set_saved_geometry)
+
+    def _apply_color_transfer(self, source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
+        """
+        Transfers the color statistics from the source_frame to the target_frame using LAB color space.
+        Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
+        Returns the color-adjusted target_frame in [C, H, W] float [0, 1] format.
+        """
+        try:
+            # Ensure tensors are on CPU and convert to numpy arrays in HWC format
+            source_np = source_frame.permute(1, 2, 0).numpy()  # [H, W, C]
+            target_np = target_frame.permute(1, 2, 0).numpy()  # [H, W, C]
+
+            # Scale from [0, 1] to [0, 255] and convert to uint8
+            source_np_uint8 = (np.clip(source_np, 0.0, 1.0) * 255).astype(np.uint8)
+            target_np_uint8 = (np.clip(target_np, 0.0, 1.0) * 255).astype(np.uint8)
+
+            # Convert to LAB color space
+            source_lab = cv2.cvtColor(source_np_uint8, cv2.COLOR_RGB2LAB)
+            target_lab = cv2.cvtColor(target_np_uint8, cv2.COLOR_RGB2LAB)
+
+            # Compute mean and standard deviation of each channel for source and target
+            # cv2.meanStdDev returns 2D arrays, reshape to 1D for easier handling
+            src_mean, src_std = cv2.meanStdDev(source_lab)
+            tgt_mean, tgt_std = cv2.meanStdDev(target_lab)
+
+            src_mean = src_mean.flatten()
+            src_std = src_std.flatten()
+            tgt_mean = tgt_mean.flatten()
+            tgt_std = tgt_std.flatten()
+
+            # Ensure no division by zero by replacing zero std with a small value
+            src_std = np.clip(src_std, 1e-6, None)
+            tgt_std = np.clip(tgt_std, 1e-6, None)
+
+            # Normalize target LAB channels based on source statistics
+            target_lab_float = target_lab.astype(np.float32)
+            for i in range(3): # For L, A, B channels
+                target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[i]
+
+            # Clip values to valid LAB range [0, 255] and convert back to uint8
+            target_lab_float = np.clip(target_lab_float, 0, 255)
+            adjusted_lab_uint8 = target_lab_float.astype(np.uint8)
+
+            # Convert back to RGB
+            adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
+
+            # Convert back to tensor [C, H, W] in [0, 1]
+            adjusted_tensor = torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
+
+            return adjusted_tensor
+        except Exception as e:
+            logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
+            return target_frame
+    
+    def _apply_gaussian_blur(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """
+        Applies Gaussian blur to the mask using separate 1D convolutions for X and Y.
+        Expects mask in [T, C, H, W] format, where C=1.
+        """
+        try:
+
+            # sets kernel_size, sigma is derived ---
+            if kernel_size <= 0:
+                logger.warning(f"Invalid blur kernel size ({kernel_size}). Skipping blur.")
+                return mask
+            
+            # Ensure kernel size is odd
+            kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+            if kernel_val < 3: # Enforce minimum odd kernel size
+                kernel_val = 3
+
+            sigma = kernel_val / 6.0 # Derive sigma from kernel_size
+            if sigma < 0.1: # Minimum sensible sigma
+                sigma = 0.1
+
+            kernel_x = self._create_1d_gaussian_kernel(kernel_val, sigma).to(mask.device) # Use derived kernel_val and sigma
+            kernel_y = self._create_1d_gaussian_kernel(kernel_val, sigma).to(mask.device) # Use derived kernel_val and sigma
+
+            kernel_x = kernel_x.view(1, 1, 1, kernel_val)
+            kernel_y = kernel_y.view(1, 1, kernel_val, 1)
+
+            padding_x = kernel_val // 2
+            blurred_mask = F.conv2d(mask, kernel_x, padding=(0, padding_x), groups=mask.shape[1])
+            
+            padding_y = kernel_val // 2
+            blurred_mask = F.conv2d(blurred_mask, kernel_y, padding=(padding_y, 0), groups=mask.shape[1])
+            
+            logger.debug(f"Applied Gaussian blur with kernel {kernel_val}x{kernel_val} (derived sigma {sigma:.2f}).") # Updated log message
+            return torch.clamp(blurred_mask, 0.0, 1.0)
+        except ValueError:
+            logger.error("Invalid input for mask blur parameters. Skipping blur.", exc_info=True)
+            return mask
+        except Exception as e:
+            logger.error(f"Error during mask blurring: {e}. Skipping blur.", exc_info=True)
+            return mask
+    
+    def _apply_mask_dilation(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """
+        Applies dilation to the mask using max pooling.
+        Expects mask in [T, C, H, W] format, where C=1.
+        # """
+        # if not self.enable_mask_processing.get():
+        #     return mask
+
+        try:
+            
+            # Ensure kernel size is positive and odd for symmetry
+            if kernel_size <= 0:
+                logger.warning(f"Invalid dilation kernel size ({kernel_size}). Skipping dilation.")
+                return mask
+            
+            kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1 # Ensure odd
+            
+            dilated_mask = F.max_pool2d(
+                mask,
+                kernel_size=(kernel_val, kernel_val), # Use single kernel_val for both dimensions
+                stride=1,
+                padding=(kernel_val // 2, kernel_val // 2)
+            )
+            logger.debug(f"Applied mask dilation with kernel ({kernel_val}x{kernel_val}).") # Updated log message
+            return dilated_mask
+        except ValueError:
+            logger.error("Invalid input for mask dilation kernel size. Skipping dilation.", exc_info=True) # Updated log message
+            return mask
+        except Exception as e:
+            logger.error(f"Error during mask dilation: {e}. Skipping dilation.", exc_info=True)
+            return mask
+    
+    def _apply_morphological_closing(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+        """
+        Applies morphological closing to fill small holes and smooth boundaries.
+        Expects mask in [T, C, H, W] float [0, 1] format (on CPU, or moved to CPU).
+        Returns processed mask in the same format.
+        """
+        # REMOVED THIS LINE: if not self.enable_morphological_closing_toggle.get():
+        # REMOVED THIS LINE:     return mask
+
+        try:
+
+            if kernel_size <= 0:
+                logger.warning(f"Invalid morphological closing kernel size ({kernel_size}). Skipping closing.")
+                return mask
+            
+            # Ensure kernel_size is odd for symmetry (OpenCV handles even, but odd is often preferred)
+            kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1 
+
+            processed_masks = []
+            for t in range(mask.shape[0]):
+                frame_mask_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+
+                # Create structuring element using a single kernel_val
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_val, kernel_val))
+
+                closed_mask_np = cv2.morphologyEx(frame_mask_np, cv2.MORPH_CLOSE, kernel)
+
+                closed_mask_tensor = torch.from_numpy(closed_mask_np).float() / 255.0
+                processed_masks.append(closed_mask_tensor.unsqueeze(0))
+
+            logger.debug(f"Applied morphological closing with kernel ({kernel_val}x{kernel_val}).") # Updated log message
+            return torch.stack(processed_masks).to(mask.device)
+        except ValueError:
+            logger.error("Invalid input for morphological closing kernel size. Skipping closing.", exc_info=True) # Updated log message
+            return mask
+        except Exception as e:
+            logger.error(f"Error during morphological closing: {e}. Skipping closing.", exc_info=True)
+            return mask
+        
+    def _apply_post_inpainting_blend(
+        self,
+        inpainted_frames: torch.Tensor,       # Generated frames from pipeline
+        original_warped_frames: torch.Tensor, # Original warped frames (bottom-right)
+        mask: torch.Tensor,                    # Processed mask (dilated, blurred)        
+        base_video_name: str
+    ) -> torch.Tensor:
+        """
+        Blends the inpainted frames with the original warped frames using the mask.
+        Ensures all input tensors are on CPU and have matching shapes before blending.
+        Expected format: [T, C, H, W] float [0, 1].
+        """
+        if not self.enable_post_inpainting_blend.get():
+            return inpainted_frames
+
+        # Check if temporal (T) and spatial (H, W) dimensions match
+        if (inpainted_frames.shape[0] != original_warped_frames.shape[0] or
+            inpainted_frames.shape[2] != original_warped_frames.shape[2] or
+            inpainted_frames.shape[3] != original_warped_frames.shape[3]):
+            logger.error(f"Temporal or Spatial shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Original Warped {original_warped_frames.shape}. Skipping blend.")
+            return inpainted_frames
+
+        if (inpainted_frames.shape[0] != mask.shape[0] or
+            inpainted_frames.shape[2] != mask.shape[2] or
+            inpainted_frames.shape[3] != mask.shape[3] or
+            mask.shape[1] != 1): # Explicitly check mask has 1 channel
+            logger.error(f"Mask shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Mask {mask.shape} (Mask must be 1-channel). Skipping blend.")
+            return inpainted_frames
+
+        try:
+            # Ensure tensors are on CPU for blending if not already (they should be after previous steps)
+            inpainted_frames_cpu = inpainted_frames.cpu()
+            original_warped_frames_cpu = original_warped_frames.cpu()
+            mask_cpu = mask.cpu()
+
+            # Ensure mask is single channel for broadcasting if needed (though it should be [T, 1, H, W])
+            if mask_cpu.shape[1] != 1:
+                logger.warning(f"Mask has {mask_cpu.shape[1]} channels for blending, expecting 1. Using mean for blending if necessary.")
+                mask_blend = mask_cpu.mean(dim=1, keepdim=True)
+            else:
+                mask_blend = mask_cpu
+            
+            # Blend: original content where mask is 0, inpainted content where mask is 1, smooth blend in between
+            blended_frames = original_warped_frames_cpu * (1 - mask_blend) + inpainted_frames_cpu * mask_blend
+            
+            logger.debug("Applied post-inpainting blending.")
+
+            # --- MODIFIED: TEMPORARY DEBUG CODE START (now conditional) ---
+            if self.debug_mode_var.get():
+                debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_blend")
+                os.makedirs(debug_output_dir, exist_ok=True)
+                # MODIFIED: Use base_video_name directly
+                video_basename_for_debug_blend = os.path.splitext(base_video_name)[0] 
+
+                for t in range(min(5, inpainted_frames_cpu.shape[0])):
+                    original_warped_img = (original_warped_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    inpainted_img = (inpainted_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    mask_img = (mask_blend[t].squeeze(0).numpy() * 255).astype(np.uint8)
+                    blended_img = (blended_frames[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+                    cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_original_warped.png"), cv2.cvtColor(original_warped_img, cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_inpainted.png"), cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_mask.png"), mask_img)
+                    cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_blended.png"), cv2.cvtColor(blended_img, cv2.COLOR_RGB2BGR))
+                logger.debug(f"Saved debug blend frames to {debug_output_dir}")
+            # --- END MODIFIED TEMPORARY DEBUG CODE ---
+
+            return blended_frames
+        except Exception as e:
+            logger.error(f"Error during post-inpainting blending: {e}. Returning original inpainted frames.", exc_info=True)
+            return inpainted_frames
+    
+    def _apply_theme(self: "InpaintingGUI", is_startup: bool = False):
+        """Applies the selected theme (dark or light) to the GUI, and adjusts window height."""
+        if self.dark_mode_var.get():
+            # --- Dark Theme ---
+            bg_color = "#2b2b2b" # Background for root and tk.Label
+            fg_color = "white"   # Foreground for tk.Label text
+            entry_field_bg = "#3c3c3c" # Background for ttk.Entry field
+            
+            self.style.theme_use("black")
+            self.configure(bg=bg_color)
+
+            # Menu bar styling (tk.Menu widgets)
+            if hasattr(self, 'menubar'): # Check if menu widgets exist yet
+                menu_bg = "#3c3c3c"
+                menu_fg = "white"
+                active_bg = "#555555"
+                active_fg = "white"
+
+                self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+            
+            # ttk.Entry widget styling
+            self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
+            
+            # ttk.LabelFrame styling (background and foreground for title)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color) # For the title text
+
+            # ttk.Label styling (for all ttk.Label widgets including the info frame ones)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
+
+        else:
+            # --- Light Theme ---
+            bg_color = "#d9d9d9"
+            fg_color = "black"
+            entry_field_bg = "#f0f0f0"
+
+            self.style.theme_use("default")
+            self.configure(bg=bg_color)
+
+            # Menu bar styling (tk.Menu widgets)
+            if hasattr(self, 'menubar'):
+                menu_bg = "#f0f0f0"
+                menu_fg = "black"
+                active_bg = "#dddddd"
+                active_fg = "black"
+                self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+
+            self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
+
+        self.update_idletasks() # Ensure all theme changes are rendered for accurate reqheight
+
+        # --- Apply geometry only if not during startup ---
+        if not is_startup:
+            current_actual_width = self.winfo_width() # Get current width (including user resize)
+            if current_actual_width <= 1: # Fallback for very first call where winfo_width might be 1
+                current_actual_width = self.window_width # Use the saved/default width
+
+            new_height = self.winfo_reqheight() # Get the new optimal height based on content and theme
+
+            # Apply the current (potentially user-adjusted) width and the new calculated height
+            self.geometry(f"{current_actual_width}x{new_height}")
+            logger.debug(f"Theme change applied geometry: {current_actual_width}x{new_height}")
+
+            # Update the stored width for next time save_config is called.
+            self.window_width = current_actual_width
+
+    def _create_1d_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
+        """
+        Creates a 1D Gaussian kernel.
+        """
+        if kernel_size <= 0 or sigma <= 0:
+            logger.warning(f"Invalid kernel_size ({kernel_size}) or sigma ({sigma}) for Gaussian kernel. Returning identity.")
+            # Return a kernel that effectively does nothing
+            identity_kernel = torch.zeros(kernel_size)
+            if kernel_size > 0:
+                identity_kernel[kernel_size // 2] = 1.0 # Central pixel is 1
+            return identity_kernel.unsqueeze(0).unsqueeze(0) # Shape (1, 1, kernel_size) for conv1d
+
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        gauss = torch.exp(-(ax ** 2) / (2 * sigma ** 2))
+        kernel = gauss / gauss.sum()
+        return kernel
+
+    def _configure_logging(self):
+        """Sets the logging level for the stereocrafter_util logger based on debug_mode_var."""
+        if self.debug_mode_var.get():
+            level = logging.DEBUG
+            # Also set the root logger if it hasn't been configured to debug, to catch other messages
+            if logging.root.level > logging.DEBUG:
+                logging.root.setLevel(logging.DEBUG)
+        else:
+            level = logging.INFO
+            # Reset root logger if it was temporarily set to debug by this GUI
+            if logging.root.level == logging.DEBUG: # Check if this GUI set it
+                 logging.root.setLevel(logging.INFO) # Reset to a less verbose default
+
+        set_util_logger_level(level) # Call the function from stereocrafter_util.py
+        logger.info(f"Logging level set to {logging.getLevelName(level)}.")
+    
+    def _prepare_video_inputs(
+        self,
+        input_video_path: str,
+        base_video_name: str,
+        is_dual_input: bool,
+        frames_chunk: int,
+        tile_num: int,
+        update_info_callback: Optional[Callable],
+        overlap: int, # Needed for display, not logic here
+        original_input_blend_strength: float,
+        process_length: int = -1
+    ) -> Optional[Tuple[
+        torch.Tensor,                  # frames_warpped_padded
+        torch.Tensor,                  # frames_mask_padded
+        Optional[torch.Tensor],        # frames_left_original_cropped
+        int,                           # num_frames_original
+        int,                           # padded_H
+        int,                           # padded_W
+        Optional[dict],                # video_stream_info
+        float,                         # fps
+        torch.Tensor,                  # frames_warpped_original_unpadded_normalized
+        torch.Tensor                   # frames_mask_processed_unpadded_original_length
+    ]]:
+        """
+        Helper method to prepare video inputs: loads frames, applies padding,
+        validates dimensions, splits views, normalizes, and prepares for tiling.
+
+        Returns: (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+                  num_frames_original, padded_H, padded_W, video_stream_info)
+                 or None if an error occurs.
+        """
+        frames, fps, video_stream_info = read_video_frames(input_video_path)
+
+        # --- Process Length Logic ---
+        total_frames_in_video = frames.shape[0]
+        actual_frames_to_process_count = total_frames_in_video
+
+        if process_length != -1 and process_length > 0:
+            actual_frames_to_process_count = min(total_frames_in_video, process_length)
+            logger.info(f"Limiting processing to first {actual_frames_to_process_count} frames (out of {total_frames_in_video}).")
+        
+        if actual_frames_to_process_count == 0:
+            logger.warning(f"No frames to process in {input_video_path} (after applying process_length), skipping.")
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", f"0 (out of {total_frames_in_video})", overlap, original_input_blend_strength))
+            return None
+
+        frames = frames[:actual_frames_to_process_count]
+        num_frames_original = frames.shape[0]
+        
+        if num_frames_original == 0:
+            logger.warning(f"No frames found in {input_video_path}, skipping.")
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength))
+            return None
+
+        # --- Dimension Divisibility Check and Resizing (if needed) ---
+        _, _, total_h_raw_input_before_resize, total_w_raw_input_before_resize = frames.shape
+        required_divisor = 8
+
+        new_h = total_h_raw_input_before_resize
+        new_w = total_w_raw_input_before_resize
+
+        if new_h % required_divisor != 0:
+            new_h = (new_h // required_divisor + 1) * required_divisor
+            logger.warning(f"Video height {total_h_raw_input_before_resize} is not divisible by {required_divisor}. Resizing to {new_h}.")
+
+        if new_w % required_divisor != 0:
+            new_w = (new_w // required_divisor + 1) * required_divisor
+            logger.warning(f"Video width {total_w_raw_input_before_resize} is not divisible by {required_divisor}. Resizing to {new_w}.")
+
+        if new_h != total_h_raw_input_before_resize or new_w != total_w_raw_input_before_resize:
+            if frames.shape[0] > 0:
+                frames = F.interpolate(frames, size=(new_h, new_w), mode='bicubic', align_corners=False)
+                logger.info(f"Frames resized from {total_h_raw_input_before_resize}x{total_w_raw_input_before_resize} to {new_h}x{new_w}.")
+            else:
+                logger.warning("Attempted to resize empty frames tensor. Skipping resize.")
+        
+        # --- Update current dimensions after potential resize ---
+        total_h_current, total_w_current = frames.shape[2], frames.shape[3]
+
+        if total_h_current < required_divisor or total_w_current < required_divisor:
+            error_msg = f"Video {base_video_name} is too small after resize ({total_w_current}x{total_h_current}), skipping."
+            logger.error(error_msg)
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, f"{total_w_current}x{total_h_current} (INVALID)", num_frames_original, overlap, original_input_blend_strength))
+            self.after(0, lambda: messagebox.showerror("Input Error", error_msg))
+            return None
+
+
+        # --- Input Splitting based on Dual/Quad ---
+        frames_left_original_cropped: Optional[torch.Tensor] = None # For SBS output, cropped to original length
+
+        if is_dual_input:
+            half_w = total_w_current // 2
+            frames_mask_raw = frames[:, :, :, :half_w]  # Left half is mask
+            frames_warpped_raw = frames[:, :, :, half_w:] # Right half is warped
+            
+            # The target_output_h/w for GUI info will be the dimensions of the inpainted part
+            output_display_h = total_h_current
+            output_display_w = half_w
+
+        else: # Quad input
+            half_h = total_h_current // 2
+            half_w = total_w_current // 2
+
+            # frames_left_original_full_padded is the top-left quadrant, padded temporally
+            frames_left_original_full_padded = frames[:, :, :half_h, :half_w]
+            # Now, crop it to the original video length for eventual SBS concatenation
+            frames_left_original_cropped = frames_left_original_full_padded[:num_frames_original].float() / 255.0 # Normalize for concat
+
+            frames_mask_raw = frames[:, :, half_h:, :half_w]  # Bottom-Left is mask
+            frames_warpped_raw = frames[:, :, half_h:, half_w:] # Bottom-Right is warped
+
+            output_display_h = half_h
+            output_display_w = half_w
+
+        # --- Normalization and Grayscale Conversion (Using OpenCV) ---
+        frames_warpped_normalized = frames_warpped_raw / 255.0
+
+        processed_masks_grayscale = []
+        for t in range(frames_mask_raw.shape[0]):
+            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
+            frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
+            processed_masks_grayscale.append(frame_tensor_gray.unsqueeze(0))
+        current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
+        logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+
+        # --- Granular Mask Processing Steps (Direct Binarization Pipeline) ---
+
+       # 1. Binarization (Direct Thresholding)
+        try:
+            binarize_threshold = float(self.mask_initial_threshold_var.get())
+            if binarize_threshold != 0.0: # Step enabled if threshold is not 0
+                if not (0.0 <= binarize_threshold <= 1.0):
+                    logger.warning(f"Invalid binarize threshold ({binarize_threshold}). Using default 0.1.")
+                    binarize_threshold = 0.1
+                current_processed_mask = (current_processed_mask > binarize_threshold).float()
+                logger.debug(f"Mask: Binarized (threshold > {binarize_threshold}, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            else:
+                logger.debug("Mask: Binarization step skipped (threshold is 0). Using grayscale (might be unsuitable for subsequent steps).")
+        except ValueError:
+            logger.error(f"Invalid value for binarize threshold: {self.mask_initial_threshold_var.get()}. Falling back to 0.1.", exc_info=True)
+            current_processed_mask = (current_processed_mask > 0.1).float() # Fallback to default behavior if error
+
+        # 2. Morphological Closing
+        try:
+            morph_kernel_size = int(self.mask_morph_kernel_size_var.get())
+            if morph_kernel_size != 0: # Step enabled if kernel size is not 0
+                current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
+                logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            else:
+                logger.debug("Mask: Morphological closing step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_morph_kernel_size: {self.mask_morph_kernel_size_var.get()}. Skipping morphological closing.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during morphological closing step: {e}. Skipping.", exc_info=True)
+
+        # 3. Mask Dilation
+        try:
+            dilate_kernel_size = int(self.mask_dilate_kernel_size_var.get())
+            if dilate_kernel_size != 0: # Step enabled if kernel size is not 0
+                current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
+                logger.debug(f"Mask: After dilation (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            else:
+                logger.debug("Mask: Dilation step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_dilate_kernel_size: {self.mask_dilate_kernel_size_var.get()}. Skipping dilation.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during mask dilation step: {e}. Skipping.", exc_info=True)
+
+        # 4. Mask Gaussian Blur
+        try:
+            blur_kernel_size = int(self.mask_blur_kernel_size_var.get()) # NEW: Parse blur kernel size
+            if blur_kernel_size != 0: # Step enabled if kernel size is not 0
+                current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size) # NEW: Pass kernel size
+                logger.debug(f"Mask: After blur (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+            else:
+                logger.debug("Mask: Gaussian blur step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_blur_kernel_size: {self.mask_blur_kernel_size_var.get()}. Skipping blur.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during mask blur step: {e}. Skipping.", exc_info=True)
+        # --- END NEW Granular Mask Processing Steps ---
+
+        # --- Store original-length, unpadded versions for post-blending ---
+        frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
+        frames_mask_processed_unpadded_original_length = current_processed_mask[:num_frames_original].clone()
+
+        # --- Pad for Tiling (for pipeline input) ---
+        frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
+        frames_mask_padded = pad_for_tiling(current_processed_mask, tile_num, tile_overlap=(128, 128))
+        
+        padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
+
+        # Update GUI with video info after processing initial dimensions
+        if update_info_callback:
+            display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
+            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
+
+        return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+                num_frames_original, padded_H, padded_W, video_stream_info, fps,
+                frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
+
+    def _set_saved_geometry(self: "InpaintingGUI"):
+        """Applies the saved window width and position, with dynamic height."""
+        # Ensure the window is visible and all widgets are laid out for accurate height calculation
+        self.update_idletasks() 
+
+        # 1. Get the optimal height for the current content
+        calculated_height = self.winfo_reqheight()
+        # Fallback in case winfo_reqheight returns a tiny value (shouldn't happen after update_idletasks)
+        if calculated_height < 100:
+            calculated_height = 500 # A reasonable fallback height if something goes wrong
+
+        # 2. Use the saved/default width
+        current_width = self.window_width
+        # Fallback if saved width is invalid or too small
+        if current_width < 200: # Minimum sensible width
+            current_width = 550 # Use default width
+
+        # 3. Construct the geometry string
+        geometry_string = f"{current_width}x{calculated_height}"
+        if self.window_x is not None and self.window_y is not None:
+            geometry_string += f"+{self.window_x}+{self.window_y}"
+        else:
+            # If no saved position, let Tkinter center it initially or place it at default
+            pass # No position appended, Tkinter will handle default placement
+
+        # 4. Apply the geometry
+        self.geometry(geometry_string)
+        logger.debug(f"Applied saved geometry: {geometry_string}")
+        
+        # Store the actual width that was applied (which is current_width) for save_config
+        self.window_width = current_width # Update instance variable for save_config
+    
+    def _toggle_color_transfer_state(self):
+        """Callback for the Enable Color Transfer checkbox. Saves config."""
+        self.save_config() # Simply save the config to persist the checkbox state
+        logger.debug(f"Color Transfer state changed to: {self.enable_color_transfer.get()}")
+    
+    def _toggle_debug_mode(self):
+        """Toggles debug mode on/off and updates logging."""
+        self._configure_logging()
+        # Save the current debug mode state to config immediately
+        self.save_config() 
+        messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
+    
+    def _toggle_blend_parameters_state(self):
+        """Enables or disables mask processing parameter entry widgets based on the blend toggle."""
+        state = tk.NORMAL if self.enable_post_inpainting_blend.get() else tk.DISABLED
+        for widget in self.mask_param_widgets:
+            widget.config(state=state)
+        # We might also want to disable the blending execution if the toggle is off,
+        # but the `if not self.enable_post_inpainting_blend.get(): return inpainted_frames`
+        # check in `_apply_post_inpainting_blend` already handles this.
+        # This function primarily affects the GUI state.
+        logger.debug(f"Blend parameters state set to: {state}")
+    
+    def browse_input(self):
+        folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
+        if folder:
+            self.input_folder_var.set(folder)
+
+    def browse_output(self):
+        folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
+        if folder:
+            self.output_folder_var.set(folder)
+
+    def create_widgets(self):
+        
+        self.menubar = tk.Menu(self)
+        self.config(menu=self.menubar)
+
+        self.option_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Option", menu=self.option_menu)
+        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.option_menu.add_separator()
+        self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+
+        # --- Help Menu ---
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_checkbutton(label="Enable Debugging", variable=self.debug_mode_var, command=self._toggle_debug_mode)
+        self.help_menu.add_command(label="About", command=self.show_about_dialog)
+
+        # --- FOLDER FRAME ---
+        folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
+        folder_frame.pack(fill="x", padx=10, pady=5)
+        folder_frame.grid_columnconfigure(1, weight=1)
+        
+        current_row = 0 # Initialize row counter for folder_frame
+
+        # Input Folder
+        input_label = ttk.Label(folder_frame, text="Input Folder:")
+        input_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(input_label, self.help_data.get("input_folder", ""))
+        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self.browse_input).grid(row=current_row, column=2, padx=5)
+        current_row += 1
+        
+        # Output Folder
+        output_label = ttk.Label(folder_frame, text="Output Folder:")
+        output_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(output_label, self.help_data.get("output_folder", ""))
+        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self.browse_output).grid(row=current_row, column=2, padx=5)
+
+
+        # --- MAIN PARAMETERS FRAME ---
+        param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
+        param_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Configure 4 columns for param_frame: Label | Entry | Label | Entry
+        param_frame.grid_columnconfigure(0, weight=1) # Left Label
+        param_frame.grid_columnconfigure(1, weight=1) # Left Entry
+        param_frame.grid_columnconfigure(2, weight=1) # Right Label
+        param_frame.grid_columnconfigure(3, weight=1) # Right Entry
+
+        current_row = 0 # Reset row counter for param_frame
+
+        # Row 0: Inference Steps (Left) & Output CRF (Right)
+        inference_steps_label = ttk.Label(param_frame, text="Inference Steps:")
+        inference_steps_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(inference_steps_label, self.help_data.get("num_inference_steps", ""))
+        ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+
+        original_blend_label = ttk.Label(param_frame, text="Original Input Bias:")
+        original_blend_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(original_blend_label, self.help_data.get("original_input_blend_strength", ""))
+        ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 1: Tile Number (Left) & Process Length (Right)
+        tile_num_label = ttk.Label(param_frame, text="Tile Number:")
+        tile_num_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
+        ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        
+        frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
+        frame_overlap_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(frame_overlap_label, self.help_data.get("frame_overlap", "")) 
+        ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 2: Frames Chunk (Left) & Frame Overlap (Right)
+        frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
+        frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
+        ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        
+        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
+        output_crf_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
+        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 3: Original Input Bias (Left) & CPU Offload (Right)
+        process_length_label = ttk.Label(param_frame, text="Process Length:")
+        process_length_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(process_length_label, self.help_data.get("process_length", "Number of frames to process. Use -1 for all frames."))
+        ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+
+        offload_label = ttk.Label(param_frame, text="CPU Offload:")
+        offload_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(offload_label, self.help_data.get("offload_type", ""))
+        offload_options = ["model", "sequential", "none"]
+        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
+        # current_row += 1 # No need to increment here, param_frame is done
+
+
+        # --- POST-PROCESSING FRAME ---
+        post_process_frame = ttk.LabelFrame(self, text="Post-Processing", padding=10)
+        post_process_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Configure 4 columns for post_process_frame: Label | Entry | Label | Entry
+        post_process_frame.grid_columnconfigure(0, weight=1) # Left Label
+        post_process_frame.grid_columnconfigure(1, weight=1) # Left Entry
+        post_process_frame.grid_columnconfigure(2, weight=1) # Right Label
+        post_process_frame.grid_columnconfigure(3, weight=1) # Right Entry
+
+        current_row = 0 # Reset row counter for post_process_frame
+
+        # Row 0: Enable Post-Inpainting Blend Checkbox
+        blend_enable_check = ttk.Checkbutton(post_process_frame, text="Enable Post-Inpainting Blend", 
+                                             variable=self.enable_post_inpainting_blend, 
+                                             command=self._toggle_blend_parameters_state)
+        blend_enable_check.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2) # Spans all 4 columns
+        Tooltip(blend_enable_check, self.help_data.get("enable_post_inpainting_blend", ""))
+
+        color_transfer_check = ttk.Checkbutton(post_process_frame, text="Enable Color Transfer", 
+                                               variable=self.enable_color_transfer,
+                                               command=self._toggle_color_transfer_state) # Will create this command
+        color_transfer_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2) # Occupies right side
+        Tooltip(color_transfer_check, self.help_data.get("enable_color_transfer", ""))
+        current_row += 1
+
+        # Row 1: Mask Binarization Threshold (Left) & Morphological Closing Kernel Size (Right)
+        bin_thresh_label = ttk.Label(post_process_frame, text="Mask Binarize Thresh:")
+        bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(bin_thresh_label, self.help_data.get("mask_initial_threshold", ""))
+        bin_thresh_entry = ttk.Entry(post_process_frame, textvariable=self.mask_initial_threshold_var, width=10)
+        bin_thresh_entry.grid(row=current_row, column=1, sticky="w", padx=5)
+        self.mask_param_widgets.append(bin_thresh_entry) # Store reference
+        
+        dilate_kernel_label = ttk.Label(post_process_frame, text="Mask Dilate Kernel:")
+        dilate_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(dilate_kernel_label, self.help_data.get("mask_dilate_kernel_size", ""))
+        dilate_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_dilate_kernel_size_var, width=10)
+        dilate_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.mask_param_widgets.append(dilate_kernel_entry) # Store reference
+        current_row += 1
+
+        # Row 2: Mask Dilation Kernel (Left) & Mask Blur Kernel Size (Right)
+        morph_kernel_label = ttk.Label(post_process_frame, text="Morph Close Kernel:")
+        morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(morph_kernel_label, self.help_data.get("mask_morph_kernel_size", ""))
+        morph_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_morph_kernel_size_var, width=10)
+        morph_kernel_entry.grid(row=current_row, column=1, sticky="w", padx=5)
+        self.mask_param_widgets.append(morph_kernel_entry) # Store reference
+
+        blur_kernel_label = ttk.Label(post_process_frame, text="Mask Blur Kernel:")
+        blur_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(blur_kernel_label, self.help_data.get("mask_blur_kernel_size", ""))
+        blur_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_blur_kernel_size_var, width=10)
+        blur_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.mask_param_widgets.append(blur_kernel_entry) # Store reference
+        # current_row += 1 # No need to increment here, post_process_frame is done
+        
+        # Initialize the state of blend parameters immediately after creation
+        self._toggle_blend_parameters_state()
+
+
+        # --- PROGRESS FRAME (no change) ---
+        progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
+        progress_frame.pack(fill="x", padx=10, pady=5)
+        self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
+        self.progress_bar.pack(fill="x")
+        self.status_label = ttk.Label(progress_frame, text="Ready")
+        self.status_label.pack(pady=5)
+
+        # --- BUTTONS FRAME (no change) ---
+        buttons_frame = ttk.Frame(self, padding=10)
+        buttons_frame.pack(fill="x", pady=10)
+        
+        inner_buttons_frame = ttk.Frame(buttons_frame)
+        inner_buttons_frame.pack(anchor="center")
+
+        self.start_button = ttk.Button(inner_buttons_frame, text="Start", command=self.start_processing)
+        self.start_button.pack(side="left", padx=5)
+        self.stop_button = ttk.Button(inner_buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
+        self.stop_button.pack(side="left", padx=5)
+        ttk.Button(inner_buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
+        ttk.Button(inner_buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
+
+        # --- INFO FRAME (no change) ---
+        self.info_frame = ttk.LabelFrame(self, text="Current Video Information", padding=10)
+        self.info_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.info_frame.grid_columnconfigure(0, weight=0)
+        self.info_frame.grid_columnconfigure(1, weight=1)
+
+        current_row = 0
+
+        ttk.Label(self.info_frame, text="Name:").grid(row=current_row, column=0, sticky="e", padx=(5, 2), pady=1)
+        self.video_name_label = ttk.Label(self.info_frame, textvariable=self.video_name_var, anchor="w")
+        self.video_name_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
+        current_row += 1
+        
+        ttk.Label(self.info_frame, text="Resolution:").grid(row=current_row, column=0, sticky="e", padx=(5, 2), pady=1)
+        self.video_res_label = ttk.Label(self.info_frame, textvariable=self.video_res_var, anchor="w")
+        self.video_res_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
+        current_row += 1
+        
+        ttk.Label(self.info_frame, text="Frames:").grid(row=current_row, column=0, sticky="e", padx=(5, 2), pady=1)
+        self.video_frames_label = ttk.Label(self.info_frame, textvariable=self.video_frames_var, anchor="w")
+        self.video_frames_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
+        current_row += 1
+
+        ttk.Label(self.info_frame, text="Overlap:").grid(row=current_row, column=0, sticky="e", padx=(5, 2), pady=1)
+        self.video_overlap_label = ttk.Label(self.info_frame, textvariable=self.video_overlap_var, anchor="w")
+        self.video_overlap_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
+        current_row += 1
+
+        ttk.Label(self.info_frame, text="Input Bias:").grid(row=current_row, column=0, sticky="e", padx=(5, 2), pady=1)
+        self.video_bias_label = ttk.Label(self.info_frame, textvariable=self.video_bias_var, anchor="w")
+        self.video_bias_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
+
+    def process_single_video(
+        self,
+        pipeline: StableVideoDiffusionInpaintingPipeline,
+        input_video_path: str,
+        save_dir: str,
+        frames_chunk: int = 23,
+        overlap: int = 3,
+        tile_num: int = 1,
+        vf: Optional[str] = None, # This vf parameter is no longer directly used by new FFmpeg logic
+        num_inference_steps: int = 5,
+        stop_event: Optional[threading.Event] = None,
+        update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
+        original_input_blend_strength: float = 0.8,
+        output_crf: int = 23,
+        process_length: int = -1,
+    ) -> bool:
+        """
+        Processes a single input video.
+        Determines input format (quad or dual) based on filename suffix.
+        Outputs SBS (left view | inpainted output) for quad input,
+        or only inpainted output for dual input.
+        Returns True if processing completed successfully, False if stopped.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        base_video_name = os.path.basename(input_video_path)
+        video_name_without_ext = os.path.splitext(base_video_name)[0]
+
+        is_dual_input = video_name_without_ext.endswith("_splatted2")
+        if is_dual_input:
+            logger.info(f"Dual Splat detected for '{base_video_name}'. Processing and outputting Inpainted Right Eye only.")
+        else:
+            logger.info(f"Quad Splat (or default) detected for '{base_video_name}'. Processing and outputting Inpainted SBS video.")
+
+        output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+        video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+        output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
+        output_video_path = os.path.join(save_dir, output_video_filename)
+
+        # NEW: Call the helper method to prepare inputs
+        prepared_inputs = self._prepare_video_inputs(
+            input_video_path=input_video_path,
+            base_video_name=base_video_name,
+            is_dual_input=is_dual_input,
+            frames_chunk=frames_chunk,
+            tile_num=tile_num,
+            update_info_callback=update_info_callback,
+            overlap=overlap,
+            original_input_blend_strength=original_input_blend_strength,
+            process_length=process_length
+        )
+
+        if prepared_inputs is None:
+            return False # Preparation failed, so stop processing this video
+
+        (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+        num_frames_original, padded_H, padded_W, video_stream_info, fps,
+        frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
+
+        # The loop will now iterate over the actual number of original frames.
+        total_frames_to_process_actual = num_frames_original        
+        stride = max(1, frames_chunk - overlap)
+        results = [] # Stores chunks to be concatenated in final video
+        previous_chunk_output_frames = None
+
+        # Loop over the *padded* number of frames
+        stride = max(1, frames_chunk - overlap)
+        results = [] # Stores chunks to be concatenated in final video
+        previous_chunk_output_frames = None
+
+        # Loop over the actual original frames (after process_length limit)
+        for i in range(0, total_frames_to_process_actual, stride):
+            if stop_event and stop_event.is_set():
+                logger.info(f"Stopping processing of {input_video_path}")
+                return False
+            
+            # Determine the end index for slicing actual original frames
+            end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
+            
+            # Slice the actual frames that exist in the video
+            original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
+            mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+            
+            # Calculate how many actual frames were sliced
+            actual_sliced_length = original_input_frames_slice.shape[0]
+
+            # Dynamically add temporal padding if the current slice is shorter than frames_chunk
+            padding_needed_for_pipeline_input = frames_chunk - actual_sliced_length
+            if padding_needed_for_pipeline_input > 0:
+                logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
+                
+                # Get the *very last* frame of the original video for repetition
+                last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+
+                repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+                repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+
+                input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
+                mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
+            else:
+                # This chunk is a full frames_chunk length, no padding needed for its input
+                input_frames_to_pipeline = original_input_frames_slice
+                mask_frames_i = mask_frames_slice
+
+            # Input-level blending for overlapping frames (keep this logic as is)
+            if previous_chunk_output_frames is not None and overlap > 0:
+                # `previous_chunk_output_frames` will always be `frames_chunk` long (from pipeline output)
+                # `input_frames_to_pipeline` will also be `frames_chunk` long (due to dynamic padding if needed)
+                overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
+                
+                if overlap_actual > 0:
+                    prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
+                    
+                    if original_input_blend_strength > 0:
+                        orig_input_overlap_frames = input_frames_to_pipeline[:overlap_actual]
+                        original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
+                        
+                        blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
+                                                        original_weights_scaled * orig_input_overlap_frames
+                        
+                        input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
+                        del orig_input_overlap_frames
+                        del original_weights_scaled
+                        del blended_input_overlap_frames
+                    else:
+                        input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
+                    
+                    del prev_gen_overlap_frames
+            
+            if tile_num > 1:
+                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Padded input size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]}, Temporal length: {input_frames_to_pipeline.shape[0]})...")
+            else:
+                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
+            
+            start_time = time.time()
+
+            with torch.no_grad():
+                video_latents = spatial_tiled_process(
+                    cond_frames=input_frames_to_pipeline, # Changed 'frames' to 'cond_frames'
+                    mask_frames=mask_frames_i,
+                    process_func=pipeline,             # Changed 'pipeline' to 'process_func'
+                    tile_num=tile_num,
+                    spatial_n_compress=8,
+                    min_guidance_scale=1.01,
+                    max_guidance_scale=1.01,
+                    decode_chunk_size=2,
+                    fps=7,
+                    motion_bucket_id=127,
+                    noise_aug_strength=0.0,
+                    num_inference_steps=num_inference_steps,
+                )
+                video_latents = video_latents.unsqueeze(0)
+
+                pipeline.vae.to(dtype=torch.float16)
+                decoded_frames = pipeline.decode_latents(
+                    video_latents,
+                    num_frames=video_latents.shape[1],
+                    decode_chunk_size=2,
+                )
+
+            end_time = time.time()
+            inference_duration = end_time - start_time
+            logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
+            
+            video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
+            current_chunk_generated_frames = []
+            for j in range(len(video_frames)):
+                img = video_frames[j]
+                current_chunk_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
+
+            current_chunk_generated = torch.stack(current_chunk_generated_frames) # This will be `frames_chunk` long
+
+            # Append only the "new" frames of the actual video content
+            if i == 0:
+                # For the first chunk, append all `actual_sliced_length` frames.
+                results.append(current_chunk_generated[:actual_sliced_length])
+            else:
+                # For subsequent chunks, append frames from `overlap` up to `actual_sliced_length`.
+                # This correctly excludes the overlapping portion and any padding.
+                results.append(current_chunk_generated[overlap:actual_sliced_length])
+            
+            previous_chunk_output_frames = current_chunk_generated # Keep full generated chunk for next blend
+            
+            previous_chunk_output_frames = current_chunk_generated 
+
+            # The loop condition `end_idx == num_frames` is good for breaking.
+
+        # --- START CRITICAL FIXES FOR NAMEERROR AND ROBUSTNESS ---
+
+        # Check if any frames were successfully generated and collected in `results`.
+        if not results:
+            logger.warning(f"No frames were successfully generated for {input_video_path} after inference. Skipping video output.")
+            if update_info_callback:
+                update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength)
+            return False
+
+        frames_output = torch.cat(results, dim=0).cpu()
+
+        # Initialize frames_output_final defensively.
+        frames_output_final: Optional[torch.Tensor] = None
+
+        # Check for valid dimensions before cropping
+        # frames_output.shape[0] will be the number of frames from `torch.cat(results)`
+        if frames_output.numel() > 0 and frames_output.shape[2] >= padded_H and frames_output.shape[3] >= padded_W: # Use padded_H/W for spatial crop checks
+            frames_output_spatially_cropped = frames_output[:, :, :padded_H, :padded_W] # NEW temp var
+            # NEW: Temporally crop the output back to the original video length
+            frames_output_final = frames_output_spatially_cropped[:num_frames_original]
+            logger.debug(f"Temporally cropped generated frames from {frames_output_spatially_cropped.shape[0]} to {frames_output_final.shape[0]} (original length).")
+        else:
+            logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}) for {input_video_path}. Skipping video output.")
+            # ... (error handling) ...
+            return False
+
+        # --- Apply Color Transfer (if enabled and applicable) ---
+        # The blend toggle now acts as a master toggle for post-processing including color transfer.
+        # This conditional check already exists but confirms the use of self.enable_color_transfer.get()
+        if self.enable_color_transfer.get() and not is_dual_input: # Only for quad input (has left view)
+            if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
+                logger.warning("Color transfer skipped: Original left frames are missing or empty.")
+            else:
+                logger.debug("Applying color transfer from original left view to inpainted right view...")
+                target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
+                
+                adjusted_frames_output = []
+                for t in range(frames_output_final.shape[0]):
+                    left_frame_resized = F.interpolate(
+                        frames_left_original_cropped[t].unsqueeze(0),
+                        size=(target_H, target_W),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+
+                    adjusted_frame = self._apply_color_transfer(left_frame_resized, frames_output_final[t])
+                    adjusted_frames_output.append(adjusted_frame)
+                
+                frames_output_final = torch.stack(adjusted_frames_output)
+                logger.debug("Color transfer complete.")
+
+        # --- Apply Post-Inpainting Blending (if enabled) ---
+        if self.enable_post_inpainting_blend.get():
+            logger.debug("Applying post-inpainting blend...")
+            # frames_output_final is the inpainted result (potentially color-transferred)
+            # frames_warpped_original_unpadded_normalized is the original input bottom-right quadrant
+            # frames_mask_processed_unpadded_original_length is the processed mask
+            
+            # Ensure spatial dimensions match before calling blend
+            target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
+            
+            # Resample original_warped and mask to match the (potentially resized) inpainted output dimensions
+            # This is crucial if resize for divisibility was applied to the pipeline input but not the stored original.
+            # However, in the updated `_prepare_video_inputs`, `frames_warpped_original_unpadded_normalized` 
+            # and `frames_mask_processed_unpadded_original_length` should already match the H, W
+            # of `frames_output_final` (which is `padded_H` and `padded_W` before cropping,
+            # then cropped back to `num_frames_original`).
+            # Let's double check this. `frames_output_final` is `frames_output_spatially_cropped[:num_frames_original]`.
+            # `frames_output_spatially_cropped` comes from `frames_output[:, :, :padded_H, :padded_W]`.
+            # And `frames_warpped_original_unpadded_normalized` is from `frames_warpped[:num_frames_original].clone()`.
+            # So `frames_output_final` and `frames_warpped_original_unpadded_normalized` will have the same H, W
+            # IF no intermediate resizing occurred AFTER `_prepare_video_inputs`.
+            # The only thing that would differ is `_prepare_video_inputs` might have resized the raw input
+            # to be divisible by 8. This ensures `frames_output_final` has those new H, W.
+            # So, the original stored `frames_warpped_original_unpadded_normalized` should match the H, W.
+
+            frames_output_final = self._apply_post_inpainting_blend(
+                inpainted_frames=frames_output_final,
+                original_warped_frames=frames_warpped_original_unpadded_normalized,
+                mask=frames_mask_processed_unpadded_original_length,
+                base_video_name=base_video_name # NEW: Pass base_video_name here
+            )
+            logger.debug("Post-inpainting blend complete.")
+            # --- END NEW ---
+
+        # Initialize final_output_frames_for_encoding defensively
+        final_output_frames_for_encoding: Optional[torch.Tensor] = None
+
+        if is_dual_input:
+            final_output_frames_for_encoding = frames_output_final # (T, C, H, W) float 0-1
+        else:
+            # Ensure frames_left_original is valid for SBS concatenation
+            if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0: # CHANGED variable name
+                logger.error(f"Original left frames are missing or empty for non-dual input {input_video_path}. Cannot create SBS output. Skipping video output.")
+                if update_info_callback:
+                    update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
+                return False
+                    
+            # Ensure dimensions match for concatenation (time, channel, height should match)
+            if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
+            frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
+            frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
+                logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
+                if update_info_callback:
+                    update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
+                return False
+
+            sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
+            final_output_frames_for_encoding = sbs_frames
+
+        # Final check: ensure the tensor to be encoded is actually populated
+        if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
+            logger.error(f"Final output frames for encoding are empty or None after preparation for {input_video_path}. Skipping video output.")
+            if update_info_callback:
+                update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength)
+            return False
+
+        # --- END CRITICAL FIXES ---
+
+        # --- START NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding ---
+        temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
+        os.makedirs(temp_png_dir, exist_ok=True)
+        logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
+
+        total_output_frames = final_output_frames_for_encoding.shape[0]
+        try:
+            for frame_idx in range(total_output_frames):
+                if stop_event and stop_event.is_set():
+                    logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
+                    return False
+
+                frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
+                frame_np = frame_tensor.permute(1, 2, 0).numpy() # (H, W, C) float 0-1
+
+                # Convert to 16-bit
+                frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                
+                # Convert to BGR for OpenCV (OpenCV uses BGR by default for imwrite)
+                # Assuming the pipeline output is RGB (common for image models)
+                frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
+
+                png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
+                cv2.imwrite(png_path, frame_bgr)
+                draw_progress_bar(frame_idx + 1, total_output_frames)
+            logger.debug(f"\nFinished saving {total_output_frames} PNG frames.")
+
+            # --- Construct FFmpeg Command ---
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y", # Overwrite output files without asking
+                "-framerate", str(fps), # Use the detected FPS
+                "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence
+            ]
+
+            # Default output parameters
+            output_codec = "libx264"
+            output_pix_fmt = "yuv420p"
+            output_profile = "main"
+            x265_params = [] # For HDR metadata
+
+            if video_stream_info:
+                logger.debug(f"Applying color metadata from source: {video_stream_info}")
+                input_pix_fmt = video_stream_info.get("pix_fmt", "")
+                color_primaries = video_stream_info.get("color_primaries")
+                transfer_characteristics = video_stream_info.get("transfer_characteristics")
+                color_space = video_stream_info.get("color_space")
+
+                # Determine HDR status
+                is_hdr_source = (color_primaries == "bt2020" and transfer_characteristics == "smpte2084")
+
+                # Determine if original source was 10-bit or higher
+                is_original_10bit_or_higher = "10" in input_pix_fmt or "12" in input_pix_fmt or "16" in input_pix_fmt
+
+                if is_hdr_source:
+                    logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
+                    output_codec = "libx265"
+                    output_pix_fmt = "yuv420p10le"
+                    output_profile = "main10"
+                    
+                    # Add HDR mastering display and CLL metadata
+                    mastering_display = video_stream_info.get("mastering_display_metadata")
+                    max_cll = video_stream_info.get("max_content_light_level")
+                    if mastering_display:
+                        x265_params.append(f"master-display={mastering_display}")
+                    if max_cll:
+                        x265_params.append(f"max-cll={max_cll}")
+                elif is_original_10bit_or_higher and video_stream_info.get("codec_name") == "hevc":
+                    logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
+                    output_codec = "libx265"
+                    output_pix_fmt = "yuv420p10le"
+                    output_profile = "main10"
+                else: # SDR 8-bit, or other source codecs
+                    logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
+                    output_codec = "libx264"
+                    output_pix_fmt = "yuv420p"
+                    output_profile = "main"
+
+                # Apply general color flags if present
+                if color_primaries:
+                    ffmpeg_cmd.extend(["-color_primaries", color_primaries])
+                if transfer_characteristics:
+                    ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
+                if color_space:
+                    ffmpeg_cmd.extend(["-colorspace", color_space])
+
+            # Add codec, profile, pix_fmt, and CRF
+            ffmpeg_cmd.extend([
+                "-c:v", output_codec,
+                "-profile:v", output_profile,
+                "-pix_fmt", output_pix_fmt,
+                "-crf", str(output_crf),
+            ])
+            
+            if x265_params:
+                ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
+
+            # Final output path
+            ffmpeg_cmd.append(output_video_path)
+
+            logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            # Update GUI status for encoding phase
+            if update_info_callback:
+                update_info_callback(base_video_name, f"Encoding {output_codec}...", total_output_frames, overlap, original_input_blend_strength)
+
+            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24h timeout
+            logger.debug(f"Successfully encoded video to {output_video_path}")
+
+        except FileNotFoundError:
+            messagebox.showerror("Error", "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
+            logger.error("FFmpeg not found in PATH.")
+            return False
+        except subprocess.CalledProcessError as e:
+            messagebox.showerror("Error", f"FFmpeg encoding failed for {base_video_name}:\n{e.stderr}\n{e.stdout}")
+            logger.error(f"FFmpeg encoding failed for {base_video_name}: {e.stderr}\n{e.stdout}")
+            return False
+        except subprocess.TimeoutExpired as e:
+            messagebox.showerror("Error", f"FFmpeg encoding timed out for {base_video_name}:\n{e.stderr}")
+            logger.error(f"FFmpeg encoding timed out for {base_video_name}: {e.stderr}")
+            return False
+        except Exception as e:
+            messagebox.showerror("Error", f"An unexpected error occurred during encoding for {base_video_name}: {str(e)}")
+            logger.error(f"Unexpected error during encoding for {base_video_name}: {e}", exc_info=True)
+            return False
+        finally:
+            # Cleanup temporary PNGs
+            if os.path.exists(temp_png_dir):
+                try:
+                    shutil.rmtree(temp_png_dir)
+                    logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
+        # --- END NEW ---
+
+        logger.info(f"Done processing {input_video_path} -> {output_video_path}")
+        return True
+
+    def processing_done(self, stopped=False):
+        if self.pipeline:
+            # Ensure pipeline is properly released and cache cleared
+            try:
+                del self.pipeline
+                release_cuda_memory()
+            except RuntimeError as e:
+                logger.warning(f"Failed to clear CUDA cache during cleanup: {e}")
+            self.pipeline = None
+
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        if stopped:
+            self.update_status_label("Processing stopped.")
+        else:
+            self.update_status_label("Processing completed.")
+            
+        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
+
+    def reset_to_defaults(self):
+        if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
+            return
+
+        # Set default values for all your configuration variables
+        self.input_folder_var.set("./output_splatted")
+        self.output_folder_var.set("./completed_output")
+        self.num_inference_steps_var.set("5")
+        self.tile_num_var.set("2")
+        self.frames_chunk_var.set("23")
+        self.overlap_var.set("3")
+        self.original_input_blend_strength_var.set("0.5")
+        self.offload_type_var.set("model")
+
+        self.save_config() # Save these new default settings
+        messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
+        logger.info("GUI settings reset to defaults.")
+
+    def restore_finished_files(self):
+        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folder back to the input directory?"):
+            return
+
+        input_folder = self.input_folder_var.get()
+        finished_folder = os.path.join(input_folder, "finished")
+
+        if not os.path.isdir(finished_folder):
+            messagebox.showinfo("Restore Info", f"The 'finished' folder does not exist at '{finished_folder}'. No files to restore.")
+            logger.info(f"Restore finished: 'finished' folder not found at {finished_folder}")
+            return
+
+        restored_count = 0
+        errors_count = 0
+        
+        # Collect files to move first, to avoid issues if the directory changes during iteration
+        files_to_move = [f for f in os.listdir(finished_folder) if os.path.isfile(os.path.join(finished_folder, f))]
+
+        if not files_to_move:
+            messagebox.showinfo("Restore Info", "No files found in the 'finished' folder to restore.")
+            logger.info(f"Restore finished: No files found in {finished_folder}")
+            return
+
+        for filename in files_to_move:
+            src_path = os.path.join(finished_folder, filename)
+            dest_path = os.path.join(input_folder, filename)
+            try:
+                shutil.move(src_path, dest_path)
+                restored_count += 1
+                logger.info(f"Moved '{filename}' from '{finished_folder}' to '{input_folder}'")
+            except Exception as e:
+                errors_count += 1
+                logger.error(f"Error moving file '{filename}' during restore: {e}")
+
+        if restored_count > 0 or errors_count > 0:
+            messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
+            logger.info(f"Restore complete: {restored_count} files moved, {errors_count} errors.")
+        else:
+            messagebox.showinfo("Restore Complete", "No files found to restore.")
+            logger.info("Restore complete: No files found to restore.")
+
+    def run_batch_process(
+            self,
+            input_folder,
+            output_folder,
+            num_inference_steps,
+            tile_num, offload_type,
+            frames_chunk, gui_overlap,
+            gui_original_input_blend_strength,
+            gui_output_crf,
+            process_length
+        ):
+        """
+        Orchestrates the batch processing of videos, handling sidecar JSON,
+        thread-safe GUI updates, and error management.
+        """
+        try:
+            self.pipeline = load_inpainting_pipeline(
+                pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
+                unet_path="./weights/StereoCrafter",
+                device="cuda",
+                dtype=torch.float16,
+                offload_type=offload_type
+            )
+            input_videos = sorted(glob.glob(os.path.join(input_folder, "*.mp4")))
+            if not input_videos:
+                self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in input folder"))
+                self.after(0, self.processing_done)
+                return
+
+            self.total_videos.set(len(input_videos))
+            finished_folder = os.path.join(input_folder, "finished")
+            os.makedirs(finished_folder, exist_ok=True)
+            os.makedirs(output_folder, exist_ok=True)
+
+            # Define a thread-safe wrapper for GUI updates
+            # This ensures that calls from the processing thread are marshaled back to the main Tkinter thread.
+            def _threaded_update_info_callback(name, resolution, frames, overlap_val, bias_val):
+                self.after(0, self.update_video_info_display, name, resolution, frames, overlap_val, bias_val)
+
+            for idx, video_path in enumerate(input_videos):
+                if self.stop_event.is_set():
+                    logger.info("Processing stopped by user.")
+                    break
+                
+                # Initialize current video's parameters with GUI fallbacks
+                current_overlap = gui_overlap
+                current_original_input_blend_strength = gui_original_input_blend_strength
+                current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
+                current_process_length = process_length # NEW: Current process_length (from GUI initially)
+
+                json_path = os.path.splitext(video_path)[0] + ".json"
+                if os.path.exists(json_path):
+                    logger.info(f"Found sidecar JSON for {os.path.basename(video_path)} at {json_path}")
+                    try:
+                        with open(json_path, 'r') as f:
+                            sidecar_data = json.load(f)
+                        
+                        if "frame_overlap" in sidecar_data:
+                            sidecar_overlap = int(sidecar_data["frame_overlap"])
+                            if sidecar_overlap >= 0:
+                                current_overlap = sidecar_overlap
+                                logger.debug(f"Using frame_overlap from sidecar: {current_overlap}")
+                            else:
+                                logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
+
+                        if "input_bias" in sidecar_data:
+                            sidecar_input_bias = float(sidecar_data["input_bias"])
+                            if 0.0 <= sidecar_input_bias <= 1.0:
+                                current_original_input_blend_strength = sidecar_input_bias
+                                logger.debug(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
+                            else:
+                                logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
+                        
+                        # NEW: Load CRF from sidecar
+                        if "output_crf" in sidecar_data:
+                            sidecar_crf = int(sidecar_data["output_crf"])
+                            if sidecar_crf >= 0:
+                                current_output_crf = sidecar_crf
+                                logger.debug(f"Using output_crf from sidecar: {current_output_crf}")
+                            else:
+                                logger.warning(f"Invalid 'output_crf' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_output_crf}).")
+
+                         # --- NEW: Load Process Length from sidecar ---
+                        if "process_length" in sidecar_data:
+                            sidecar_process_length = int(sidecar_data["process_length"])
+                            if sidecar_process_length == -1 or sidecar_process_length > 0:
+                                current_process_length = sidecar_process_length
+                                logger.debug(f"Using process_length from sidecar: {current_process_length}")
+                            else:
+                                logger.warning(f"Invalid 'process_length' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({process_length}).")
+
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
+                else:
+                    logger.debug(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
+
+                # Update status label to indicate which video is starting processing
+                self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
+
+                logger.info(f"Starting processing of {video_path}")
+                completed = self.process_single_video(
+                    pipeline=self.pipeline,
+                    input_video_path=video_path,
+                    save_dir=output_folder,
+                    frames_chunk=frames_chunk,
+                    overlap=current_overlap, # Pass the (potentially overridden) overlap
+                    tile_num=tile_num,
+                    vf=None, # Keep as None, not actively used with new FFmpeg logic
+                    num_inference_steps=num_inference_steps,
+                    stop_event=self.stop_event,
+                    update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
+                    original_input_blend_strength=current_original_input_blend_strength,
+                    output_crf=current_output_crf,
+                    process_length=current_process_length
+                )
+                
+                if completed:
+                    try:
+                        shutil.move(video_path, finished_folder)
+                        logger.debug(f"Moved {video_path} to {finished_folder}")
+                    except Exception as e:
+                        logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
+                else:
+                    logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
+                
+                self.processed_count.set(idx + 1)
+                
+            stopped = self.stop_event.is_set()
+            self.after(0, lambda: self.processing_done(stopped))
+
+        except Exception as e:
+            logger.exception("An unhandled error occurred during batch processing.") # Log full traceback
+            self.after(0, lambda: messagebox.showerror("Error", f"An error occurred during batch processing: {str(e)}"))
+            self.after(0, self.processing_done)
+    
+    def show_about_dialog(self):
+        """Displays an 'About' dialog for the application."""
+        about_text = (
+            "Batch Video Inpainting Application\n"
+            "Version: 1.0\n"
+            "This tool processes 'splatted' videos to fill occlusions using a Stable Video Diffusion inpainting pipeline.\n"
+            "It supports custom mask processing, color transfer, and post-inpainting blending for high-quality outputs.\n\n"
+            "Developed by [Your Name/Alias] for StereoCrafter projects." # Customize this!
+        )
+        messagebox.showinfo("About Batch Video Inpainting", about_text)
+    
+    def start_processing(self):
+        input_folder = self.input_folder_var.get()
+        output_folder = self.output_folder_var.get()
+        try:
+            num_inference_steps = int(self.num_inference_steps_var.get())
+            tile_num = int(self.tile_num_var.get())
+            frames_chunk = int(self.frames_chunk_var.get())
+            gui_overlap = int(self.overlap_var.get())
+            gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
+            gui_output_crf = int(self.output_crf_var.get()) # NEW: Get CRF
+            # Get Process Length and Validate
+            process_length = int(self.process_length_var.get())
+            if process_length != -1 and process_length <= 0:
+                raise ValueError("Process Length must be -1 or a positive integer.")
+            
+            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
+               not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
+                raise ValueError("Invalid parameter values")
+        except ValueError:
+            # UPDATED ERROR MESSAGE
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            return
+        offload_type = self.offload_type_var.get()
+
+        if not os.path.isdir(input_folder) or not os.path.isdir(output_folder):
+            messagebox.showerror("Error", "Invalid input or output folder")
+            return
+
+        self.processed_count.set(0)
+        self.total_videos.set(0)
+        self.stop_event.clear()
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.update_status_label("Starting processing...")
+        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
+
+        threading.Thread(target=self.run_batch_process,
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf, process_length),
+                         daemon=True).start()
+
+    def stop_processing(self):
+        self.stop_event.set()
+        if self.pipeline:
+            # Attempt to clear CUDA cache if pipeline exists
+            try:
+                release_cuda_memory()
+            except RuntimeError as e:
+                logger.warning(f"Failed to clear CUDA cache: {e}")
+        self.update_status_label("Stopping...")
+
+    def update_progress(self):
+        total = self.total_videos.get()
+        processed = self.processed_count.get()
+        if total > 0:
+            progress = (processed / total) * 100
+            self.progress_bar['value'] = progress
+        else:
+            self.progress_bar['value'] = 0
+            # Status label is updated directly by start/run_batch_process/processing_done
+        self.after(100, self.update_progress) # Schedule next update
+
+    def update_status_label(self, message):
+        self.status_label.config(text=message)
+
+    def update_video_info_display(self, name, resolution, frames, overlap_val="N/A", bias_val="N/A"):
+        self.video_name_var.set(name)
+        self.video_res_var.set(resolution)
+        self.video_frames_var.set(frames)
+        self.video_overlap_var.set(overlap_val)
+        self.video_bias_var.set(bias_val)
+
+    def load_config(self):
+        try:
+            with open("config_inpaint.json", "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def load_help_data(self):
+        try:
+            with open(os.path.join("dependency", "inpaint_help.json"), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.warning("dependency/inpaint_help.json not found. No help tips will be available.")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding inpaint_help.json: {e}")
+            return {}
+
+    def save_config(self):
+        config = {
+            # Folder Configurations
+            "input_folder": self.input_folder_var.get(),
+            "output_folder": self.output_folder_var.get(),
+
+            # Parameter Configurations
+            "num_inference_steps": self.num_inference_steps_var.get(),
+            "tile_num": self.tile_num_var.get(),
+            "process_length": self.process_length_var.get(),
+            "frames_chunk": self.frames_chunk_var.get(),
+            "frame_overlap": self.overlap_var.get(),
+            "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
+            "output_crf": self.output_crf_var.get(),
+            "offload_type": self.offload_type_var.get(),
+
+            # GUI State Configurations
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+            "debug_mode_enabled": self.debug_mode_var.get(),
+            
+            # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
+            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
+            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
+            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
+            
+            "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
+            "enable_color_transfer": self.enable_color_transfer.get(),
+        }
+        try:
+            with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
+                json.dump(config, f, indent=4)
+            logger.info("Configuration saved successfully.")
+        except Exception as e:
+            logger.warning(f"Failed to save config: {e}", exc_info=True)
+
+    def show_general_help(self):
+        help_text = self.help_data.get("general_help", "No general help information available.")
+        messagebox.showinfo("Help", help_text)
+
+    def exit_application(self):
+        self.save_config() 
+        self.destroy()
 
 def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor, float, Optional[dict]]:
     """
@@ -287,839 +1937,6 @@ def spatial_tiled_process(
     x = torch.cat(final_rows, dim=2)
 
     return x
-
-def process_single_video(
-    pipeline: StableVideoDiffusionInpaintingPipeline,
-    input_video_path: str,
-    save_dir: str,
-    frames_chunk: int = 23,
-    overlap: int = 3,
-    tile_num: int = 1,
-    vf: Optional[str] = None, # This vf parameter is no longer directly used by new FFmpeg logic
-    num_inference_steps: int = 5,
-    stop_event: threading.Event = None,
-    update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
-    original_input_blend_strength: float = 0.8,
-) -> bool:
-    """
-    Processes a single input video.
-    Determines input format (quad or dual) based on filename suffix.
-    Outputs SBS (left view | inpainted output) for quad input,
-    or only inpainted output for dual input.
-    Returns True if processing completed successfully, False if stopped.
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    base_video_name = os.path.basename(input_video_path)
-    video_name_without_ext = os.path.splitext(base_video_name)[0]
-
-    is_dual_input = video_name_without_ext.endswith("_splatted2")
-    if is_dual_input:
-        logger.info(f"Dual Splat detected for '{base_video_name}'. Processing and outputting Inpainted Right Eye only.")
-    else:
-        logger.info(f"Quad Splat (or default) detected for '{base_video_name}'. Processing and outputting Inpainted SBS video.")
-
-    output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
-    video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
-    output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
-    output_video_path = os.path.join(save_dir, output_video_filename)
-
-    # Read video frames and stream info
-    frames, fps, video_stream_info = read_video_frames(input_video_path)
-    num_frames = frames.shape[0]
-
-    if num_frames == 0:
-        logger.warning(f"No frames found in {input_video_path}, skipping.")
-        if update_info_callback:
-            update_info_callback(base_video_name, "N/A", "0 (skipped)", overlap, original_input_blend_strength)
-        return False
-
-    _, _, total_h_raw_input, total_w_raw_input = frames.shape
-    if total_h_raw_input < 2 or total_w_raw_input < 2:
-        logger.warning(f"Video {input_video_path} is too small ({total_h_raw_input}x{total_w_raw_input}), skipping.")
-        if update_info_callback:
-            update_info_callback(base_video_name, f"{total_w_raw_input}x{total_h_raw_input}", num_frames, overlap, original_input_blend_strength)
-        return False
-
-    # Determine output resolution for GUI display (after splitting/inpainting)
-    output_display_w = total_w_raw_input // 2
-    output_display_h = total_h_raw_input // 2 if not is_dual_input else total_h_raw_input
-    current_display_res_str = f"{output_display_w}x{output_display_h}"
-    
-    # Update GUI with video info before processing
-    if update_info_callback:
-        update_info_callback(base_video_name, current_display_res_str, num_frames, overlap, original_input_blend_strength)
-
-    # Frame chunking and mask extraction based on input type
-    frames_left_original: Optional[torch.Tensor] = None # Initialize outside if/else
-    if is_dual_input:
-        half_w_input = total_w_raw_input // 2
-        frames_mask_raw = frames[:, :, :, :half_w_input]  # Left half is mask
-        frames_warpped_raw = frames[:, :, :, half_w_input:] # Right half is warped
-        
-        frames_warpped = frames_warpped_raw
-        frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
-        
-        target_output_h = frames_warpped.shape[2]
-        target_output_w = frames_warpped.shape[3]
-
-    else:
-        half_h_input = total_h_raw_input // 2
-        half_w_input = total_w_raw_input // 2
-
-        frames_left_original = frames[:, :, :half_h_input, :half_w_input] # Top-Left is original view
-        frames_mask_raw = frames[:, :, half_h_input:, :half_w_input]  # Bottom-Left is mask
-        frames_warpped_raw = frames[:, :, half_h_input:, half_w_input:] # Bottom-Right is warped
-
-        frames_warpped = frames_warpped_raw
-        frames_mask = frames_mask_raw.mean(dim=1, keepdim=True) # Convert mask to grayscale
-
-        target_output_h = frames_warpped.shape[2]
-        target_output_w = frames_warpped.shape[3]
-
-    # Pre-process frames for inpainting pipeline
-    frames_warpped = frames_warpped / 255.0 # Normalize to 0-1
-
-    # Pad for tiling before processing
-    frames_warpped_padded = pad_for_tiling(frames_warpped, tile_num, tile_overlap=(128, 128))
-    frames_mask_padded = pad_for_tiling(frames_mask, tile_num, tile_overlap=(128, 128))
-    
-    padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
-
-
-    stride = max(1, frames_chunk - overlap)
-    results = [] # Stores chunks to be concatenated in final video
-    previous_chunk_output_frames = None
-
-    for i in range(0, num_frames, stride): # Loop over original num_frames
-        if stop_event and stop_event.is_set():
-            logger.info(f"Stopping processing of {input_video_path}")
-            return False
-        
-        # Adjust end_idx to use the original number of frames, not padded
-        end_idx = min(i + frames_chunk, num_frames)
-        chunk_size = end_idx - i
-        if chunk_size <= 0:
-            break
-
-        # Get the original input for the current chunk (from padded frames)
-        # We need to slice the padded frames for inference, but the logic for
-        # `previous_chunk_output_frames` and `input_frames_to_pipeline` handles
-        # the blending of *actual* generated content.
-        # It's important that `frames_warpped_padded` and `frames_mask_padded`
-        # are used here.
-        original_input_frames_for_chunk = frames_warpped_padded[i:end_idx].clone()
-        mask_frames_i = frames_mask_padded[i:end_idx].clone()
-
-        input_frames_to_pipeline = original_input_frames_for_chunk.clone()
-
-        # Input-level blending for overlapping frames
-        if previous_chunk_output_frames is not None and overlap > 0:
-            overlap_actual = min(overlap, len(previous_chunk_output_frames), len(original_input_frames_for_chunk))
-
-            if overlap_actual > 0:
-                prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
-                
-                if original_input_blend_strength > 0:
-                    orig_input_overlap_frames = original_input_frames_for_chunk[:overlap_actual]
-                    original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
-                    
-                    blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
-                                                    original_weights_scaled * orig_input_overlap_frames
-                    
-                    input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
-                    del orig_input_overlap_frames
-                    del original_weights_scaled
-                    del blended_input_overlap_frames
-                else:
-                    input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
-                
-                del prev_gen_overlap_frames
-
-        logger.info(f"Starting inference for chunk {i}-{end_idx} (padded size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]})...")
-        start_time = time.time()
-
-        with torch.no_grad():
-            video_latents = spatial_tiled_process(
-                input_frames_to_pipeline,
-                mask_frames_i,
-                pipeline,
-                tile_num,
-                spatial_n_compress=8,
-                min_guidance_scale=1.01,
-                max_guidance_scale=1.01,
-                decode_chunk_size=8,
-                fps=7, # Fixed FPS for pipeline, might not match video's original FPS
-                motion_bucket_id=127,
-                noise_aug_strength=0.0,
-                num_inference_steps=num_inference_steps,
-            )
-            video_latents = video_latents.unsqueeze(0)
-
-            pipeline.vae.to(dtype=torch.float16)
-            decoded_frames = pipeline.decode_latents(
-                video_latents,
-                num_frames=video_latents.shape[1],
-                decode_chunk_size=2,
-            )
-
-        end_time = time.time()
-        inference_duration = end_time - start_time
-        logger.debug(f"Inference for chunk {i}-{end_idx} completed in {inference_duration:.2f} seconds.")
-        
-        video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
-        current_chunk_generated_frames = []
-        for j in range(len(video_frames)):
-            img = video_frames[j]
-            current_chunk_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
-
-        current_chunk_generated = torch.stack(current_chunk_generated_frames)
-
-        if i == 0:
-            results.append(current_chunk_generated)
-        else:
-            results.append(current_chunk_generated[overlap:])
-        
-        previous_chunk_output_frames = current_chunk_generated 
-
-        # The loop condition `end_idx == num_frames` is good for breaking.
-
-    # --- START CRITICAL FIXES FOR NAMEERROR AND ROBUSTNESS ---
-
-    # Check if any frames were successfully generated and collected in `results`.
-    if not results:
-        logger.warning(f"No frames were successfully generated for {input_video_path} after inference. Skipping video output.")
-        if update_info_callback:
-            update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength)
-        return False
-
-    frames_output = torch.cat(results, dim=0).cpu()
-
-    # Initialize frames_output_final defensively.
-    frames_output_final: Optional[torch.Tensor] = None
-
-    # Check for valid dimensions before cropping
-    # frames_output.shape[0] will be the number of frames from `torch.cat(results)`
-    if frames_output.numel() > 0 and frames_output.shape[2] >= target_output_h and frames_output.shape[3] >= target_output_w:
-        # Crop the output to the original, unpadded dimensions for this section
-        frames_output_final = frames_output[:, :, :target_output_h, :target_output_w]
-    else:
-        logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {target_output_h}x{target_output_w}) for {input_video_path}. Skipping video output.")
-        if update_info_callback:
-            update_info_callback(base_video_name, "N/A", "0 (Crop Error)", overlap, original_input_blend_strength)
-        return False
-
-    # Initialize final_output_frames_for_encoding defensively
-    final_output_frames_for_encoding: Optional[torch.Tensor] = None
-
-    if is_dual_input:
-        final_output_frames_for_encoding = frames_output_final # (T, C, H, W) float 0-1
-    else:
-        # Ensure frames_left_original is valid for SBS concatenation
-        if frames_left_original is None or frames_left_original.numel() == 0:
-            logger.error(f"Original left frames are missing or empty for non-dual input {input_video_path}. Cannot create SBS output. Skipping video output.")
-            if update_info_callback:
-                update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
-            return False
-        
-        frames_left_original_normalized = frames_left_original.float() / 255.0
-        
-        # Ensure dimensions match for concatenation (time, channel, height should match)
-        if frames_left_original_normalized.shape[0] != frames_output_final.shape[0] or \
-           frames_left_original_normalized.shape[1] != frames_output_final.shape[1] or \
-           frames_left_original_normalized.shape[2] != frames_output_final.shape[2]:
-            logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_normalized.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
-            if update_info_callback:
-                update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
-            return False
-
-        sbs_frames = torch.cat([frames_left_original_normalized, frames_output_final], dim=3)
-        final_output_frames_for_encoding = sbs_frames
-
-    # Final check: ensure the tensor to be encoded is actually populated
-    if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
-        logger.error(f"Final output frames for encoding are empty or None after preparation for {input_video_path}. Skipping video output.")
-        if update_info_callback:
-            update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength)
-        return False
-
-    # --- END CRITICAL FIXES ---
-
-    # --- START NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding ---
-    temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
-    os.makedirs(temp_png_dir, exist_ok=True)
-    logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
-
-    total_output_frames = final_output_frames_for_encoding.shape[0]
-    try:
-        for frame_idx in range(total_output_frames):
-            if stop_event and stop_event.is_set():
-                logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
-                return False
-
-            frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
-            frame_np = frame_tensor.permute(1, 2, 0).numpy() # (H, W, C) float 0-1
-
-            # Convert to 16-bit
-            frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
-            
-            # Convert to BGR for OpenCV (OpenCV uses BGR by default for imwrite)
-            # Assuming the pipeline output is RGB (common for image models)
-            frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
-
-            png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
-            cv2.imwrite(png_path, frame_bgr)
-            draw_progress_bar(frame_idx + 1, total_output_frames)
-        logger.debug(f"\nFinished saving {total_output_frames} PNG frames.")
-
-        # --- Construct FFmpeg Command ---
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y", # Overwrite output files without asking
-            "-framerate", str(fps), # Use the detected FPS
-            "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence
-        ]
-
-        # Default output parameters
-        output_codec = "libx264"
-        output_pix_fmt = "yuv420p"
-        output_crf = "23" # Default CRF for SDR x264 (lower is better quality)
-        output_profile = "main"
-        x265_params = [] # For HDR metadata
-
-        if video_stream_info:
-            logger.debug(f"Applying color metadata from source: {video_stream_info}")
-            input_pix_fmt = video_stream_info.get("pix_fmt", "")
-            color_primaries = video_stream_info.get("color_primaries")
-            transfer_characteristics = video_stream_info.get("transfer_characteristics")
-            color_space = video_stream_info.get("color_space")
-
-            # Determine HDR status
-            is_hdr_source = (color_primaries == "bt2020" and transfer_characteristics == "smpte2084")
-
-            # Determine if original source was 10-bit or higher
-            is_original_10bit_or_higher = "10" in input_pix_fmt or "12" in input_pix_fmt or "16" in input_pix_fmt
-
-            if is_hdr_source:
-                logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
-                output_codec = "libx265"
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "28" # Higher CRF for HEVC 10-bit (higher is lower quality, but 28 is common for HDR)
-                output_profile = "main10"
-                
-                # Add HDR mastering display and CLL metadata
-                mastering_display = video_stream_info.get("mastering_display_metadata")
-                max_cll = video_stream_info.get("max_content_light_level")
-                if mastering_display:
-                    x265_params.append(f"master-display={mastering_display}")
-                if max_cll:
-                    x265_params.append(f"max-cll={max_cll}")
-            elif is_original_10bit_or_higher and video_stream_info.get("codec_name") == "hevc":
-                logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
-                output_codec = "libx265"
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "24" # Slightly lower CRF for SDR 10-bit HEVC (better quality than HDR)
-                output_profile = "main10"
-            else: # SDR 8-bit, or other source codecs
-                logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
-                output_codec = "libx264"
-                output_pix_fmt = "yuv420p"
-                output_crf = "18" # Higher quality CRF for SDR H.264 (lower is better quality)
-                output_profile = "main"
-
-            # Apply general color flags if present
-            if color_primaries:
-                ffmpeg_cmd.extend(["-color_primaries", color_primaries])
-            if transfer_characteristics:
-                ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
-            if color_space:
-                ffmpeg_cmd.extend(["-colorspace", color_space])
-
-        # Add codec, profile, pix_fmt, and CRF
-        ffmpeg_cmd.extend([
-            "-c:v", output_codec,
-            "-profile:v", output_profile,
-            "-pix_fmt", output_pix_fmt,
-            "-crf", output_crf,
-        ])
-        
-        if x265_params:
-            ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
-
-        # Final output path
-        ffmpeg_cmd.append(output_video_path)
-
-        logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
-        # Update GUI status for encoding phase
-        if update_info_callback:
-            update_info_callback(base_video_name, f"Encoding {output_codec}...", total_output_frames, overlap, original_input_blend_strength)
-
-        subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24h timeout
-        logger.debug(f"Successfully encoded video to {output_video_path}")
-
-    except FileNotFoundError:
-        messagebox.showerror("Error", "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
-        logger.error("FFmpeg not found in PATH.")
-        return False
-    except subprocess.CalledProcessError as e:
-        messagebox.showerror("Error", f"FFmpeg encoding failed for {base_video_name}:\n{e.stderr}\n{e.stdout}")
-        logger.error(f"FFmpeg encoding failed for {base_video_name}: {e.stderr}\n{e.stdout}")
-        return False
-    except subprocess.TimeoutExpired as e:
-        messagebox.showerror("Error", f"FFmpeg encoding timed out for {base_video_name}:\n{e.stderr}")
-        logger.error(f"FFmpeg encoding timed out for {base_video_name}: {e.stderr}")
-        return False
-    except Exception as e:
-        messagebox.showerror("Error", f"An unexpected error occurred during encoding for {base_video_name}: {str(e)}")
-        logger.error(f"Unexpected error during encoding for {base_video_name}: {e}", exc_info=True)
-        return False
-    finally:
-        # Cleanup temporary PNGs
-        if os.path.exists(temp_png_dir):
-            try:
-                shutil.rmtree(temp_png_dir)
-                logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
-            except Exception as e:
-                logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-    # --- END NEW ---
-
-    logger.info(f"Done processing {input_video_path} -> {output_video_path}")
-    return True
-
-class InpaintingGUI(tk.Tk):
-    
-    def __init__(self):
-        super().__init__()
-        self.title("Batch Video Inpainting")   
-        # Adjusted geometry to accommodate new widgets
-        self.geometry("600x590") # Increased height from 400 to 550
-        self.app_config = self.load_config()
-        # NEW: Load help data from renamed file
-        self.help_data = self.load_help_data()
-
-        self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
-        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
-        self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
-        self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
-        self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
-        # Renamed variable key for consistency
-        self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
-        self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.5))) # Default to 0.5
-        self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
-        self.processed_count = tk.IntVar(value=0)
-        self.total_videos = tk.IntVar(value=0)
-        self.stop_event = threading.Event()
-        self.pipeline = None
-
-        self.create_widgets()
-        self.update_progress() # Start the progress bar and status updates
-        self.update_status_label("Ready")
-
-    def create_widgets(self):
-        
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
-
-        option_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Option", menu=option_menu)
-        option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
-        option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
-
-        folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
-        folder_frame.pack(fill="x", padx=10, pady=5)
-        folder_frame.grid_columnconfigure(1, weight=1)
-        
-        # Input Folder
-        input_label = ttk.Label(folder_frame, text="Input Folder:")
-        input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(input_label, self.help_data.get("input_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=0, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self.browse_input).grid(row=0, column=2, padx=5)
-        
-        # Output Folder
-        output_label = ttk.Label(folder_frame, text="Output Folder:")
-        output_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(output_label, self.help_data.get("output_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=1, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self.browse_output).grid(row=1, column=2, padx=5)
-
-        param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
-        param_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Inference Steps
-        inference_steps_label = ttk.Label(param_frame, text="Inference Steps:")
-        inference_steps_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(inference_steps_label, self.help_data.get("num_inference_steps", ""))
-        ttk.Entry(param_frame, textvariable=self.num_inference_steps_var, width=10).grid(row=0, column=1, sticky="w")
-        
-        # Tile Number
-        tile_num_label = ttk.Label(param_frame, text="Tile Number:")
-        tile_num_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
-        ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=1, column=1, sticky="w")
-        
-        # Frames Chunk
-        frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
-        frames_chunk_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
-        ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=2, column=1, sticky="w")
-        
-        # Frame Overlap (Renamed from Overlap)
-        # Updated label text and tooltip key
-        frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
-        frame_overlap_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(frame_overlap_label, self.help_data.get("frame_overlap", "")) 
-        ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=3, column=1, sticky="w")
-        
-        # Original Input Bias (NEW PARAMETER)
-        original_blend_label = ttk.Label(param_frame, text="Original Input Bias:") # Concise name for GUI
-        original_blend_label.grid(row=4, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(original_blend_label, self.help_data.get("original_input_blend_strength", ""))
-        ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=4, column=1, sticky="w")
-
-        # CPU Offload
-        offload_label = ttk.Label(param_frame, text="CPU Offload:")
-        offload_label.grid(row=5, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(offload_label, self.help_data.get("offload_type", ""))
-        offload_options = ["model", "sequential", "none"]
-        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=5, column=1, sticky="w")
-
-        progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
-        progress_frame.pack(fill="x", padx=10, pady=5)
-        self.progress_bar = ttk.Progressbar(progress_frame, length=400, mode='determinate')
-        self.progress_bar.pack(fill="x")
-        # New: Progress count and status label
-        self.status_label = ttk.Label(progress_frame, text="Ready")
-        self.status_label.pack(pady=5)
-
-        buttons_frame = ttk.Frame(self, padding=10)
-        buttons_frame.pack(fill="x")
-        self.start_button = ttk.Button(buttons_frame, text="Start", command=self.start_processing)
-        self.start_button.pack(side="left", padx=5)
-        self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.pack(side="left", padx=5)
-        # NEW: Help button
-        ttk.Button(buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
-        ttk.Button(buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
-
-        # New: Information window for current video
-        info_frame = ttk.LabelFrame(self, text="Current Video Information", padding=10)
-        info_frame.pack(fill="x", padx=10, pady=5)
-        
-        self.video_name_label = ttk.Label(info_frame, text="Name: N/A")
-        self.video_name_label.pack(anchor="w", padx=5, pady=1)
-        
-        self.video_res_label = ttk.Label(info_frame, text="Resolution: N/A")
-        self.video_res_label.pack(anchor="w", padx=5, pady=1)
-        
-        self.video_frames_label = ttk.Label(info_frame, text="Frames: N/A")
-        self.video_frames_label.pack(anchor="w", padx=5, pady=1)
-
-        self.video_overlap_label = ttk.Label(info_frame, text="Overlap: N/A")
-        self.video_overlap_label.pack(anchor="w", padx=5, pady=1)
-
-        self.video_bias_label = ttk.Label(info_frame, text="Input Bias: N/A")
-        self.video_bias_label.pack(anchor="w", padx=5, pady=1)
-
-    def reset_to_defaults(self):
-        if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
-            return
-
-        # Set default values for all your configuration variables
-        self.input_folder_var.set("./output_splatted")
-        self.output_folder_var.set("./completed_output")
-        self.num_inference_steps_var.set("5")
-        self.tile_num_var.set("2")
-        self.frames_chunk_var.set("23")
-        self.overlap_var.set("3")
-        self.original_input_blend_strength_var.set("0.5")
-        self.offload_type_var.set("model")
-
-        self.save_config() # Save these new default settings
-        messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
-        logger.info("GUI settings reset to defaults.")
-
-    def restore_finished_files(self):
-        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folder back to the input directory?"):
-            return
-
-        input_folder = self.input_folder_var.get()
-        finished_folder = os.path.join(input_folder, "finished")
-
-        if not os.path.isdir(finished_folder):
-            messagebox.showinfo("Restore Info", f"The 'finished' folder does not exist at '{finished_folder}'. No files to restore.")
-            logger.info(f"Restore finished: 'finished' folder not found at {finished_folder}")
-            return
-
-        restored_count = 0
-        errors_count = 0
-        
-        # Collect files to move first, to avoid issues if the directory changes during iteration
-        files_to_move = [f for f in os.listdir(finished_folder) if os.path.isfile(os.path.join(finished_folder, f))]
-
-        if not files_to_move:
-            messagebox.showinfo("Restore Info", "No files found in the 'finished' folder to restore.")
-            logger.info(f"Restore finished: No files found in {finished_folder}")
-            return
-
-        for filename in files_to_move:
-            src_path = os.path.join(finished_folder, filename)
-            dest_path = os.path.join(input_folder, filename)
-            try:
-                shutil.move(src_path, dest_path)
-                restored_count += 1
-                logger.info(f"Moved '{filename}' from '{finished_folder}' to '{input_folder}'")
-            except Exception as e:
-                errors_count += 1
-                logger.error(f"Error moving file '{filename}' during restore: {e}")
-
-        if restored_count > 0 or errors_count > 0:
-            messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
-            logger.info(f"Restore complete: {restored_count} files moved, {errors_count} errors.")
-        else:
-            messagebox.showinfo("Restore Complete", "No files found to restore.")
-            logger.info("Restore complete: No files found to restore.")
-
-    def browse_input(self):
-        folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
-        if folder:
-            self.input_folder_var.set(folder)
-
-    def browse_output(self):
-        folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
-        if folder:
-            self.output_folder_var.set(folder)
-
-    def update_status_label(self, message):
-        self.status_label.config(text=message)
-
-    def update_video_info_display(self, name, resolution, frames, overlap_val="N/A", bias_val="N/A"):
-        self.video_name_label.config(text=f"Name: {name}")
-        self.video_res_label.config(text=f"Resolution: {resolution}")
-        self.video_frames_label.config(text=f"Frames: {frames}")
-        self.video_overlap_label.config(text=f"Overlap: {overlap_val}")
-        self.video_bias_label.config(text=f"Input Bias: {bias_val}")
-
-    def start_processing(self):
-        input_folder = self.input_folder_var.get()
-        output_folder = self.output_folder_var.get()
-        try:
-            num_inference_steps = int(self.num_inference_steps_var.get())
-            tile_num = int(self.tile_num_var.get())
-            frames_chunk = int(self.frames_chunk_var.get())
-            gui_overlap = int(self.overlap_var.get()) # Renamed for clarity
-            gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
-            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
-               not (0.0 <= gui_original_input_blend_strength  <= 1.0): # NEW VALIDATION
-                raise ValueError("Invalid parameter values")
-        except ValueError:
-            # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0")
-            return
-        offload_type = self.offload_type_var.get()
-
-        if not os.path.isdir(input_folder) or not os.path.isdir(output_folder):
-            messagebox.showerror("Error", "Invalid input or output folder")
-            return
-
-        self.processed_count.set(0)
-        self.total_videos.set(0)
-        self.stop_event.clear()
-        self.start_button.config(state="disabled")
-        self.stop_button.config(state="normal")
-        self.update_status_label("Starting processing...")
-        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
-
-        threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength),
-                         daemon=True).start()
-
-    def run_batch_process(self, input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength):
-        """
-        Orchestrates the batch processing of videos, handling sidecar JSON,
-        thread-safe GUI updates, and error management.
-        """
-        try:
-            self.pipeline = load_inpainting_pipeline(
-                pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
-                unet_path="./weights/StereoCrafter",
-                device="cuda",
-                dtype=torch.float16,
-                offload_type=offload_type
-            )
-            input_videos = sorted(glob.glob(os.path.join(input_folder, "*.mp4")))
-            if not input_videos:
-                self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in input folder"))
-                self.after(0, self.processing_done)
-                return
-
-            self.total_videos.set(len(input_videos))
-            finished_folder = os.path.join(input_folder, "finished")
-            os.makedirs(finished_folder, exist_ok=True)
-            os.makedirs(output_folder, exist_ok=True)
-
-            # Define a thread-safe wrapper for GUI updates
-            # This ensures that calls from the processing thread are marshaled back to the main Tkinter thread.
-            def _threaded_update_info_callback(name, resolution, frames, overlap_val, bias_val):
-                self.after(0, self.update_video_info_display, name, resolution, frames, overlap_val, bias_val)
-
-            for idx, video_path in enumerate(input_videos):
-                if self.stop_event.is_set():
-                    logger.info("Processing stopped by user.")
-                    break
-                
-                # Initialize current video's parameters with GUI fallbacks
-                current_overlap = gui_overlap
-                current_original_input_blend_strength = gui_original_input_blend_strength
-
-                json_path = os.path.splitext(video_path)[0] + ".json"
-                if os.path.exists(json_path):
-                    logger.info(f"Found sidecar JSON for {os.path.basename(video_path)} at {json_path}")
-                    try:
-                        with open(json_path, 'r') as f:
-                            sidecar_data = json.load(f)
-                        
-                        if "frame_overlap" in sidecar_data:
-                            sidecar_overlap = int(sidecar_data["frame_overlap"])
-                            if sidecar_overlap >= 0:
-                                current_overlap = sidecar_overlap
-                                logger.debug(f"Using frame_overlap from sidecar: {current_overlap}")
-                            else:
-                                logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
-
-                        if "input_bias" in sidecar_data:
-                            sidecar_input_bias = float(sidecar_data["input_bias"])
-                            if 0.0 <= sidecar_input_bias <= 1.0:
-                                current_original_input_blend_strength = sidecar_input_bias
-                                logger.debug(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
-                            else:
-                                logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
-
-                    except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
-                else:
-                    logger.debug(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
-
-                # Update status label to indicate which video is starting processing
-                self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
-
-                logger.info(f"Starting processing of {video_path}")
-                completed = process_single_video(
-                    pipeline=self.pipeline,
-                    input_video_path=video_path,
-                    save_dir=output_folder,
-                    frames_chunk=frames_chunk,
-                    overlap=current_overlap, # Pass the (potentially overridden) overlap
-                    tile_num=tile_num,
-                    vf=None, # Keep as None, not actively used with new FFmpeg logic
-                    num_inference_steps=num_inference_steps,
-                    stop_event=self.stop_event,
-                    update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
-                    original_input_blend_strength=current_original_input_blend_strength # Pass the (potentially overridden) bias
-                )
-                
-                if completed:
-                    try:
-                        shutil.move(video_path, finished_folder)
-                        logger.debug(f"Moved {video_path} to {finished_folder}")
-                    except Exception as e:
-                        logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
-                else:
-                    logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
-                
-                self.processed_count.set(idx + 1)
-                
-            stopped = self.stop_event.is_set()
-            self.after(0, lambda: self.processing_done(stopped))
-
-        except Exception as e:
-            logger.exception("An unhandled error occurred during batch processing.") # Log full traceback
-            self.after(0, lambda: messagebox.showerror("Error", f"An error occurred during batch processing: {str(e)}"))
-            self.after(0, self.processing_done)
-
-    def stop_processing(self):
-        self.stop_event.set()
-        if self.pipeline:
-            # Attempt to clear CUDA cache if pipeline exists
-            try:
-                release_cuda_memory()
-            except RuntimeError as e:
-                logger.warning(f"Failed to clear CUDA cache: {e}")
-        self.update_status_label("Stopping...")
-
-    def update_progress(self):
-        total = self.total_videos.get()
-        processed = self.processed_count.get()
-        if total > 0:
-            progress = (processed / total) * 100
-            self.progress_bar['value'] = progress
-        else:
-            self.progress_bar['value'] = 0
-            # Status label is updated directly by start/run_batch_process/processing_done
-        self.after(100, self.update_progress) # Schedule next update
-
-    def processing_done(self, stopped=False):
-        if self.pipeline:
-            # Ensure pipeline is properly released and cache cleared
-            try:
-                del self.pipeline
-                release_cuda_memory()
-            except RuntimeError as e:
-                logger.warning(f"Failed to clear CUDA cache during cleanup: {e}")
-            self.pipeline = None
-
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled")
-        if stopped:
-            self.update_status_label("Processing stopped.")
-        else:
-            self.update_status_label("Processing completed.")
-            
-        self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
-
-    def exit_application(self):
-        self.save_config() 
-        self.destroy()
-
-    def load_config(self):
-        try:
-            with open("config_inpaint.json", "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {}
-
-    def load_help_data(self):
-        try:
-            with open(os.path.join("dependency", "inpaint_help.json"), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            logger.warning("dependency/inpaint_help.json not found. No help tips will be available.")
-            return {}
-        except json.JSONDecodeError as e:
-            logger.error(f"Error decoding inpaint_help.json: {e}")
-            return {}
-
-    def save_config(self):
-        config = {
-            "input_folder": self.input_folder_var.get(),
-            "output_folder": self.output_folder_var.get(),
-            "num_inference_steps": self.num_inference_steps_var.get(),
-            "tile_num": self.tile_num_var.get(),
-            "offload_type": self.offload_type_var.get(),
-            "frames_chunk": self.frames_chunk_var.get(),
-            "frame_overlap": self.overlap_var.get(),
-            "original_input_blend_strength": self.original_input_blend_strength_var.get()             
-        }
-        try:
-            with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
-                json.dump(config, f, indent=4)
-            logger.info("Configuration saved successfully.")
-        except Exception as e:
-            logger.warning(f"Failed to save config: {e}", exc_info=True)
-
-    def show_general_help(self):
-        help_text = self.help_data.get("general_help", "No general help information available.")
-        messagebox.showinfo("Help", help_text)
 
 if __name__ == "__main__":
     app = InpaintingGUI()

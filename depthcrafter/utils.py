@@ -54,8 +54,6 @@ def format_duration(seconds: float) -> str:
     seconds %= 60
     return f"{hours}:{minutes:02}:{seconds:04.1f}"
 
-# Removed get_formatted_timestamp_utils as logging handles timestamps
-
 def get_segment_output_folder_name(original_video_basename: str) -> str:
     """Returns the standard name for a segment subfolder."""
     return f"{original_video_basename}_seg"
