@@ -122,5 +122,23 @@
   },
   "enable_debug_logging": {
     "text": "Check to enable verbose debug logging in the console output. This provides much more detailed information about internal processes, which is useful for troubleshooting. Uncheck to revert to standard information-level logging."
+  },
+  "enable_secondary_output": {
+      "text": "If enabled, a second depth map video/sequence will be generated using a robust, global normalization method. This can help stabilize depth appearance by ignoring extreme outliers, preventing flicker caused by objects entering/exiting the scene."
+  },
+  "robust_norm_output_min": {
+      "text": "The minimum value (0-1) that the normalized secondary output depth map will be clamped to. Typically 0.0 (black/far)."
+  },
+  "robust_norm_output_max": {
+      "text": "The maximum value (0-1) that the normalized secondary output depth map will be clamped to. Typically 1.0 (white/close). Lowering this (e.g., to 0.25) can compress the entire scene to a darker visual range, emphasizing relative changes more subtly."
+  },
+  "robust_norm_low_percentile": {
+      "text": "The lower percentile of raw depth values to consider for robust normalization. Depths numerically smaller than this percentile will be mapped to the 'Low' output range. Helps ignore extreme closest outliers (e.g., 0.5 for 0.5%)."
+  },
+  "robust_norm_high_percentile": {
+      "text": "The upper percentile of raw depth values to consider for robust normalization. Depths numerically larger than this percentile will be mapped to the 'High' output range. Helps ignore extreme farthest outliers (e.g., 99.5 for 99.5%). Setting a lower value (e.g., 75.0) can aggressively compress the far background to black."
+  },
+  "robust_output_suffix": {
+      "text": "The suffix added to the filename of the second (robustly normalized) output. E.g., '_clipped_depth' will result in 'video_name_clipped_depth.mp4'."
   }
 }

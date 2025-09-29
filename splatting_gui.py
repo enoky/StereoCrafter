@@ -145,10 +145,13 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
             
             if hasattr(self, 'info_frame'):
                 for label in self.info_labels:
-                    label.config(bg=entry_bg, fg=fg_color)
+                    label.config(bg=bg_color, fg=fg_color)
 
         else:
             # --- Light Theme ---
@@ -168,6 +171,9 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
             
             if hasattr(self, 'info_frame'):
                 for label in self.info_labels:
