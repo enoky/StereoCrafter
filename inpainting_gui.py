@@ -26,7 +26,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25.09.26"
+GUI_VERSION = "25.09.29"
 
 # torch.backends.cudnn.benchmark = True
 
