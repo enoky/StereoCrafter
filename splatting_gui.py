@@ -28,7 +28,7 @@ from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_in
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.09.26"
+GUI_VERSION = "25.09.29"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -145,10 +145,13 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
             
             if hasattr(self, 'info_frame'):
                 for label in self.info_labels:
-                    label.config(bg=entry_bg, fg=fg_color)
+                    label.config(bg=bg_color, fg=fg_color)
 
         else:
             # --- Light Theme ---
@@ -168,6 +171,9 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
             
             if hasattr(self, 'info_frame'):
                 for label in self.info_labels:
@@ -570,48 +576,79 @@ class SplatterGUI(ThemedTk):
             "max_disp_source": max_disp_source
         }
     
-    def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, fill_width_pixels: int = 20) -> torch.Tensor:
+    def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
         """
-        Fills horizontal left-edge occlusions in the right-eye video by stretching
-        adjacent visible pixels from the right.
+        Creates a thin, content-filled boundary at the absolute left edge of the screen
+        by replicating the first visible pixels (from the right) into the leftmost columns.
+        The region between this new boundary and the actual content is left occluded for inpainting.
 
         Args:
             right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W],
                                                values in [0, 1].
             occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W],
                                                   where 1 indicates occlusion.
-            fill_width_pixels (int): The maximum number of columns from the left edge to attempt to fill.
+            boundary_width_pixels (int): How many columns at the absolute left edge to fill
+                                         with replicated content (e.g., 1, 2, or 3 pixels wide).
 
         Returns:
-            torch.Tensor: The modified right-eye video tensor with left-edge occlusions filled.
+            torch.Tensor: The modified right-eye video tensor with the left-edge boundary filled.
         """
         B, C, H, W = right_video_tensor.shape
 
-        # Ensure fill_width_pixels is within valid bounds
-        fill_width_pixels = min(W - 1, fill_width_pixels) # W-1 because we access x+1
-
-        if fill_width_pixels <= 0:
-            logger.debug("Fill width for left-edge occlusions is 0 or less, skipping fill.")
+        # Ensure boundary_width_pixels is valid and not too large
+        boundary_width_pixels = min(W, boundary_width_pixels)
+        if boundary_width_pixels <= 0:
+            logger.debug("Boundary width for left-edge occlusions is 0 or less, skipping fill.")
             return right_video_tensor # No filling needed
 
         modified_right_video_tensor = right_video_tensor.clone()
 
-        # Iterate from the right-most column of the fill region (fill_width_pixels - 1)
-        # backwards to the left-most column (0).
-        for x in range(fill_width_pixels - 1, -1, -1):
-            # Create a condition mask for the current column 'x'.
-            # It's True where 'occlusion_mask_tensor' is > 0.5 (occluded)
-            # Unsqueeze and expand to match C dimension for torch.where
-            condition_is_occluded_at_x = (occlusion_mask_tensor[:, 0, :, x] > 0.5).unsqueeze(1).expand(-1, C, -1)
+        # Iterate through each batch item and each row independently
+        for b_idx in range(B):
+            for h_idx in range(H):
+                # Find the first non-occluded column 'X' for this specific row, moving from left to right.
+                # If a row is entirely occluded, or only has content on the far right, it defaults to W-1
+                # to pick up some content, or just won't apply if col 0 is already visible and we don't overwrite.
+                
+                # Invert the occlusion mask (0=occluded, 1=visible) to find the first '1' (visible)
+                visible_mask_row = (occlusion_mask_tensor[b_idx, 0, h_idx, :] <= 0.5) # True where visible
+                
+                # Invert the occlusion mask (0=occluded, 1=visible) to find the first '1' (visible)
+                # `occlusion_mask_tensor` is 1 for occluded, 0 for visible.
+                # We want to find the first column where occlusion is NOT 1 (i.e., visible)
+                # Ensure it's a bool tensor for torch.nonzero
+                is_visible_col_mask = (occlusion_mask_tensor[b_idx, 0, h_idx, :] < 0.5)
+                
+                # Find all column indices that are visible
+                visible_column_indices = torch.nonzero(is_visible_col_mask, as_tuple=True)[0]
 
-            # Conditionally fill: if occluded, take value from x+1; otherwise, keep original.
-            modified_right_video_tensor[:, :, :, x] = torch.where(
-                condition_is_occluded_at_x,
-                modified_right_video_tensor[:, :, :, x+1], # Value from column to the right
-                modified_right_video_tensor[:, :, :, x]     # Keep original value
-            )
-        
-        logger.debug(f"Filled left-edge occlusions for {fill_width_pixels} columns.")
+                # Determine the 'source column' for filling
+                source_col_for_boundary_fill: int # Explicitly type as int for Pylance
+                
+                if visible_column_indices.numel() > 0:
+                    # If there's any visible content, take the *first* visible column.
+                    source_col_for_boundary_fill = int(visible_column_indices[0].item())
+                    # Ensure it's not trying to access beyond the tensor boundary if some edge cases exist.
+                    source_col_for_boundary_fill = min(source_col_for_boundary_fill, W - 1)
+                else:
+                    # If the entire row is occluded, or only has very far-right content.
+                    # Fallback: Use the last valid column (W-1) to ensure we always get *some* pixels.
+                    # This might replicate a black pixel if the whole row is black, but avoids IndexError.
+                    source_col_for_boundary_fill = W - 1
+                    logger.debug(f"Row {h_idx} in batch {b_idx} is fully occluded or near-fully. Using last column for boundary fill source.")
+                
+                # Get the pixel values from this 'source column' to use for the boundary.
+                # Pylance should now correctly infer source_col_for_boundary_fill as an int.
+                source_pixel_values = right_video_tensor[b_idx, :, h_idx, source_col_for_boundary_fill] # Shape [C]
+
+                # Now, fill the leftmost 'boundary_width_pixels' columns for this row,
+                # but ONLY if those columns are currently occluded.
+                for x in range(boundary_width_pixels):
+                    # Check if the current pixel at (b_idx, :, h_idx, x) is occluded
+                    if occlusion_mask_tensor[b_idx, 0, h_idx, x] > 0.5: # If currently occluded
+                        modified_right_video_tensor[b_idx, :, h_idx, x] = source_pixel_values
+
+        logger.debug(f"Created {boundary_width_pixels}-pixel left-edge content boundary.")
         return modified_right_video_tensor
 
     def _initialize_video_and_depth_readers(self, video_path, actual_depth_map_path, process_length, task_settings, match_depth_res):
@@ -1103,6 +1140,8 @@ class SplatterGUI(ThemedTk):
                     self.start_button.config(state="normal")
                     self.stop_button.config(state="disabled")
                     self.progress_var.set(0)
+                    logger.info(f"==> All process completed.")
+
                     break
                 elif message[0] == "total":
                     total_tasks = message[1]
@@ -1326,21 +1365,20 @@ class SplatterGUI(ThemedTk):
                 # Perform the forward warp to get the raw right-eye view and occlusion mask
                 right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
                 
-                # --- Conditional Left-Edge Occlusion Filling ---
+                # --- Conditional Left-Edge Occlusion Filling (Mask Boundary) ---
                 if is_low_res_task:
-                    logger.debug("Applying left-edge occlusion filling for low-resolution output.")
-                    # You can adjust 'fill_width_pixels=20' here or in the function definition.
-                    # '20' is an example, try values like 5, 10, 15, or more if your black band is wide.
+                    logger.debug("Applying left-edge occlusion boundary filling for low-resolution output.")
+                    # 'boundary_width_pixels' controls how many columns at the very left edge
+                    # will be filled. A small value like 1, 2, or 3 is usually good for a boundary.
                     right_video_tensor = self._fill_left_edge_occlusions(
                         right_video_tensor_raw,
                         occlusion_mask_tensor,
-                        fill_width_pixels=20 # <--- ADJUST THIS VALUE as needed
+                        boundary_width_pixels=3 # <--- ADJUST THIS VALUE as needed (e.g., 1, 2, 3, or 4)
                     )
                 else:
-                    logger.debug("Skipping left-edge occlusion filling for high-resolution output.")
+                    logger.debug("Skipping left-edge occlusion boundary filling for high-resolution output.")
                     right_video_tensor = right_video_tensor_raw # Use the raw warped tensor
 
-                # --- END Conditional ---
             
             right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
             occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)

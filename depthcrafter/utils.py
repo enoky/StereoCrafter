@@ -690,6 +690,7 @@ def save_video(video_frames: Union[List[np.ndarray], List[PIL.Image.Image], np.n
 
 class ColorMapper:
     def __init__(self, colormap: str = "inferno"):
+        # other colors = viridis, plasma, inferno, magma
         self.colormap_name = colormap
         self._cmap_data = None
 
