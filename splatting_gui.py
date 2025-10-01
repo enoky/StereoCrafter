@@ -498,7 +498,7 @@ class SplatterGUI(ThemedTk):
     
     def _get_video_specific_settings(self, video_path, input_depth_maps_path_setting, default_zero_disparity_anchor, gui_max_disp, is_single_file_mode):
         """
-        Determines the actual depth map path and reads video-specific settings from a sidecar JSON.
+        Determines the actual depth map path and reads video-specific settings from a sidecar file.
         Returns a dictionary containing relevant settings or an 'error' key.
         """
         video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -521,7 +521,7 @@ class SplatterGUI(ThemedTk):
         
         actual_depth_map_path = os.path.normpath(actual_depth_map_path)
         depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
+        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.fssidecar")
 
         current_zero_disparity_anchor = default_zero_disparity_anchor
         current_max_disparity_percentage = gui_max_disp
@@ -537,34 +537,34 @@ class SplatterGUI(ThemedTk):
 
                 if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
                     current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                    logger.debug(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
+                    logger.debug(f"==> Using convergence_plane from sidecar file '{json_sidecar_path}': {current_zero_disparity_anchor}")
                     anchor_source = "JSON"
                 else:
-                    logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                    anchor_source = "GUI (Invalid JSON)"
+                    logger.warning(f"==> Warning: Sidecar file '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
+                    anchor_source = "GUI (Invalid file)"
 
                 if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
                     current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                    logger.debug(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
+                    logger.debug(f"==> Using max_disparity from sidecar file '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
                     max_disp_source = "JSON"
                 else:
-                    logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
-                    max_disp_source = "GUI (Invalid JSON)"
+                    logger.warning(f"==> Warning: Sidecar file '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
+                    max_disp_source = "GUI (Invalid file)"
 
                 if "frame_overlap" in sidecar_data and isinstance(sidecar_data["frame_overlap"], (int, float)):
                     current_frame_overlap = int(sidecar_data["frame_overlap"])
-                    logger.debug(f"==> Using frame_overlap from sidecar JSON '{json_sidecar_path}': {current_frame_overlap}")
+                    logger.debug(f"==> Using frame_overlap from sidecar file '{json_sidecar_path}': {current_frame_overlap}")
 
                 if "input_bias" in sidecar_data and isinstance(sidecar_data["input_bias"], (int, float)):
                     current_input_bias = float(sidecar_data["input_bias"])
-                    logger.debug(f"==> Using input_bias from sidecar JSON '{json_sidecar_path}': {current_input_bias:.2f}")
+                    logger.debug(f"==> Using input_bias from sidecar file '{json_sidecar_path}': {current_input_bias:.2f}")
 
             except json.JSONDecodeError:
-                logger.error(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Error: Could not parse sidecar file '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
             except Exception as e:
-                logger.error(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Unexpected error reading sidecar file '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
         else:
-            logger.debug(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+            logger.debug(f"==> No sidecar file '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
 
         return {
             "actual_depth_map_path": actual_depth_map_path,
@@ -731,7 +731,7 @@ class SplatterGUI(ThemedTk):
             self.help_texts = {}
 
     def _move_processed_files(self, video_path, actual_depth_map_path, finished_source_folder, finished_depth_folder):
-        """Moves source video, depth map, and its sidecar JSON to 'finished' folders."""
+        """Moves source video, depth map, and its sidecar file to 'finished' folders."""
         max_retries = 5
         retry_delay_sec = 0.5 # Wait half a second between retries
 
@@ -757,7 +757,7 @@ class SplatterGUI(ThemedTk):
         else:
             logger.warning(f"==> Cannot move source video '{os.path.basename(video_path)}': 'finished_source_folder' is not set (not in batch mode).")
 
-        # Move depth map and its sidecar JSON
+        # Move depth map and its sidecar file
         if actual_depth_map_path and finished_depth_folder:
             dest_path_depth = os.path.join(finished_depth_folder, os.path.basename(actual_depth_map_path))
             # --- Retry for Depth Map ---
@@ -778,31 +778,31 @@ class SplatterGUI(ThemedTk):
             else:
                 logger.error(f"==> Failed to move depth map '{os.path.basename(actual_depth_map_path)}' after {max_retries} attempts due to PermissionError.")
 
-            # --- Retry for Sidecar JSON (if it exists) ---
+            # --- Retry for Sidecar file (if it exists) ---
             depth_map_dirname = os.path.dirname(actual_depth_map_path)
             depth_map_basename_without_ext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.json")
-            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}.json")
+            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.fssidecar")
+            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}.fssidecar")
 
             if os.path.exists(json_sidecar_path_to_move):
                 for attempt in range(max_retries):
                     try:
                         if os.path.exists(dest_path_json):
-                            logger.warning(f"Sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' already exists in '{finished_depth_folder}'. Overwriting.")
+                            logger.warning(f"Sidecar file '{os.path.basename(json_sidecar_path_to_move)}' already exists in '{finished_depth_folder}'. Overwriting.")
                             os.remove(dest_path_json)
                         shutil.move(json_sidecar_path_to_move, finished_depth_folder)
-                        logger.debug(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
+                        logger.debug(f"==> Moved sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
                         break
                     except PermissionError as e:
-                        logger.warning(f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving JSON '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s...")
+                        logger.warning(f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving file '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s...")
                         time.sleep(retry_delay_sec)
                     except Exception as e:
-                        logger.error(f"==> Failed to move sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to '{finished_depth_folder}': {e}", exc_info=True)
+                        logger.error(f"==> Failed to move sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to '{finished_depth_folder}': {e}", exc_info=True)
                         break
                 else:
-                    logger.error(f"==> Failed to move sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' after {max_retries} attempts due to PermissionError.")
+                    logger.error(f"==> Failed to move sidecar file '{os.path.basename(json_sidecar_path_to_move)}' after {max_retries} attempts due to PermissionError.")
             else:
-                logger.debug(f"==> No sidecar JSON '{json_sidecar_path_to_move}' found to move.")
+                logger.debug(f"==> No sidecar file '{json_sidecar_path_to_move}' found to move.")
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
@@ -1571,13 +1571,13 @@ class SplatterGUI(ThemedTk):
             output_sidecar_data["input_bias"] = input_bias
 
         if frame_overlap is not None or input_bias is not None:
-            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.json"
+            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.fssidecar"
             try:
                 with open(output_sidecar_path, 'w') as f:
                     json.dump(output_sidecar_data, f, indent=4)
-                logger.debug(f"==> Created output sidecar JSON: {output_sidecar_path}")
+                logger.debug(f"==> Created output sidecar file: {output_sidecar_path}")
             except Exception as e:
-                logger.error(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
+                logger.error(f"==> Error creating output sidecar file '{output_sidecar_path}': {e}")
 
         if os.path.exists(temp_png_dir):
             try:

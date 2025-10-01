@@ -1497,9 +1497,9 @@ class InpaintingGUI(ThemedTk):
                 current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
                 current_process_length = process_length # NEW: Current process_length (from GUI initially)
 
-                json_path = os.path.splitext(video_path)[0] + ".json"
+                json_path = os.path.splitext(video_path)[0] + ".fssidecar"
                 if os.path.exists(json_path):
-                    logger.info(f"Found sidecar JSON for {os.path.basename(video_path)} at {json_path}")
+                    logger.info(f"Found sidecar fssidecar for {os.path.basename(video_path)} at {json_path}")
                     try:
                         with open(json_path, 'r') as f:
                             sidecar_data = json.load(f)
@@ -1510,7 +1510,7 @@ class InpaintingGUI(ThemedTk):
                                 current_overlap = sidecar_overlap
                                 logger.debug(f"Using frame_overlap from sidecar: {current_overlap}")
                             else:
-                                logger.warning(f"Invalid 'frame_overlap' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
+                                logger.warning(f"Invalid 'frame_overlap' in sidecar file for {os.path.basename(video_path)}. Using GUI value ({gui_overlap}).")
 
                         if "input_bias" in sidecar_data:
                             sidecar_input_bias = float(sidecar_data["input_bias"])
@@ -1518,7 +1518,7 @@ class InpaintingGUI(ThemedTk):
                                 current_original_input_blend_strength = sidecar_input_bias
                                 logger.debug(f"Using input_bias from sidecar: {current_original_input_blend_strength}")
                             else:
-                                logger.warning(f"Invalid 'input_bias' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
+                                logger.warning(f"Invalid 'input_bias' in sidecar file for {os.path.basename(video_path)}. Using GUI value ({gui_original_input_blend_strength}).")
                         
                         # NEW: Load CRF from sidecar
                         if "output_crf" in sidecar_data:
@@ -1527,7 +1527,7 @@ class InpaintingGUI(ThemedTk):
                                 current_output_crf = sidecar_crf
                                 logger.debug(f"Using output_crf from sidecar: {current_output_crf}")
                             else:
-                                logger.warning(f"Invalid 'output_crf' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({gui_output_crf}).")
+                                logger.warning(f"Invalid 'output_crf' in sidecar file for {os.path.basename(video_path)}. Using GUI value ({gui_output_crf}).")
 
                          # --- NEW: Load Process Length from sidecar ---
                         if "process_length" in sidecar_data:
@@ -1536,12 +1536,12 @@ class InpaintingGUI(ThemedTk):
                                 current_process_length = sidecar_process_length
                                 logger.debug(f"Using process_length from sidecar: {current_process_length}")
                             else:
-                                logger.warning(f"Invalid 'process_length' in sidecar JSON for {os.path.basename(video_path)}. Using GUI value ({process_length}).")
+                                logger.warning(f"Invalid 'process_length' in sidecar file for {os.path.basename(video_path)}. Using GUI value ({process_length}).")
 
                     except (json.JSONDecodeError, ValueError) as e:
-                        logger.warning(f"Error reading or parsing sidecar JSON {json_path}: {e}. Falling back to GUI parameters for this video.")
+                        logger.warning(f"Error reading or parsing sidecar file {json_path}: {e}. Falling back to GUI parameters for this video.")
                 else:
-                    logger.debug(f"No sidecar JSON found for {os.path.basename(video_path)}. Using GUI parameters.")
+                    logger.debug(f"No sidecar file found for {os.path.basename(video_path)}. Using GUI parameters.")
 
                 # Update status label to indicate which video is starting processing
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
