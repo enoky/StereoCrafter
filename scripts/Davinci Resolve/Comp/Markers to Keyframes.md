@@ -11,7 +11,7 @@ The script serves to quickly apply animation timing dictated by timeline markers
 
 ## 📋 Requirements
 
-*   **Node Name:** Requires a Fusion node named **`Control_Panel`** to exist in the current composition.
+*   **Node Name:** Requires a Fusion node named **`Control_Panel`** to exist or is selected.
 *   **Markers:** Requires one or more markers to be placed on the **Resolve Timeline Ruler** (not on individual clips).
 *   **Execution:** This script must be run from the **Fusion Tab** within DaVinci Resolve (using the Workspace > Scripts menu).
 
@@ -40,7 +40,7 @@ The script supports two primary modes for setting values:
 ## 🕹️ Usage
 
 1.  **Open DaVinci Resolve Studio** and navigate to the **Fusion Page**.
-2.  Ensure your Fusion Composition contains the required node named **`Control_Panel`**.
+2.  Ensure your Fusion Composition contains the required node named **`Control_Panel`** or has it selested.
 3.  Set the desired static value for any control configured for the `STATIC_VALUE` mode.
 4.  Navigate to the **Workspace** menu.
 5.  Select **Scripts** -> **Comp** (or your chosen subfolder).

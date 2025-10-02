@@ -115,7 +115,7 @@ for i in range(1, len(timeline_items)):
 # 3. MARKER AT END (Frame after the last frame, which V14 proved safe)
 # --------------------------------------------------------------------------------
 # V14 worked with GetEndFrame() + 1, proving this boundary is markable.
-timeline_end_frame = int(timeline.GetEndFrame()) + 1 
+timeline_end_frame = int(timeline.GetEndFrame())
 
 if add_timeline_marker(
     timeline_end_frame, 

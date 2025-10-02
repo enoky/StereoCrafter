@@ -9,17 +9,21 @@ from datetime import datetime
 CONTROLS_TO_EXPORT = [
     "MaxDisparity", 
     "Convergence",
+    "FrontGamma",
+    "Bias",
+    "Overlap",
 ]
 FRAME_OFFSET = 1 
 LAST_PATH_KEY = "MyStudioInc.MarkerExport.LastPath" 
 DEFAULT_BASE_DIR = os.environ.get('USERPROFILE', os.path.expanduser('~')) 
 
 # --- 1. DATA GATHERING FUNCTION ---
-def get_export_data(comp, timeline, controls_list):
+def get_export_data(comp, timeline, controls_list, control_panel): 
     """Reads markers from Resolve and control values from Fusion."""
     
-    control_panel = comp.Control_Panel
-    markers_dict = timeline.GetMarkers() # Keys are frame IDs (strings), Values are marker data (dict)
+    # --- CRITICAL FIX: Ensure markers_dict is defined in this function's scope ---
+    markers_dict = timeline.GetMarkers() 
+    # --------------------------------------------------------------------------
 
     if not markers_dict:
         print("No Timeline Markers found to export. Returning empty data.")
@@ -27,62 +31,107 @@ def get_export_data(comp, timeline, controls_list):
 
     # Collect all input objects and validate them
     input_objects = {}
+    
+    # ... (input_objects retrieval logic remains the same) ...
     for control_id in controls_list:
-        input_obj = getattr(control_panel, control_id, None)
+        
+        # --- ROBUST INPUT LOOKUP SEQUENCE ---
+        input_obj = None
+        
+        try:
+            # 1. Try Pythonic Item Access (Most Reliable for Macros/Groups: tool["ID"])
+            input_obj = control_panel[control_id]
+        except (AttributeError, KeyError):
+            # 2. Fallback to GetAttr (Standard Pythonic access: tool.ID)
+            input_obj = getattr(control_panel, control_id, None)
+            
         if input_obj is None:
-            print(f"WARNING: Control '{control_id}' not found. Skipping.", file=sys.stderr)
+            print(f"WARNING: Control '{control_id}' not found on node '{control_panel.Name}'. Skipping.", file=sys.stderr)
         else:
-            input_objects[control_id] = input_obj
+            # Validate that the object found has the expected properties (e.g., 'Name')
+            if not hasattr(input_obj, 'Name'):
+                print(f"WARNING: Found object for '{control_id}' but it is not a valid input object. Skipping.", file=sys.stderr)
+            else:
+                input_objects[control_id] = input_obj
 
     if not input_objects:
-        print("ERROR: No valid controls found to export. Aborting.")
+        print(f"ERROR: No valid controls found on '{control_panel.Name}' to export. Aborting.")
         return None
 
-    # Build the Export Dictionary
+    # --- BUILD THE EXPORT DICTIONARY ---
     export_data = {
         "export_date": datetime.now().isoformat(),
         "timeline_name": timeline.GetName(),
         "project_name": resolve.GetProjectManager().GetCurrentProject().GetName(),
         "data_units": "frames",
-        "markers": []
+        "markers": [] 
     }
 
-    # ITERATE DIRECTLY OVER THE VALID MARKER ITEMS (keys are FRAME_ID_STR, values are marker_data dict)
-    for frame_id_str, marker_data in markers_dict.items():
-        
-        try:
-            frame_id = int(frame_id_str)
-        except ValueError:
-            print(f"WARNING: Skipping non-numeric marker frame ID: {frame_id_str}", file=sys.stderr)
-            continue # Skip this loop iteration if the frame ID is invalid
-            
-        # Calculate Fusion frame ID (correcting for the offset)
-        corrected_frame_id = frame_id
-        if frame_id > 0:
-            corrected_frame_id = frame_id - FRAME_OFFSET
-            
-        marker_entry = {
-            "frame": corrected_frame_id, 
-            "name": marker_data.get("name", "N/A"), # Marker data is guaranteed to be a dict here
-            "color": marker_data.get("color", "N/A"),
-            "note": marker_data.get("note", ""),
-            "values": {}
-        }
-        
-        # Read values from Fusion controls
-        for control_id, input_obj in input_objects.items():
-            try:
-                # Read the value at the corrected time: input_obj[time]
-                value = input_obj[corrected_frame_id]
-                marker_entry["values"][control_id] = float(value) 
-            except Exception as e:
-                print(f"WARNING: Could not read value for '{control_id}' at frame {corrected_frame_id}. Error: {e}", file=sys.stderr)
-                marker_entry["values"][control_id] = None
+    # --- DATA POPULATION LOOP WITH ROBUST ERROR HANDLING (Type Mismatch Fix) ---
 
-        export_data["markers"].append(marker_entry)
+    # Get the keys (Frame IDs) from the Resolve dictionary, then convert to integers for sorting
+    marker_keys = list(markers_dict.keys())
+    
+    try:
+        # Create list of tuples: (original_key_type, int_frame_id) for sorting and safe lookup
+        sorted_keys_and_frames = sorted(
+            [(k, int(k)) for k in marker_keys], 
+            key=lambda x: x[1]
+        )
+    except ValueError:
+        print("WARNING: Marker keys are non-integer. Sorting by string name.", file=sys.stderr)
+        sorted_keys_and_frames = [(k, k) for k in marker_keys]
+        sorted_keys_and_frames.sort(key=lambda x: x[0])
+
+
+    for original_key, frame_id in sorted_keys_and_frames:
+        
+        # Wrap the entire frame processing in a try/except
+        try:
+            # Look up the marker data using its original key
+            marker_data = markers_dict.get(original_key)
+            
+            if marker_data is None:
+                # Should not happen if original_key is from markers_dict.keys(), but safest to check.
+                print(f"ERROR: Marker data for key {original_key} is genuinely missing. Skipping.", file=sys.stderr)
+                continue 
+            
+            # Use the integer frame_id for all calculations
+            
+            # Calculate Fusion frame ID
+            corrected_frame_id = frame_id
+            if frame_id > 0:
+                corrected_frame_id = frame_id - FRAME_OFFSET
+                
+            marker_entry = {
+                "frame": corrected_frame_id, 
+                "name": marker_data.get("name", "N/A"),
+                "color": marker_data.get("color", "N/A"),
+                "note": marker_data.get("note", ""),
+                "values": {}
+            }
+            
+            # Read values from Fusion controls
+            for control_id, input_obj in input_objects.items():
+                try:
+                    # Read the value at the corrected time: input_obj[time]
+                    value = input_obj[corrected_frame_id]
+                    marker_entry["values"][control_id] = float(value) 
+                except Exception as e:
+                    # Inner except: If one control fails, log and set to None, but continue
+                    print(f"WARNING: Control '{control_id}' failed read at frame {corrected_frame_id}. Error: {e}", file=sys.stderr)
+                    marker_entry["values"][control_id] = None
+
+            export_data["markers"].append(marker_entry)
+            
+        except Exception as e:
+            # Outer except: If an entire frame fails, log and continue to the next frame
+            print(f"FATAL LOOP ERROR: Frame {frame_id} failed to process entirely. Skipping. Error: {e}", file=sys.stderr)
+            continue 
 
     # Sort the markers list by frame number before returning
-    export_data["markers"].sort(key=lambda x: x["frame"])
+    if export_data["markers"]:
+        export_data["markers"].sort(key=lambda x: x["frame"])
     
     print(f"SUCCESS: Extracted data for {len(export_data['markers'])} markers.")
     return export_data
@@ -155,7 +204,54 @@ def get_save_path(comp, fusion, timeline_name):
     print(f"INFO: Saved last-used directory for next run: {output_path_dir}")
     
     return output_path
+
+def get_target_tool(comp):
+    """
+    Tries to get the active tool. If not valid, asks the user.
+    """
     
+    # 1. Check for active tool
+    active_tool = comp.ActiveTool
+    if active_tool is not None:
+        print(f"INFO: Using currently selected node: '{active_tool.Name}'")
+        return active_tool
+    
+    # 2. If no tool is active, prompt the user
+    dialog_controls = {
+        1: {
+            1: "NodeName",
+            "Name": "Enter Control Node Name (e.g., 'Control_Panel')",
+            2: "Text",
+            "Default": "Control_Panel",
+            "LINKID_DataType": "Text",
+        }
+    }
+
+    dialog_result = comp.AskUser(
+        "Select Node for Export",
+        dialog_controls
+    )
+
+    if dialog_result is None:
+        print("\n--- NODE SELECTION CANCELED BY USER. ---")
+        return None
+    
+    node_name = dialog_result.get(1)
+    
+    if not node_name:
+        print("\n--- ERROR: Node name cannot be empty. ---")
+        return None
+        
+    # 3. Search for the tool by the entered name
+    target_tool = comp.FindTool(node_name)
+    
+    if target_tool is None:
+        print(f"\n--- ERROR: Node named '{node_name}' not found. ---")
+        return None
+        
+    print(f"INFO: Found node: '{target_tool.Name}'")
+    return target_tool
+
 # --- 3. MAIN COORDINATION FUNCTION ---
 def main():
     """Coordinates the entire export process."""
@@ -169,8 +265,8 @@ def main():
         timeline = project.GetCurrentTimeline()
         comp = fusion.GetCurrentComp()
         
-        if not (project and timeline and comp and comp.Control_Panel):
-            raise Exception("Project, Timeline, or 'Control_Panel' node not loaded/found.")
+        if not (project and timeline and comp):
+            raise Exception("Project, Timeline, or Composition not loaded/found.")
             
     except Exception as e:
         print(f"Error during API setup: {e}", file=sys.stderr)
@@ -178,8 +274,14 @@ def main():
 
     print("--- Fusion/Resolve Keyframe Data Export (Modular) ---")
     
+    # --- GET THE TARGET NODE ---
+    target_tool = get_target_tool(comp) # Returns the actual Tool object
+    if target_tool is None:
+        sys.exit()
+
     # 1. GATHER DATA
-    export_data = get_export_data(comp, timeline, CONTROLS_TO_EXPORT)
+    # PASS THE TOOL OBJECT DIRECTLY, not just the name.
+    export_data = get_export_data(comp, timeline, CONTROLS_TO_EXPORT, target_tool)
     
     if export_data is None:
         sys.exit()

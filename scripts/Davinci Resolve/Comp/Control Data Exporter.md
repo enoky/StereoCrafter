@@ -12,7 +12,7 @@ The script's purpose is to act as a data bridge between your marked timeline eve
 
 ## 📋 Requirements
 
-*   **Node Name:** Requires a Fusion node named **`Control_Panel`** to exist in the current composition.
+*   **Node Name:** Requires a Fusion node named **`Control_Panel`** to exist in the current composition, or if renamed then it is selected.
 *   **Markers:** Requires one or more markers to be placed on the **Resolve Timeline Ruler** (not on individual clips).
 *   **Execution:** This script must be run from the **Fusion Tab** within DaVinci Resolve (using the Workspace > Scripts menu).
 
@@ -34,7 +34,7 @@ To add or remove controls for data export, modify the `CONTROLS_TO_EXPORT` list 
 ## 🕹️ Usage
 
 1.  **Open DaVinci Resolve Studio** and navigate to the **Fusion Page**.
-2.  Ensure your Fusion Composition contains the required node named **`Control_Panel`**.
+2.  Ensure your Fusion Composition contains the required node named **`Control_Panel`** or is selected.
 3.  Navigate to the **Workspace** menu.
 4.  Select **Scripts** -> **Comp** (or your chosen subfolder).
 5.  Click on **`Control_Data_Exporter`**.
