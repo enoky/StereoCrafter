@@ -97,6 +97,15 @@ class SplatterGUI(ThemedTk):
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", "0.5"))
         self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", "23"))
 
+        # --- NEW: Depth Pre-processing Variables ---
+        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", "1.0"))
+        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", "1"))
+        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", "3"))
+
+        # --- NEW: Sidecar Control Toggle Variables ---
+        self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
+        self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
+
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
         self.processing_resolution_var = tk.StringVar(value="N/A")
@@ -248,155 +257,244 @@ class SplatterGUI(ThemedTk):
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
+        current_row = 0
+
         # --- Menu Bar ---
         self.menubar = tk.Menu(self)
         self.config(menu=self.menubar)
 
         self.option_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Option", menu=self.option_menu)
-        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.option_menu.add_separator()
         self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
-        
-        # NEW: Help Menu
-        self.help_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Help", menu=self.help_menu)
-        self.help_menu.add_checkbutton(label="Enable Debugging", variable=self.debug_mode_var, command=self._toggle_debug_mode)
-        self.help_menu.add_command(label="About", command=self.show_about_dialog)
+        self.theme_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
+        self.theme_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
 
         # --- Folder selection frame ---
-        folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
-        folder_frame.pack(pady=10, padx=10, fill="x")
-        folder_frame.grid_columnconfigure(1, weight=1)
+        self.folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
+        self.folder_frame.pack(pady=10, padx=10, fill="x")
+        self.folder_frame.grid_columnconfigure(1, weight=1)
+
+        # Settings Container (NEW)
+        self.settings_container_frame = ttk.Frame(self) # <-- ADD self. to settings_container_frame
+        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
 
         # Input Source Clips Row
-        lbl_source_clips = ttk.Label(folder_frame, text="Input Source Clips:")
-        lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        entry_source_clips = ttk.Entry(folder_frame, textvariable=self.input_source_clips_var)
-        entry_source_clips.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_source_clips_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_source_clips_var))
-        btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
-        btn_select_source_clips_file = ttk.Button(folder_frame, text="Select File", command=lambda: self._browse_file(self.input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
-        btn_select_source_clips_file.grid(row=0, column=3, padx=2, pady=2)
-        self._create_hover_tooltip(lbl_source_clips, "input_source_clips")
-        self._create_hover_tooltip(entry_source_clips, "input_source_clips")
-        self._create_hover_tooltip(btn_browse_source_clips_folder, "input_source_clips_folder")
-        self._create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file")
+        self.lbl_source_clips = ttk.Label(self.folder_frame, text="Input Source Clips:")
+        self.lbl_source_clips.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_source_clips = ttk.Entry(self.folder_frame, textvariable=self.input_source_clips_var)
+        self.entry_source_clips.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_source_clips_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_source_clips_var))
+        self.btn_browse_source_clips_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_select_source_clips_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
+        self.btn_select_source_clips_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self._create_hover_tooltip(self.lbl_source_clips, "input_source_clips")
+        self._create_hover_tooltip(self.entry_source_clips, "input_source_clips")
+        self._create_hover_tooltip(self.btn_browse_source_clips_folder, "input_source_clips_folder")
+        self._create_hover_tooltip(self.btn_select_source_clips_file, "input_source_clips_file")
+        current_row += 1
 
         # Input Depth Maps Row
-        lbl_input_depth_maps = ttk.Label(folder_frame, text="Input Depth Maps:")
-        lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        entry_input_depth_maps = ttk.Entry(folder_frame, textvariable=self.input_depth_maps_var)
-        entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_input_depth_maps_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_depth_maps_var))
-        btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
-        btn_select_input_depth_maps_file = ttk.Button(folder_frame, text="Select File", command=lambda: self._browse_file(self.input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
-        btn_select_input_depth_maps_file.grid(row=1, column=3, padx=2, pady=2)
-        self._create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps")
-        self._create_hover_tooltip(entry_input_depth_maps, "input_depth_maps")
-        self._create_hover_tooltip(btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
-        self._create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file")
+        self.lbl_input_depth_maps = ttk.Label(self.folder_frame, text="Input Depth Maps:")
+        self.lbl_input_depth_maps.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_input_depth_maps = ttk.Entry(self.folder_frame, textvariable=self.input_depth_maps_var)
+        self.entry_input_depth_maps.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_input_depth_maps_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_depth_maps_var))
+        self.btn_browse_input_depth_maps_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_select_input_depth_maps_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
+        self.btn_select_input_depth_maps_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self._create_hover_tooltip(self.lbl_input_depth_maps, "input_depth_maps")
+        self._create_hover_tooltip(self.entry_input_depth_maps, "input_depth_maps")
+        self._create_hover_tooltip(self.btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
+        self._create_hover_tooltip(self.btn_select_input_depth_maps_file, "input_depth_maps_file")
+        current_row += 1
 
         # Output Splatted Row
-        lbl_output_splatted = ttk.Label(folder_frame, text="Output Splatted:")
-        lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        entry_output_splatted = ttk.Entry(folder_frame, textvariable=self.output_splatted_var)
-        entry_output_splatted.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_output_splatted = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.output_splatted_var))
-        btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2)
-        self._create_hover_tooltip(lbl_output_splatted, "output_splatted")
-        self._create_hover_tooltip(entry_output_splatted, "output_splatted")
-        self._create_hover_tooltip(btn_browse_output_splatted, "output_splatted")
+        self.lbl_output_splatted = ttk.Label(self.folder_frame, text="Output Splatted:")
+        self.lbl_output_splatted.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_output_splatted = ttk.Entry(self.folder_frame, textvariable=self.output_splatted_var)
+        self.entry_output_splatted.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_output_splatted = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.output_splatted_var))
+        self.btn_browse_output_splatted.grid(row=current_row, column=2, columnspan=2, padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_output_splatted, "output_splatted")
+        self._create_hover_tooltip(self.entry_output_splatted, "output_splatted")
+        self._create_hover_tooltip(self.btn_browse_output_splatted, "output_splatted")
+        # Reset current_row for next frame
+        current_row = 0
 
-        # --- Process Resolution and Settings Frame ---
-        self.preprocessing_frame = ttk.LabelFrame(self, text="Process Resolution and Settings")
-        self.preprocessing_frame.pack(pady=10, padx=10, fill="x")
-        self.preprocessing_frame.grid_columnconfigure(1, weight=1)
-        self.preprocessing_frame.grid_columnconfigure(3, weight=1)
+        # --- Settings Container Frame (to hold two side-by-side frames) ---
+        self.settings_container_frame = ttk.Frame(self)
+        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
+        self.settings_container_frame.grid_columnconfigure(0, weight=1)
+        self.settings_container_frame.grid_columnconfigure(1, weight=1)
 
+        # ===================================================================
+        # LEFT SIDE: Process Resolution and Settings Frame
+        # ===================================================================
+        self.preprocessing_frame = ttk.LabelFrame(self.settings_container_frame, text="Process Resolution")
+        self.preprocessing_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew")
+        self.preprocessing_frame.grid_columnconfigure(1, weight=1) # Allow Entry to expand
+
+        current_row = 0
         # Enable Full Resolution Section
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output (Native Video Resolution)", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_full_res_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
+        current_row += 1
 
         self.lbl_full_res_batch_size = ttk.Label(self.preprocessing_frame, text="Full Res Batch Size:")
-        self.lbl_full_res_batch_size.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_full_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_full_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.batch_size_var, width=15)
-        self.entry_full_res_batch_size.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        self.entry_full_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
+        current_row += 1
+
 
         # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (Pre-defined Below)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_low_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(10, 2))
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
+        current_row += 1
 
-        self.pre_res_width_label = ttk.Label(self.preprocessing_frame, text="Low Res Width:")
-        self.pre_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-        self.pre_res_width_entry = ttk.Entry(self.preprocessing_frame, textvariable=self.pre_res_width_var, width=10)
-        self.pre_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+        # Low Res Width/Height (Squeezed onto one row)
+        self.low_res_wh_frame = ttk.Frame(self.preprocessing_frame)
+        self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        
+        self.pre_res_width_label = ttk.Label(self.low_res_wh_frame, text="Width:")
+        self.pre_res_width_label.pack(side="left", padx=(0, 2))
+        self.pre_res_width_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_width_var, width=8)
+        self.pre_res_width_entry.pack(side="left", padx=(0, 10))
+
+        self.pre_res_height_label = ttk.Label(self.low_res_wh_frame, text="Heigh:")
+        self.pre_res_height_label.pack(side="left", padx=(0, 2))
+        self.pre_res_height_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_height_var, width=8)
+        self.pre_res_height_entry.pack(side="left", padx=(0, 0))
+
         self._create_hover_tooltip(self.pre_res_width_label, "low_res_width")
         self._create_hover_tooltip(self.pre_res_width_entry, "low_res_width")
-
-        self.pre_res_height_label = ttk.Label(self.preprocessing_frame, text="Low Res Height:")
-        self.pre_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
-        self.pre_res_height_entry = ttk.Entry(self.preprocessing_frame, textvariable=self.pre_res_height_var, width=10)
-        self.pre_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.pre_res_height_label, "low_res_height")
         self._create_hover_tooltip(self.pre_res_height_entry, "low_res_height")
+        current_row += 1
+
 
         self.lbl_low_res_batch_size = ttk.Label(self.preprocessing_frame, text="Low Res Batch Size:")
-        self.lbl_low_res_batch_size.grid(row=4, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_low_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_low_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.low_res_batch_size_var, width=15)
-        self.entry_low_res_batch_size.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+        self.entry_low_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
         self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
+        current_row = 0 # Reset for next frame
 
-        # --- Output Settings Frame ---
-        output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
-        output_settings_frame.pack(pady=10, padx=10, fill="x")
-        # ADD THESE LINES for layout balancing
-        output_settings_frame.grid_columnconfigure(1, weight=1)
-        output_settings_frame.grid_columnconfigure(3, weight=1) # Allow right side to expand
-        # END ADDITION
+        # ===================================================================
+        # RIGHT SIDE: Depth Map Pre-processing Frame
+        # ===================================================================
+        self.depth_settings_container = ttk.Frame(self.settings_container_frame)
+        self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+        self.depth_settings_container.grid_columnconfigure(0, weight=1)
 
-        lbl_max_disp = ttk.Label(output_settings_frame, text="Max Disparity %:")
-        lbl_max_disp.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        entry_max_disp = ttk.Entry(output_settings_frame, textvariable=self.max_disp_var, width=15)
-        entry_max_disp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_max_disp, "max_disp")
-        self._create_hover_tooltip(entry_max_disp, "max_disp")
+        # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing")
+        self.depth_prep_frame.grid(row=current_row, column=0, sticky="ew") # Use grid here for placement inside container
+        self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
-        lbl_zero_disparity_anchor = ttk.Label(output_settings_frame, text="Convergence Point (0-1):")
-        lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        entry_zero_disparity_anchor = ttk.Entry(output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
-        entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_zero_disparity_anchor, "convergence_point")
-        self._create_hover_tooltip(entry_zero_disparity_anchor, "convergence_point")
+        row_inner = 0
+        # Gamma
+        self.lbl_depth_gamma = ttk.Label(self.depth_prep_frame, text="Gamma (1.0=Off):")
+        self.lbl_depth_gamma.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_gamma = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_gamma_var, width=15)
+        self.entry_depth_gamma.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
+        self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
+        row_inner += 1
+        
+        # Dilate Size
+        self.lbl_depth_dilate_size = ttk.Label(self.depth_prep_frame, text="Dilate Size (0=Off):")
+        self.lbl_depth_dilate_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_dilate_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_dilate_size_var, width=15)
+        self.entry_depth_dilate_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_dilate_size, "depth_dilate_size")
+        self._create_hover_tooltip(self.entry_depth_dilate_size, "depth_dilate_size")
+        row_inner += 1
+        
+        # Blur Size (Sigma = Size/6)
+        self.lbl_depth_blur_size = ttk.Label(self.depth_prep_frame, text="Blur Size (0/Odd):")
+        self.lbl_depth_blur_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_blur_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_blur_size_var, width=15)
+        self.entry_depth_blur_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
+        self._create_hover_tooltip(self.entry_depth_blur_size, "depth_blur_size")
+        row_inner = 0 # Reset for next frame
 
-        lbl_process_length = ttk.Label(output_settings_frame, text="Process Length (-1 for all):")
-        lbl_process_length.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        entry_process_length = ttk.Entry(output_settings_frame, textvariable=self.process_length_var, width=15)
-        entry_process_length.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_process_length, "process_length")
-        self._create_hover_tooltip(entry_process_length, "process_length")
+        current_row += 1
 
-        # NEW: Output CRF setting, placed on the right side
-        lbl_output_crf = ttk.Label(output_settings_frame, text="Output CRF (0-51):")
-        lbl_output_crf.grid(row=2, column=2, sticky="e", padx=5, pady=2) # Place on the right side
-        entry_output_crf = ttk.Entry(output_settings_frame, textvariable=self.output_crf_var, width=15)
-        entry_output_crf.grid(row=2, column=3, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_output_crf, "output_crf")
-        self._create_hover_tooltip(entry_output_crf, "output_crf")
+        # ===================================================================
+        # --- Sidecar Control Frame (Placed below Depth Prep Frame) ---
+        self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text="Sidecar (.fssidecar) Control")
+        self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
+        self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
 
-        dual_output_checkbox = ttk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=self.dual_output_var)
-        dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(dual_output_checkbox, "dual_output")
+        row_inner = 0
+        # Sidecar Toggles
+        self.sidecar_gamma_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Depth Gamma Override", variable=self.enable_sidecar_gamma_var)
+        self.sidecar_gamma_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
+        row_inner += 1
 
-        autogain_checkbox = ttk.Checkbutton(output_settings_frame, text="No Normalization (Assume Raw 0-1 Input)", variable=self.enable_autogain_var)
-        autogain_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(autogain_checkbox, "no_normalization")
+        self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
+        self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.sidecar_blur_dilate_checkbox, "sidecar_blur_dilate_toggle")
+        current_row = 0 # Reset for next frame
+
+        # ===================================================================
+        # --- Output Settings Frame (Now placed below the settings_container_frame) ---
+        current_row = 0
+        self.output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
+        self.output_settings_frame.pack(pady=10, padx=10, fill="x")
+        self.output_settings_frame.grid_columnconfigure(1, weight=1)
+        self.output_settings_frame.grid_columnconfigure(3, weight=1)
+
+        self.lbl_max_disp = ttk.Label(self.output_settings_frame, text="Max Disparity %:")
+        self.lbl_max_disp.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_max_disp = ttk.Entry(self.output_settings_frame, textvariable=self.max_disp_var, width=15)
+        self.entry_max_disp.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_max_disp, "max_disp")
+        self._create_hover_tooltip(self.entry_max_disp, "max_disp")
+
+        self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length (-1 for all):")
+        self.lbl_process_length.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
+        self.entry_process_length.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_process_length, "process_length")
+        self._create_hover_tooltip(self.entry_process_length, "process_length")
+        current_row += 1
+
+        self.lbl_zero_disparity_anchor = ttk.Label(self.output_settings_frame, text="Convergence Point (0-1):")
+        self.lbl_zero_disparity_anchor.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_zero_disparity_anchor = ttk.Entry(self.output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
+        self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
+        self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+
+        # Output CRF setting, placed on the right side
+        self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF (0-51):")
+        self.lbl_output_crf.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.entry_output_crf = ttk.Entry(self.output_settings_frame, textvariable=self.output_crf_var, width=15)
+        self.entry_output_crf.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_output_crf, "output_crf")
+        self._create_hover_tooltip(self.entry_output_crf, "output_crf")
+        current_row += 1
+
+        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="No Normalization (Assume Raw 0-1 Input)", variable=self.enable_autogain_var)
+        self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+
+        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output (Mask & Warped)", variable=self.dual_output_var)
+        self.dual_output_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
+
+        current_row = 0 # Reset for next frame
 
         # --- Progress frame ---
         progress_frame = ttk.LabelFrame(self, text="Progress")
@@ -523,41 +621,69 @@ class SplatterGUI(ThemedTk):
         depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
         json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.fssidecar")
 
+         # [NEW]: Default values read from GUI
+        try:
+            default_gamma_gui = float(self.depth_gamma_var.get())
+            default_dilate_gui = int(self.depth_dilate_size_var.get())
+            default_blur_gui = int(self.depth_blur_size_var.get())
+        except ValueError:
+            default_gamma_gui, default_dilate_gui, default_blur_gui = 1.0, 0, 0
+
         current_zero_disparity_anchor = default_zero_disparity_anchor
         current_max_disparity_percentage = gui_max_disp
         current_frame_overlap = None
         current_input_bias = None
+        # --- NEW: Default values for new controls ---
+        current_depth_gamma = default_gamma_gui     # <--- START with GUI value
+        current_depth_dilate_size = default_dilate_gui # <--- START with GUI value
+        current_depth_blur_size = default_blur_gui     # <--- START with GUI value
         anchor_source = "GUI"
         max_disp_source = "GUI"
 
         if os.path.exists(json_sidecar_path):
             try:
+                # --- THIS LINE DEFINES sidecar_data ---
                 with open(json_sidecar_path, 'r') as f:
                     sidecar_data = json.load(f)
 
+                # --- Existing Logic for Convergence/Max_Disp ---
                 if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
                     current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                    logger.debug(f"==> Using convergence_plane from sidecar file '{json_sidecar_path}': {current_zero_disparity_anchor}")
+                    logger.debug(f"==> Using convergence_plane from sidecar: {current_zero_disparity_anchor}")
                     anchor_source = "JSON"
-                else:
-                    logger.warning(f"==> Warning: Sidecar file '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                    anchor_source = "GUI (Invalid file)"
-
+                # ... (max_disparity and other existing checks) ...
                 if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
                     current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                    logger.debug(f"==> Using max_disparity from sidecar file '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
+                    logger.debug(f"==> Using max_disparity from sidecar: {current_max_disparity_percentage:.1f}")
                     max_disp_source = "JSON"
-                else:
-                    logger.warning(f"==> Warning: Sidecar file '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
-                    max_disp_source = "GUI (Invalid file)"
-
+                
+                # ... (frame_overlap and input_bias checks) ...
                 if "frame_overlap" in sidecar_data and isinstance(sidecar_data["frame_overlap"], (int, float)):
                     current_frame_overlap = int(sidecar_data["frame_overlap"])
-                    logger.debug(f"==> Using frame_overlap from sidecar file '{json_sidecar_path}': {current_frame_overlap}")
+                    logger.debug(f"==> Using frame_overlap from sidecar: {current_frame_overlap}")
 
                 if "input_bias" in sidecar_data and isinstance(sidecar_data["input_bias"], (int, float)):
                     current_input_bias = float(sidecar_data["input_bias"])
-                    logger.debug(f"==> Using input_bias from sidecar file '{json_sidecar_path}': {current_input_bias:.2f}")
+                    logger.debug(f"==> Using input_bias from sidecar: {current_input_bias:.2f}")
+
+                # --- NEW LOGIC for Gamma, Blur, Dilate (MUST be here) ---
+                if self.enable_sidecar_gamma_var.get(): 
+                    if "depth_gamma" in sidecar_data and isinstance(sidecar_data["depth_gamma"], (int, float)):
+                        current_depth_gamma = float(sidecar_data["depth_gamma"])
+                        logger.debug(f"==> Using sidecar depth_gamma: {current_depth_gamma:.2f} (Override)")
+                
+                if self.enable_sidecar_blur_dilate_var.get():
+                    if "depth_dilate_size" in sidecar_data and isinstance(sidecar_data["depth_dilate_size"], (int, float)):
+                        current_depth_dilate_size = max(0, int(sidecar_data["depth_dilate_size"]))
+                        logger.debug(f"==> Using sidecar depth_dilate_size: {current_depth_dilate_size} (Override)")
+                    
+                    if "depth_blur_size" in sidecar_data and isinstance(sidecar_data["depth_blur_size"], (int, float)):
+                        current_depth_blur_size = max(0, int(sidecar_data["depth_blur_size"]))
+                        if current_depth_blur_size > 0 and current_depth_blur_size % 2 == 0:
+                            current_depth_blur_size += 1
+                            logger.warning(f"==> Blur size must be odd. Increased to {current_depth_blur_size}.")
+                        logger.debug(f"==> Using sidecar depth_blur_size: {current_depth_blur_size} (Override)")
+                # -----------------------------------------
 
             except json.JSONDecodeError:
                 logger.error(f"==> Error: Could not parse sidecar file '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
@@ -573,7 +699,11 @@ class SplatterGUI(ThemedTk):
             "frame_overlap": current_frame_overlap,
             "input_bias": current_input_bias,
             "anchor_source": anchor_source,
-            "max_disp_source": max_disp_source
+            "max_disp_source": max_disp_source,
+            # --- NEW RETURN VALUES ---
+            "depth_gamma": current_depth_gamma,
+            "depth_dilate_size": current_depth_dilate_size,
+            "depth_blur_size": current_depth_blur_size
         }
     
     def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
@@ -806,6 +936,56 @@ class SplatterGUI(ThemedTk):
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
+    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float, depth_dilate_size: int, depth_blur_size: int) -> np.ndarray:
+        """
+        Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
+        """
+        # 1. Grayscale Conversion (Existing logic from depthSplatting)
+        if batch_depth_numpy_raw.ndim == 4:
+            if batch_depth_numpy_raw.shape[-1] == 3: # RGB
+                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
+            else: # Grayscale with channel dim (e.g., T,H,W,1)
+                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
+        else: # If depth video is grayscale (ndim 3: T,H,W)
+            batch_depth_numpy = batch_depth_numpy_raw
+        
+        # Convert to float32 for processing
+        batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
+
+        # 2. Gamma Adjustment (always applied if gamma != 1.0)
+        if depth_gamma != 1.0:
+            logger.debug(f"Applying depth gamma adjustment: {depth_gamma:.2f}")
+            min_val = batch_depth_numpy_float.min()
+            max_val = batch_depth_numpy_float.max()
+            
+            if max_val - min_val > 1e-5:
+                normalized_chunk = (batch_depth_numpy_float - min_val) / (max_val - min_val)
+                normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
+                batch_depth_numpy_float = normalized_chunk_gamma * (max_val - min_val) + min_val
+            else:
+                logger.warning("Chunk min/max too close for gamma normalization. Skipping gamma.")
+
+        # 3. Dilation (if size > 0)
+        if depth_dilate_size > 0:
+            logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
+            kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
+            for j in range(batch_depth_numpy_float.shape[0]):
+                batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
+        
+        # 4. Gaussian Blur (if size > 0)
+        if depth_blur_size > 0:
+            logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
+            sigma = depth_blur_size / 6.0 
+            for j in range(batch_depth_numpy_float.shape[0]):
+                batch_depth_numpy_float[j] = cv2.GaussianBlur(
+                    batch_depth_numpy_float[j], 
+                    (depth_blur_size, depth_blur_size), 
+                    sigmaX=sigma, 
+                    sigmaY=sigma
+                )
+
+        return batch_depth_numpy_float
+
     def _run_batch_process(self, settings):
         """
         The main processing logic, run in a separate thread.
@@ -874,6 +1054,10 @@ class SplatterGUI(ThemedTk):
                 current_input_bias = video_specific_settings["input_bias"]
                 anchor_source = video_specific_settings["anchor_source"]
                 max_disp_source = video_specific_settings["max_disp_source"]
+                # --- NEW: Extract new depth settings ---
+                current_depth_gamma = video_specific_settings["depth_gamma"]
+                current_depth_dilate_size = video_specific_settings["depth_dilate_size"]
+                current_depth_blur_size = video_specific_settings["depth_blur_size"]
 
                 processing_tasks = self._get_defined_tasks(settings)
                 if not processing_tasks:
@@ -962,7 +1146,11 @@ class SplatterGUI(ThemedTk):
                         global_depth_min=global_depth_min,
                         global_depth_max=global_depth_max,
                         depth_stream_info=depth_stream_info,
-                        is_low_res_task=task["is_low_res"]
+                        is_low_res_task=task["is_low_res"],
+                        # --- NEW ARGUMENTS ---
+                        depth_gamma=current_depth_gamma,
+                        depth_dilate_size=current_depth_dilate_size,
+                        depth_blur_size=current_depth_blur_size
                     )
 
                     if self.stop_event.is_set():
@@ -1040,10 +1228,68 @@ class SplatterGUI(ThemedTk):
             "convergence_point": self.zero_disparity_anchor_var.get(),
             "dark_mode_enabled": self.dark_mode_var.get(),
             "output_crf": self.output_crf_var.get(),
+            
+            # --- NEW: Depth Pre-processing Config ---
+            "depth_gamma": self.depth_gamma_var.get(),
+            "depth_dilate_size": self.depth_dilate_size_var.get(),
+            "depth_blur_size": self.depth_blur_size_var.get(),
+            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
+            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
 
+    def _set_input_state(self, state):
+        """Sets the state of all input widgets to 'normal' or 'disabled'."""
+        
+        # Helper to set the state of all children in a frame
+        def set_frame_children_state(frame, state, exclude_frames=False):
+            """Recursively sets the state of all configurable widgets within a frame."""
+            for child in frame.winfo_children():
+                child_type = child.winfo_class()
+                
+                # Check if the child is a Frame/LabelFrame that we need to recurse into
+                if isinstance(child, (ttk.Frame, tk.Frame, ttk.LabelFrame)) and not exclude_frames:
+                    set_frame_children_state(child, state, exclude_frames)
+                
+                # Check for widgets that accept the 'state' configuration
+                if child_type in ('TEntry', 'TButton', 'TCheckbutton', 'TCombobox'):
+                    try:
+                        # Use a keyword argument to pass the state
+                        child.config(state=state)
+                    except tk.TclError as e:
+                        # Some buttons/labels might throw an error if they don't support 'state' directly,
+                        # but Entries, Buttons, and Checkbuttons should be fine.
+                        pass
+                
+                # Special handling for labels whose colors might need adjusting if they are linked to entry/button states
+                # (Not needed for simple ttk styles, but left for reference)
+
+
+        # --- 1. Top-level Frames ---
+        
+        # Folder Frame (Input/Output Paths)
+        set_frame_children_state(self.folder_frame, state)
+
+        # Output Settings Frame (Max Disp, CRF, etc.)
+        set_frame_children_state(self.output_settings_frame, state)
+
+        # --- 2. Depth/Resolution Frames (Containers) ---
+        
+        # Process Resolution Frame (Left Side)
+        set_frame_children_state(self.preprocessing_frame, state)
+        
+        # Depth Map Pre-processing Container (Right Side)
+        set_frame_children_state(self.depth_settings_container, state)
+
+
+        # 3. Re-apply the specific field enable/disable logic
+        # This is CRITICAL. If we set state='normal' for everything, 
+        # toggle_processing_settings_fields will correctly re-disable the Low Res W/H fields
+        # if the "Enable Low Resolution" checkbox is unchecked.
+        if state == 'normal':
+            self.toggle_processing_settings_fields()
+    
     def _set_saved_geometry(self: "SplatterGUI"):
         """Applies the saved window width and position, with dynamic height."""
         # Ensure the window is visible and all widgets are laid out for accurate height calculation
@@ -1140,9 +1386,11 @@ class SplatterGUI(ThemedTk):
                     self.start_button.config(state="normal")
                     self.stop_button.config(state="disabled")
                     self.progress_var.set(0)
+                    # --- NEW: Enable all inputs at finish ---
+                    self._set_input_state('normal')
                     logger.info(f"==> All process completed.")
-
                     break
+                
                 elif message[0] == "total":
                     total_tasks = message[1]
                     self.progress_bar.config(maximum=total_tasks)
@@ -1205,7 +1453,11 @@ class SplatterGUI(ThemedTk):
             global_depth_max: float,  
             depth_stream_info: Optional[dict],
             user_output_crf: Optional[int] = None,
-            is_low_res_task: bool = False
+            is_low_res_task: bool = False,
+            # --- NEW PARAMETERS ---
+            depth_gamma: float = 1.0,
+            depth_dilate_size: int = 0,
+            depth_blur_size: int = 0
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1229,12 +1481,12 @@ class SplatterGUI(ThemedTk):
 
         frame_count = 0
         logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
-        draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
+        # draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
 
         if assume_raw_input:
-            logger.info("No Normalization (Assume Raw 0-1 Input) is ENABLED. Depth maps will be directly scaled from raw pixel values to 0-1.")
+            logger.debug("No Normalization (Assume Raw 0-1 Input) is ENABLED. Depth maps will be directly scaled from raw pixel values to 0-1.")
         else:
-            logger.info("Global Depth Normalization is ENABLED. Depth maps will be normalized using pre-computed global min/max for consistency.")
+            logger.debug("Global Depth Normalization is ENABLED. Depth maps will be normalized using pre-computed global min/max for consistency.")
 
 
         for i in range(0, num_frames, batch_size):
@@ -1254,15 +1506,21 @@ class SplatterGUI(ThemedTk):
 
             batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
             batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
+            
+            batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
+            batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
 
-            # Process depth frames (grayscale conversion if needed)
-            if batch_depth_numpy_raw.ndim == 4: # If depth video is RGB
-                if batch_depth_numpy_raw.shape[-1] == 3: # RGB
-                    batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
-                else: # Grayscale with channel dim (e.g., T,H,W,1)
-                    batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
-            else: # If depth video is grayscale (ndim 3: T,H,W)
-                batch_depth_numpy = batch_depth_numpy_raw
+            # --- NEW: Process depth map using the helper method ---
+            batch_depth_numpy = self._process_depth_batch(
+                batch_depth_numpy_raw=batch_depth_numpy_raw,
+                depth_stream_info=depth_stream_info,
+                depth_gamma=depth_gamma,
+                depth_dilate_size=depth_dilate_size,
+                depth_blur_size=depth_blur_size
+            )
+
+            # Convert original batch frames to float 0-1 for display in grid
+            batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
             
             # Normalize depth frames based on selected mode
             if assume_raw_input:
@@ -1356,8 +1614,7 @@ class SplatterGUI(ThemedTk):
 
             # Convert to tensors for GPU processing
             left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
-            disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()
-
+            disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()        
             disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
             disp_map_tensor = disp_map_tensor * max_disp
 
@@ -1379,7 +1636,6 @@ class SplatterGUI(ThemedTk):
                     logger.debug("Skipping left-edge occlusion boundary filling for high-resolution output.")
                     right_video_tensor = right_video_tensor_raw # Use the raw warped tensor
 
-            
             right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
             occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
 
@@ -1619,6 +1875,8 @@ class SplatterGUI(ThemedTk):
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.status_label.config(text="Starting processing...")
+        # --- NEW: Disable all inputs at start ---
+        self._set_input_state('disabled')
 
         # Input validation for all fields
         try:
@@ -1646,6 +1904,23 @@ class SplatterGUI(ThemedTk):
 
             if not (self.enable_full_res_var.get() or self.enable_low_res_var.get()):
                 raise ValueError("At least one resolution (Full or Low) must be enabled to start processing.")
+            
+            # --- NEW: Depth Pre-processing Validation ---
+            depth_gamma_val = float(self.depth_gamma_var.get())
+            if depth_gamma_val <= 0:
+                raise ValueError("Depth Gamma must be positive.")
+            
+            depth_dilate_size_val = int(self.depth_dilate_size_var.get())
+            if depth_dilate_size_val < 0:
+                raise ValueError("Depth Dilate Size must be non-negative.")
+            
+            depth_blur_size_val = int(self.depth_blur_size_var.get())
+            if depth_blur_size_val < 0:
+                raise ValueError("Depth Blur Size must be non-negative.")
+            if depth_blur_size_val > 0 and depth_blur_size_val % 2 == 0:
+                raise ValueError("Depth Blur Size must be 0 or an odd number.")
+            # --- END NEW Validation ---
+
 
         except ValueError as e:
             self.status_label.config(text=f"Error: {e}")
@@ -1670,6 +1945,12 @@ class SplatterGUI(ThemedTk):
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
             "output_crf": int(self.output_crf_var.get()),
+            # --- NEW: Depth Pre-processing Settings ---
+            "depth_gamma": depth_gamma_val,
+            "depth_dilate_size": depth_dilate_size_val,
+            "depth_blur_size": depth_blur_size_val,
+            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
+            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
         self.processing_thread = threading.Thread(target=self._run_batch_process, args=(settings,))
         self.processing_thread.start()
@@ -1840,7 +2121,7 @@ def compute_global_depth_stats(
         
         # draw_progress_bar(i + len(current_indices), total_frames, prefix="  Depth Stats:", suffix="Complete")
 
-    logger.info(f"\n==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
+    logger.info(f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
     return float(global_min), float(global_max)
 
 def round_to_nearest_64(value):
