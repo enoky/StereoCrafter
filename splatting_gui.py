@@ -62,6 +62,39 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 class SplatterGUI(ThemedTk):
+    # --- GLOBAL CONFIGURATION DICTIONARY ---
+    APP_CONFIG_DEFAULTS = {
+        # File Extensions
+        "SIDECAR_EXT": ".fssidecar", # The internal variable you want to use
+        
+        # GUI/Processing Defaults (Used for reset/fallback)
+        "MAX_DISP": "20.0",
+        "CONV_POINT": "0.5",
+        "PROC_LENGTH": "-1",
+        "BATCH_SIZE_FULL": "10",
+        "BATCH_SIZE_LOW": "50",
+        "CRF_OUTPUT": "23",
+        
+        # Depth Processing Defaults
+        "DEPTH_GAMMA": "1.0",
+        "DEPTH_DILATE_SIZE": "0",
+        "DEPTH_BLUR_SIZE": "0"
+    }
+    # ---------------------------------------
+    # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
+    SIDECAR_KEY_MAP = {
+        "convergence_plane": "CONV_POINT",
+        "max_disparity": "MAX_DISP",
+        # Your existing key:
+        "gamma": "DEPTH_GAMMA", 
+        # Add the two new keys (using internal names for now, we'll confirm sidecar keys later)
+        "depth_dilate_size": "DEPTH_DILATE_SIZE",
+        "depth_blur_size": "DEPTH_BLUR_SIZE",
+        "frame_overlap": "FRAME_OVERLAP", # Add existing sidecar keys for completeness
+        "input_bias": "INPUT_BIAS"
+    }
+    # ---------------------------------------
+
     def __init__(self):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
@@ -80,27 +113,31 @@ class SplatterGUI(ThemedTk):
         self.window_width = self.app_config.get("window_width", 620)
 
         # --- Variables with defaults ---
+        defaults = self.APP_CONFIG_DEFAULTS # Convenience variable
+
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.input_source_clips_var = tk.StringVar(value=self.app_config.get("input_source_clips", "./input_source_clips"))
         self.input_depth_maps_var = tk.StringVar(value=self.app_config.get("input_depth_maps", "./input_depth_maps"))
         self.output_splatted_var = tk.StringVar(value=self.app_config.get("output_splatted", "./output_splatted"))
-        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", "20.0"))
-        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", "-1"))
-        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", "10"))
+
+        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", defaults["MAX_DISP"])) # <--- CHANGED
+        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", defaults["PROC_LENGTH"])) # <--- CHANGED
+        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"])) # <--- CHANGED
+        
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
         self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", True)) 
         self.enable_full_res_var = tk.BooleanVar(value=self.app_config.get("enable_full_resolution", True))
         self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", False))
         self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1920"))
         self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "1080"))
-        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", "25"))
-        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", "0.5"))
-        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", "23"))
+        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"])) # <--- CHANGED
+        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"])) # <--- CHANGED
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"])) # <--- CHANGED
 
-        # --- NEW: Depth Pre-processing Variables ---
-        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", "1.0"))
-        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", "1"))
-        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", "3"))
+        # --- Depth Pre-processing Variables ---
+        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"])) # <--- CHANGED
+        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", defaults["DEPTH_DILATE_SIZE"])) # <--- CHANGED
+        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", defaults["DEPTH_BLUR_SIZE"])) # <--- CHANGED
 
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
@@ -154,6 +191,7 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
@@ -180,6 +218,7 @@ class SplatterGUI(ThemedTk):
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
@@ -353,7 +392,7 @@ class SplatterGUI(ThemedTk):
 
 
         # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (Inpaint)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
         self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
         current_row += 1
@@ -393,21 +432,24 @@ class SplatterGUI(ThemedTk):
         self.depth_settings_container = ttk.Frame(self.settings_container_frame)
         self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
         self.depth_settings_container.grid_columnconfigure(0, weight=1)
+        
+        # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
 
         # --- Depth Map Pre-processing Frame (Inner Frame) ---
-        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing")
+        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
         self.depth_prep_frame.grid(row=current_row, column=0, sticky="ew") # Use grid here for placement inside container
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
         row_inner = 0
         # Gamma
-        self.lbl_depth_gamma = ttk.Label(self.depth_prep_frame, text="Gamma (1.0=Off):")
-        self.lbl_depth_gamma.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
-        self.entry_depth_gamma = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_gamma_var, width=15)
-        self.entry_depth_gamma.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
-        self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
-        row_inner += 1
+        # self.lbl_depth_gamma = ttk.Label(self.depth_prep_frame, text="Gamma (1.0=Off):")
+        # self.lbl_depth_gamma.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        # self.entry_depth_gamma = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_gamma_var, width=15)
+        # self.entry_depth_gamma.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
+        # self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
+        # row_inner += 1
         
         # Dilate Size
         self.lbl_depth_dilate_size = ttk.Label(self.depth_prep_frame, text="Dilate Size (0=Off):")
@@ -431,7 +473,8 @@ class SplatterGUI(ThemedTk):
 
         # ===================================================================
         # --- Sidecar Control Frame (Placed below Depth Prep Frame) ---
-        self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text="Sidecar (.fssidecar) Control")
+        label_text = "Sidecar (" + sidecar_ext + ") Control"
+        self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text=label_text) # <-- Already self. and using corrected text
         self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
         self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
 
@@ -596,12 +639,13 @@ class SplatterGUI(ThemedTk):
     
     def _get_video_specific_settings(self, video_path, input_depth_maps_path_setting, default_zero_disparity_anchor, gui_max_disp, is_single_file_mode):
         """
-        Determines the actual depth map path and reads video-specific settings from a sidecar file.
+        Determines the actual depth map path and reads video-specific settings from a sidecar JSON.
         Returns a dictionary containing relevant settings or an 'error' key.
         """
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         actual_depth_map_path = None
         
+        # Determine actual depth map file path
         if is_single_file_mode:
             actual_depth_map_path = input_depth_maps_path_setting
             if not os.path.exists(actual_depth_map_path):
@@ -619,91 +663,109 @@ class SplatterGUI(ThemedTk):
         
         actual_depth_map_path = os.path.normpath(actual_depth_map_path)
         depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.fssidecar")
+        
+        # --- DEFINES json_sidecar_path ---
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        # ---------------------------------
 
-         # [NEW]: Default values read from GUI
+
+        # [NEW]: Read GUI Input Fields for defaults
         try:
             default_gamma_gui = float(self.depth_gamma_var.get())
             default_dilate_gui = int(self.depth_dilate_size_var.get())
             default_blur_gui = int(self.depth_blur_size_var.get())
         except ValueError:
             default_gamma_gui, default_dilate_gui, default_blur_gui = 1.0, 0, 0
-
-        current_zero_disparity_anchor = default_zero_disparity_anchor
-        current_max_disparity_percentage = gui_max_disp
-        current_frame_overlap = None
-        current_input_bias = None
-        # --- NEW: Default values for new controls ---
-        current_depth_gamma = default_gamma_gui     # <--- START with GUI value
-        current_depth_dilate_size = default_dilate_gui # <--- START with GUI value
-        current_depth_blur_size = default_blur_gui     # <--- START with GUI value
+        
+        # Initialize final parameters with GUI defaults (or passed values)
+        current_params = {
+            "convergence_plane": default_zero_disparity_anchor,
+            "max_disparity_percentage": gui_max_disp,
+            "frame_overlap": None,
+            "input_bias": None,
+            "depth_gamma": default_gamma_gui,
+            "depth_dilate_size": default_dilate_gui,
+            "depth_blur_size": default_blur_gui
+        }
         anchor_source = "GUI"
+        max_disp_source = "GUI"
         max_disp_source = "GUI"
 
         if os.path.exists(json_sidecar_path):
             try:
-                # --- THIS LINE DEFINES sidecar_data ---
                 with open(json_sidecar_path, 'r') as f:
                     sidecar_data = json.load(f)
 
-                # --- Existing Logic for Convergence/Max_Disp ---
-                if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
-                    current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                    logger.debug(f"==> Using convergence_plane from sidecar: {current_zero_disparity_anchor}")
-                    anchor_source = "JSON"
-                # ... (max_disparity and other existing checks) ...
-                if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
-                    current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                    logger.debug(f"==> Using max_disparity from sidecar: {current_max_disparity_percentage:.1f}")
-                    max_disp_source = "JSON"
-                
-                # ... (frame_overlap and input_bias checks) ...
-                if "frame_overlap" in sidecar_data and isinstance(sidecar_data["frame_overlap"], (int, float)):
-                    current_frame_overlap = int(sidecar_data["frame_overlap"])
-                    logger.debug(f"==> Using frame_overlap from sidecar: {current_frame_overlap}")
+                # --- MAPPING LOGIC: Iterate through the central map ---
+                for sidecar_key, internal_key in self.SIDECAR_KEY_MAP.items():
+                    if sidecar_key in sidecar_data:
+                        value = sidecar_data[sidecar_key]
+                        
+                        # --- Apply the value based on the internal key ---
+                        
+                        # Max Disparity and Convergence Plane (Requires special source tracking)
+                        if internal_key in ["CONV_POINT", "MAX_DISP"]:
+                            if internal_key == "CONV_POINT":
+                                current_params["convergence_plane"] = float(value)
+                                anchor_source = "JSON"
+                            if internal_key == "MAX_DISP":
+                                current_params["max_disparity_percentage"] = float(value)
+                                max_disp_source = "JSON"
+                            logger.debug(f"==> Using sidecar {sidecar_key}: {value}")
 
-                if "input_bias" in sidecar_data and isinstance(sidecar_data["input_bias"], (int, float)):
-                    current_input_bias = float(sidecar_data["input_bias"])
-                    logger.debug(f"==> Using input_bias from sidecar: {current_input_bias:.2f}")
+                        # Gamma (Check toggle: self.enable_sidecar_gamma_var)
+                        elif internal_key == "DEPTH_GAMMA" and self.enable_sidecar_gamma_var.get():
+                            if isinstance(value, (int, float)) and float(value) > 0:
+                                current_params["depth_gamma"] = float(value)
+                                logger.debug(f"==> Using sidecar {sidecar_key}: {value} (Override)")
+                        
+                        # Blur/Dilate (Check toggle: self.enable_sidecar_blur_dilate_var)
+                        elif internal_key in ["DEPTH_DILATE_SIZE", "DEPTH_BLUR_SIZE"] and self.enable_sidecar_blur_dilate_var.get():
+                            if isinstance(value, (int, float)):
+                                processed_val = max(0, int(value))
+                                
+                                if internal_key == "DEPTH_DILATE_SIZE":
+                                    current_params["depth_dilate_size"] = processed_val
+                                    logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
+                                    
+                                elif internal_key == "DEPTH_BLUR_SIZE":
+                                    # Ensure blur size is odd
+                                    if processed_val > 0 and processed_val % 2 == 0:
+                                        processed_val += 1
+                                        logger.warning(f"==> Blur size must be odd. Increased to {processed_val}.")
+                                    current_params["depth_blur_size"] = processed_val
+                                    logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
 
-                # --- NEW LOGIC for Gamma, Blur, Dilate (MUST be here) ---
-                if self.enable_sidecar_gamma_var.get(): 
-                    if "depth_gamma" in sidecar_data and isinstance(sidecar_data["depth_gamma"], (int, float)):
-                        current_depth_gamma = float(sidecar_data["depth_gamma"])
-                        logger.debug(f"==> Using sidecar depth_gamma: {current_depth_gamma:.2f} (Override)")
-                
-                if self.enable_sidecar_blur_dilate_var.get():
-                    if "depth_dilate_size" in sidecar_data and isinstance(sidecar_data["depth_dilate_size"], (int, float)):
-                        current_depth_dilate_size = max(0, int(sidecar_data["depth_dilate_size"]))
-                        logger.debug(f"==> Using sidecar depth_dilate_size: {current_depth_dilate_size} (Override)")
-                    
-                    if "depth_blur_size" in sidecar_data and isinstance(sidecar_data["depth_blur_size"], (int, float)):
-                        current_depth_blur_size = max(0, int(sidecar_data["depth_blur_size"]))
-                        if current_depth_blur_size > 0 and current_depth_blur_size % 2 == 0:
-                            current_depth_blur_size += 1
-                            logger.warning(f"==> Blur size must be odd. Increased to {current_depth_blur_size}.")
-                        logger.debug(f"==> Using sidecar depth_blur_size: {current_depth_blur_size} (Override)")
-                # -----------------------------------------
-
+                        # Frame Overlap and Input Bias (No GUI toggle, always use sidecar if present)
+                        elif internal_key in ["FRAME_OVERLAP", "INPUT_BIAS"]:
+                            if internal_key == "FRAME_OVERLAP" and isinstance(value, (int, float)):
+                                current_params["frame_overlap"] = int(value)
+                                logger.debug(f"==> Using sidecar {sidecar_key}: {int(value)}")
+                            elif internal_key == "INPUT_BIAS" and isinstance(value, (int, float)):
+                                current_params["input_bias"] = float(value)
+                                logger.debug(f"==> Using sidecar {sidecar_key}: {float(value):.2f}")
+                            
+                # --- END MAPPING LOGIC ---
+            
             except json.JSONDecodeError:
-                logger.error(f"==> Error: Could not parse sidecar file '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Error: Could not parse sidecar '{json_sidecar_path}'. Using GUI defaults.")
             except Exception as e:
-                logger.error(f"==> Unexpected error reading sidecar file '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Unexpected error reading sidecar '{json_sidecar_path}': {e}. Using GUI defaults.")
         else:
-            logger.debug(f"==> No sidecar file '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+            logger.debug(f"==> No sidecar '{json_sidecar_path}' found. Using GUI defaults.")
 
         return {
             "actual_depth_map_path": actual_depth_map_path,
-            "convergence_plane": current_zero_disparity_anchor,
-            "max_disparity_percentage": current_max_disparity_percentage,
-            "frame_overlap": current_frame_overlap,
-            "input_bias": current_input_bias,
+            "convergence_plane": current_params["convergence_plane"],
+            "max_disparity_percentage": current_params["max_disparity_percentage"],
+            "frame_overlap": current_params["frame_overlap"],
+            "input_bias": current_params["input_bias"],
+            "depth_gamma": current_params["depth_gamma"],
+            "depth_dilate_size": current_params["depth_dilate_size"],
+            "depth_blur_size": current_params["depth_blur_size"],
             "anchor_source": anchor_source,
             "max_disp_source": max_disp_source,
-            # --- NEW RETURN VALUES ---
-            "depth_gamma": current_depth_gamma,
-            "depth_dilate_size": current_depth_dilate_size,
-            "depth_blur_size": current_depth_blur_size
         }
     
     def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
