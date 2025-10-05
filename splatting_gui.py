@@ -23,12 +23,12 @@ from typing import Optional, Tuple, Optional
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
 from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
-    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level
+    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level, encode_frames_to_mp4
 )
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.09.29"
+GUI_VERSION = "25.10.05"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -65,7 +65,8 @@ class SplatterGUI(ThemedTk):
     # --- GLOBAL CONFIGURATION DICTIONARY ---
     APP_CONFIG_DEFAULTS = {
         # File Extensions
-        "SIDECAR_EXT": ".fssidecar", # The internal variable you want to use
+        "SIDECAR_EXT": ".fssidecar",
+        "OUTPUT_SIDECAR_EXT": ".spsidecar",
         
         # GUI/Processing Defaults (Used for reset/fallback)
         "MAX_DISP": "20.0",
@@ -107,6 +108,7 @@ class SplatterGUI(ThemedTk):
         
         self._is_startup = True # NEW: for theme/geometry handling
         self.debug_mode_var = tk.BooleanVar(value=self.app_config.get("debug_mode_enabled", False))
+        self._debug_logging_enabled = False # start in INFO mode
         # NEW: Window size and position variables
         self.window_x = self.app_config.get("window_x", None)
         self.window_y = self.app_config.get("window_y", None)
@@ -189,6 +191,7 @@ class SplatterGUI(ThemedTk):
                 active_fg = "white"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
             self.style.configure("TFrame", background=bg_color, foreground=fg_color)
@@ -216,6 +219,7 @@ class SplatterGUI(ThemedTk):
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
             self.style.configure("TFrame", background=bg_color, foreground=fg_color)
@@ -304,11 +308,19 @@ class SplatterGUI(ThemedTk):
 
         self.option_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Option", menu=self.option_menu)
+        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.option_menu.add_separator()
         self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
-        self.theme_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Theme", menu=self.theme_menu)
-        self.theme_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.debug_logging_var = tk.BooleanVar(value=self._debug_logging_enabled)
+        self.help_menu.add_checkbutton(label="Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging)
+        self.help_menu.add_separator()
+
+        # Add "About" submenu (after "Debug Logging")
+        self.help_menu.add_command(label="About Stereocrafter Splatting", command=self.show_about)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
 
         # --- Folder selection frame ---
         self.folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
@@ -433,8 +445,8 @@ class SplatterGUI(ThemedTk):
         self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
         self.depth_settings_container.grid_columnconfigure(0, weight=1)
         
-        # --- Depth Map Pre-processing Frame (Inner Frame) ---
-        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        # # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        # sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
 
         # --- Depth Map Pre-processing Frame (Inner Frame) ---
         self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
@@ -464,17 +476,17 @@ class SplatterGUI(ThemedTk):
 
         # ===================================================================
         # --- Sidecar Control Frame (Placed below Depth Prep Frame) ---
-        label_text = "Sidecar (" + sidecar_ext + ") Control"
-        self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text=label_text) # <-- Already self. and using corrected text
-        self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
-        self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
+        # label_text = "Sidecar (" + sidecar_ext + ") Control"
+        # self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text=label_text) # <-- Already self. and using corrected text
+        # self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
+        # self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
 
-        row_inner = 0
-        # Sidecar Toggles
-        self.sidecar_gamma_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Depth Gamma Override", variable=self.enable_sidecar_gamma_var)
-        self.sidecar_gamma_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
-        row_inner += 1
+        # row_inner = 0
+        # # Sidecar Toggles
+        # self.sidecar_gamma_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Depth Gamma Override", variable=self.enable_sidecar_gamma_var)
+        # self.sidecar_gamma_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
+        # row_inner += 1
 
         # self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
         # self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
@@ -612,6 +624,15 @@ class SplatterGUI(ThemedTk):
         lbl_convergence_value.grid(row=5, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
 
+        # --- NEW ROW 6: Gamma ---
+        self.processing_gamma_var = tk.StringVar(value="N/A") # <-- ADD this variable to __init__
+        lbl_gamma_static = tk.Label(self.info_frame, text="Gamma:")
+        lbl_gamma_static.grid(row=6, column=0, sticky="e", padx=5, pady=1)
+        lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w")
+        lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
+        self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
+        # ------------------------
+
     def _get_defined_tasks(self, settings):
         """Helper to return a list of processing tasks based on GUI settings."""
         processing_tasks = []
@@ -690,7 +711,7 @@ class SplatterGUI(ThemedTk):
         }
         anchor_source = "GUI"
         max_disp_source = "GUI"
-        max_disp_source = "GUI"
+        gamma_source = "GUI"
 
         if os.path.exists(json_sidecar_path):
             try:
@@ -708,16 +729,17 @@ class SplatterGUI(ThemedTk):
                         if internal_key in ["CONV_POINT", "MAX_DISP"]:
                             if internal_key == "CONV_POINT":
                                 current_params["convergence_plane"] = float(value)
-                                anchor_source = "JSON"
+                                anchor_source = "Sidecar"
                             if internal_key == "MAX_DISP":
                                 current_params["max_disparity_percentage"] = float(value)
-                                max_disp_source = "JSON"
+                                max_disp_source = "Sidecar"
                             logger.debug(f"==> Using sidecar {sidecar_key}: {value}")
 
                         # Gamma (Check toggle: self.enable_sidecar_gamma_var)
                         elif internal_key == "DEPTH_GAMMA" and self.enable_sidecar_gamma_var.get():
                             if isinstance(value, (int, float)) and float(value) > 0:
                                 current_params["depth_gamma"] = float(value)
+                                gamma_source = "Sidecar"
                                 logger.debug(f"==> Using sidecar {sidecar_key}: {value} (Override)")
                         
                         # Blur/Dilate (Check toggle: self.enable_sidecar_blur_dilate_var)
@@ -739,12 +761,12 @@ class SplatterGUI(ThemedTk):
 
                         # Frame Overlap and Input Bias (No GUI toggle, always use sidecar if present)
                         elif internal_key in ["FRAME_OVERLAP", "INPUT_BIAS"]:
-                            if internal_key == "FRAME_OVERLAP" and isinstance(value, (int, float)):
-                                current_params["frame_overlap"] = int(value)
-                                logger.debug(f"==> Using sidecar {sidecar_key}: {int(value)}")
-                            elif internal_key == "INPUT_BIAS" and isinstance(value, (int, float)):
-                                current_params["input_bias"] = float(value)
-                                logger.debug(f"==> Using sidecar {sidecar_key}: {float(value):.2f}")
+                            if isinstance(value, (int, float)):
+                                if internal_key == "FRAME_OVERLAP":
+                                    current_params["frame_overlap"] = int(value)
+                                elif internal_key == "INPUT_BIAS":
+                                    current_params["input_bias"] = float(value)
+                                logger.debug(f"==> Using sidecar {sidecar_key} ({internal_key}): {value}")
                             
                 # --- END MAPPING LOGIC ---
             
@@ -766,6 +788,7 @@ class SplatterGUI(ThemedTk):
             "depth_blur_size": current_params["depth_blur_size"],
             "anchor_source": anchor_source,
             "max_disp_source": max_disp_source,
+            "gamma_source": gamma_source,
         }
     
     def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
@@ -1128,10 +1151,12 @@ class SplatterGUI(ThemedTk):
                 current_input_bias = video_specific_settings["input_bias"]
                 anchor_source = video_specific_settings["anchor_source"]
                 max_disp_source = video_specific_settings["max_disp_source"]
-                # --- NEW: Extract new depth settings ---
+                gamma_source = video_specific_settings["gamma_source"]
                 current_depth_gamma = video_specific_settings["depth_gamma"]
                 current_depth_dilate_size = video_specific_settings["depth_dilate_size"]
                 current_depth_blur_size = video_specific_settings["depth_blur_size"]
+
+
 
                 processing_tasks = self._get_defined_tasks(settings)
                 if not processing_tasks:
@@ -1153,7 +1178,8 @@ class SplatterGUI(ThemedTk):
                     self.progress_queue.put(("update_info", {
                         "task_name": task['name'],
                         "convergence": f"{current_zero_disparity_anchor:.2f} ({anchor_source})",
-                        "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})"
+                        "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})",
+                        "gamma": f"{current_depth_gamma:.2f} ({gamma_source})",
                     }))
 
                     video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width, \
@@ -1307,8 +1333,8 @@ class SplatterGUI(ThemedTk):
             "depth_gamma": self.depth_gamma_var.get(),
             "depth_dilate_size": self.depth_dilate_size_var.get(),
             "depth_blur_size": self.depth_blur_size_var.get(),
-            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
-            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
+            # "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
+            # "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
@@ -1444,12 +1470,22 @@ class SplatterGUI(ThemedTk):
 
         return input_videos, is_single_file_mode, finished_source_folder, finished_depth_folder
     
-    def _toggle_debug_mode(self):
-        """Toggles debug mode on/off and updates logging."""
-        self._configure_logging()
-        self._save_config() # Save the current debug mode state to config immediately
-        messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
-    
+    def _toggle_debug_logging(self):
+        """Toggles debug logging and updates shared logger."""
+        self._debug_logging_enabled = self.debug_logging_var.get() # Get checkbutton state
+        
+        if self._debug_logging_enabled:
+            new_level = logging.DEBUG
+            level_str = "DEBUG"
+        else:
+            new_level = logging.INFO
+            level_str = "INFO"
+
+        # Call the utility function to change the root logger level
+        set_util_logger_level(new_level)
+
+        logger.info(f"Setting application logging level to: {level_str}")
+
     def check_queue(self):
         """Periodically checks the progress queue for updates to the GUI."""
         try:
@@ -1489,6 +1525,8 @@ class SplatterGUI(ThemedTk):
                         self.processing_disparity_var.set(info_data["disparity"])
                     if "convergence" in info_data:
                         self.processing_convergence_var.set(info_data["convergence"])
+                    if "gamma" in info_data: # <--- ADD THIS CHECK
+                        self.processing_gamma_var.set(info_data["gamma"])
                     if "task_name" in info_data:
                         self.processing_task_name_var.set(info_data["task_name"])
 
@@ -1503,6 +1541,7 @@ class SplatterGUI(ThemedTk):
         self.processing_frames_var.set("N/A")
         self.processing_disparity_var.set("N/A")
         self.processing_convergence_var.set("N/A")
+        self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
 
     def depthSplatting(
@@ -1743,183 +1782,45 @@ class SplatterGUI(ThemedTk):
         torch.cuda.empty_cache()
         gc.collect()
 
-        # --- FFmpeg encoding (already modified, keeping it here for context) ---
-        logger.debug(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-framerate", str(processed_fps), 
-            "-i", os.path.join(temp_png_dir, "%05d.png"), 
-        ]
-
-        output_crf_val = 24 # Default CRF for x265 10-bit SDR (lower is better quality)
-        output_profile = "main10"
-        x265_params = [] 
-
-        nvenc_preset = "medium" 
-        nvenc_cq_val = 23 # Constant Quality value for NVENC (lower is better quality)
-
-        if user_output_crf is not None and 0 <= user_output_crf <= 51:
-            output_crf_val = user_output_crf
-            nvenc_cq_val = user_output_crf # Use same value for CQ for consistency
-            logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
+        # Determine the final output path suffix (splatted2 or splatted4)
+        if dual_output:
+            suffix = "_splatted2"
         else:
-            logger.debug(f"Using auto-determined output CRF ({output_crf_val}) / CQ ({nvenc_cq_val}).")
+            suffix = "_splatted4"
+        res_suffix = f"_{width}"
+        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
 
-        is_hdr_source = False
-        original_source_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
-        original_source_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
-        
-        is_original_source_10bit_or_higher = False
-        if original_source_pix_fmt:
-            if "10" in original_source_pix_fmt or "12" in original_source_pix_fmt or "16" in original_source_pix_fmt:
-                is_original_source_10bit_or_higher = True
-                logger.debug(f"==> Detected original video pixel format: {original_source_pix_fmt} (>= 10-bit)")
-            else:
-                logger.debug(f"==> Detected original video pixel format: {original_source_pix_fmt} (< 10-bit)")
-        else:
-            logger.debug("==> Could not detect original video pixel format.")
-
-        if video_stream_info:
-            logger.debug("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
-
-            if video_stream_info.get("color_primaries") == "bt2020" and \
-               video_stream_info.get("transfer_characteristics") == "smpte2084":
-                is_hdr_source = True
-                logger.debug("==> Source detected as HDR. Targeting HEVC 10-bit HDR output.")
-                output_codec = "libx265"
-                if CUDA_AVAILABLE:
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "28" 
-                output_profile = "main10"
-                if video_stream_info.get("mastering_display_metadata"):
-                    md_meta = video_stream_info["mastering_display_metadata"]
-                    x265_params.append(f"mastering-display={md_meta}")
-                    logger.debug(f"==> Adding mastering display metadata: {md_meta}")
-                if video_stream_info.get("max_content_light_level"):
-                    max_cll_meta = video_stream_info["max_content_light_level"]
-                    x265_params.append(f"max-cll={max_cll_meta}")
-                    logger.debug(f"==> Adding max content light level: {max_cll_meta}")
-
-            elif original_source_codec_name == "hevc" and is_original_source_10bit_or_higher:
-                logger.debug("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC 10-bit SDR output.")
-                output_codec = "libx265"
-                if CUDA_AVAILABLE:
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "24" 
-                output_profile = "main10"
-
-            else:
-                logger.debug("==> No specific HEVC/HDR or 10-bit HEVC SDR source detected. Prioritizing 10-bit output due to 16-bit intermediate PNGs.")
-                if CUDA_AVAILABLE and (torch.cuda.get_device_properties(0).major >= 6): 
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration for 10-bit SDR output)")
-                else:
-                    output_codec = "libx265" 
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "24" 
-                output_profile = "main10"
-
-        else:
-            logger.debug("==> No source video stream info detected. Falling back to default HEVC (x265) 10-bit SDR output (due to 16-bit internal processing).")
-            if CUDA_AVAILABLE and (torch.cuda.get_device_properties(0).major >= 6):
-                output_codec = "hevc_nvenc"
-                logger.debug("    (Using hevc_nvenc for hardware acceleration for default 10-bit SDR output)")
-            else:
-                output_codec = "libx265"
-            
-            output_pix_fmt = "yuv420p10le"
-            output_crf = "24"
-            output_profile = "main10"
-
-
-        ffmpeg_cmd.extend(["-c:v", output_codec])
-        if "nvenc" in output_codec:
-            ffmpeg_cmd.extend(["-preset", nvenc_preset])
-            ffmpeg_cmd.extend(["-cq", str(nvenc_cq_val)]) # Use the actual NVENC CQ value
-        else:
-            ffmpeg_cmd.extend(["-crf", str(output_crf_val)]) # Use the actual CRF value
-        
-        ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-        if output_profile:
-            ffmpeg_cmd.extend(["-profile:v", output_profile])
-
-        if output_codec == "libx265" and x265_params:
-            ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
-
-        if video_stream_info:
-            if video_stream_info.get("color_primaries"):
-                ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
-            if video_stream_info.get("transfer_characteristics"):
-                ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
-            if video_stream_info.get("color_space"):
-                ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
-        else: 
-            ffmpeg_cmd.extend(["-color_primaries", "bt709"])
-            ffmpeg_cmd.extend(["-color_trc", "bt709"]) 
-            ffmpeg_cmd.extend(["-colorspace", "bt709"])
-
-
-        ffmpeg_cmd.append(final_output_video_path)
-
-        logger.debug(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
-
-        try:
-            ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24)
-            logger.debug(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
-            logger.debug(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
-            logger.debug(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
-        except FileNotFoundError:
-            logger.error("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
-            messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
-            logger.error(f"==> FFmpeg stdout: {e.stdout}")
-            logger.error(f"==> FFmpeg stderr: {e.stderr}")
-            logger.error("==> Final video encoding failed due to ffmpeg error.")
-        except subprocess.TimeoutExpired:
-            logger.error(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
-        except Exception as e:
-            logger.error(f"==> An unexpected error occurred during ffmpeg execution: {e}")
-
-        logger.debug(f"==> Final output video written to: {final_output_video_path}")
-
+        # Prepare sidecar data (only frame_overlap and input_bias are needed for the output sidecar)
         output_sidecar_data = {}
-        output_sidecar_data["convergence_plane"] = zero_disparity_anchor_val
-        output_sidecar_data["max_disparity"] = (max_disp / width) * 100.0
-        
         if frame_overlap is not None:
             output_sidecar_data["frame_overlap"] = frame_overlap
         if input_bias is not None:
             output_sidecar_data["input_bias"] = input_bias
 
-        if frame_overlap is not None or input_bias is not None:
-            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.fssidecar"
-            try:
-                with open(output_sidecar_path, 'w') as f:
-                    json.dump(output_sidecar_data, f, indent=4)
-                logger.debug(f"==> Created output sidecar file: {output_sidecar_path}")
-            except Exception as e:
-                logger.error(f"==> Error creating output sidecar file '{output_sidecar_path}': {e}")
+        # Determine output CRF from GUI setting
+        # NOTE: If user_output_crf is None, it will default to a sensible value inside encode_frames_to_mp4
+        output_crf = user_output_crf if user_output_crf is not None else int(self.output_crf_var.get())
 
-        if os.path.exists(temp_png_dir):
-            try:
-                shutil.rmtree(temp_png_dir)
-                logger.debug(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
-            except Exception as e:
-                logger.error(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-                return True
-
-        logger.debug(f"==> Final output video written to: {final_output_video_path}")
-        return True
+        # Call the utility function to handle encoding, cleanup, and sidecar writing
+        encoding_successful = encode_frames_to_mp4(
+            temp_png_dir=temp_png_dir,
+            final_output_mp4_path=final_output_video_path,
+            fps=processed_fps,
+            total_output_frames=frame_count,
+            video_stream_info=video_stream_info,
+            stop_event=self.stop_event, # Pass the threading stop event
+            sidecar_json_data=output_sidecar_data, # Pass the data to be written
+            user_output_crf=output_crf,
+            output_sidecar_ext=self.APP_CONFIG_DEFAULTS['OUTPUT_SIDECAR_EXT'] 
+        )
+        
+        # Return True/False based on encoding success
+        if encoding_successful:
+            logger.debug(f"Successfully finished encoding to: {final_output_video_path}")
+            return True
+        else:
+            logger.error(f"Encoding failed or was stopped by user for {final_output_video_path}.")
+            return False
     
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
@@ -1933,16 +1834,15 @@ class SplatterGUI(ThemedTk):
         release_cuda_memory()
         self.destroy()
 
-    def show_about_dialog(self):
-        """Displays an 'About' dialog for the application."""
-        about_text = (
-            "Stereocrafter Splatting Application\n"
-            f"Version: {GUI_VERSION}\n"
-            "This tool generates right-eye views from source videos and depth maps through a process called depth splatting.\n"
-            "It supports different output resolutions, dual/quad output modes, and custom disparity settings.\n\n"
-            "Developed by [Your Name/Alias] for StereoCrafter projects." # Customize this!
+    def show_about(self):
+        """Displays the 'About' message box."""
+        message = (
+            f"Stereocrafter Splatting (Batch) - {GUI_VERSION}\n"
+            "A tool for generating right-eye stereo views from source video and depth maps.\n"
+            "Based on Decord, PyTorch, and OpenCV.\n"
+            "\n(C) 2024 Some Rights Reserved"
         )
-        messagebox.showinfo("About Batch Video Splatting", about_text)
+        tk.messagebox.showinfo("About Stereocrafter Splatting", message)
 
     def start_processing(self):
         """Starts the video processing in a separate thread."""
@@ -2198,10 +2098,6 @@ def compute_global_depth_stats(
 
     logger.info(f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
     return float(global_min), float(global_max)
-
-def round_to_nearest_64(value):
-    """Rounds a given value up to the nearest multiple of 64, with a minimum of 64."""
-    return max(64, round(value / 64) * 64)
 
 def read_video_frames(
         video_path: str,

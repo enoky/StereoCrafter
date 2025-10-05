@@ -62,7 +62,7 @@ class SidecarEditTool:
         
         self.progress_save_data = {}
 
-        self.config_file_path = "sidecaredit_config.json"
+        self.config_file_path = "config_sidecaredit.json"
         self.progress_file_path = None
 
         # --- Step 2: Load Configuration (this doesn't interact with GUI directly yet) ---

@@ -7,16 +7,16 @@
     "input_depth_maps_file": "Select a single depth map file corresponding to the selected source video.",
     "output_splatted": "Path to the folder where the splatted output videos will be saved.",
     
-    "enable_full_res": "When checked, the script will generate a splatted video at the original resolution of the input video. Uses 'Full Res Batch Size'.",
+    "enable_full_res": "When checked, will generate a splatted video at the original resolution of the input video. Use this for blending over the inpaint.",
     "full_res_batch_size": "The number of frames to process simultaneously when generating the full-resolution output. A higher value uses more VRAM but can be faster. Adjust based on your GPU's memory.",
-    "enable_low_res": "When checked, the script will generate an additional splatted video at the specified Low Resolution. Uses 'Low Res Batch Size'.",
+    "enable_low_res": "When checked, will generate a splatted video of specified resolution. Use this for inpainting.",
     "low_res_width": "The target width for the low-resolution output. The input video and depth maps will be resized to this width for the low-resolution pass.",
     "low_res_height": "The target height for the low-resolution output. The input video and depth maps will be resized to this height for the low-resolution pass.",
     "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements.",
     
     "depth_gamma": "Applies a non-linear adjustment to the depth map before normalization. above 1.0 moves the midground towards the camera. Below 1.0 move further away. Set to 1.0 to disable.",
-    "depth_dilate_size": "Dilate or blur the foregound object if you see jagged edge of the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
-    "depth_blur_size": "Blur or dilate the foregound object if you see jagged edge of the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable. Sigma is automatically calculated as Size/6.",
+    "depth_dilate_size": "Dilate or blur the foregound object if you see jagged edge on the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
+    "depth_blur_size": "Blur or dilate the foregound object if you see jagged edge on the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable. Sigma is automatically calculated as Size/6.",
     
     "sidecar_gamma_toggle": "If checked, will give automated control from sidecar file to set gamma values & overiding the GUI for that specific video.",
     "sidecar_blur_dilate_toggle": "If checked, will give automated control from sidecar file to set Dilate and Blur values & overiding the GUI for that specific video.",

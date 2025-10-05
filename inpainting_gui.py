@@ -26,7 +26,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25.09.29"
+GUI_VERSION = "25.10.05"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1497,7 +1497,7 @@ class InpaintingGUI(ThemedTk):
                 current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
                 current_process_length = process_length # NEW: Current process_length (from GUI initially)
 
-                json_path = os.path.splitext(video_path)[0] + ".fssidecar"
+                json_path = os.path.splitext(video_path)[0] + ".spsidecar"
                 if os.path.exists(json_path):
                     logger.info(f"Found sidecar fssidecar for {os.path.basename(video_path)} at {json_path}")
                     try:
