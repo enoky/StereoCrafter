@@ -377,7 +377,7 @@ class SplatterGUI(ThemedTk):
 
         current_row = 0
         # Enable Full Resolution Section
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output(For Blending)", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
         self.enable_full_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
         current_row += 1
@@ -392,7 +392,7 @@ class SplatterGUI(ThemedTk):
 
 
         # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (Inpaint)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (For Inpainting)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
         self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
         current_row += 1
@@ -442,15 +442,6 @@ class SplatterGUI(ThemedTk):
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
         row_inner = 0
-        # Gamma
-        # self.lbl_depth_gamma = ttk.Label(self.depth_prep_frame, text="Gamma (1.0=Off):")
-        # self.lbl_depth_gamma.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
-        # self.entry_depth_gamma = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_gamma_var, width=15)
-        # self.entry_depth_gamma.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
-        # self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
-        # self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
-        # row_inner += 1
-        
         # Dilate Size
         self.lbl_depth_dilate_size = ttk.Label(self.depth_prep_frame, text="Dilate Size (0=Off):")
         self.lbl_depth_dilate_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
@@ -485,10 +476,10 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
         row_inner += 1
 
-        self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
-        self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.sidecar_blur_dilate_checkbox, "sidecar_blur_dilate_toggle")
-        current_row = 0 # Reset for next frame
+        # self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
+        # self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.sidecar_blur_dilate_checkbox, "sidecar_blur_dilate_toggle")
+        # current_row = 0 # Reset for next frame
 
         # ===================================================================
         # --- Output Settings Frame (Now placed below the settings_container_frame) ---
@@ -497,13 +488,14 @@ class SplatterGUI(ThemedTk):
         self.output_settings_frame.pack(pady=10, padx=10, fill="x")
         self.output_settings_frame.grid_columnconfigure(1, weight=1)
         self.output_settings_frame.grid_columnconfigure(3, weight=1)
-
-        self.lbl_max_disp = ttk.Label(self.output_settings_frame, text="Max Disparity %:")
-        self.lbl_max_disp.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_max_disp = ttk.Entry(self.output_settings_frame, textvariable=self.max_disp_var, width=15)
-        self.entry_max_disp.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_max_disp, "max_disp")
-        self._create_hover_tooltip(self.entry_max_disp, "max_disp")
+        
+        # Gamma
+        self.lbl_depth_gamma = ttk.Label(self.output_settings_frame, text="Gamma (1.0=Off):")
+        self.lbl_depth_gamma.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_gamma = ttk.Entry(self.output_settings_frame, textvariable=self.depth_gamma_var, width=15)
+        self.entry_depth_gamma.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
+        self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
 
         self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length (-1 for all):")
         self.lbl_process_length.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
@@ -512,13 +504,13 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.lbl_process_length, "process_length")
         self._create_hover_tooltip(self.entry_process_length, "process_length")
         current_row += 1
-
-        self.lbl_zero_disparity_anchor = ttk.Label(self.output_settings_frame, text="Convergence Point (0-1):")
-        self.lbl_zero_disparity_anchor.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_zero_disparity_anchor = ttk.Entry(self.output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
-        self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
-        self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+        
+        self.lbl_max_disp = ttk.Label(self.output_settings_frame, text="Max Disparity %:")
+        self.lbl_max_disp.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_max_disp = ttk.Entry(self.output_settings_frame, textvariable=self.max_disp_var, width=15)
+        self.entry_max_disp.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_max_disp, "max_disp")
+        self._create_hover_tooltip(self.entry_max_disp, "max_disp")
 
         # Output CRF setting, placed on the right side
         self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF (0-51):")
@@ -529,11 +521,19 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.entry_output_crf, "output_crf")
         current_row += 1
 
-        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="No Normalization (Assume Raw 0-1 Input)", variable=self.enable_autogain_var)
+        self.lbl_zero_disparity_anchor = ttk.Label(self.output_settings_frame, text="Convergence Point (0-1):")
+        self.lbl_zero_disparity_anchor.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_zero_disparity_anchor = ttk.Entry(self.output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
+        self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
+        self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+        current_row += 1
+
+        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
         self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
 
-        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output (Mask & Warped)", variable=self.dual_output_var)
+        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
         self.dual_output_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
 
@@ -998,7 +998,7 @@ class SplatterGUI(ThemedTk):
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
-    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float, depth_dilate_size: int, depth_blur_size: int) -> np.ndarray:
+    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float, depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool) -> np.ndarray:
         """
         Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
         """
@@ -1027,24 +1027,36 @@ class SplatterGUI(ThemedTk):
             else:
                 logger.warning("Chunk min/max too close for gamma normalization. Skipping gamma.")
 
-        # 3. Dilation (if size > 0)
-        if depth_dilate_size > 0:
-            logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
-            kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
-            for j in range(batch_depth_numpy_float.shape[0]):
-                batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
-        
-        # 4. Gaussian Blur (if size > 0)
-        if depth_blur_size > 0:
-            logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
-            sigma = depth_blur_size / 6.0 
-            for j in range(batch_depth_numpy_float.shape[0]):
-                batch_depth_numpy_float[j] = cv2.GaussianBlur(
-                    batch_depth_numpy_float[j], 
-                    (depth_blur_size, depth_blur_size), 
-                    sigmaX=sigma, 
-                    sigmaY=sigma
-                )
+        # Dilate and Blur should ONLY be applied if it is NOT a low-res task.
+        if is_low_res_task:
+            if depth_dilate_size > 0 or depth_blur_size > 0:
+                 # Log a warning if user set a value but it's being skipped
+                 logger.debug(f"Dilate ({depth_dilate_size}) or Blur ({depth_blur_size}) skipped for low-resolution (inpaint) task as per configuration.")
+        else:
+            # This is the HI-RES path: apply Dilate and Blur based on size setting.
+
+            # 3. Dilation (if size > 0)
+            if depth_dilate_size > 0:
+                logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
+                # Create a square kernel for dilation
+                kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
+                # Apply dilation: cv2.dilate expects C-order (H, W) for image processing
+                for j in range(batch_depth_numpy_float.shape[0]):
+                    batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
+            
+            # 4. Gaussian Blur (if size > 0)
+            if depth_blur_size > 0:
+                logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
+                # Sigma is fixed at size / 6.0 as requested
+                sigma = depth_blur_size / 6.0 
+                # Apply Gaussian Blur: cv2.GaussianBlur expects C-order (H, W)
+                for j in range(batch_depth_numpy_float.shape[0]):
+                    batch_depth_numpy_float[j] = cv2.GaussianBlur(
+                        batch_depth_numpy_float[j], 
+                        (depth_blur_size, depth_blur_size), 
+                        sigmaX=sigma, 
+                        sigmaY=sigma
+                    )
 
         return batch_depth_numpy_float
 
@@ -1578,7 +1590,8 @@ class SplatterGUI(ThemedTk):
                 depth_stream_info=depth_stream_info,
                 depth_gamma=depth_gamma,
                 depth_dilate_size=depth_dilate_size,
-                depth_blur_size=depth_blur_size
+                depth_blur_size=depth_blur_size,
+                is_low_res_task=is_low_res_task
             )
 
             # Convert original batch frames to float 0-1 for display in grid
