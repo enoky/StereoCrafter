@@ -69,7 +69,7 @@ class SplatterGUI(ThemedTk):
         "OUTPUT_SIDECAR_EXT": ".spsidecar",
         
         # GUI/Processing Defaults (Used for reset/fallback)
-        "MAX_DISP": "20.0",
+        "MAX_DISP": "30.0",
         "CONV_POINT": "0.5",
         "PROC_LENGTH": "-1",
         "BATCH_SIZE_FULL": "10",
@@ -129,9 +129,9 @@ class SplatterGUI(ThemedTk):
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
         self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", True)) 
         self.enable_full_res_var = tk.BooleanVar(value=self.app_config.get("enable_full_resolution", True))
-        self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", False))
-        self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1920"))
-        self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "1080"))
+        self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", True))
+        self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1024"))
+        self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "512"))
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"])) # <--- CHANGED
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"])) # <--- CHANGED
         self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"])) # <--- CHANGED
@@ -190,7 +190,7 @@ class SplatterGUI(ThemedTk):
                 active_bg = "#555555"
                 active_fg = "white"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
@@ -218,7 +218,7 @@ class SplatterGUI(ThemedTk):
                 active_bg = "#dddddd"
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
@@ -306,12 +306,18 @@ class SplatterGUI(ThemedTk):
         self.menubar = tk.Menu(self)
         self.config(menu=self.menubar)
 
-        self.option_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Option", menu=self.option_menu)
-        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.option_menu.add_separator()
-        self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
-        self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+        self.file_menu  = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="File", menu=self.file_menu )
+        
+        # Add new commands to the File menu
+        self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
+        self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
+        self.file_menu.add_separator() # Separator for organization
+
+        self.file_menu .add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.file_menu .add_separator()
+        self.file_menu .add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.file_menu .add_command(label="Restore Finished", command=self.restore_finished_files)
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.debug_logging_var = tk.BooleanVar(value=self._debug_logging_enabled)
@@ -632,6 +638,40 @@ class SplatterGUI(ThemedTk):
         lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
+
+    def _get_current_config(self):
+        """Collects all current GUI variable values into a single dictionary."""
+        config = {
+            # Folder Configurations
+            "input_source_clips": self.input_source_clips_var.get(),
+            "input_depth_maps": self.input_depth_maps_var.get(),
+            "output_splatted": self.output_splatted_var.get(),
+            
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+
+            "enable_full_resolution": self.enable_full_res_var.get(),
+            "batch_size": self.batch_size_var.get(),
+            "enable_low_resolution": self.enable_low_res_var.get(),
+            "pre_res_width": self.pre_res_width_var.get(),
+            "pre_res_height": self.pre_res_height_var.get(),
+            "low_res_batch_size": self.low_res_batch_size_var.get(),
+            
+            "depth_dilate_size": self.depth_dilate_size_var.get(),
+            "depth_blur_size": self.depth_blur_size_var.get(),
+
+            "process_length": self.process_length_var.get(),
+            "output_crf": self.output_crf_var.get(),
+            "dual_output": self.dual_output_var.get(),
+            
+            "depth_gamma": self.depth_gamma_var.get(),
+            "max_disp": self.max_disp_var.get(),
+            "convergence_point": self.zero_disparity_anchor_var.get(),
+            "enable_autogain": self.enable_autogain_var.get(),
+        }
+        return config
 
     def _get_defined_tasks(self, settings):
         """Helper to return a list of processing tasks based on GUI settings."""
@@ -1302,40 +1342,7 @@ class SplatterGUI(ThemedTk):
 
     def _save_config(self):
         """Saves current GUI settings to config_splat.json."""
-        config = {
-            # Folder Configurations
-            "input_source_clips": self.input_source_clips_var.get(),
-            "input_depth_maps": self.input_depth_maps_var.get(),
-            "output_splatted": self.output_splatted_var.get(),
-            
-            # GUI State Configurations
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "window_width": self.winfo_width(),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "debug_mode_enabled": self.debug_mode_var.get(),
-
-            "max_disp": self.max_disp_var.get(),
-            "process_length": self.process_length_var.get(),
-            "batch_size": self.batch_size_var.get(),
-            "dual_output": self.dual_output_var.get(),
-            "enable_autogain": self.enable_autogain_var.get(),
-            "enable_full_resolution": self.enable_full_res_var.get(),
-            "enable_low_resolution": self.enable_low_res_var.get(),
-            "pre_res_width": self.pre_res_width_var.get(),
-            "pre_res_height": self.pre_res_height_var.get(),
-            "low_res_batch_size": self.low_res_batch_size_var.get(),
-            "convergence_point": self.zero_disparity_anchor_var.get(),
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "output_crf": self.output_crf_var.get(),
-            
-            # --- NEW: Depth Pre-processing Config ---
-            "depth_gamma": self.depth_gamma_var.get(),
-            "depth_dilate_size": self.depth_dilate_size_var.get(),
-            "depth_blur_size": self.depth_blur_size_var.get(),
-            # "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
-            # "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
-        }
+        config = self._get_current_config()
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
 
@@ -1834,6 +1841,77 @@ class SplatterGUI(ThemedTk):
         release_cuda_memory()
         self.destroy()
 
+    def load_settings(self):
+        """Loads settings from a user-selected JSON file."""
+        filename = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Load Settings from File"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "r") as f:
+                loaded_config = json.load(f)
+            # Apply loaded config values to the variables
+            for config_key, config_value in loaded_config.items(): # Iterate over loaded keys
+                # --- NEW MAPPING LOGIC ---
+                # Construct the expected name of the Tkinter variable
+                tk_var_attr_name = config_key + '_var'
+                
+                if hasattr(self, tk_var_attr_name):
+                    tk_var_object = getattr(self, tk_var_attr_name)
+                    
+                    if isinstance(tk_var_object, tk.BooleanVar):
+                        # Ensure value is converted to a proper boolean/int before setting BooleanVar
+                        tk_var_object.set(bool(config_value))
+                    elif isinstance(tk_var_object, tk.StringVar):
+                        # Set StringVar directly
+                        tk_var_object.set(str(config_value))
+            
+            # Apply loaded config values to the variables
+            for key, var in self.__dict__.items():
+                if key.endswith('_var') and key in loaded_config:
+                    # Logic to safely set values:
+                    # For tk.StringVar, set()
+                    # For tk.BooleanVar, use set() with the bool/int value
+                    if isinstance(var, tk.BooleanVar):
+                        var.set(bool(loaded_config[key]))
+                    elif isinstance(var, tk.StringVar):
+                        var.set(str(loaded_config[key]))
+
+            self._apply_theme() # Re-apply theme in case dark mode setting was loaded
+            self.toggle_processing_settings_fields() # Update state of dependent fields
+            messagebox.showinfo("Settings Loaded", f"Successfully loaded settings from:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings loaded.")
+
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load settings from {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings load failed.")
+    
+    def save_settings(self):
+        """Saves current GUI settings to a user-selected JSON file."""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Save Settings to File"
+        )
+        if not filename:
+            return
+
+        try:
+            config_to_save = self._get_current_config()
+            with open(filename, "w") as f:
+                json.dump(config_to_save, f, indent=4)
+
+            messagebox.showinfo("Settings Saved", f"Successfully saved settings to:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings saved.")
+
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save settings to {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings save failed.")
+    
     def show_about(self):
         """Displays the 'About' message box."""
         message = (
