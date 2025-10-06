@@ -27,6 +27,7 @@
     "dual_output": "If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.",
     "no_normalization": "Use this only if your scene is too long and you have split your video/depthmap into shorter lengths to be rejoined after processing. Otherwise your cut scenes depth will not align",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
+    "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged throughout the clip.",
    
     "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
     "stop_button": "Stops the currently running processing task cleanly.",

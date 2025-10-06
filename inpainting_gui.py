@@ -350,12 +350,12 @@ class InpaintingGUI(ThemedTk):
                 active_fg = "white"
 
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             # ttk.Entry widget styling
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
-            
-            # ttk.LabelFrame styling (background and foreground for title)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color) # For the title text
 
@@ -378,9 +378,11 @@ class InpaintingGUI(ThemedTk):
                 active_bg = "#dddddd"
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
@@ -434,6 +436,41 @@ class InpaintingGUI(ThemedTk):
 
         set_util_logger_level(level) # Call the function from stereocrafter_util.py
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
+    
+    def _get_current_config(self):
+        """Collects all current GUI variable values into a single dictionary."""
+        config = {
+            # Folder Configurations
+            "input_folder": self.input_folder_var.get(),
+            "output_folder": self.output_folder_var.get(),
+
+            # GUI State Configurations
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+            "debug_mode_enabled": self.debug_mode_var.get(),
+            
+            # Parameter Configurations
+            "num_inference_steps": self.num_inference_steps_var.get(),
+            "tile_num": self.tile_num_var.get(),
+            "process_length": self.process_length_var.get(),
+            "frames_chunk": self.frames_chunk_var.get(),
+            "frame_overlap": self.overlap_var.get(),
+            "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
+            "output_crf": self.output_crf_var.get(),
+            "offload_type": self.offload_type_var.get(),
+
+            # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
+            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
+            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
+            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
+            
+            "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
+            "enable_color_transfer": self.enable_color_transfer.get(),
+        }
+        return config
     
     def _prepare_video_inputs(
         self,
@@ -710,17 +747,21 @@ class InpaintingGUI(ThemedTk):
         self.menubar = tk.Menu(self)
         self.config(menu=self.menubar)
 
-        self.option_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Option", menu=self.option_menu)
-        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.option_menu.add_separator()
-        self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
-        self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+        self.file_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="File", menu=self.file_menu)        
+        self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
+        self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
+        self.file_menu.add_separator() # Separator for organization
+        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.file_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
 
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
         self.help_menu.add_checkbutton(label="Enable Debugging", variable=self.debug_mode_var, command=self._toggle_debug_mode)
+        self.help_menu.add_separator()
         self.help_menu.add_command(label="About", command=self.show_about_dialog)
 
         # --- FOLDER FRAME ---
@@ -1402,6 +1443,17 @@ class InpaintingGUI(ThemedTk):
         self.original_input_blend_strength_var.set("0.5")
         self.offload_type_var.set("model")
 
+        self.mask_initial_threshold_var.set("0.3")
+        self.mask_morph_kernel_size_var.set("0.0")
+        self.mask_dilate_kernel_size_var.set("5")
+        self.mask_blur_kernel_size_var.set("7")
+
+        self.enable_post_inpainting_blend.set(False) # Default state is OFF
+        self.enable_color_transfer.set(True) # Default state is ON
+        
+        # Crucially, call the function to disable the entry fields if the blend toggle is now False
+        self._toggle_blend_parameters_state() 
+
         self.save_config() # Save these new default settings
         messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
         logger.info("GUI settings reset to defaults.")
@@ -1682,38 +1734,57 @@ class InpaintingGUI(ThemedTk):
             logger.error(f"Error decoding inpaint_help.json: {e}")
             return {}
 
+    def load_settings(self):
+        """Loads settings from a user-selected JSON file."""
+        filename = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Load Settings from File"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "r") as f:
+                loaded_config = json.load(f)
+            
+            # Iterate through the loaded config and apply values to the correct instance attributes
+            for key, value in loaded_config.items():
+                
+                # 1. Try to find a corresponding tk.Variable (e.g., 'input_folder' -> 'input_folder_var')
+                var_attr_name = key + "_var"
+
+                if hasattr(self, var_attr_name):
+                    var_instance = getattr(self, var_attr_name)
+                    
+                    if isinstance(var_instance, tk.BooleanVar):
+                        var_instance.set(bool(value))
+                    elif isinstance(var_instance, tk.StringVar):
+                        var_instance.set(str(value))
+                    else:
+                        logger.warning(f"Skipping config key {key}: unknown tk.Variable type.")
+                
+                # 2. Handle direct instance attributes (e.g., window position/size)
+                elif hasattr(self, key) and key in ["window_x", "window_y", "window_width"]:
+                    setattr(self, key, value)
+                
+                else:
+                    logger.debug(f"Skipping config key {key}: No matching tk.Variable or direct attribute found.")
+
+            self._apply_theme() # Re-apply theme in case dark mode setting was loaded
+            # --- FIX: Correct function name for updating blend fields state ---
+            self._toggle_blend_parameters_state() # Update state of dependent fields
+            # --- END FIX ---
+            
+            messagebox.showinfo("Settings Loaded", f"Successfully loaded settings from:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings loaded.")
+
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load settings from {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings load failed.")
+
     def save_config(self):
-        config = {
-            # Folder Configurations
-            "input_folder": self.input_folder_var.get(),
-            "output_folder": self.output_folder_var.get(),
-
-            # GUI State Configurations
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "window_width": self.winfo_width(),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "debug_mode_enabled": self.debug_mode_var.get(),
-            
-            # Parameter Configurations
-            "num_inference_steps": self.num_inference_steps_var.get(),
-            "tile_num": self.tile_num_var.get(),
-            "process_length": self.process_length_var.get(),
-            "frames_chunk": self.frames_chunk_var.get(),
-            "frame_overlap": self.overlap_var.get(),
-            "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
-            "output_crf": self.output_crf_var.get(),
-            "offload_type": self.offload_type_var.get(),
-
-            # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
-            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
-            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
-            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
-            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
-            
-            "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
-            "enable_color_transfer": self.enable_color_transfer.get(),
-        }
+        config = self._get_current_config()
         try:
             with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
                 json.dump(config, f, indent=4)
@@ -1721,6 +1792,28 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.warning(f"Failed to save config: {e}", exc_info=True)
 
+    def save_settings(self):
+        """Saves current GUI settings to a user-selected JSON file."""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Save Settings to File"
+        )
+        if not filename:
+            return
+
+        try:
+            config_to_save = self._get_current_config() 
+            with open(filename, "w", encoding='utf-8') as f:
+                json.dump(config_to_save, f, indent=4)
+
+            messagebox.showinfo("Settings Saved", f"Successfully saved settings to:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings saved.")
+
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save settings to {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings save failed.")
+    
     def show_general_help(self):
         help_text = self.help_data.get("general_help", "No general help information available.")
         messagebox.showinfo("Help", help_text)

@@ -122,9 +122,9 @@ class SplatterGUI(ThemedTk):
         self.input_depth_maps_var = tk.StringVar(value=self.app_config.get("input_depth_maps", "./input_depth_maps"))
         self.output_splatted_var = tk.StringVar(value=self.app_config.get("output_splatted", "./output_splatted"))
 
-        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", defaults["MAX_DISP"])) # <--- CHANGED
-        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", defaults["PROC_LENGTH"])) # <--- CHANGED
-        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"])) # <--- CHANGED
+        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", defaults["MAX_DISP"]))
+        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", defaults["PROC_LENGTH"]))
+        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"]))
         
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
         self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", True)) 
@@ -132,14 +132,15 @@ class SplatterGUI(ThemedTk):
         self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", True))
         self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1024"))
         self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "512"))
-        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"])) # <--- CHANGED
-        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"])) # <--- CHANGED
-        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"])) # <--- CHANGED
+        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
+        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
+        self.enable_auto_convergence_var = tk.BooleanVar(value=self.app_config.get("enable_auto_convergence", False))
 
         # --- Depth Pre-processing Variables ---
-        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"])) # <--- CHANGED
-        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", defaults["DEPTH_DILATE_SIZE"])) # <--- CHANGED
-        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", defaults["DEPTH_BLUR_SIZE"])) # <--- CHANGED
+        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"]))
+        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", defaults["DEPTH_DILATE_SIZE"]))
+        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", defaults["DEPTH_BLUR_SIZE"]))
 
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
@@ -545,6 +546,10 @@ class SplatterGUI(ThemedTk):
         self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
         self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+
+        self.auto_convergence_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Auto-Determine Convergence (Video Avg)", variable=self.enable_auto_convergence_var)
+        self.auto_convergence_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.auto_convergence_checkbox, "auto_convergence_toggle")
         current_row += 1
 
         self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
@@ -639,6 +644,109 @@ class SplatterGUI(ThemedTk):
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
 
+    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int) -> float:
+        """
+        Calculates the Auto Convergence point (average depth value) for the entire video.
+        Uses a hard blur and crops to the center 75% to eliminate noise/edge artifacts.
+
+        Returns:
+            float: The new zero_disparity_anchor_val (0.0 to 1.0).
+        """
+        logger.info("==> Starting Auto-Convergence pre-pass to determine global average depth.")
+        
+        # --- Constants for Auto-Convergence Logic ---
+        BLUR_KERNEL_SIZE = 9  # Hard blur to capture bulk depth, must be odd
+        CENTER_CROP_PERCENT = 0.75 # Use the center 75% of the frame (1 - 0.75 = 0.25 margin total)
+        MIN_VALID_PIXELS = 100 # Minimum number of non-zero/non-max pixels to consider a frame valid
+        INTERNAL_ANCHOR_OFFSET = 0.1 # <--- ADJUST THIS VALUE FOR TESTING (e.g., 0.02, 0.05, 0.1)
+        # -------------------------------------------
+
+        all_valid_frame_averages = []
+
+        try:
+            # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
+            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
+            if len(depth_reader) == 0:
+                 logger.error("Depth map reader has no frames. Cannot calculate Auto-Convergence.")
+                 return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+        except Exception as e:
+            logger.error(f"Error initializing depth map reader for Auto-Convergence: {e}")
+            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+
+
+        # 2. Iterate and Average
+        num_frames = min(total_frames_to_process, len(depth_reader))
+        
+        for i in range(0, num_frames, batch_size):
+            if self.stop_event.is_set():
+                logger.warning("Auto-Convergence pre-pass stopped by user.")
+                return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback
+
+            current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
+            if not current_frame_indices:
+                break
+            
+            batch_depth_numpy_raw = depth_reader.get_batch(current_frame_indices).asnumpy()
+
+            # Process depth frames (Grayscale, Float conversion, 0-1 Normalization)
+            if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
+                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
+            elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
+                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
+            else:
+                batch_depth_numpy = batch_depth_numpy_raw
+            
+            batch_depth_float = batch_depth_numpy.astype(np.float32)
+
+            # Get chunk min/max for normalization (using the chunk's range, since we don't have global stats yet)
+            min_val = batch_depth_float.min()
+            max_val = batch_depth_float.max()
+            
+            if max_val - min_val > 1e-5:
+                batch_depth_normalized = (batch_depth_float - min_val) / (max_val - min_val)
+            else:
+                # If chunk is flat, use a neutral value
+                batch_depth_normalized = np.full_like(batch_depth_float, fill_value=0.5, dtype=np.float32)
+
+            # Frame-by-Frame Processing (Blur & Crop)
+            for frame in batch_depth_normalized:
+                H, W = frame.shape
+                
+                # a) Blur
+                frame_blurred = cv2.GaussianBlur(frame, (BLUR_KERNEL_SIZE, BLUR_KERNEL_SIZE), 0)
+                
+                # b) Center Crop (75% of H and W)
+                margin_h = int(H * (1 - CENTER_CROP_PERCENT) / 2)
+                margin_w = int(W * (1 - CENTER_CROP_PERCENT) / 2)
+                
+                cropped_frame = frame_blurred[margin_h:H-margin_h, margin_w:W-margin_w]
+                
+                # c) Average (Exclude true black/white pixels (0.0 or 1.0) which may be background/edges)
+                # Use a small epsilon to catch near-zero/near-one
+                valid_pixels = cropped_frame[(cropped_frame > 0.001) & (cropped_frame < 0.999)] 
+                
+                if valid_pixels.size > MIN_VALID_PIXELS:
+                    all_valid_frame_averages.append(valid_pixels.mean())
+                # else: frame is likely too empty or uniform, skip for averaging
+
+            draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
+        
+        # 3. Final Temporal Average
+        if all_valid_frame_averages:
+            raw_anchor = np.mean(all_valid_frame_averages)
+            
+            # --- NEW: Apply Offset and Clamping ---
+            final_anchor_offset = raw_anchor + INTERNAL_ANCHOR_OFFSET
+            
+            # Clamp to the valid range [0.0, 1.0]
+            final_anchor = np.clip(final_anchor_offset, 0.0, 1.0)
+            
+            logger.info(f"\n==> Auto-Convergence Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
+            return float(final_anchor)
+        else:
+            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI default.")
+            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
         config = {
@@ -665,6 +773,7 @@ class SplatterGUI(ThemedTk):
             "process_length": self.process_length_var.get(),
             "output_crf": self.output_crf_var.get(),
             "dual_output": self.dual_output_var.get(),
+            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
             
             "depth_gamma": self.depth_gamma_var.get(),
             "max_disp": self.max_disp_var.get(),
@@ -1199,6 +1308,23 @@ class SplatterGUI(ThemedTk):
 
 
                 processing_tasks = self._get_defined_tasks(settings)
+
+                # --- NEW: Auto-Convergence Logic (BEFORE initializing readers) ---
+                if settings["enable_auto_convergence"]:
+                    logger.info("Auto-Convergence is ENABLED. Running pre-pass...")
+
+                    new_anchor_val = self._determine_auto_convergence(
+                        actual_depth_map_path,
+                        settings["process_length"],
+                        settings["full_res_batch_size"] # Use a reasonable batch size for the pre-pass
+                    )
+                    
+                    # Update variables for current task
+                    current_zero_disparity_anchor = new_anchor_val
+                    anchor_source = "Auto"
+                    logger.info(f"Using Auto-Determined Convergence Point: {current_zero_disparity_anchor:.4f}")
+                # --- END Auto-Convergence Logic ---
+
                 if not processing_tasks:
                     logger.debug(f"==> No processing tasks configured for {video_name}. Skipping.")
                     overall_task_counter += 0
@@ -1230,7 +1356,7 @@ class SplatterGUI(ThemedTk):
                         )
                     
                     # Explicitly check for None for critical components before proceeding
-                    if video_reader_input is None or depth_reader_input is None or video_stream_info is None: # <--- CHANGED HERE: Added check for video_stream_info
+                    if video_reader_input is None or depth_reader_input is None or video_stream_info is None:
                         logger.error(f"Skipping {task['name']} pass for {video_name} due to reader initialization error, frame count mismatch, or missing stream info.")
                         overall_task_counter += 1
                         self.progress_queue.put(("processed", overall_task_counter))
@@ -2002,6 +2128,7 @@ class SplatterGUI(ThemedTk):
             "depth_gamma": depth_gamma_val,
             "depth_dilate_size": depth_dilate_size_val,
             "depth_blur_size": depth_blur_size_val,
+            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
             "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
             "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
