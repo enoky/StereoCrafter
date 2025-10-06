@@ -557,6 +557,160 @@ class InpaintingGUI(ThemedTk):
         set_util_logger_level(level) # Call the function from stereocrafter_util.py
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
     
+    def _finalize_output_frames(
+        self,
+        inpainted_frames: torch.Tensor,
+        mask_frames: torch.Tensor,
+        original_warped_frames: torch.Tensor,
+        original_left_frames: Optional[torch.Tensor],
+        hires_data: dict,
+        base_video_name: str,
+        is_dual_input: bool,
+    ) -> Optional[torch.Tensor]:
+        """
+        Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final SBS concatenation.
+        Returns the final tensor for encoding, or None on error.
+        """
+        frames_output_final = inpainted_frames
+        frames_mask_processed = mask_frames
+        frames_warpped_original_unpadded_normalized = original_warped_frames
+        frames_left_original_cropped = original_left_frames
+        
+        # --- START: HI-RES BLENDING (If Enabled) ---
+        if hires_data["is_hires_blend_enabled"]:
+            hires_H, hires_W = hires_data["hires_H"], hires_data["hires_W"]
+            num_frames_original = frames_output_final.shape[0]
+
+            logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
+            
+            # 1. Upscale Low-Res Inpainted Output
+            frames_output_final_hires = F.interpolate(
+                frames_output_final, size=(hires_H, hires_W), mode='bicubic', align_corners=False
+            ).to(frames_output_final.device)
+
+            # 2. Upscale Low-Res Mask (Bilinear for smoother blend)
+            frames_mask_processed_unpadded_original_length_hires = F.interpolate(
+                frames_mask_processed, size=(hires_H, hires_W), mode='bilinear', align_corners=False
+            ).to(frames_output_final.device)
+            
+            # 3. Load High-Res Original/Warped Frames (The risk is here, but necessary with current read_video_frames)
+            # hires_video_path is guaranteed to be str if is_hires_blend_enabled is True here
+            hires_full_frames_torch, _, _ = read_video_frames(hires_data["hires_video_path"]) 
+            hires_full_frames_torch = hires_full_frames_torch[:num_frames_original] # Crop HR video
+
+            if is_dual_input:
+                half_w_hires = hires_full_frames_torch.shape[3] // 2
+                hires_warped_for_blend = hires_full_frames_torch[:, :, :, half_w_hires:] / 255.0
+                hires_left_for_concat = None
+            else:
+                half_h_hires = hires_full_frames_torch.shape[2] // 2
+                half_w_hires = hires_full_frames_torch.shape[3] // 2
+                hires_left_for_concat = hires_full_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
+                hires_warped_for_blend = hires_full_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
+            
+            # 4. Overwrite Low-Res Variables with Hi-Res Upscaled/Loaded Variables
+            frames_output_final = frames_output_final_hires
+            frames_mask_processed = frames_mask_processed_unpadded_original_length_hires
+            frames_warpped_original_unpadded_normalized = hires_warped_for_blend.to(frames_output_final.device)
+            frames_left_original_cropped = hires_left_for_concat.to(frames_output_final.device) if hires_left_for_concat is not None else None
+            
+            logger.info("Hi-Res Upscaling and Data Overwrite complete.")
+            
+        # --- END: HI-RES BLENDING ---
+
+        # The rest of the logic remains largely the same, but uses the now-guaranteed-to-be-set frames_output_final
+        
+        # --- Apply Color Transfer (if enabled) ---
+        if self.enable_color_transfer.get():
+            # ... (Color Transfer logic using frames_output_final, frames_mask_processed, etc.) ...
+            # ... (Replace the large Color Transfer block in your code with its body using the simplified variable names) ...
+            reference_frames_for_transfer: Optional[torch.Tensor] = None
+
+            if is_dual_input:
+                # DUAL Input: Create an occlusion-free reference from the warped frames (bottom-right)
+                logger.debug("Dual input detected. Creating occlusion-free reference via directional dilation for color transfer...")
+                
+                warped_frames_base = frames_warpped_original_unpadded_normalized.cpu() 
+                processed_mask = frames_mask_processed.cpu() 
+                
+                reference_frames_for_transfer = self._apply_directional_dilation(
+                    frame_chunk=warped_frames_base, mask_chunk=processed_mask
+                ).to(frames_output_final.device)
+
+                if self.debug_mode_var.get():
+                    debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_color_ref")
+                    os.makedirs(debug_output_dir, exist_ok=True)
+                    video_basename_for_debug = base_video_name.rsplit('.', 1)[0]
+                    for t in range(min(5, reference_frames_for_transfer.shape[0])):
+                        ref_img = (reference_frames_for_transfer[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        cv2.imwrite(
+                            os.path.join(debug_output_dir, f"{video_basename_for_debug}_frame_{t:04d}_color_ref_dilated.png"), 
+                            cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR)
+                        )
+                    logger.debug(f"Saved debug color reference frames to {debug_output_dir}")
+                
+            else: 
+                reference_frames_for_transfer = frames_left_original_cropped
+                
+            # --- Perform the Color Transfer ---
+            if reference_frames_for_transfer is None or reference_frames_for_transfer.numel() == 0:
+                logger.warning("Color transfer skipped: No valid reference frames available.")
+            else:
+                logger.debug("Applying color transfer from reference view to inpainted right view...")
+                target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
+                adjusted_frames_output = []
+                for t in range(frames_output_final.shape[0]):
+                    ref_frame_resized = F.interpolate(
+                        reference_frames_for_transfer[t].unsqueeze(0),
+                        size=(target_H, target_W),
+                        mode='bilinear', align_corners=False
+                    ).squeeze(0).cpu()
+                    target_frame_cpu = frames_output_final[t].cpu()
+                    adjusted_frame = self._apply_color_transfer(ref_frame_resized, target_frame_cpu)
+                    adjusted_frames_output.append(adjusted_frame.to(frames_output_final.device))
+                
+                frames_output_final = torch.stack(adjusted_frames_output)
+                logger.debug("Color transfer complete.")
+        # --- END Apply Color Transfer ---
+
+
+        # --- Apply Post-Inpainting Blending (if enabled) ---
+        if self.enable_post_inpainting_blend.get():
+            logger.debug("Applying post-inpainting blend...")
+            frames_output_final = self._apply_post_inpainting_blend(
+                inpainted_frames=frames_output_final,
+                original_warped_frames=frames_warpped_original_unpadded_normalized,
+                mask=frames_mask_processed, # Note: using the simplified variable name
+                base_video_name=base_video_name 
+            )
+            logger.debug("Post-inpainting blend complete.")
+
+        # --- Final Concatenation ---
+        final_output_frames_for_encoding: Optional[torch.Tensor] = None
+
+        if is_dual_input:
+            final_output_frames_for_encoding = frames_output_final
+        else:
+            if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
+                logger.error(f"Original left frames are missing or empty for non-dual input {base_video_name}. Cannot create SBS output.")
+                return None
+                    
+            if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
+            frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
+            frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
+                logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {base_video_name}.")
+                return None
+
+            sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
+            final_output_frames_for_encoding = sbs_frames
+
+        # Final check: ensure the tensor to be encoded is actually populated
+        if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
+            logger.error(f"Final output frames for encoding are empty or None after preparation for {base_video_name}.")
+            return None
+
+        return final_output_frames_for_encoding
+    
     def _find_high_res_match(self, low_res_video_path: str) -> Optional[str]:
         """
         Attempts to find a matching high-resolution splatted file in the hi-res folder.
@@ -939,6 +1093,67 @@ class InpaintingGUI(ThemedTk):
         # Store the actual width that was applied (which is current_width) for save_config
         self.window_width = current_width # Update instance variable for save_config
     
+    def _setup_video_info_and_hires(
+        self,
+        input_video_path: str,
+        save_dir: str,
+        is_dual_input: bool,
+    ) -> Tuple[Optional[str], dict]:
+        """
+        Initializes Hi-Res variables, finds a Hi-Res match, determines the final output path,
+        and initializes variables for process flow.
+        Returns (output_video_path, hires_data).
+        """
+        base_video_name = os.path.basename(input_video_path)
+        video_name_without_ext = os.path.splitext(base_video_name)[0]
+        output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+
+        # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
+        hires_video_path: Optional[str] = self._find_high_res_match(input_video_path)
+        is_hires_blend_enabled = False
+        hires_H, hires_W = 0, 0
+        
+        if hires_video_path:
+            is_hires_blend_enabled = True
+            try:
+                # Load first frame of Hi-Res video to get its dimensions
+                temp_reader = VideoReader(hires_video_path, ctx=cpu(0))
+                full_h_hires, full_w_hires = temp_reader.get_batch([0]).shape[1:3]
+                del temp_reader
+
+                if is_dual_input:
+                    hires_H, hires_W = full_h_hires, full_w_hires // 2
+                else:
+                    hires_H, hires_W = full_h_hires // 2, full_w_hires // 2
+                
+                logger.info(f"Hi-Res blending enabled. Target resolution: {hires_W}x{hires_H}")
+            except Exception as e:
+                logger.error(f"Failed to read Hi-Res video dimensions from {hires_video_path}: {e}")
+                is_hires_blend_enabled = False # Disable blending if dimensions can't be read
+                hires_video_path = None # Ensure it's None on failure
+
+        # --- CALCULATE FINAL OUTPUT FILENAME (STEP 2) ---
+        if is_hires_blend_enabled and hires_video_path:
+            hires_base_name = os.path.basename(hires_video_path)
+            hires_name_without_ext = os.path.splitext(hires_base_name)[0]
+            video_name_for_output = hires_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+            logger.debug(f"Output filename base set to Hi-Res: {video_name_for_output}")
+        else:
+            video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+        
+        output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
+        output_video_path = os.path.join(save_dir, output_video_filename)
+
+        hires_data = {
+            "hires_video_path": hires_video_path,
+            "is_hires_blend_enabled": is_hires_blend_enabled,
+            "hires_H": hires_H,
+            "hires_W": hires_W,
+            "base_video_name": base_video_name, # Keep this for update_info_callback
+            "video_name_for_output": video_name_for_output, # For temp PNG dir
+        }
+        return output_video_path, hires_data
+    
     def _toggle_color_transfer_state(self):
         """Callback for the Enable Color Transfer checkbox. Saves config."""
         self.save_config() # Simply save the config to persist the checkbox state
@@ -1202,66 +1417,35 @@ class InpaintingGUI(ThemedTk):
         frames_chunk: int = 23,
         overlap: int = 3,
         tile_num: int = 1,
-        vf: Optional[str] = None, # This vf parameter is no longer directly used by new FFmpeg logic
+        vf: Optional[str] = None,
         num_inference_steps: int = 5,
         stop_event: Optional[threading.Event] = None,
-        update_info_callback=None, # Callback to update GUI info (now wrapped for threading)
+        update_info_callback=None,
         original_input_blend_strength: float = 0.8,
         output_crf: int = 23,
         process_length: int = -1,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         """
-        Processes a single input video.
-        Determines input format (quad or dual) based on filename suffix.
-        Outputs SBS (left view | inpainted output) for quad input,
-        or only inpainted output for dual input.
-        Returns True if processing completed successfully, False if stopped.
+        Orchestrates the processing of a single video: Setup, Inpainting, Finalization, Encoding.
+        Returns (completion_status, hi_res_input_path).
         """
         os.makedirs(save_dir, exist_ok=True)
-
+        
+        # Determine splat type early
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-
         is_dual_input = video_name_without_ext.endswith("_splatted2")
-        if is_dual_input:
-            logger.info(f"Dual Splat detected for '{base_video_name}'. Processing and outputting Inpainted Right Eye only.")
-        else:
-            logger.info(f"Quad Splat (or default) detected for '{base_video_name}'. Processing and outputting Inpainted SBS video.")
 
-        output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
-        video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
-        output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
-        output_video_path = os.path.join(save_dir, output_video_filename)
-
-        # --- NEW: Hi-Res Blending Variables ---
-        hires_video_path: Optional[str] = None
-        is_hires_blend_enabled = False
-        hires_H, hires_W = 0, 0
+        # 1. SETUP & HI-RES DETECTION
+        # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
+        output_video_path, hires_data = self._setup_video_info_and_hires(
+            input_video_path, save_dir, is_dual_input
+        )
+        base_video_name = hires_data["base_video_name"]
+        video_name_for_output = hires_data["video_name_for_output"]
+        hires_video_path = hires_data["hires_video_path"] # Optional[str]
         
-        # --- Find Hi-Res Match (outside the main loop) ---
-        hires_video_path = self._find_high_res_match(input_video_path)
-        if hires_video_path:
-            is_hires_blend_enabled = True
-            try:
-                # Load first frame of Hi-Res video to get its dimensions
-                temp_reader = VideoReader(hires_video_path, ctx=cpu(0))
-                # Note: Assuming the high-res video is also encoded with the splatting format
-                # The height/width of the *splatted image* (which is the input frame size)
-                full_h_hires, full_w_hires = temp_reader.get_batch([0]).shape[1:3]
-                del temp_reader
-
-                # Split dimensions based on splat type (dual=half-width, quad=quarter-area)
-                if is_dual_input:
-                    hires_H, hires_W = full_h_hires, full_w_hires // 2
-                else:
-                    hires_H, hires_W = full_h_hires // 2, full_w_hires // 2
-                
-                logger.info(f"Hi-Res blending enabled. Target resolution: {hires_W}x{hires_H}")
-            except Exception as e:
-                logger.error(f"Failed to read Hi-Res video dimensions from {hires_video_path}: {e}")
-                is_hires_blend_enabled = False
-        
-        # NEW: Call the helper method to prepare inputs
+        # 2. INPUT PREPARATION (Low-Res)
         prepared_inputs = self._prepare_video_inputs(
             input_video_path=input_video_path,
             base_video_name=base_video_name,
@@ -1275,441 +1459,179 @@ class InpaintingGUI(ThemedTk):
         )
 
         if prepared_inputs is None:
-            return False # Preparation failed, so stop processing this video
-
+            return False, None # Preparation failed
+        
+        # Unpack, ensuring all torch.Tensor return values are not None
         (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
         num_frames_original, padded_H, padded_W, video_stream_info, fps,
         frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
 
-        # The loop will now iterate over the actual number of original frames.
+        # 3. INPAINTING CHUNKS (The main loop)
+        # This part of the loop remains the same, but the logic inside is simplified
         total_frames_to_process_actual = num_frames_original        
         stride = max(1, frames_chunk - overlap)
-        results = [] # Stores chunks to be concatenated in final video
-        previous_chunk_output_frames = None
+        results = [] 
+        previous_chunk_output_frames: Optional[torch.Tensor] = None
 
-        # Loop over the *padded* number of frames
-        stride = max(1, frames_chunk - overlap)
-        results = [] # Stores chunks to be concatenated in final video
-        previous_chunk_output_frames = None
-
-        # Loop over the actual original frames (after process_length limit)
         for i in range(0, total_frames_to_process_actual, stride):
             if stop_event and stop_event.is_set():
                 logger.info(f"Stopping processing of {input_video_path}")
-                return False
+                return False, None
             
-            # Determine the end index for slicing actual original frames
+            # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
             end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
-            
-            # Slice the actual frames that exist in the video
             original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
             mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
-            
-            # Calculate how many actual frames were sliced
             actual_sliced_length = original_input_frames_slice.shape[0]
 
-            # Dynamically add temporal padding if the current slice is shorter than frames_chunk
             padding_needed_for_pipeline_input = 0
             if actual_sliced_length <= 4:
-                # Target a minimum length (e.g., 6) if the remaining chunk is very small
                 target_length = 6
                 padding_needed_for_pipeline_input = target_length - actual_sliced_length
                 logger.debug(f"End-of-video optimization: Short chunk of {actual_sliced_length} frames padded to minimum {target_length}.")
+            
             if padding_needed_for_pipeline_input > 0:
                 logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
-                
-                # Get the *very last* frame of the original video for repetition
                 last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
                 last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
-
                 repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                 repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
-
                 input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
                 mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
             else:
-                # This chunk is a full frames_chunk length, no padding needed for its input
                 input_frames_to_pipeline = original_input_frames_slice
                 mask_frames_i = mask_frames_slice
+            # --- END CHUNK SLICING AND PADDING LOGIC ---
 
-            # Input-level blending for overlapping frames (keep this logic as is)
+            # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
             if previous_chunk_output_frames is not None and overlap > 0:
-                # `previous_chunk_output_frames` will always be `frames_chunk` long (from pipeline output)
-                # `input_frames_to_pipeline` will also be `frames_chunk` long (due to dynamic padding if needed)
+                # ... (Input-level blending logic) ...
                 overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
-                
                 if overlap_actual > 0:
                     prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
-                    
                     if original_input_blend_strength > 0:
                         orig_input_overlap_frames = input_frames_to_pipeline[:overlap_actual]
                         original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
-                        
-                        blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + \
-                                                        original_weights_scaled * orig_input_overlap_frames
-                        
+                        blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + original_weights_scaled * orig_input_overlap_frames
                         input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
-                        del orig_input_overlap_frames
-                        del original_weights_scaled
-                        del blended_input_overlap_frames
+                        del orig_input_overlap_frames, original_weights_scaled, blended_input_overlap_frames
                     else:
                         input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
-                    
                     del prev_gen_overlap_frames
-            
-            if tile_num > 1:
-                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Padded input size {input_frames_to_pipeline.shape[2]}x{input_frames_to_pipeline.shape[3]}, Temporal length: {input_frames_to_pipeline.shape[0]})...")
-            else:
-                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
-            
+            # --- END INPUT-LEVEL BLENDING ---
+
+            # --- INFERENCE ---
+            logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
             start_time = time.time()
 
             with torch.no_grad():
                 video_latents = spatial_tiled_process(
-                    cond_frames=input_frames_to_pipeline, # Changed 'frames' to 'cond_frames'
-                    mask_frames=mask_frames_i,
-                    process_func=pipeline,             # Changed 'pipeline' to 'process_func'
-                    tile_num=tile_num,
-                    spatial_n_compress=8,
-                    min_guidance_scale=1.01,
-                    max_guidance_scale=1.01,
-                    decode_chunk_size=2,
-                    fps=7,
-                    motion_bucket_id=127,
-                    noise_aug_strength=0.0,
-                    num_inference_steps=num_inference_steps,
+                    # ... (spatial_tiled_process arguments) ...
+                    cond_frames=input_frames_to_pipeline, mask_frames=mask_frames_i, process_func=pipeline, tile_num=tile_num,
+                    spatial_n_compress=8, min_guidance_scale=1.01, max_guidance_scale=1.01, decode_chunk_size=2,
+                    fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=num_inference_steps,
                 )
                 video_latents = video_latents.unsqueeze(0)
-
                 pipeline.vae.to(dtype=torch.float16)
-                decoded_frames = pipeline.decode_latents(
-                    video_latents,
-                    num_frames=video_latents.shape[1],
-                    decode_chunk_size=2,
-                )
+                decoded_frames = pipeline.decode_latents(video_latents, num_frames=video_latents.shape[1], decode_chunk_size=2)
 
-            end_time = time.time()
-            inference_duration = end_time - start_time
+            # --- DECODING & CHUNK COLLECT ---
+            inference_duration = time.time() - start_time
             logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
             
             video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
-            current_chunk_generated_frames = []
-            for j in range(len(video_frames)):
-                img = video_frames[j]
-                current_chunk_generated_frames.append(torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0)
+            current_chunk_generated = torch.stack([
+                torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0 for img in video_frames
+            ])
 
-            current_chunk_generated = torch.stack(current_chunk_generated_frames) # This will be `frames_chunk` long
-
-            # Append only the "new" frames of the actual video content
+            # Append only the "new" frames
             if i == 0:
-                # For the first chunk, append all `actual_sliced_length` frames.
                 results.append(current_chunk_generated[:actual_sliced_length])
             else:
-                # For subsequent chunks, append frames from `overlap` up to `actual_sliced_length`.
-                # This correctly excludes the overlapping portion and any padding.
                 results.append(current_chunk_generated[overlap:actual_sliced_length])
             
-            previous_chunk_output_frames = current_chunk_generated # Keep full generated chunk for next blend
-            
-            previous_chunk_output_frames = current_chunk_generated 
+            previous_chunk_output_frames = current_chunk_generated
+        # --- END INPAINTING CHUNKS ---
 
-            # The loop condition `end_idx == num_frames` is good for breaking.
-
-        # --- START CRITICAL FIXES FOR NAMEERROR AND ROBUSTNESS ---
-
-        # Check if any frames were successfully generated and collected in `results`.
+        # 4. PREPARE FRAMES FOR FINALIZATION (Temporal/Spatial Cropping)
         if not results:
-            logger.warning(f"No frames were successfully generated for {input_video_path} after inference. Skipping video output.")
+            logger.warning(f"No frames generated for {input_video_path}.")
             if update_info_callback:
-                update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength)
-            return False
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength))
+            return False, None
 
         frames_output = torch.cat(results, dim=0).cpu()
+        if frames_output.numel() == 0 or frames_output.shape[2] < padded_H or frames_output.shape[3] < padded_W:
+            logger.error(f"Generated frames_output has invalid dimensions (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}).")
+            return False, None
 
-        # Initialize frames_output_final defensively.
-        frames_output_final: Optional[torch.Tensor] = None
-
-        # Check for valid dimensions before cropping
-        # frames_output.shape[0] will be the number of frames from `torch.cat(results)`
-        if frames_output.numel() > 0 and frames_output.shape[2] >= padded_H and frames_output.shape[3] >= padded_W: # Use padded_H/W for spatial crop checks
-            frames_output_spatially_cropped = frames_output[:, :, :padded_H, :padded_W] # NEW temp var
-            # NEW: Temporally crop the output back to the original video length
-            frames_output_final = frames_output_spatially_cropped[:num_frames_original]
-            logger.debug(f"Temporally cropped generated frames from {frames_output_spatially_cropped.shape[0]} to {frames_output_final.shape[0]} (original length).")
-        else:
-            logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}) for {input_video_path}. Skipping video output.")
-            # ... (error handling) ...
-            return False
+        frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
         
-        # --- START: HI-RES BLENDING (If Enabled) ---
-        if is_hires_blend_enabled:
-            logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
-            
-            # 1. Upscale Low-Res Inpainted Output
-            frames_output_final_hires = F.interpolate(
-                frames_output_final, 
-                size=(hires_H, hires_W), 
-                mode='bicubic', # Use simple bicubic upscaling for speed
-                align_corners=False
-            ).to(frames_output_final.device)
+        # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
+        final_output_frames_for_encoding = self._finalize_output_frames(
+            inpainted_frames=frames_output_final,
+            mask_frames=frames_mask_processed_unpadded_original_length,
+            original_warped_frames=frames_warpped_original_unpadded_normalized,
+            original_left_frames=frames_left_original_cropped,
+            hires_data=hires_data,
+            base_video_name=base_video_name,
+            is_dual_input=is_dual_input,
+        )
 
-            # 2. Upscale Low-Res Mask (Bilinear for smoother blend)
-            frames_mask_processed_unpadded_original_length_hires = F.interpolate(
-                frames_mask_processed_unpadded_original_length, 
-                size=(hires_H, hires_W), 
-                mode='bilinear', 
-                align_corners=False
-            ).to(frames_output_final.device)
-            
-            # 3. Load High-Res Original/Warped Frames (Chunk by Chunk for RAM efficiency)
-            hires_frames_to_blend = []
-            
-            # Load the high-res video using Decord with a specific chunking strategy
-            # Note: For simplicity and to avoid a complex chunk-loading loop, we will use Decord's frame index array
-            # which is still memory intensive but less complex than writing a chunked loader here.
-            # A truly memory-safe version would require re-writing the main loop to iterate over *HR* frames.
-
-            # For now, we will load the entire HR video chunk for the final blend, but only once.
-            # This is a RAM risk, but necessary for a simple implementation.
-            
-            # Use the simple read_video_frames (which uses decord)
-            hires_full_frames_torch, _, _ = read_video_frames(hires_video_path) 
-            
-            # Temporally crop the HR video to the same length as the LR output
-            hires_full_frames_torch = hires_full_frames_torch[:num_frames_original]
-            
-            if is_dual_input:
-                # Dual Splat (Mask | Warped). We need the Warped (Right half)
-                half_w_hires = hires_full_frames_torch.shape[3] // 2
-                hires_warped_for_blend = hires_full_frames_torch[:, :, :, half_w_hires:] / 255.0 # Normalize
-                hires_left_for_concat = None
-            else:
-                # Quad Splat (Left | Mask | Warped | Top-Left). We need Left (Top-Left) and Warped (Bottom-Right)
-                half_h_hires = hires_full_frames_torch.shape[2] // 2
-                half_w_hires = hires_full_frames_torch.shape[3] // 2
-                
-                # Top-Left is the Left View for concat
-                hires_left_for_concat = hires_full_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
-                # Bottom-Right is the Warped View for blending
-                hires_warped_for_blend = hires_full_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
-            
-            # 4. Overwrite Low-Res Variables with Hi-Res Upscaled/Loaded Variables
-            frames_output_final = frames_output_final_hires
-            frames_mask_processed_unpadded_original_length = frames_mask_processed_unpadded_original_length_hires
-            
-            # Overwrite the original low-res warped for the blend function (used by _apply_post_inpainting_blend)
-            frames_warpped_original_unpadded_normalized = hires_warped_for_blend.to(frames_output_final.device)
-            
-            # Overwrite the original low-res left for the final concat
-            frames_left_original_cropped = hires_left_for_concat.to(frames_output_final.device) if hires_left_for_concat is not None else None
-            
-            # Update output resolution display
-            if update_info_callback:
-                display_frames_info = str(num_frames_original)
-                self.after(0, lambda: update_info_callback(base_video_name, f"{hires_W}x{hires_H} (HR Blend)", display_frames_info, overlap, original_input_blend_strength))
-
-            logger.info("Hi-Res Upscaling and Data Overwrite complete.")
-            
-        # --- END: HI-RES BLENDING (If Enabled) ---
-
-        # --- Apply Color Transfer (if enabled) ---
-        if self.enable_color_transfer.get():
-            reference_frames_for_transfer: Optional[torch.Tensor] = None
-
-            if is_dual_input:
-                # DUAL Input: Create an occlusion-free reference from the warped frames (bottom-right)
-                logger.debug("Dual input detected. Creating occlusion-free reference via directional dilation for color transfer...")
-                
-                # 1. Use warped frames (bottom-right) as the base
-                warped_frames_base = frames_warpped_original_unpadded_normalized.cpu() 
-                # 2. Use the processed mask for the holes
-                processed_mask = frames_mask_processed_unpadded_original_length.cpu() 
-                
-                # 3. Apply directional dilation to fill the holes
-                reference_frames_for_transfer = self._apply_directional_dilation(
-                    frame_chunk=warped_frames_base, 
-                    mask_chunk=processed_mask
-                ).to(frames_output_final.device) # Move back to CUDA if needed later, but transfer is on CPU
-                
-                logger.debug("Occlusion-free reference created.")
-
-                # --- NEW DEBUG SAVE LOGIC ---
-                if self.debug_mode_var.get():
-                    debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_color_ref")
-                    os.makedirs(debug_output_dir, exist_ok=True)
-                    video_basename_for_debug = os.path.splitext(base_video_name)[0] 
-                    
-                    # Save the first 5 frames of the generated reference
-                    for t in range(min(5, reference_frames_for_transfer.shape[0])):
-                        # Tensor [C, H, W] float [0, 1] -> Numpy [H, W, C] uint8
-                        ref_img = (reference_frames_for_transfer[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                        # Convert RGB to BGR for OpenCV imwrite
-                        cv2.imwrite(
-                            os.path.join(debug_output_dir, f"{video_basename_for_debug}_frame_{t:04d}_color_ref_dilated.png"), 
-                            cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR)
-                        )
-                    logger.debug(f"Saved debug color reference frames to {debug_output_dir}")
-                # --- END NEW DEBUG SAVE LOGIC ---
-                
-            else: # QUAD Input: Use the original left view (top-left) as reference
-                reference_frames_for_transfer = frames_left_original_cropped
-                
-            # --- Perform the Color Transfer ---
-            if reference_frames_for_transfer is None or reference_frames_for_transfer.numel() == 0:
-                logger.warning("Color transfer skipped: No valid reference frames available.")
-            else:
-                logger.debug("Applying color transfer from reference view to inpainted right view...")
-                target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
-                
-                adjusted_frames_output = []
-                for t in range(frames_output_final.shape[0]):
-                    # Resize the reference frame to match the size of the inpainted output
-                    ref_frame_resized = F.interpolate(
-                        reference_frames_for_transfer[t].unsqueeze(0),
-                        size=(target_H, target_W),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0).cpu() # Ensure source is on CPU for the _apply_color_transfer method
-                    
-                    target_frame_cpu = frames_output_final[t].cpu()
-
-                    adjusted_frame = self._apply_color_transfer(ref_frame_resized, target_frame_cpu)
-                    adjusted_frames_output.append(adjusted_frame.to(frames_output_final.device)) # Move back to original device
-                
-                frames_output_final = torch.stack(adjusted_frames_output)
-                logger.debug("Color transfer complete.")
-
-        # --- Apply Post-Inpainting Blending (if enabled) ---
-        if self.enable_post_inpainting_blend.get():
-            logger.debug("Applying post-inpainting blend...")
-            # frames_output_final is the inpainted result (potentially color-transferred)
-            # frames_warpped_original_unpadded_normalized is the original input bottom-right quadrant
-            # frames_mask_processed_unpadded_original_length is the processed mask
-            
-            # Ensure spatial dimensions match before calling blend
-            target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
-            
-            # Resample original_warped and mask to match the (potentially resized) inpainted output dimensions
-            # This is crucial if resize for divisibility was applied to the pipeline input but not the stored original.
-            # However, in the updated `_prepare_video_inputs`, `frames_warpped_original_unpadded_normalized` 
-            # and `frames_mask_processed_unpadded_original_length` should already match the H, W
-            # of `frames_output_final` (which is `padded_H` and `padded_W` before cropping,
-            # then cropped back to `num_frames_original`).
-            # Let's double check this. `frames_output_final` is `frames_output_spatially_cropped[:num_frames_original]`.
-            # `frames_output_spatially_cropped` comes from `frames_output[:, :, :padded_H, :padded_W]`.
-            # And `frames_warpped_original_unpadded_normalized` is from `frames_warpped[:num_frames_original].clone()`.
-            # So `frames_output_final` and `frames_warpped_original_unpadded_normalized` will have the same H, W
-            # IF no intermediate resizing occurred AFTER `_prepare_video_inputs`.
-            # The only thing that would differ is `_prepare_video_inputs` might have resized the raw input
-            # to be divisible by 8. This ensures `frames_output_final` has those new H, W.
-            # So, the original stored `frames_warpped_original_unpadded_normalized` should match the H, W.
-
-            frames_output_final = self._apply_post_inpainting_blend(
-                inpainted_frames=frames_output_final,
-                original_warped_frames=frames_warpped_original_unpadded_normalized,
-                mask=frames_mask_processed_unpadded_original_length,
-                base_video_name=base_video_name # NEW: Pass base_video_name here
-            )
-            logger.debug("Post-inpainting blend complete.")
-            # --- END NEW ---
-
-        # Initialize final_output_frames_for_encoding defensively
-        final_output_frames_for_encoding: Optional[torch.Tensor] = None
-
-        if is_dual_input:
-            final_output_frames_for_encoding = frames_output_final # (T, C, H, W) float 0-1
-        else:
-            # Ensure frames_left_original is valid for SBS concatenation
-            if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0: # CHANGED variable name
-                logger.error(f"Original left frames are missing or empty for non-dual input {input_video_path}. Cannot create SBS output. Skipping video output.")
-                if update_info_callback:
-                    update_info_callback(base_video_name, "N/A", "0 (SBS Error)", overlap, original_input_blend_strength)
-                return False
-                    
-            # Ensure dimensions match for concatenation (time, channel, height should match)
-            if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
-            frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
-            frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
-                logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {input_video_path}. Skipping video output.")
-                if update_info_callback:
-                    update_info_callback(base_video_name, "N/A", "0 (Dim Mismatch)", overlap, original_input_blend_strength)
-                return False
-
-            sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
-            final_output_frames_for_encoding = sbs_frames
-
-        # Final check: ensure the tensor to be encoded is actually populated
         if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
-            logger.error(f"Final output frames for encoding are empty or None after preparation for {input_video_path}. Skipping video output.")
+            logger.error(f"Final output frames are empty after finalization for {base_video_name}.")
             if update_info_callback:
-                update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength)
-            return False
-
-        # --- NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding using Helper ---
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength))
+            return False, None
+            
+        # 6. ENCODING
         temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
         os.makedirs(temp_png_dir, exist_ok=True)
         logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
 
         total_output_frames = final_output_frames_for_encoding.shape[0]
+        stop_event_non_optional = stop_event if stop_event is not None else threading.Event()
         
-        # 1. Save PNG Sequence
         try:
+            # 6a. Save PNG Sequence
             for frame_idx in range(total_output_frames):
-                if stop_event and stop_event.is_set():
+                if stop_event_non_optional.is_set():
                     logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
-                    # Cleanup must happen outside the loop
                     shutil.rmtree(temp_png_dir, ignore_errors=True)
-                    return False
+                    return False, None
 
-                frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
-                frame_np = frame_tensor.permute(1, 2, 0).numpy() # (H, W, C) float 0-1
-
-                # Convert to 16-bit
+                frame_tensor = final_output_frames_for_encoding[frame_idx] 
+                frame_np = frame_tensor.permute(1, 2, 0).numpy()
                 frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
-                
-                # Convert to BGR for OpenCV (OpenCV uses BGR by default for imwrite)
                 frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
-
                 png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
                 cv2.imwrite(png_path, frame_bgr)
                 draw_progress_bar(frame_idx + 1, total_output_frames)
             logger.debug(f"\nFinished saving {total_output_frames} PNG frames.")
             
-        except Exception as e:
-            logger.error(f"Error saving intermediate PNGs for {base_video_name}: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Error saving intermediate PNGs for {base_video_name}: {str(e)}")
-            shutil.rmtree(temp_png_dir, ignore_errors=True)
-            return False
+            # 6b. Encode to MP4
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, f"Encoding video...", total_output_frames, overlap, original_input_blend_strength))
             
-        # 2. Encode to MP4 using the helper function
-        # Update GUI status for encoding phase
-        if update_info_callback:
-            self.after(0, lambda: update_info_callback(base_video_name, f"Encoding video...", total_output_frames, overlap, original_input_blend_strength))
-        
-        if stop_event is None:
-            # Fallback for unexpected case where it is None, though InpaintingGUI always provides one
-            stop_event = threading.Event() 
+            encoding_success = encode_frames_to_mp4(
+                temp_png_dir=temp_png_dir, final_output_mp4_path=output_video_path, fps=fps,
+                total_output_frames=total_output_frames, video_stream_info=video_stream_info,
+                stop_event=stop_event_non_optional, sidecar_json_data=None, user_output_crf=output_crf,
+                output_sidecar_ext=".spsidecar",
+            )
+            
+            if not encoding_success:
+                logger.info(f"Encoding stopped or failed for {input_video_path}.")
+                return False, None
 
-        encoding_success = encode_frames_to_mp4(
-            temp_png_dir=temp_png_dir,
-            final_output_mp4_path=output_video_path,
-            fps=fps,
-            total_output_frames=total_output_frames,
-            video_stream_info=video_stream_info,
-            stop_event=stop_event,
-            sidecar_json_data=None, # Not needed here, as the input sidecar is only for reading settings
-            user_output_crf=output_crf,
-            output_sidecar_ext=".spsidecar", # Use the correct sidecar extension
-        )
-
-        if not encoding_success:
-            logger.info(f"Encoding stopped or failed for {input_video_path}.")
-            # Note: encode_frames_to_mp4 handles its own PNG cleanup
-            return False
-        # --- END NEW HELPER CALL ---
+        except Exception as e:
+            logger.error(f"Error during PNG saving or Encoding for {base_video_name}: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Error during PNG saving or Encoding for {base_video_name}: {str(e)}")
+            shutil.rmtree(temp_png_dir, ignore_errors=True)
+            return False, None
 
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
-        return True
+        return True, hires_video_path
 
     def processing_done(self, stopped=False):
         if self.pipeline:
@@ -1760,38 +1682,46 @@ class InpaintingGUI(ThemedTk):
         logger.info("GUI settings reset to defaults.")
 
     def restore_finished_files(self):
-        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folder back to the input directory?"):
+        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folders back to their respective input directories?"):
             return
 
         input_folder = self.input_folder_var.get()
-        finished_folder = os.path.join(input_folder, "finished")
+        hires_input_folder = self.hires_blend_folder_var.get()
 
-        if not os.path.isdir(finished_folder):
-            messagebox.showinfo("Restore Info", f"The 'finished' folder does not exist at '{finished_folder}'. No files to restore.")
-            logger.info(f"Restore finished: 'finished' folder not found at {finished_folder}")
-            return
+        restore_dirs = [
+            (input_folder, os.path.join(input_folder, "finished"))
+        ]
+        
+        # Only check the hires folder if it's different from the low-res folder
+        if os.path.normpath(input_folder) != os.path.normpath(hires_input_folder):
+            restore_dirs.append((hires_input_folder, os.path.join(hires_input_folder, "finished")))
+
 
         restored_count = 0
         errors_count = 0
         
-        # Collect files to move first, to avoid issues if the directory changes during iteration
-        files_to_move = [f for f in os.listdir(finished_folder) if os.path.isfile(os.path.join(finished_folder, f))]
+        for input_dir, finished_dir in restore_dirs:
+            if not os.path.isdir(finished_dir):
+                logger.info(f"Restore skipped: 'finished' folder not found at {finished_dir}")
+                continue
 
-        if not files_to_move:
-            messagebox.showinfo("Restore Info", "No files found in the 'finished' folder to restore.")
-            logger.info(f"Restore finished: No files found in {finished_folder}")
-            return
+            # Collect files to move first
+            files_to_move = [f for f in os.listdir(finished_dir) if os.path.isfile(os.path.join(finished_dir, f))]
 
-        for filename in files_to_move:
-            src_path = os.path.join(finished_folder, filename)
-            dest_path = os.path.join(input_folder, filename)
-            try:
-                shutil.move(src_path, dest_path)
-                restored_count += 1
-                logger.info(f"Moved '{filename}' from '{finished_folder}' to '{input_folder}'")
-            except Exception as e:
-                errors_count += 1
-                logger.error(f"Error moving file '{filename}' during restore: {e}")
+            if not files_to_move:
+                logger.info(f"Restore skipped: No files found in {finished_dir}")
+                continue
+
+            for filename in files_to_move:
+                src_path = os.path.join(finished_dir, filename)
+                dest_path = os.path.join(input_dir, filename)
+                try:
+                    shutil.move(src_path, dest_path)
+                    restored_count += 1
+                    logger.info(f"Moved '{filename}' from '{finished_dir}' back to '{input_dir}'")
+                except Exception as e:
+                    errors_count += 1
+                    logger.error(f"Error moving file '{filename}' during restore: {e}")
 
         if restored_count > 0 or errors_count > 0:
             messagebox.showinfo("Restore Complete", f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.")
@@ -1830,8 +1760,8 @@ class InpaintingGUI(ThemedTk):
                 return
 
             self.total_videos.set(len(input_videos))
-            finished_folder = os.path.join(input_folder, "finished")
-            os.makedirs(finished_folder, exist_ok=True)
+            # finished_folder = os.path.join(input_folder, "finished")
+            # os.makedirs(finished_folder, exist_ok=True)
             os.makedirs(output_folder, exist_ok=True)
 
             # Define a thread-safe wrapper for GUI updates
@@ -1900,28 +1830,50 @@ class InpaintingGUI(ThemedTk):
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
 
                 logger.info(f"Starting processing of {video_path}")
-                completed = self.process_single_video(
+                completed, hi_res_input_path = self.process_single_video(
                     pipeline=self.pipeline,
                     input_video_path=video_path,
                     save_dir=output_folder,
                     frames_chunk=frames_chunk,
-                    overlap=current_overlap, # Pass the (potentially overridden) overlap
+                    overlap=current_overlap,
                     tile_num=tile_num,
-                    vf=None, # Keep as None, not actively used with new FFmpeg logic
+                    vf=None, 
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
-                    update_info_callback=_threaded_update_info_callback, # Pass the wrapped callback
+                    update_info_callback=_threaded_update_info_callback, 
                     original_input_blend_strength=current_original_input_blend_strength,
                     output_crf=current_output_crf,
                     process_length=current_process_length
                 )
                 
                 if completed:
+                    # Define finished folder paths dynamically
+                    low_res_input_folder = input_folder
+                    hires_input_folder = self.hires_blend_folder_var.get()
+
+                    low_res_finished_folder = os.path.join(low_res_input_folder, "finished")
+                    
+                    # 1. Move LOW-RES input file
                     try:
-                        shutil.move(video_path, finished_folder)
-                        logger.debug(f"Moved {video_path} to {finished_folder}")
+                        os.makedirs(low_res_finished_folder, exist_ok=True) # Ensure low-res finished exists
+                        shutil.move(video_path, low_res_finished_folder)
+                        logger.debug(f"Moved {video_path} to {low_res_finished_folder}")
                     except Exception as e:
-                        logger.error(f"Failed to move {video_path} to {finished_folder}: {e}")
+                        logger.error(f"Failed to move {video_path} to {low_res_finished_folder}: {e}")
+                        
+                    # 2. Move HI-RES input file if it was used
+                    if hi_res_input_path:
+                        # Ensure the high-res folder is different before trying to move
+                        if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
+                            hires_finished_folder = os.path.join(hires_input_folder, "finished")
+                            try:
+                                os.makedirs(hires_finished_folder, exist_ok=True) # Ensure hi-res finished exists
+                                shutil.move(hi_res_input_path, hires_finished_folder)
+                                logger.debug(f"Moved Hi-Res input {hi_res_input_path} to {hires_finished_folder}")
+                            except Exception as e:
+                                logger.error(f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}")
+                        else:
+                            logger.warning(f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder.")
                 else:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
                 
