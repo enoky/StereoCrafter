@@ -127,7 +127,7 @@ class SplatterGUI(ThemedTk):
         self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"]))
         
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
-        self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", True)) 
+        self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", False)) 
         self.enable_full_res_var = tk.BooleanVar(value=self.app_config.get("enable_full_resolution", True))
         self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", True))
         self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1024"))
