@@ -11,7 +11,7 @@
   "process_length": "Number of frames to process for each video. Enter -1 to process all frames, or a positive integer to limit the processing to the first N frames. Useful for quick testing.",
   "latent_blend_strength": "Strength of latent-space crossfade applied on the first overlap frames. Smoothly blends denoised latents from the previous chunk with the current chunk to reduce seams. Range: 0.0–1.0. Default:0.8",	
 	"enable_post_inpainting_blend": "Toggle the final post-inpainting blending step and enable/disable its parameters.",
-	"enable_color_transfer": "If enabled, the color palette and statistics of the inpainted output will be adjusted to match the original left eye view, improving visual consistency. Only applicable for quad-splatted inputs.",
+	"enable_color_transfer": "If enabled, the color palette and statistics of the inpainted output will be adjusted to match the original left eye view, improving visual consistency. Now also works in dual-splatted inputs.",
 	"mask_initial_threshold": "Sets a mid value to turn a grayscale image into black and white, separating light and dark areas. (0 to 1). Set to 0 to disable.",
 	"mask_morph_kernel_size": "Kernel size for morphological closing: Defines the size of the shape used to fill small holes and smooth edges in an image during the closing process (e.g., 3, 5). Set to 0 to disable.",
 	"mask_dilate_kernel_size": "Sets the size of the shape used to expand white areas in a mask, making objects larger and filling small gaps during dilation  (e.g., 7, 15). Set to 0 to disable.",

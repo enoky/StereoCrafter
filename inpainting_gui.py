@@ -19,14 +19,14 @@ import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
 
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25.10.05"
+GUI_VERSION = "25.10.06"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -57,6 +57,7 @@ class InpaintingGUI(ThemedTk):
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
+        self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", "./output_splatted_hires"))
         
         # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
@@ -145,6 +146,110 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
             return target_frame
+    
+    def _apply_directional_dilation(self, frame_chunk: torch.Tensor, mask_chunk: torch.Tensor) -> torch.Tensor:
+        """
+        Fills occluded areas in a warped frame chunk (float [0,1], [T, C, H, W]) 
+        by dilating/growing valid pixels from the right (background side) using OpenCV.
+        The result is a frame chunk with clean color statistics for transfer.
+        
+        Args:
+            frame_chunk: The warped frames with black occlusion holes.
+            mask_chunk: The mask (float [0,1], [T, 1, H, W]) indicating occluded areas.
+            
+        Returns:
+            The occlusion-filled frame chunk.
+        """
+        try:
+            # We want to fill the black holes in the frame_chunk (warped image)
+            # using the mask_chunk (processed mask).
+
+            if frame_chunk.shape[0] != mask_chunk.shape[0]:
+                logger.error("Frame and mask chunks must have the same temporal dimension.")
+                return frame_chunk
+                
+            # Define the directional kernel for right-to-left growth
+            # A (1, 5) or (1, 7) kernel biases the fill horizontally from the right
+            # We use a non-symmetric kernel that is wider on the right side of the center.
+            # Example: [0, 0, 1, 1, 1, 1, 1] means 2 pixels left, 4 pixels right (or similar)
+            # For pure right-to-left growth, a simple horizontal line kernel is sufficient for dilation
+            kernel_width = 7 # Adjust as needed (e.g., 5, 7, 9)
+            kernel = np.zeros((1, kernel_width), dtype=np.uint8)
+            # Set the pixel on the right-most side (or center) to 1 to promote growth from that direction
+            kernel[0, kernel_width - 1] = 1 # Simple 1xN kernel, just for basic right-to-left bias
+
+            # Use a slightly more complex kernel for stronger right bias.
+            # Example: a 1x7 kernel where the right side has a higher influence
+            # kernel = np.array([[0, 0, 0, 0, 1, 1, 1]], dtype=np.uint8) 
+            # Dilation with a horizontal kernel:
+            # We will use the simplest, most effective one: a 1xN horizontal kernel on the valid (non-masked) pixels.
+            
+            # Convert tensors to numpy, scale to 0-255, and convert to BGR (OpenCV)
+            # Since the tensor is already float 0-1, we need to get the RGB image and the mask.
+            
+            filled_frames_list = []
+            device = frame_chunk.device
+            
+            for t in range(frame_chunk.shape[0]):
+                frame_np = (frame_chunk[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) # [H, W, C] RGB
+                mask_np = (mask_chunk[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8) # [H, W] grayscale mask
+                
+                # Invert the mask: The mask defines the hole (1) but we want to dilate the *source* (0)
+                # No, wait, we want to fill the hole. We need to create a kernel/operation that expands the
+                # non-zero (valid) areas into the zero (black) areas.
+                
+                # Method: Simple Image Dilation on the entire image
+                # Dilation will grow bright pixels into dark ones.
+                # Since the "hole" is black (0) and the "valid area" is colored (>0),
+                # dilating the *image* will fill the black hole with surrounding color.
+                
+                # The kernel is now a simple horizontal line (e.g., 1x7)
+                dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+
+                # Apply dilation to the BGR frame (OpenCV uses BGR by default)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                
+                # Apply dilation on the entire image. This will expand the texture from the right/left/etc.
+                # but with a strong horizontal bias from the 1xN kernel.
+                dilated_frame_bgr = cv2.dilate(frame_bgr, dilation_kernel, iterations=5) # 5 iterations for more fill depth
+
+                # The key is to only replace the masked (black) areas with the dilated result.
+                
+                # 1. Prepare mask for blending: HWC, 3 channels, float [0,1]
+                mask_float = mask_np.astype(np.float32) / 255.0
+                mask_3ch = np.stack([mask_float] * 3, axis=2) # [H, W, 3]
+                
+                # 2. Convert back to RGB
+                dilated_frame_rgb = cv2.cvtColor(dilated_frame_bgr, cv2.COLOR_BGR2RGB)
+                
+                # 3. Blend: (Original Frame * (1 - Mask)) + (Dilated Frame * Mask)
+                # This keeps the original valid pixels and only uses the dilated content for the hole.
+                
+                # Both np arrays are HWC, uint8
+                original_frame_np = frame_np 
+                dilated_frame_np = dilated_frame_rgb 
+                
+                # Use a slightly softer mask for blending by applying a small blur to the mask
+                mask_for_blend = cv2.GaussianBlur(mask_float, (21, 21), 0) # Apply blur to the 1-channel mask
+                mask_3ch_blend = np.stack([mask_for_blend] * 3, axis=2) # [H, W, 3]
+
+                # Blend (still in uint8 or convert to float 0-1)
+                # It's cleaner to convert to float 0-1 for blending
+                original_frame_float = original_frame_np.astype(np.float32) / 255.0
+                dilated_frame_float = dilated_frame_np.astype(np.float32) / 255.0
+                
+                blended_float = (original_frame_float * (1 - mask_3ch_blend)) + (dilated_frame_float * mask_3ch_blend)
+                
+                # Convert back to tensor [C, H, W] float [0, 1]
+                blended_tensor = torch.from_numpy(blended_float).permute(2, 0, 1).float().to(device)
+                filled_frames_list.append(blended_tensor)
+
+            logger.debug(f"Applied directional dilation with {kernel_width}x1 kernel for color reference.")
+            return torch.stack(filled_frames_list)
+            
+        except Exception as e:
+            logger.error(f"Error during directional dilation for color transfer reference: {e}. Returning original frames.", exc_info=True)
+            return frame_chunk
     
     def _apply_gaussian_blur(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
         """
@@ -404,6 +509,21 @@ class InpaintingGUI(ThemedTk):
             # Update the stored width for next time save_config is called.
             self.window_width = current_actual_width
 
+    def _browse_hires_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.hires_blend_folder_var.get())
+        if folder:
+            self.hires_blend_folder_var.set(folder)
+
+    def _browse_input(self):
+        folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
+        if folder:
+            self.input_folder_var.set(folder)
+
+    def _browse_output(self):
+        folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
+        if folder:
+            self.output_folder_var.set(folder)
+
     def _create_1d_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
         """
         Creates a 1D Gaussian kernel.
@@ -437,19 +557,129 @@ class InpaintingGUI(ThemedTk):
         set_util_logger_level(level) # Call the function from stereocrafter_util.py
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
     
+    def _find_high_res_match(self, low_res_video_path: str) -> Optional[str]:
+        """
+        Attempts to find a matching high-resolution splatted file in the hi-res folder.
+        Applies safety checks.
+        Returns the full path to the hi-res video or None.
+        """
+        low_res_input_folder = self.input_folder_var.get()
+        hires_blend_folder = self.hires_blend_folder_var.get()
+
+        logger.debug(f"Hires Check: Low-Res Path: {low_res_video_path}")
+        logger.debug(f"Hires Check: Low-Res Folder: {low_res_input_folder}")
+        logger.debug(f"Hires Check: Hi-Res Folder: {hires_blend_folder}")
+
+        # Safety Check 1: Hires folder is the same as the low-res input folder
+        if os.path.normpath(low_res_input_folder) == os.path.normpath(hires_blend_folder):
+            logger.warning("Hi-Res Blend Folder is the same as Input Folder. Disabling Hi-Res blending.")
+            return None
+        
+        # 1. Extract Base Name and Splatting Suffix
+        low_res_filename = os.path.basename(low_res_video_path)
+        low_res_name_without_ext = os.path.splitext(low_res_filename)[0]
+        
+        splatted_suffix = None
+        if low_res_name_without_ext.endswith('_splatted2'):
+            splatted_suffix = '_splatted2.mp4'
+            splatted_core = '_splatted2'
+        elif low_res_name_without_ext.endswith('_splatted4'):
+            splatted_suffix = '_splatted4.mp4'
+            splatted_core = '_splatted4'
+        else:
+            logger.warning(f"Could not parse splatting suffix from {low_res_filename}. Skipping Hi-Res match.")
+            return None
+        
+        # --- NEW ULTRA-SIMPLIFIED NAME STRIPPING ---
+        # The key is to strip the resolution number AND the splatting suffix.
+        
+        # Find the index of the splatted core (e.g., '_splatted2')
+        splat_index = low_res_name_without_ext.rfind(splatted_core)
+        if splat_index == -1:
+             logger.warning(f"Failed to find splatted core in {low_res_name_without_ext}. Skipping Hi-Res match.")
+             return None
+
+        # Take everything before the splatted core, e.g., 'FSC-clips_crp_cropped-0006_640'
+        name_core_with_dim = low_res_name_without_ext[:splat_index]
+        
+        # Find the last underscore, which precedes the dimension
+        last_underscore_index = name_core_with_dim.rfind('_')
+        
+        if last_underscore_index == -1:
+            # If no underscore is found (unlikely for your file names)
+            base_pattern_no_dim = name_core_with_dim
+        else:
+            # Take everything up to the last underscore (removes the resolution number)
+            # Result: 'FSC-clips_crp_cropped-0006'
+            base_pattern_no_dim = name_core_with_dim[:last_underscore_index]
+            
+        if not base_pattern_no_dim:
+            logger.warning(f"Failed to find true base name for {low_res_filename} after stripping resolution. Skipping Hi-Res match.")
+            return None
+        # --- END NEW ULTRA-SIMPLIFIED NAME STRIPPING ---
+
+        # 2. Search Hi-Res Folder for Match
+        search_pattern = os.path.join(hires_blend_folder, f"{base_pattern_no_dim}_*{splatted_suffix}")
+        logger.debug(f"Hi-Res Search Pattern: {search_pattern}")
+        matches = glob.glob(search_pattern)
+
+        logger.debug(f"Hi-Res Glob Matches Found: {[os.path.basename(m) for m in matches]}")
+        
+        if not matches:
+            logger.debug(f"No Hi-Res match found for {low_res_filename} in {hires_blend_folder}.")
+            return None
+
+        # Filter out the current low-res video if it somehow ended up in the search list
+        matches = [m for m in matches if os.path.normpath(m) != os.path.normpath(low_res_video_path)]
+
+        if len(matches) > 1:
+            logger.warning(f"Multiple Hi-Res matches found for {low_res_filename}. Using the first match: {os.path.basename(matches[0])}")
+            
+        # 3. Final Path
+        hires_path = matches[0] if matches else None
+        
+        # Safety Check 2: Check resolution equality (requires loading a frame)
+        if hires_path:
+            try:
+                # 1. Get low-res width
+                low_res_reader = VideoReader(low_res_video_path, ctx=cpu(0))
+                low_res_w_raw = low_res_reader.get_batch([0]).shape[2] 
+                del low_res_reader
+                
+                # 2. Get hi-res width
+                hires_reader = VideoReader(hires_path, ctx=cpu(0))
+                hires_w_raw = hires_reader.get_batch([0]).shape[2]
+                del hires_reader
+            except Exception as e:
+                logger.error(f"Failed to read raw video width for resolution check: {e}")
+                return None
+
+            # --- NEW DEBUG LINE HERE ---
+            logger.debug(f"Hires Check: Low-Res Raw Width: {low_res_w_raw} | Hi-Res Raw Width: {hires_w_raw}")
+            # --- END NEW DEBUG LINE HERE ---
+            
+            if hires_w_raw <= low_res_w_raw: # Check if Hi-Res is NOT strictly higher resolution
+                logger.warning(f"Hi-Res candidate {os.path.basename(hires_path)} ({hires_w_raw}px) is not higher resolution than Low-Res ({low_res_w_raw}px). Disabling Hi-Res blending.")
+                return None
+            
+            logger.info(f"Found Hi-Res match: {os.path.basename(hires_path)} ({hires_w_raw}px).")
+            return hires_path
+
+        return None
+    
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
         config = {
             # Folder Configurations
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
+            "hires_blend_folder": self.hires_blend_folder_var.get(),
 
             # GUI State Configurations
             "dark_mode_enabled": self.dark_mode_var.get(),
             "window_width": self.winfo_width(),
             "window_x": self.winfo_x(),
             "window_y": self.winfo_y(),
-            "debug_mode_enabled": self.debug_mode_var.get(),
             
             # Parameter Configurations
             "num_inference_steps": self.num_inference_steps_var.get(),
@@ -719,7 +949,7 @@ class InpaintingGUI(ThemedTk):
         self._configure_logging()
         # Save the current debug mode state to config immediately
         self.save_config() 
-        messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
+        # messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
     
     def _toggle_blend_parameters_state(self):
         """Enables or disables mask processing parameter entry widgets based on the blend toggle."""
@@ -732,16 +962,6 @@ class InpaintingGUI(ThemedTk):
         # This function primarily affects the GUI state.
         logger.debug(f"Blend parameters state set to: {state}")
     
-    def browse_input(self):
-        folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
-        if folder:
-            self.input_folder_var.set(folder)
-
-    def browse_output(self):
-        folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
-        if folder:
-            self.output_folder_var.set(folder)
-
     def create_widgets(self):
         
         self.menubar = tk.Menu(self)
@@ -776,7 +996,15 @@ class InpaintingGUI(ThemedTk):
         input_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self.browse_input).grid(row=current_row, column=2, padx=5)
+        ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=current_row, column=2, padx=5)
+        current_row += 1
+
+        # --- NEW: Hi-Res Blend Folder ---
+        hires_label = ttk.Label(folder_frame, text="Hi-Res Blend Folder:")
+        hires_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(hires_label, "Folder containing matching high-resolution splatted files for final blending.")
+        ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=current_row, column=2, padx=5)
         current_row += 1
         
         # Output Folder
@@ -784,7 +1012,7 @@ class InpaintingGUI(ThemedTk):
         output_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_label, self.help_data.get("output_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self.browse_output).grid(row=current_row, column=2, padx=5)
+        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=current_row, column=2, padx=5)
 
 
         # --- MAIN PARAMETERS FRAME ---
@@ -1005,6 +1233,34 @@ class InpaintingGUI(ThemedTk):
         output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
         output_video_path = os.path.join(save_dir, output_video_filename)
 
+        # --- NEW: Hi-Res Blending Variables ---
+        hires_video_path: Optional[str] = None
+        is_hires_blend_enabled = False
+        hires_H, hires_W = 0, 0
+        
+        # --- Find Hi-Res Match (outside the main loop) ---
+        hires_video_path = self._find_high_res_match(input_video_path)
+        if hires_video_path:
+            is_hires_blend_enabled = True
+            try:
+                # Load first frame of Hi-Res video to get its dimensions
+                temp_reader = VideoReader(hires_video_path, ctx=cpu(0))
+                # Note: Assuming the high-res video is also encoded with the splatting format
+                # The height/width of the *splatted image* (which is the input frame size)
+                full_h_hires, full_w_hires = temp_reader.get_batch([0]).shape[1:3]
+                del temp_reader
+
+                # Split dimensions based on splat type (dual=half-width, quad=quarter-area)
+                if is_dual_input:
+                    hires_H, hires_W = full_h_hires, full_w_hires // 2
+                else:
+                    hires_H, hires_W = full_h_hires // 2, full_w_hires // 2
+                
+                logger.info(f"Hi-Res blending enabled. Target resolution: {hires_W}x{hires_H}")
+            except Exception as e:
+                logger.error(f"Failed to read Hi-Res video dimensions from {hires_video_path}: {e}")
+                is_hires_blend_enabled = False
+        
         # NEW: Call the helper method to prepare inputs
         prepared_inputs = self._prepare_video_inputs(
             input_video_path=input_video_path,
@@ -1053,7 +1309,12 @@ class InpaintingGUI(ThemedTk):
             actual_sliced_length = original_input_frames_slice.shape[0]
 
             # Dynamically add temporal padding if the current slice is shorter than frames_chunk
-            padding_needed_for_pipeline_input = frames_chunk - actual_sliced_length
+            padding_needed_for_pipeline_input = 0
+            if actual_sliced_length <= 4:
+                # Target a minimum length (e.g., 6) if the remaining chunk is very small
+                target_length = 6
+                padding_needed_for_pipeline_input = target_length - actual_sliced_length
+                logger.debug(f"End-of-video optimization: Short chunk of {actual_sliced_length} frames padded to minimum {target_length}.")
             if padding_needed_for_pipeline_input > 0:
                 logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
                 
@@ -1179,28 +1440,141 @@ class InpaintingGUI(ThemedTk):
             logger.error(f"Generated frames_output has invalid dimensions for final cropping (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}) for {input_video_path}. Skipping video output.")
             # ... (error handling) ...
             return False
+        
+        # --- START: HI-RES BLENDING (If Enabled) ---
+        if is_hires_blend_enabled:
+            logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
+            
+            # 1. Upscale Low-Res Inpainted Output
+            frames_output_final_hires = F.interpolate(
+                frames_output_final, 
+                size=(hires_H, hires_W), 
+                mode='bicubic', # Use simple bicubic upscaling for speed
+                align_corners=False
+            ).to(frames_output_final.device)
 
-        # --- Apply Color Transfer (if enabled and applicable) ---
-        # The blend toggle now acts as a master toggle for post-processing including color transfer.
-        # This conditional check already exists but confirms the use of self.enable_color_transfer.get()
-        if self.enable_color_transfer.get() and not is_dual_input: # Only for quad input (has left view)
-            if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
-                logger.warning("Color transfer skipped: Original left frames are missing or empty.")
+            # 2. Upscale Low-Res Mask (Bilinear for smoother blend)
+            frames_mask_processed_unpadded_original_length_hires = F.interpolate(
+                frames_mask_processed_unpadded_original_length, 
+                size=(hires_H, hires_W), 
+                mode='bilinear', 
+                align_corners=False
+            ).to(frames_output_final.device)
+            
+            # 3. Load High-Res Original/Warped Frames (Chunk by Chunk for RAM efficiency)
+            hires_frames_to_blend = []
+            
+            # Load the high-res video using Decord with a specific chunking strategy
+            # Note: For simplicity and to avoid a complex chunk-loading loop, we will use Decord's frame index array
+            # which is still memory intensive but less complex than writing a chunked loader here.
+            # A truly memory-safe version would require re-writing the main loop to iterate over *HR* frames.
+
+            # For now, we will load the entire HR video chunk for the final blend, but only once.
+            # This is a RAM risk, but necessary for a simple implementation.
+            
+            # Use the simple read_video_frames (which uses decord)
+            hires_full_frames_torch, _, _ = read_video_frames(hires_video_path) 
+            
+            # Temporally crop the HR video to the same length as the LR output
+            hires_full_frames_torch = hires_full_frames_torch[:num_frames_original]
+            
+            if is_dual_input:
+                # Dual Splat (Mask | Warped). We need the Warped (Right half)
+                half_w_hires = hires_full_frames_torch.shape[3] // 2
+                hires_warped_for_blend = hires_full_frames_torch[:, :, :, half_w_hires:] / 255.0 # Normalize
+                hires_left_for_concat = None
             else:
-                logger.debug("Applying color transfer from original left view to inpainted right view...")
+                # Quad Splat (Left | Mask | Warped | Top-Left). We need Left (Top-Left) and Warped (Bottom-Right)
+                half_h_hires = hires_full_frames_torch.shape[2] // 2
+                half_w_hires = hires_full_frames_torch.shape[3] // 2
+                
+                # Top-Left is the Left View for concat
+                hires_left_for_concat = hires_full_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
+                # Bottom-Right is the Warped View for blending
+                hires_warped_for_blend = hires_full_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
+            
+            # 4. Overwrite Low-Res Variables with Hi-Res Upscaled/Loaded Variables
+            frames_output_final = frames_output_final_hires
+            frames_mask_processed_unpadded_original_length = frames_mask_processed_unpadded_original_length_hires
+            
+            # Overwrite the original low-res warped for the blend function (used by _apply_post_inpainting_blend)
+            frames_warpped_original_unpadded_normalized = hires_warped_for_blend.to(frames_output_final.device)
+            
+            # Overwrite the original low-res left for the final concat
+            frames_left_original_cropped = hires_left_for_concat.to(frames_output_final.device) if hires_left_for_concat is not None else None
+            
+            # Update output resolution display
+            if update_info_callback:
+                display_frames_info = str(num_frames_original)
+                self.after(0, lambda: update_info_callback(base_video_name, f"{hires_W}x{hires_H} (HR Blend)", display_frames_info, overlap, original_input_blend_strength))
+
+            logger.info("Hi-Res Upscaling and Data Overwrite complete.")
+            
+        # --- END: HI-RES BLENDING (If Enabled) ---
+
+        # --- Apply Color Transfer (if enabled) ---
+        if self.enable_color_transfer.get():
+            reference_frames_for_transfer: Optional[torch.Tensor] = None
+
+            if is_dual_input:
+                # DUAL Input: Create an occlusion-free reference from the warped frames (bottom-right)
+                logger.debug("Dual input detected. Creating occlusion-free reference via directional dilation for color transfer...")
+                
+                # 1. Use warped frames (bottom-right) as the base
+                warped_frames_base = frames_warpped_original_unpadded_normalized.cpu() 
+                # 2. Use the processed mask for the holes
+                processed_mask = frames_mask_processed_unpadded_original_length.cpu() 
+                
+                # 3. Apply directional dilation to fill the holes
+                reference_frames_for_transfer = self._apply_directional_dilation(
+                    frame_chunk=warped_frames_base, 
+                    mask_chunk=processed_mask
+                ).to(frames_output_final.device) # Move back to CUDA if needed later, but transfer is on CPU
+                
+                logger.debug("Occlusion-free reference created.")
+
+                # --- NEW DEBUG SAVE LOGIC ---
+                if self.debug_mode_var.get():
+                    debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_color_ref")
+                    os.makedirs(debug_output_dir, exist_ok=True)
+                    video_basename_for_debug = os.path.splitext(base_video_name)[0] 
+                    
+                    # Save the first 5 frames of the generated reference
+                    for t in range(min(5, reference_frames_for_transfer.shape[0])):
+                        # Tensor [C, H, W] float [0, 1] -> Numpy [H, W, C] uint8
+                        ref_img = (reference_frames_for_transfer[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        # Convert RGB to BGR for OpenCV imwrite
+                        cv2.imwrite(
+                            os.path.join(debug_output_dir, f"{video_basename_for_debug}_frame_{t:04d}_color_ref_dilated.png"), 
+                            cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR)
+                        )
+                    logger.debug(f"Saved debug color reference frames to {debug_output_dir}")
+                # --- END NEW DEBUG SAVE LOGIC ---
+                
+            else: # QUAD Input: Use the original left view (top-left) as reference
+                reference_frames_for_transfer = frames_left_original_cropped
+                
+            # --- Perform the Color Transfer ---
+            if reference_frames_for_transfer is None or reference_frames_for_transfer.numel() == 0:
+                logger.warning("Color transfer skipped: No valid reference frames available.")
+            else:
+                logger.debug("Applying color transfer from reference view to inpainted right view...")
                 target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
                 
                 adjusted_frames_output = []
                 for t in range(frames_output_final.shape[0]):
-                    left_frame_resized = F.interpolate(
-                        frames_left_original_cropped[t].unsqueeze(0),
+                    # Resize the reference frame to match the size of the inpainted output
+                    ref_frame_resized = F.interpolate(
+                        reference_frames_for_transfer[t].unsqueeze(0),
                         size=(target_H, target_W),
                         mode='bilinear',
                         align_corners=False
-                    ).squeeze(0)
+                    ).squeeze(0).cpu() # Ensure source is on CPU for the _apply_color_transfer method
+                    
+                    target_frame_cpu = frames_output_final[t].cpu()
 
-                    adjusted_frame = self._apply_color_transfer(left_frame_resized, frames_output_final[t])
-                    adjusted_frames_output.append(adjusted_frame)
+                    adjusted_frame = self._apply_color_transfer(ref_frame_resized, target_frame_cpu)
+                    adjusted_frames_output.append(adjusted_frame.to(frames_output_final.device)) # Move back to original device
                 
                 frames_output_final = torch.stack(adjusted_frames_output)
                 logger.debug("Color transfer complete.")
@@ -1271,18 +1645,20 @@ class InpaintingGUI(ThemedTk):
                 update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength)
             return False
 
-        # --- END CRITICAL FIXES ---
-
-        # --- START NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding ---
+        # --- NEW: Intermediate PNG Sequence Saving and Final FFmpeg Encoding using Helper ---
         temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
         os.makedirs(temp_png_dir, exist_ok=True)
         logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
 
         total_output_frames = final_output_frames_for_encoding.shape[0]
+        
+        # 1. Save PNG Sequence
         try:
             for frame_idx in range(total_output_frames):
                 if stop_event and stop_event.is_set():
                     logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
+                    # Cleanup must happen outside the loop
+                    shutil.rmtree(temp_png_dir, ignore_errors=True)
                     return False
 
                 frame_tensor = final_output_frames_for_encoding[frame_idx] # (C, H, W) float 0-1
@@ -1292,120 +1668,45 @@ class InpaintingGUI(ThemedTk):
                 frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
                 
                 # Convert to BGR for OpenCV (OpenCV uses BGR by default for imwrite)
-                # Assuming the pipeline output is RGB (common for image models)
                 frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
 
                 png_path = os.path.join(temp_png_dir, f"{frame_idx:05d}.png")
                 cv2.imwrite(png_path, frame_bgr)
                 draw_progress_bar(frame_idx + 1, total_output_frames)
             logger.debug(f"\nFinished saving {total_output_frames} PNG frames.")
-
-            # --- Construct FFmpeg Command ---
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-y", # Overwrite output files without asking
-                "-framerate", str(fps), # Use the detected FPS
-                "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence
-            ]
-
-            # Default output parameters
-            output_codec = "libx264"
-            output_pix_fmt = "yuv420p"
-            output_profile = "main"
-            x265_params = [] # For HDR metadata
-
-            if video_stream_info:
-                logger.debug(f"Applying color metadata from source: {video_stream_info}")
-                input_pix_fmt = video_stream_info.get("pix_fmt", "")
-                color_primaries = video_stream_info.get("color_primaries")
-                transfer_characteristics = video_stream_info.get("transfer_characteristics")
-                color_space = video_stream_info.get("color_space")
-
-                # Determine HDR status
-                is_hdr_source = (color_primaries == "bt2020" and transfer_characteristics == "smpte2084")
-
-                # Determine if original source was 10-bit or higher
-                is_original_10bit_or_higher = "10" in input_pix_fmt or "12" in input_pix_fmt or "16" in input_pix_fmt
-
-                if is_hdr_source:
-                    logger.debug("Detected HDR source. Encoding with H.265 10-bit and HDR metadata.")
-                    output_codec = "libx265"
-                    output_pix_fmt = "yuv420p10le"
-                    output_profile = "main10"
-                    
-                    # Add HDR mastering display and CLL metadata
-                    mastering_display = video_stream_info.get("mastering_display_metadata")
-                    max_cll = video_stream_info.get("max_content_light_level")
-                    if mastering_display:
-                        x265_params.append(f"master-display={mastering_display}")
-                    if max_cll:
-                        x265_params.append(f"max-cll={max_cll}")
-                elif is_original_10bit_or_higher and video_stream_info.get("codec_name") == "hevc":
-                    logger.debug("Detected SDR 10-bit HEVC source. Encoding with H.265 10-bit.")
-                    output_codec = "libx265"
-                    output_pix_fmt = "yuv420p10le"
-                    output_profile = "main10"
-                else: # SDR 8-bit, or other source codecs
-                    logger.debug("Detected SDR (8-bit H.264 or other) source. Encoding with H.264 8-bit.")
-                    output_codec = "libx264"
-                    output_pix_fmt = "yuv420p"
-                    output_profile = "main"
-
-                # Apply general color flags if present
-                if color_primaries:
-                    ffmpeg_cmd.extend(["-color_primaries", color_primaries])
-                if transfer_characteristics:
-                    ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
-                if color_space:
-                    ffmpeg_cmd.extend(["-colorspace", color_space])
-
-            # Add codec, profile, pix_fmt, and CRF
-            ffmpeg_cmd.extend([
-                "-c:v", output_codec,
-                "-profile:v", output_profile,
-                "-pix_fmt", output_pix_fmt,
-                "-crf", str(output_crf),
-            ])
             
-            if x265_params:
-                ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
-
-            # Final output path
-            ffmpeg_cmd.append(output_video_path)
-
-            logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
-            # Update GUI status for encoding phase
-            if update_info_callback:
-                update_info_callback(base_video_name, f"Encoding {output_codec}...", total_output_frames, overlap, original_input_blend_strength)
-
-            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24) # 24h timeout
-            logger.debug(f"Successfully encoded video to {output_video_path}")
-
-        except FileNotFoundError:
-            messagebox.showerror("Error", "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
-            logger.error("FFmpeg not found in PATH.")
-            return False
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Error", f"FFmpeg encoding failed for {base_video_name}:\n{e.stderr}\n{e.stdout}")
-            logger.error(f"FFmpeg encoding failed for {base_video_name}: {e.stderr}\n{e.stdout}")
-            return False
-        except subprocess.TimeoutExpired as e:
-            messagebox.showerror("Error", f"FFmpeg encoding timed out for {base_video_name}:\n{e.stderr}")
-            logger.error(f"FFmpeg encoding timed out for {base_video_name}: {e.stderr}")
-            return False
         except Exception as e:
-            messagebox.showerror("Error", f"An unexpected error occurred during encoding for {base_video_name}: {str(e)}")
-            logger.error(f"Unexpected error during encoding for {base_video_name}: {e}", exc_info=True)
+            logger.error(f"Error saving intermediate PNGs for {base_video_name}: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Error saving intermediate PNGs for {base_video_name}: {str(e)}")
+            shutil.rmtree(temp_png_dir, ignore_errors=True)
             return False
-        finally:
-            # Cleanup temporary PNGs
-            if os.path.exists(temp_png_dir):
-                try:
-                    shutil.rmtree(temp_png_dir)
-                    logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-        # --- END NEW ---
+            
+        # 2. Encode to MP4 using the helper function
+        # Update GUI status for encoding phase
+        if update_info_callback:
+            self.after(0, lambda: update_info_callback(base_video_name, f"Encoding video...", total_output_frames, overlap, original_input_blend_strength))
+        
+        if stop_event is None:
+            # Fallback for unexpected case where it is None, though InpaintingGUI always provides one
+            stop_event = threading.Event() 
+
+        encoding_success = encode_frames_to_mp4(
+            temp_png_dir=temp_png_dir,
+            final_output_mp4_path=output_video_path,
+            fps=fps,
+            total_output_frames=total_output_frames,
+            video_stream_info=video_stream_info,
+            stop_event=stop_event,
+            sidecar_json_data=None, # Not needed here, as the input sidecar is only for reading settings
+            user_output_crf=output_crf,
+            output_sidecar_ext=".spsidecar", # Use the correct sidecar extension
+        )
+
+        if not encoding_success:
+            logger.info(f"Encoding stopped or failed for {input_video_path}.")
+            # Note: encode_frames_to_mp4 handles its own PNG cleanup
+            return False
+        # --- END NEW HELPER CALL ---
 
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
         return True

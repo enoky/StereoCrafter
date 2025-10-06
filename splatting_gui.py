@@ -28,7 +28,7 @@ from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_in
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.05"
+GUI_VERSION = "25.10.06"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -78,8 +78,8 @@ class SplatterGUI(ThemedTk):
         
         # Depth Processing Defaults
         "DEPTH_GAMMA": "1.0",
-        "DEPTH_DILATE_SIZE": "0",
-        "DEPTH_BLUR_SIZE": "0"
+        "DEPTH_DILATE_SIZE": "3",
+        "DEPTH_BLUR_SIZE": "7"
     }
     # ---------------------------------------
     # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
@@ -546,18 +546,18 @@ class SplatterGUI(ThemedTk):
         self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
         self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+        current_row += 1
 
         self.auto_convergence_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Auto-Determine Convergence (Video Avg)", variable=self.enable_auto_convergence_var)
         self.auto_convergence_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.auto_convergence_checkbox, "auto_convergence_toggle")
-        current_row += 1
 
-        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
-        self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+        # self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
+        # self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
 
         self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
-        self.dual_output_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
 
         current_row = 0 # Reset for next frame
@@ -778,7 +778,7 @@ class SplatterGUI(ThemedTk):
             "depth_gamma": self.depth_gamma_var.get(),
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
-            "enable_autogain": self.enable_autogain_var.get(),
+            # "enable_autogain": self.enable_autogain_var.get(),
         }
         return config
 
@@ -1170,7 +1170,8 @@ class SplatterGUI(ThemedTk):
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
-    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float, depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool) -> np.ndarray:
+    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
+                              depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool, max_raw_value: float) -> np.ndarray:
         """
         Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
         """
@@ -1187,17 +1188,16 @@ class SplatterGUI(ThemedTk):
         batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
 
         # 2. Gamma Adjustment (always applied if gamma != 1.0)
-        if depth_gamma != 1.0:
-            logger.debug(f"Applying depth gamma adjustment: {depth_gamma:.2f}")
-            min_val = batch_depth_numpy_float.min()
-            max_val = batch_depth_numpy_float.max()
+        if depth_gamma != 1.0 and max_raw_value > 1.0: # Only apply if raw value is > 1.0 (i.e., not already 0-1 float)
+            logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
             
-            if max_val - min_val > 1e-5:
-                normalized_chunk = (batch_depth_numpy_float - min_val) / (max_val - min_val)
-                normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
-                batch_depth_numpy_float = normalized_chunk_gamma * (max_val - min_val) + min_val
-            else:
-                logger.warning("Chunk min/max too close for gamma normalization. Skipping gamma.")
+            # Apply Gamma across the MAX RAW VALUE range for consistency!
+            # Scale to [0, 1], apply gamma, scale back to raw range.
+            normalized_chunk = batch_depth_numpy_float / max_raw_value
+            normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
+            batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
+        elif depth_gamma != 1.0:
+            logger.warning("Gamma adjustment skipped: Max expected raw value is 1.0. Gamma assumed applied to 0-1 range if needed later.")
 
         # Dilate and Blur should ONLY be applied if it is NOT a low-res task.
         if is_low_res_task:
@@ -1368,14 +1368,36 @@ class SplatterGUI(ThemedTk):
                     global_depth_max = 1.0 
 
                     if not assume_raw_input_mode: 
-                        logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass...")
-                        global_depth_min, global_depth_max = compute_global_depth_stats(
-                            depth_map_reader=depth_reader_input,
-                            total_frames=total_frames_depth,
-                            chunk_size=task["batch_size"] 
-                        )
+                        logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass with RAW reader.")
+                        
+                        # --- FIX: Use a DEDICATED, RAW reader for consistent global stats ---
+                        raw_depth_reader_temp = None
+                        try:
+                            # 1. Initialize a NON-RESIZING reader
+                            raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0))
+                            
+                            # 2. Compute stats using the RAW reader
+                            if len(raw_depth_reader_temp) > 0:
+                                global_depth_min, global_depth_max = compute_global_depth_stats(
+                                    depth_map_reader=raw_depth_reader_temp,
+                                    total_frames=total_frames_depth,
+                                    chunk_size=task["batch_size"] 
+                                )
+                                logger.debug("Successfully computed global stats from RAW reader.")
+                            else:
+                                logger.error("RAW depth reader has no frames.")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize/read RAW depth reader for global stats: {e}")
+                            global_depth_min = 0.0 # Ensure min/max are reset on fatal error
+                            global_depth_max = 1.0
+                        finally:
+                            # 3. Clean up the temporary RAW reader
+                            if raw_depth_reader_temp:
+                                del raw_depth_reader_temp
+                                gc.collect()
+                        # -----------------------------------------------------------------
                     else:
-                        logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping depth stats pre-pass.")
+                        logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass.")
                         global_depth_min = 0.0
                         global_depth_max = 1.0
 
@@ -1713,6 +1735,28 @@ class SplatterGUI(ThemedTk):
 
         os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
 
+        # --- NEW: Determine max_expected_raw_value for consistent Gamma ---
+        max_expected_raw_value = 1.0 # Default to 1.0 (already normalized float)
+        depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
+        depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
+
+        # Prioritize 10-bit/1023.0 for all passes if the source video metadata suggests 10-bit.
+        # This overrides any 8-bit detection to prevent scaling errors.
+        is_source_10bit = False
+        if depth_pix_fmt:
+            if "10" in depth_pix_fmt or "gray10" in depth_pix_fmt or "12" in depth_pix_fmt or (depth_profile and "main10" in depth_profile):
+                is_source_10bit = True
+        
+        if is_source_10bit:
+            max_expected_raw_value = 1023.0
+        elif depth_pix_fmt and ("8" in depth_pix_fmt or depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"]):
+             max_expected_raw_value = 255.0
+        elif isinstance(depth_pix_fmt, str) and "float" in depth_pix_fmt:
+            max_expected_raw_value = 1.0
+        
+        logger.debug(f"Determined max_expected_raw_value: {max_expected_raw_value:.1f} (Source: {depth_pix_fmt}/{depth_profile})")
+        # --- END NEW ---
+
         if dual_output:
             suffix = "_splatted2"
         else:
@@ -1752,9 +1796,6 @@ class SplatterGUI(ThemedTk):
 
             batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
             batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
-            
-            batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
-            batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
 
             # --- NEW: Process depth map using the helper method ---
             batch_depth_numpy = self._process_depth_batch(
@@ -1763,77 +1804,28 @@ class SplatterGUI(ThemedTk):
                 depth_gamma=depth_gamma,
                 depth_dilate_size=depth_dilate_size,
                 depth_blur_size=depth_blur_size,
-                is_low_res_task=is_low_res_task
+                is_low_res_task=is_low_res_task,
+                max_raw_value=max_expected_raw_value,
             )
 
             # Convert original batch frames to float 0-1 for display in grid
             batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
             
-            # Normalize depth frames based on selected mode
+            # Final Normalization Step: This MUST be the final step before converting to tensor.
+            
             if assume_raw_input:
-                current_chunk_min_val = batch_depth_numpy.min()
-                current_chunk_max_val = batch_depth_numpy.max()
-                
-                max_expected_raw_value = None
-                depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
-                depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
-
-                # Determine max_expected_raw_value from pix_fmt and profile if available
-                if depth_pix_fmt:
-                    if "10" in depth_pix_fmt or "gray10" in depth_pix_fmt or (depth_profile and "main10" in depth_profile):
-                        max_expected_raw_value = 1023.0
-                        logger.debug(f"Depth pix_fmt '{depth_pix_fmt}' or profile '{depth_profile}' suggests 10-bit. Expected max raw: {max_expected_raw_value}")
-                    elif ("8" in depth_pix_fmt or "gray" in depth_pix_fmt or 
-                          depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"] or # Explicitly add common 8-bit YUV formats
-                          (depth_profile and ("main" in depth_profile.lower() or "high" in depth_profile.lower()))): # Make profile check case-insensitive and include 'high'
-                        max_expected_raw_value = 255.0
-                        logger.debug(f"Depth pix_fmt '{depth_pix_fmt}' or profile '{depth_profile}' suggests 8-bit. Expected max raw: {max_expected_raw_value}")
-                    elif "float" in depth_pix_fmt: # If the source video itself is a float format
-                        logger.warning(f"Depth pix_fmt '{depth_pix_fmt}' is float. Assuming values are already in 0-1 range if max <= 1.0, otherwise will be clipped. No explicit scaling by a fixed raw max value.")
-                        max_expected_raw_value = 1.0 # Will effectively cause no division if already float 0-1
-                    else:
-                        logger.warning(f"Unknown depth pix_fmt '{depth_pix_fmt}' and profile '{depth_profile}'. Attempting to guess original bit depth based on common max values if current chunk max > 1.0.")
-                else:
-                    logger.warning(f"No depth stream info (pix_fmt/profile) available. Attempting to guess original bit depth based on common max values if current chunk max > 1.0.")
-
-                # Fallback / Heuristic if pix_fmt didn't give a clear answer or it's a float dtype with values > 1
-                if max_expected_raw_value is None or (batch_depth_numpy.dtype in [np.float32, np.float64] and max_expected_raw_value == 1.0 and current_chunk_max_val > 1.01):
-                    if current_chunk_max_val > 1.01: # Values are float, but clearly not 0-1 range
-                        if current_chunk_max_val <= 255.01 and current_chunk_min_val >= 0: # Max value indicates potential 8-bit original values
-                            max_expected_raw_value = 255.0
-                            logger.debug(f"Heuristic: Float depth values (max {current_chunk_max_val:.2f}) appear to be unscaled 8-bit. Scaling by {max_expected_raw_value}.")
-                        elif current_chunk_max_val <= 1023.01 and current_chunk_min_val >= 0: # Max value indicates potential 10-bit original values
-                            max_expected_raw_value = 1023.0
-                            logger.debug(f"Heuristic: Float depth values (max {current_chunk_max_val:.2f}) appear to be unscaled 10-bit. Scaling by {max_expected_raw_value}.")
-                        else:
-                            # If it's float and still very high, or range doesn't fit typical bit depths.
-                            logger.warning(f"Depth map values are float (dtype: {batch_depth_numpy.dtype}) with max {current_chunk_max_val:.2f}, which is outside typical 8-bit (0-255) or 10-bit (0-1023) raw ranges. As 'No Normalization' is enabled, values will be directly used and clipped to 0-1, which might lead to dark output if values are very high.")
-                            max_expected_raw_value = 1.0 # Treat as already effectively normalized, will be clipped below
-                    else:
-                        # It's float and values are already <= 1.0, so assume it's already 0-1 normalized
-                        max_expected_raw_value = 1.0
-                        logger.debug(f"Depth map chunk type is float (max {current_chunk_max_val:.2f}), suggests it's already in 0-1 range. Using directly.")
-
-                # Apply scaling based on determined or guessed max_expected_raw_value
-                if max_expected_raw_value is not None and max_expected_raw_value > 1.0:
-                    batch_depth_normalized = batch_depth_numpy.astype(np.float32) / max_expected_raw_value
-                    logger.debug(f"Scaled depth chunk (dtype: {batch_depth_numpy.dtype}) from [{current_chunk_min_val:.3f}, {current_chunk_max_val:.3f}] by 1/{max_expected_raw_value} for 'No Normalization'.")
-                else:
-                    # If max_expected_raw_value is 1.0 (already float 0-1 or unknown), or no scaling was determined
-                    batch_depth_normalized = batch_depth_numpy.astype(np.float32)
-                    if current_chunk_max_val > 1.01:
-                         logger.warning(f"Could not reliably determine scaling for depth map (dtype: {batch_depth_numpy.dtype}, max: {current_chunk_max_val:.2f}) in 'No Normalization' mode. Using values directly and relying on final clip (0-1). This may result in dark output if values are high.")
-                    else:
-                         logger.debug(f"Using float depth values directly (max {current_chunk_max_val:.2f}), assuming they are already 0-1 range for 'No Normalization'.")
-
+                # RAW INPUT MODE: Normalize by the max expected raw value (determined earlier).
+                # NOTE: max_expected_raw_value is the one determined outside the loop (1023.0, 255.0, or 1.0)
+                batch_depth_normalized = batch_depth_numpy / max_expected_raw_value
+                logger.debug(f"Final normalization by {max_expected_raw_value:.1f} (Raw Input Mode).")
             else:
-                # Global normalization using pre-computed min/max (ensures consistency)
-                logger.debug(f"Applying global normalization for chunk {i}-{i+len(current_frame_indices)} using min={global_depth_min:.3f}, max={global_depth_max:.3f}.")
+                # GLOBAL NORM MODE: Normalize by the pre-computed global min/max.
+                logger.debug(f"Final normalization by global range [{global_depth_min:.3f}, {global_depth_max:.3f}] (Global Norm Mode).")
                 if global_depth_max - global_depth_min > 1e-5:
-                    batch_depth_normalized = (batch_depth_numpy.astype(np.float32) - global_depth_min) / (global_depth_max - global_depth_min)
+                    batch_depth_normalized = (batch_depth_numpy - global_depth_min) / (global_depth_max - global_depth_min)
                 else:
                     batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
-                    logger.warning(f"Global depth range for normalization is too small ({global_depth_min:.3f}-{global_depth_max:.3f}). Setting depth map to constant {zero_disparity_anchor_val} for this video.")
+                    logger.warning(f"Global depth range for normalization is too small. Setting to constant {zero_disparity_anchor_val}.")
             
             # Clip to ensure values are strictly within 0-1 range after normalization
             batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)

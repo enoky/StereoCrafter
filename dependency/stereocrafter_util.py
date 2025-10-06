@@ -58,7 +58,7 @@ class Tooltip:
         self.tooltip_window.wm_geometry(f"+{x}+{y}")
 
         label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
-                      font=("tahoma", "8", "normal"), justify="left", wraplength=250)
+                      justify="left", wraplength=250)
         label.pack(ipadx=1)
 
     def hide_tooltip(self, event=None):
@@ -137,7 +137,6 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     except subprocess.TimeoutExpired:
         logger.error("ffprobe check timed out.")
         return None
-
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
@@ -296,7 +295,7 @@ def encode_frames_to_mp4(
     fps: float,
     total_output_frames: int,
     video_stream_info: Optional[dict],
-    stop_event: threading.Event, # Added stop_event to allow early exit during encoding
+    stop_event: Optional[threading.Event] = None,
     sidecar_json_data: Optional[dict] = None,
     user_output_crf: Optional[int] = None, # NEW: Add this parameter
     output_sidecar_ext: str = ".json",
@@ -419,14 +418,14 @@ def encode_frames_to_mp4(
 
     # Final output path
     ffmpeg_cmd.append(final_output_mp4_path)
-
-    logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+    logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")    
+    process = None
 
     try:
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         
         while process.poll() is None: # While process is still running
-            if stop_event.is_set():
+            if stop_event and stop_event.is_set(): 
                 logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_mp4_path)}.")
                 process.terminate() # or process.kill()
                 process.wait(timeout=5)
