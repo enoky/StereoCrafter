@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inpainting VRAM & Resolution Calculator (Filtered)</title>
+    <style>
+        /* Dark Theme Styles */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+        }
+        .container {
+            background-color: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            max-width: 600px;
+            margin: auto;
+            margin-bottom: 20px;
+        }
+        label, input, button, textarea, select {
+            display: block;
+            margin-bottom: 10px;
+        }
+        input[type="text"], select, textarea {
+            width: calc(100% - 22px);
+            padding: 10px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background-color: #3a3a3a;
+            color: #f0f0f0;
+        }
+        button {
+            background-color: #0056b3;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #004080;
+        }
+        textarea {
+            height: 200px;
+            font-family: monospace;
+            resize: vertical;
+        }
+        .input-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px 20px;
+            margin-bottom: 15px;
+        }
+        .input-group {
+            display: flex;
+            flex-direction: column;
+        }
+        .input-group label {
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .input-group input, .input-group select {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px;
+            margin-bottom: 0;
+        }
+        .full-width {
+            grid-column: 1 / -1;
+        }
+        .explanation {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #3a3a3a;
+            border-radius: 5px;
+            border: 1px solid #555;
+            color: #e0e0e0;
+        }
+        .explanation h3 {
+            margin-top: 0;
+        }
+        .explanation strong {
+            color: #f92672;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Inpainting VRAM & Resolution Calculator</h1>
+
+        <div class="input-grid">
+            <div class="input-group">
+                <label for="widthInput">Target Width:</label>
+                <input type="text" id="widthInput" value="1920">
+            </div>
+            <div class="input-group">
+                <label for="heightInput">Target Height:</label>
+                <input type="text" id="heightInput" value="1080">
+            </div>
+            <div class="input-group">
+                <label for="tileNumInput">Tile Number:</label>
+                <input type="text" id="tileNumInput" value="2">
+            </div>
+            <div class="input-group">
+                <label for="framesChunkInput">Frames Chunk:</label>
+                <input type="text" id="framesChunkInput" value="23">
+            </div>
+            <div class="input-group full-width">
+                <label for="offloadSelect">CPU Offload:</label>
+                <select id="offloadSelect">
+                    <option value="none">None (Highest VRAM)</option>
+                    <option value="model" selected>Model (Recommended)</option>
+                    <option value="sequential">Sequential (Lowest VRAM)</option>
+                </select>
+            </div>
+             <div class="input-group full-width">
+                <label for="aspectRatio">Aspect Ratio:</label>
+                <input type="text" id="aspectRatio" readonly>
+            </div>
+        </div>
+        
+        <button onclick="calculateResolutions()">Calculate Resolutions</button>
+
+        <div class="explanation">
+            <h3>Understanding the Results</h3>
+            <p>This tool estimates VRAM based on the AI model's architecture. <strong>CPU Offload</strong> trades slower speed for lower VRAM usage by keeping parts of the model in system RAM.</p>
+            <ul>
+                <li><strong>Est. VRAM:</strong> An approximation of peak GPU memory.</li>
+                <li><strong>Tile Size:</strong> The dimension of the image chunk processed by the GPU. This is the primary driver of dynamic VRAM usage.</li>
+            </ul>
+        </div>
+
+        <div class="results-section">
+            <label for="resultsOutput"><strong>Calculated Resolutions (6GB to 32GB VRAM):</strong></label>
+            <textarea id="resultsOutput" readonly></textarea>
+        </div>
+    </div>
+
+    <script>
+        // --- DOM References ---
+        const widthInput = document.getElementById('widthInput');
+        const heightInput = document.getElementById('heightInput');
+        const tileNumInput = document.getElementById('tileNumInput');
+        const framesChunkInput = document.getElementById('framesChunkInput');
+        const offloadSelect = document.getElementById('offloadSelect');
+        const aspectRatioOutput = document.getElementById('aspectRatio');
+        const resultsOutput = document.getElementById('resultsOutput');
+
+        // --- Core Functions ---
+        function calculateAspectRatio() {
+            const width = parseFloat(widthInput.value);
+            const height = parseFloat(heightInput.value);
+            if (!isNaN(width) && !isNaN(height) && height > 0) {
+                const ratio = width / height;
+                aspectRatioOutput.value = `${ratio.toFixed(5)}:1`;
+            } else {
+                aspectRatioOutput.value = "Invalid input";
+            }
+        }
+
+        function calculateResolutions() {
+            // --- 1. Get and Validate Inputs ---
+            const targetWidth = parseInt(widthInput.value);
+            const targetHeight = parseInt(heightInput.value);
+            const tileNum = parseInt(tileNumInput.value);
+            const framesChunk = parseInt(framesChunkInput.value);
+            const offloadType = offloadSelect.value;
+            const [ratioStr] = aspectRatioOutput.value.split(':');
+            const targetRatio = parseFloat(ratioStr);
+
+            if (isNaN(targetWidth) || isNaN(targetHeight) || isNaN(tileNum) || isNaN(framesChunk) || isNaN(targetRatio) || tileNum < 1 || framesChunk < 1) {
+                alert("Please enter valid positive numbers for all fields.");
+                return;
+            }
+
+            // --- 2. Define Constants ---
+            const STEP = 64; 
+            const OVERLAP = 128; 
+            const SPATIAL_COMPRESS = 8;
+            const BASE_VRAM_GB = 4.5;
+            const VRAM_CACHE_GB = 1.0; // VRAM for cache/context when offloading
+            const VRAM_CALIBRATION_FACTOR = 8.5e-9;
+
+            let resolutions = [];
+            resultsOutput.value = 'Calculating...';
+
+            // --- 3. Generate and Evaluate Potential Resolutions ---
+            for (let w = Math.ceil(targetWidth / STEP) * STEP; w >= STEP; w -= STEP) {
+                const idealHeight = w / targetRatio;
+                const h = Math.round(idealHeight / STEP) * STEP;
+
+                if (h <= 0) continue;
+
+                // --- 4. VRAM Calculation Logic ---
+                const tileH = Math.ceil((h + OVERLAP * (tileNum - 1)) / tileNum);
+                const tileW = Math.ceil((w + OVERLAP * (tileNum - 1)) / tileNum);
+                const latentH = tileH / SPATIAL_COMPRESS;
+                const latentW = tileW / SPATIAL_COMPRESS;
+                
+                const sequenceLength = latentW * latentH;
+                const dynamicVramScore = framesChunk * (sequenceLength ** 2);
+                let dynamicVramGb = dynamicVramScore * VRAM_CALIBRATION_FACTOR;
+
+                let estimatedTotalVram;
+                switch (offloadType) {
+                    case 'sequential':
+                        estimatedTotalVram = VRAM_CACHE_GB + (dynamicVramGb * 0.75);
+                        break;
+                    case 'model':
+                        estimatedTotalVram = VRAM_CACHE_GB + dynamicVramGb;
+                        break;
+                    case 'none':
+                    default:
+                        estimatedTotalVram = BASE_VRAM_GB + dynamicVramGb;
+                        break;
+                }
+
+                // --- 5. Store Results ---
+                const actualRatio = w / h;
+                const discrepancy = Math.abs(actualRatio - targetRatio) / targetRatio;
+
+                resolutions.push({
+                    width: w,
+                    height: h,
+                    vram: estimatedTotalVram,
+                    tileW: tileW,
+                    tileH: tileH,
+                    discrepancy: discrepancy
+                });
+            }
+
+            // --- 6. Sort and Display Results ---
+            const uniqueResolutions = Array.from(new Map(resolutions.map(res => [`${res.width}x${res.height}`, res])).values());
+            uniqueResolutions.sort((a, b) => a.vram - b.vram);
+            
+            // --- FIX: Filter the results based on VRAM range ---
+            const filteredResolutions = uniqueResolutions.filter(res => res.vram >= 6 && res.vram <= 32);
+
+            if (filteredResolutions.length === 0) {
+                resultsOutput.value = "No resolutions found within the 6GB to 32GB VRAM range with the current settings.";
+            } else {
+                resultsOutput.value = filteredResolutions.map(res => {
+                    return `${res.width}x${res.height} | Est. VRAM: ${res.vram.toFixed(2)} GB | Tile Size: ${res.tileW}x${res.height} | Discrepancy: ${(res.discrepancy * 100).toFixed(2)}%`;
+                }).join('\n');
+            }
+        }
+        
+        // --- Event Listeners and Initializers ---
+        widthInput.addEventListener('input', calculateAspectRatio);
+        heightInput.addEventListener('input', calculateAspectRatio);
+
+        document.addEventListener('DOMContentLoaded', () => {
+            calculateAspectRatio();
+            calculateResolutions(); // Run once on load
+        });
+    </script>
+</body>
+</html>

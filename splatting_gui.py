@@ -23,12 +23,12 @@ from typing import Optional, Tuple, Optional
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
 from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
-    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level
+    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level, encode_frames_to_mp4
 )
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.09.29"
+GUI_VERSION = "25.10.06"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -62,6 +62,40 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 class SplatterGUI(ThemedTk):
+    # --- GLOBAL CONFIGURATION DICTIONARY ---
+    APP_CONFIG_DEFAULTS = {
+        # File Extensions
+        "SIDECAR_EXT": ".fssidecar",
+        "OUTPUT_SIDECAR_EXT": ".spsidecar",
+        
+        # GUI/Processing Defaults (Used for reset/fallback)
+        "MAX_DISP": "30.0",
+        "CONV_POINT": "0.5",
+        "PROC_LENGTH": "-1",
+        "BATCH_SIZE_FULL": "10",
+        "BATCH_SIZE_LOW": "50",
+        "CRF_OUTPUT": "23",
+        
+        # Depth Processing Defaults
+        "DEPTH_GAMMA": "1.0",
+        "DEPTH_DILATE_SIZE": "3",
+        "DEPTH_BLUR_SIZE": "7"
+    }
+    # ---------------------------------------
+    # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
+    SIDECAR_KEY_MAP = {
+        "convergence_plane": "CONV_POINT",
+        "max_disparity": "MAX_DISP",
+        # Your existing key:
+        "gamma": "DEPTH_GAMMA", 
+        # Add the two new keys (using internal names for now, we'll confirm sidecar keys later)
+        "depth_dilate_size": "DEPTH_DILATE_SIZE",
+        "depth_blur_size": "DEPTH_BLUR_SIZE",
+        "frame_overlap": "FRAME_OVERLAP", # Add existing sidecar keys for completeness
+        "input_bias": "INPUT_BIAS"
+    }
+    # ---------------------------------------
+
     def __init__(self):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
@@ -74,28 +108,43 @@ class SplatterGUI(ThemedTk):
         
         self._is_startup = True # NEW: for theme/geometry handling
         self.debug_mode_var = tk.BooleanVar(value=self.app_config.get("debug_mode_enabled", False))
+        self._debug_logging_enabled = False # start in INFO mode
         # NEW: Window size and position variables
         self.window_x = self.app_config.get("window_x", None)
         self.window_y = self.app_config.get("window_y", None)
         self.window_width = self.app_config.get("window_width", 620)
 
         # --- Variables with defaults ---
+        defaults = self.APP_CONFIG_DEFAULTS # Convenience variable
+
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.input_source_clips_var = tk.StringVar(value=self.app_config.get("input_source_clips", "./input_source_clips"))
         self.input_depth_maps_var = tk.StringVar(value=self.app_config.get("input_depth_maps", "./input_depth_maps"))
         self.output_splatted_var = tk.StringVar(value=self.app_config.get("output_splatted", "./output_splatted"))
-        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", "20.0"))
-        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", "-1"))
-        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", "10"))
+
+        self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", defaults["MAX_DISP"]))
+        self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", defaults["PROC_LENGTH"]))
+        self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"]))
+        
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
-        self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", True)) 
+        self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", False)) 
         self.enable_full_res_var = tk.BooleanVar(value=self.app_config.get("enable_full_resolution", True))
-        self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", False))
-        self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1920"))
-        self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "1080"))
-        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", "25"))
-        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", "0.5"))
-        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", "23"))
+        self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", True))
+        self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1024"))
+        self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "512"))
+        self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
+        self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
+        self.enable_auto_convergence_var = tk.BooleanVar(value=self.app_config.get("enable_auto_convergence", False))
+
+        # --- Depth Pre-processing Variables ---
+        self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"]))
+        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", defaults["DEPTH_DILATE_SIZE"]))
+        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", defaults["DEPTH_BLUR_SIZE"]))
+
+        # --- NEW: Sidecar Control Toggle Variables ---
+        self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
+        self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
 
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
@@ -142,9 +191,11 @@ class SplatterGUI(ThemedTk):
                 active_bg = "#555555"
                 active_fg = "white"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
             
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
@@ -168,9 +219,11 @@ class SplatterGUI(ThemedTk):
                 active_bg = "#dddddd"
                 active_fg = "black"
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.option_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
@@ -248,155 +301,266 @@ class SplatterGUI(ThemedTk):
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
+        current_row = 0
+
         # --- Menu Bar ---
         self.menubar = tk.Menu(self)
         self.config(menu=self.menubar)
 
-        self.option_menu = tk.Menu(self.menubar, tearoff=0)
-        self.menubar.add_cascade(label="Option", menu=self.option_menu)
-        self.option_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.option_menu.add_separator()
-        self.option_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
-        self.option_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+        self.file_menu  = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="File", menu=self.file_menu )
         
-        # NEW: Help Menu
+        # Add new commands to the File menu
+        self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
+        self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
+        self.file_menu.add_separator() # Separator for organization
+
+        self.file_menu .add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.file_menu .add_separator()
+        self.file_menu .add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.file_menu .add_command(label="Restore Finished", command=self.restore_finished_files)
+
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.debug_logging_var = tk.BooleanVar(value=self._debug_logging_enabled)
+        self.help_menu.add_checkbutton(label="Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging)
+        self.help_menu.add_separator()
+
+        # Add "About" submenu (after "Debug Logging")
+        self.help_menu.add_command(label="About Stereocrafter Splatting", command=self.show_about)
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
-        self.help_menu.add_checkbutton(label="Enable Debugging", variable=self.debug_mode_var, command=self._toggle_debug_mode)
-        self.help_menu.add_command(label="About", command=self.show_about_dialog)
 
         # --- Folder selection frame ---
-        folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
-        folder_frame.pack(pady=10, padx=10, fill="x")
-        folder_frame.grid_columnconfigure(1, weight=1)
+        self.folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
+        self.folder_frame.pack(pady=10, padx=10, fill="x")
+        self.folder_frame.grid_columnconfigure(1, weight=1)
+
+        # Settings Container (NEW)
+        self.settings_container_frame = ttk.Frame(self) # <-- ADD self. to settings_container_frame
+        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
 
         # Input Source Clips Row
-        lbl_source_clips = ttk.Label(folder_frame, text="Input Source Clips:")
-        lbl_source_clips.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        entry_source_clips = ttk.Entry(folder_frame, textvariable=self.input_source_clips_var)
-        entry_source_clips.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_source_clips_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_source_clips_var))
-        btn_browse_source_clips_folder.grid(row=0, column=2, padx=2, pady=2)
-        btn_select_source_clips_file = ttk.Button(folder_frame, text="Select File", command=lambda: self._browse_file(self.input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
-        btn_select_source_clips_file.grid(row=0, column=3, padx=2, pady=2)
-        self._create_hover_tooltip(lbl_source_clips, "input_source_clips")
-        self._create_hover_tooltip(entry_source_clips, "input_source_clips")
-        self._create_hover_tooltip(btn_browse_source_clips_folder, "input_source_clips_folder")
-        self._create_hover_tooltip(btn_select_source_clips_file, "input_source_clips_file")
+        self.lbl_source_clips = ttk.Label(self.folder_frame, text="Input Source Clips:")
+        self.lbl_source_clips.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_source_clips = ttk.Entry(self.folder_frame, textvariable=self.input_source_clips_var)
+        self.entry_source_clips.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_source_clips_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_source_clips_var))
+        self.btn_browse_source_clips_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_select_source_clips_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
+        self.btn_select_source_clips_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self._create_hover_tooltip(self.lbl_source_clips, "input_source_clips")
+        self._create_hover_tooltip(self.entry_source_clips, "input_source_clips")
+        self._create_hover_tooltip(self.btn_browse_source_clips_folder, "input_source_clips_folder")
+        self._create_hover_tooltip(self.btn_select_source_clips_file, "input_source_clips_file")
+        current_row += 1
 
         # Input Depth Maps Row
-        lbl_input_depth_maps = ttk.Label(folder_frame, text="Input Depth Maps:")
-        lbl_input_depth_maps.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        entry_input_depth_maps = ttk.Entry(folder_frame, textvariable=self.input_depth_maps_var)
-        entry_input_depth_maps.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_input_depth_maps_folder = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_depth_maps_var))
-        btn_browse_input_depth_maps_folder.grid(row=1, column=2, padx=2, pady=2)
-        btn_select_input_depth_maps_file = ttk.Button(folder_frame, text="Select File", command=lambda: self._browse_file(self.input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
-        btn_select_input_depth_maps_file.grid(row=1, column=3, padx=2, pady=2)
-        self._create_hover_tooltip(lbl_input_depth_maps, "input_depth_maps")
-        self._create_hover_tooltip(entry_input_depth_maps, "input_depth_maps")
-        self._create_hover_tooltip(btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
-        self._create_hover_tooltip(btn_select_input_depth_maps_file, "input_depth_maps_file")
+        self.lbl_input_depth_maps = ttk.Label(self.folder_frame, text="Input Depth Maps:")
+        self.lbl_input_depth_maps.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_input_depth_maps = ttk.Entry(self.folder_frame, textvariable=self.input_depth_maps_var)
+        self.entry_input_depth_maps.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_input_depth_maps_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_depth_maps_var))
+        self.btn_browse_input_depth_maps_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_select_input_depth_maps_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
+        self.btn_select_input_depth_maps_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self._create_hover_tooltip(self.lbl_input_depth_maps, "input_depth_maps")
+        self._create_hover_tooltip(self.entry_input_depth_maps, "input_depth_maps")
+        self._create_hover_tooltip(self.btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
+        self._create_hover_tooltip(self.btn_select_input_depth_maps_file, "input_depth_maps_file")
+        current_row += 1
 
         # Output Splatted Row
-        lbl_output_splatted = ttk.Label(folder_frame, text="Output Splatted:")
-        lbl_output_splatted.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        entry_output_splatted = ttk.Entry(folder_frame, textvariable=self.output_splatted_var)
-        entry_output_splatted.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-        btn_browse_output_splatted = ttk.Button(folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.output_splatted_var))
-        btn_browse_output_splatted.grid(row=2, column=2, columnspan=2, padx=5, pady=2)
-        self._create_hover_tooltip(lbl_output_splatted, "output_splatted")
-        self._create_hover_tooltip(entry_output_splatted, "output_splatted")
-        self._create_hover_tooltip(btn_browse_output_splatted, "output_splatted")
+        self.lbl_output_splatted = ttk.Label(self.folder_frame, text="Output Splatted:")
+        self.lbl_output_splatted.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_output_splatted = ttk.Entry(self.folder_frame, textvariable=self.output_splatted_var)
+        self.entry_output_splatted.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.btn_browse_output_splatted = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.output_splatted_var))
+        self.btn_browse_output_splatted.grid(row=current_row, column=2, columnspan=2, padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_output_splatted, "output_splatted")
+        self._create_hover_tooltip(self.entry_output_splatted, "output_splatted")
+        self._create_hover_tooltip(self.btn_browse_output_splatted, "output_splatted")
+        # Reset current_row for next frame
+        current_row = 0
 
-        # --- Process Resolution and Settings Frame ---
-        self.preprocessing_frame = ttk.LabelFrame(self, text="Process Resolution and Settings")
-        self.preprocessing_frame.pack(pady=10, padx=10, fill="x")
-        self.preprocessing_frame.grid_columnconfigure(1, weight=1)
-        self.preprocessing_frame.grid_columnconfigure(3, weight=1)
+        # --- Settings Container Frame (to hold two side-by-side frames) ---
+        self.settings_container_frame = ttk.Frame(self)
+        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
+        self.settings_container_frame.grid_columnconfigure(0, weight=1)
+        self.settings_container_frame.grid_columnconfigure(1, weight=1)
 
+        # ===================================================================
+        # LEFT SIDE: Process Resolution and Settings Frame
+        # ===================================================================
+        self.preprocessing_frame = ttk.LabelFrame(self.settings_container_frame, text="Process Resolution")
+        self.preprocessing_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew")
+        self.preprocessing_frame.grid_columnconfigure(1, weight=1) # Allow Entry to expand
+
+        current_row = 0
         # Enable Full Resolution Section
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output (Native Video Resolution)", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_full_res_checkbox.grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output(For Blending)", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
+        current_row += 1
 
         self.lbl_full_res_batch_size = ttk.Label(self.preprocessing_frame, text="Full Res Batch Size:")
-        self.lbl_full_res_batch_size.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_full_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_full_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.batch_size_var, width=15)
-        self.entry_full_res_batch_size.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        self.entry_full_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
+        current_row += 1
+
 
         # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (Pre-defined Below)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_low_res_checkbox.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(10, 2))
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (For Inpainting)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
+        current_row += 1
 
-        self.pre_res_width_label = ttk.Label(self.preprocessing_frame, text="Low Res Width:")
-        self.pre_res_width_label.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-        self.pre_res_width_entry = ttk.Entry(self.preprocessing_frame, textvariable=self.pre_res_width_var, width=10)
-        self.pre_res_width_entry.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+        # Low Res Width/Height (Squeezed onto one row)
+        self.low_res_wh_frame = ttk.Frame(self.preprocessing_frame)
+        self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        
+        self.pre_res_width_label = ttk.Label(self.low_res_wh_frame, text="Width:")
+        self.pre_res_width_label.pack(side="left", padx=(0, 2))
+        self.pre_res_width_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_width_var, width=8)
+        self.pre_res_width_entry.pack(side="left", padx=(0, 10))
+
+        self.pre_res_height_label = ttk.Label(self.low_res_wh_frame, text="Heigh:")
+        self.pre_res_height_label.pack(side="left", padx=(0, 2))
+        self.pre_res_height_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_height_var, width=8)
+        self.pre_res_height_entry.pack(side="left", padx=(0, 0))
+
         self._create_hover_tooltip(self.pre_res_width_label, "low_res_width")
         self._create_hover_tooltip(self.pre_res_width_entry, "low_res_width")
-
-        self.pre_res_height_label = ttk.Label(self.preprocessing_frame, text="Low Res Height:")
-        self.pre_res_height_label.grid(row=3, column=2, sticky="e", padx=5, pady=2)
-        self.pre_res_height_entry = ttk.Entry(self.preprocessing_frame, textvariable=self.pre_res_height_var, width=10)
-        self.pre_res_height_entry.grid(row=3, column=3, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.pre_res_height_label, "low_res_height")
         self._create_hover_tooltip(self.pre_res_height_entry, "low_res_height")
+        current_row += 1
+
 
         self.lbl_low_res_batch_size = ttk.Label(self.preprocessing_frame, text="Low Res Batch Size:")
-        self.lbl_low_res_batch_size.grid(row=4, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_low_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_low_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.low_res_batch_size_var, width=15)
-        self.entry_low_res_batch_size.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+        self.entry_low_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
         self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
+        current_row = 0 # Reset for next frame
 
-        # --- Output Settings Frame ---
-        output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
-        output_settings_frame.pack(pady=10, padx=10, fill="x")
-        # ADD THESE LINES for layout balancing
-        output_settings_frame.grid_columnconfigure(1, weight=1)
-        output_settings_frame.grid_columnconfigure(3, weight=1) # Allow right side to expand
-        # END ADDITION
+        # ===================================================================
+        # RIGHT SIDE: Depth Map Pre-processing Frame
+        # ===================================================================
+        self.depth_settings_container = ttk.Frame(self.settings_container_frame)
+        self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+        self.depth_settings_container.grid_columnconfigure(0, weight=1)
+        
+        # # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        # sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
 
-        lbl_max_disp = ttk.Label(output_settings_frame, text="Max Disparity %:")
-        lbl_max_disp.grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        entry_max_disp = ttk.Entry(output_settings_frame, textvariable=self.max_disp_var, width=15)
-        entry_max_disp.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_max_disp, "max_disp")
-        self._create_hover_tooltip(entry_max_disp, "max_disp")
+        # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
+        self.depth_prep_frame.grid(row=current_row, column=0, sticky="ew") # Use grid here for placement inside container
+        self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
-        lbl_zero_disparity_anchor = ttk.Label(output_settings_frame, text="Convergence Point (0-1):")
-        lbl_zero_disparity_anchor.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        entry_zero_disparity_anchor = ttk.Entry(output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
-        entry_zero_disparity_anchor.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_zero_disparity_anchor, "convergence_point")
-        self._create_hover_tooltip(entry_zero_disparity_anchor, "convergence_point")
+        row_inner = 0
+        # Dilate Size
+        self.lbl_depth_dilate_size = ttk.Label(self.depth_prep_frame, text="Dilate Size (0=Off):")
+        self.lbl_depth_dilate_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_dilate_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_dilate_size_var, width=15)
+        self.entry_depth_dilate_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_dilate_size, "depth_dilate_size")
+        self._create_hover_tooltip(self.entry_depth_dilate_size, "depth_dilate_size")
+        row_inner += 1
+        
+        # Blur Size (Sigma = Size/6)
+        self.lbl_depth_blur_size = ttk.Label(self.depth_prep_frame, text="Blur Size (0/Odd):")
+        self.lbl_depth_blur_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_blur_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_blur_size_var, width=15)
+        self.entry_depth_blur_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
+        self._create_hover_tooltip(self.entry_depth_blur_size, "depth_blur_size")
+        row_inner = 0 # Reset for next frame
 
-        lbl_process_length = ttk.Label(output_settings_frame, text="Process Length (-1 for all):")
-        lbl_process_length.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        entry_process_length = ttk.Entry(output_settings_frame, textvariable=self.process_length_var, width=15)
-        entry_process_length.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_process_length, "process_length")
-        self._create_hover_tooltip(entry_process_length, "process_length")
+        current_row += 1
 
-        # NEW: Output CRF setting, placed on the right side
-        lbl_output_crf = ttk.Label(output_settings_frame, text="Output CRF (0-51):")
-        lbl_output_crf.grid(row=2, column=2, sticky="e", padx=5, pady=2) # Place on the right side
-        entry_output_crf = ttk.Entry(output_settings_frame, textvariable=self.output_crf_var, width=15)
-        entry_output_crf.grid(row=2, column=3, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(lbl_output_crf, "output_crf")
-        self._create_hover_tooltip(entry_output_crf, "output_crf")
+        # ===================================================================
+        # --- Sidecar Control Frame (Placed below Depth Prep Frame) ---
+        # label_text = "Sidecar (" + sidecar_ext + ") Control"
+        # self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text=label_text) # <-- Already self. and using corrected text
+        # self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
+        # self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
 
-        dual_output_checkbox = ttk.Checkbutton(output_settings_frame, text="Dual Output (Mask & Warped)", variable=self.dual_output_var)
-        dual_output_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(dual_output_checkbox, "dual_output")
+        # row_inner = 0
+        # # Sidecar Toggles
+        # self.sidecar_gamma_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Depth Gamma Override", variable=self.enable_sidecar_gamma_var)
+        # self.sidecar_gamma_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
+        # row_inner += 1
 
-        autogain_checkbox = ttk.Checkbutton(output_settings_frame, text="No Normalization (Assume Raw 0-1 Input)", variable=self.enable_autogain_var)
-        autogain_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(autogain_checkbox, "no_normalization")
+        # self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
+        # self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.sidecar_blur_dilate_checkbox, "sidecar_blur_dilate_toggle")
+        # current_row = 0 # Reset for next frame
+
+        # ===================================================================
+        # --- Output Settings Frame (Now placed below the settings_container_frame) ---
+        current_row = 0
+        self.output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
+        self.output_settings_frame.pack(pady=10, padx=10, fill="x")
+        self.output_settings_frame.grid_columnconfigure(1, weight=1)
+        self.output_settings_frame.grid_columnconfigure(3, weight=1)
+        
+        # Gamma
+        self.lbl_depth_gamma = ttk.Label(self.output_settings_frame, text="Gamma (1.0=Off):")
+        self.lbl_depth_gamma.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_depth_gamma = ttk.Entry(self.output_settings_frame, textvariable=self.depth_gamma_var, width=15)
+        self.entry_depth_gamma.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
+        self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
+
+        self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length (-1 for all):")
+        self.lbl_process_length.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
+        self.entry_process_length.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_process_length, "process_length")
+        self._create_hover_tooltip(self.entry_process_length, "process_length")
+        current_row += 1
+        
+        self.lbl_max_disp = ttk.Label(self.output_settings_frame, text="Max Disparity %:")
+        self.lbl_max_disp.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_max_disp = ttk.Entry(self.output_settings_frame, textvariable=self.max_disp_var, width=15)
+        self.entry_max_disp.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_max_disp, "max_disp")
+        self._create_hover_tooltip(self.entry_max_disp, "max_disp")
+
+        # Output CRF setting, placed on the right side
+        self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF (0-51):")
+        self.lbl_output_crf.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.entry_output_crf = ttk.Entry(self.output_settings_frame, textvariable=self.output_crf_var, width=15)
+        self.entry_output_crf.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_output_crf, "output_crf")
+        self._create_hover_tooltip(self.entry_output_crf, "output_crf")
+        current_row += 1
+
+        self.lbl_zero_disparity_anchor = ttk.Label(self.output_settings_frame, text="Convergence Point (0-1):")
+        self.lbl_zero_disparity_anchor.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.entry_zero_disparity_anchor = ttk.Entry(self.output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
+        self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
+        self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
+        current_row += 1
+
+        self.auto_convergence_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Auto-Determine Convergence (Video Avg)", variable=self.enable_auto_convergence_var)
+        self.auto_convergence_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.auto_convergence_checkbox, "auto_convergence_toggle")
+
+        # self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
+        # self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        # self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+
+        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
+        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
+
+        current_row = 0 # Reset for next frame
 
         # --- Progress frame ---
         progress_frame = ttk.LabelFrame(self, text="Progress")
@@ -471,6 +635,153 @@ class SplatterGUI(ThemedTk):
         lbl_convergence_value.grid(row=5, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
 
+        # --- NEW ROW 6: Gamma ---
+        self.processing_gamma_var = tk.StringVar(value="N/A") # <-- ADD this variable to __init__
+        lbl_gamma_static = tk.Label(self.info_frame, text="Gamma:")
+        lbl_gamma_static.grid(row=6, column=0, sticky="e", padx=5, pady=1)
+        lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w")
+        lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
+        self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
+        # ------------------------
+
+    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int) -> float:
+        """
+        Calculates the Auto Convergence point (average depth value) for the entire video.
+        Uses a hard blur and crops to the center 75% to eliminate noise/edge artifacts.
+
+        Returns:
+            float: The new zero_disparity_anchor_val (0.0 to 1.0).
+        """
+        logger.info("==> Starting Auto-Convergence pre-pass to determine global average depth.")
+        
+        # --- Constants for Auto-Convergence Logic ---
+        BLUR_KERNEL_SIZE = 9  # Hard blur to capture bulk depth, must be odd
+        CENTER_CROP_PERCENT = 0.75 # Use the center 75% of the frame (1 - 0.75 = 0.25 margin total)
+        MIN_VALID_PIXELS = 100 # Minimum number of non-zero/non-max pixels to consider a frame valid
+        INTERNAL_ANCHOR_OFFSET = 0.1 # <--- ADJUST THIS VALUE FOR TESTING (e.g., 0.02, 0.05, 0.1)
+        # -------------------------------------------
+
+        all_valid_frame_averages = []
+
+        try:
+            # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
+            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
+            if len(depth_reader) == 0:
+                 logger.error("Depth map reader has no frames. Cannot calculate Auto-Convergence.")
+                 return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+        except Exception as e:
+            logger.error(f"Error initializing depth map reader for Auto-Convergence: {e}")
+            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+
+
+        # 2. Iterate and Average
+        num_frames = min(total_frames_to_process, len(depth_reader))
+        
+        for i in range(0, num_frames, batch_size):
+            if self.stop_event.is_set():
+                logger.warning("Auto-Convergence pre-pass stopped by user.")
+                return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback
+
+            current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
+            if not current_frame_indices:
+                break
+            
+            batch_depth_numpy_raw = depth_reader.get_batch(current_frame_indices).asnumpy()
+
+            # Process depth frames (Grayscale, Float conversion, 0-1 Normalization)
+            if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
+                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
+            elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
+                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
+            else:
+                batch_depth_numpy = batch_depth_numpy_raw
+            
+            batch_depth_float = batch_depth_numpy.astype(np.float32)
+
+            # Get chunk min/max for normalization (using the chunk's range, since we don't have global stats yet)
+            min_val = batch_depth_float.min()
+            max_val = batch_depth_float.max()
+            
+            if max_val - min_val > 1e-5:
+                batch_depth_normalized = (batch_depth_float - min_val) / (max_val - min_val)
+            else:
+                # If chunk is flat, use a neutral value
+                batch_depth_normalized = np.full_like(batch_depth_float, fill_value=0.5, dtype=np.float32)
+
+            # Frame-by-Frame Processing (Blur & Crop)
+            for frame in batch_depth_normalized:
+                H, W = frame.shape
+                
+                # a) Blur
+                frame_blurred = cv2.GaussianBlur(frame, (BLUR_KERNEL_SIZE, BLUR_KERNEL_SIZE), 0)
+                
+                # b) Center Crop (75% of H and W)
+                margin_h = int(H * (1 - CENTER_CROP_PERCENT) / 2)
+                margin_w = int(W * (1 - CENTER_CROP_PERCENT) / 2)
+                
+                cropped_frame = frame_blurred[margin_h:H-margin_h, margin_w:W-margin_w]
+                
+                # c) Average (Exclude true black/white pixels (0.0 or 1.0) which may be background/edges)
+                # Use a small epsilon to catch near-zero/near-one
+                valid_pixels = cropped_frame[(cropped_frame > 0.001) & (cropped_frame < 0.999)] 
+                
+                if valid_pixels.size > MIN_VALID_PIXELS:
+                    all_valid_frame_averages.append(valid_pixels.mean())
+                # else: frame is likely too empty or uniform, skip for averaging
+
+            draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
+        
+        # 3. Final Temporal Average
+        if all_valid_frame_averages:
+            raw_anchor = np.mean(all_valid_frame_averages)
+            
+            # --- NEW: Apply Offset and Clamping ---
+            final_anchor_offset = raw_anchor + INTERNAL_ANCHOR_OFFSET
+            
+            # Clamp to the valid range [0.0, 1.0]
+            final_anchor = np.clip(final_anchor_offset, 0.0, 1.0)
+            
+            logger.info(f"\n==> Auto-Convergence Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
+            return float(final_anchor)
+        else:
+            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI default.")
+            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+
+    def _get_current_config(self):
+        """Collects all current GUI variable values into a single dictionary."""
+        config = {
+            # Folder Configurations
+            "input_source_clips": self.input_source_clips_var.get(),
+            "input_depth_maps": self.input_depth_maps_var.get(),
+            "output_splatted": self.output_splatted_var.get(),
+            
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "window_width": self.winfo_width(),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+
+            "enable_full_resolution": self.enable_full_res_var.get(),
+            "batch_size": self.batch_size_var.get(),
+            "enable_low_resolution": self.enable_low_res_var.get(),
+            "pre_res_width": self.pre_res_width_var.get(),
+            "pre_res_height": self.pre_res_height_var.get(),
+            "low_res_batch_size": self.low_res_batch_size_var.get(),
+            
+            "depth_dilate_size": self.depth_dilate_size_var.get(),
+            "depth_blur_size": self.depth_blur_size_var.get(),
+
+            "process_length": self.process_length_var.get(),
+            "output_crf": self.output_crf_var.get(),
+            "dual_output": self.dual_output_var.get(),
+            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
+            
+            "depth_gamma": self.depth_gamma_var.get(),
+            "max_disp": self.max_disp_var.get(),
+            "convergence_point": self.zero_disparity_anchor_var.get(),
+            # "enable_autogain": self.enable_autogain_var.get(),
+        }
+        return config
+
     def _get_defined_tasks(self, settings):
         """Helper to return a list of processing tasks based on GUI settings."""
         processing_tasks = []
@@ -504,6 +815,7 @@ class SplatterGUI(ThemedTk):
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         actual_depth_map_path = None
         
+        # Determine actual depth map file path
         if is_single_file_mode:
             actual_depth_map_path = input_depth_maps_path_setting
             if not os.path.exists(actual_depth_map_path):
@@ -521,59 +833,111 @@ class SplatterGUI(ThemedTk):
         
         actual_depth_map_path = os.path.normpath(actual_depth_map_path)
         depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}.json")
+        
+        # --- DEFINES json_sidecar_path ---
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        # ---------------------------------
 
-        current_zero_disparity_anchor = default_zero_disparity_anchor
-        current_max_disparity_percentage = gui_max_disp
-        current_frame_overlap = None
-        current_input_bias = None
+
+        # [NEW]: Read GUI Input Fields for defaults
+        try:
+            default_gamma_gui = float(self.depth_gamma_var.get())
+            default_dilate_gui = int(self.depth_dilate_size_var.get())
+            default_blur_gui = int(self.depth_blur_size_var.get())
+        except ValueError:
+            default_gamma_gui, default_dilate_gui, default_blur_gui = 1.0, 0, 0
+        
+        # Initialize final parameters with GUI defaults (or passed values)
+        current_params = {
+            "convergence_plane": default_zero_disparity_anchor,
+            "max_disparity_percentage": gui_max_disp,
+            "frame_overlap": None,
+            "input_bias": None,
+            "depth_gamma": default_gamma_gui,
+            "depth_dilate_size": default_dilate_gui,
+            "depth_blur_size": default_blur_gui
+        }
         anchor_source = "GUI"
         max_disp_source = "GUI"
+        gamma_source = "GUI"
 
         if os.path.exists(json_sidecar_path):
             try:
                 with open(json_sidecar_path, 'r') as f:
                     sidecar_data = json.load(f)
 
-                if "convergence_plane" in sidecar_data and isinstance(sidecar_data["convergence_plane"], (int, float)):
-                    current_zero_disparity_anchor = float(sidecar_data["convergence_plane"])
-                    logger.debug(f"==> Using convergence_plane from sidecar JSON '{json_sidecar_path}': {current_zero_disparity_anchor}")
-                    anchor_source = "JSON"
-                else:
-                    logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'convergence_plane' key is missing or invalid. Using GUI anchor: {current_zero_disparity_anchor:.2f}")
-                    anchor_source = "GUI (Invalid JSON)"
+                # --- MAPPING LOGIC: Iterate through the central map ---
+                for sidecar_key, internal_key in self.SIDECAR_KEY_MAP.items():
+                    if sidecar_key in sidecar_data:
+                        value = sidecar_data[sidecar_key]
+                        
+                        # --- Apply the value based on the internal key ---
+                        
+                        # Max Disparity and Convergence Plane (Requires special source tracking)
+                        if internal_key in ["CONV_POINT", "MAX_DISP"]:
+                            if internal_key == "CONV_POINT":
+                                current_params["convergence_plane"] = float(value)
+                                anchor_source = "Sidecar"
+                            if internal_key == "MAX_DISP":
+                                current_params["max_disparity_percentage"] = float(value)
+                                max_disp_source = "Sidecar"
+                            logger.debug(f"==> Using sidecar {sidecar_key}: {value}")
 
-                if "max_disparity" in sidecar_data and isinstance(sidecar_data["max_disparity"], (int, float)):
-                    current_max_disparity_percentage = float(sidecar_data["max_disparity"])
-                    logger.debug(f"==> Using max_disparity from sidecar JSON '{json_sidecar_path}': {current_max_disparity_percentage:.1f}")
-                    max_disp_source = "JSON"
-                else:
-                    logger.warning(f"==> Warning: Sidecar JSON '{json_sidecar_path}' found but 'max_disparity' key is missing or invalid. Using GUI max_disp: {current_max_disparity_percentage:.1f}")
-                    max_disp_source = "GUI (Invalid JSON)"
+                        # Gamma (Check toggle: self.enable_sidecar_gamma_var)
+                        elif internal_key == "DEPTH_GAMMA" and self.enable_sidecar_gamma_var.get():
+                            if isinstance(value, (int, float)) and float(value) > 0:
+                                current_params["depth_gamma"] = float(value)
+                                gamma_source = "Sidecar"
+                                logger.debug(f"==> Using sidecar {sidecar_key}: {value} (Override)")
+                        
+                        # Blur/Dilate (Check toggle: self.enable_sidecar_blur_dilate_var)
+                        elif internal_key in ["DEPTH_DILATE_SIZE", "DEPTH_BLUR_SIZE"] and self.enable_sidecar_blur_dilate_var.get():
+                            if isinstance(value, (int, float)):
+                                processed_val = max(0, int(value))
+                                
+                                if internal_key == "DEPTH_DILATE_SIZE":
+                                    current_params["depth_dilate_size"] = processed_val
+                                    logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
+                                    
+                                elif internal_key == "DEPTH_BLUR_SIZE":
+                                    # Ensure blur size is odd
+                                    if processed_val > 0 and processed_val % 2 == 0:
+                                        processed_val += 1
+                                        logger.warning(f"==> Blur size must be odd. Increased to {processed_val}.")
+                                    current_params["depth_blur_size"] = processed_val
+                                    logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
 
-                if "frame_overlap" in sidecar_data and isinstance(sidecar_data["frame_overlap"], (int, float)):
-                    current_frame_overlap = int(sidecar_data["frame_overlap"])
-                    logger.debug(f"==> Using frame_overlap from sidecar JSON '{json_sidecar_path}': {current_frame_overlap}")
-
-                if "input_bias" in sidecar_data and isinstance(sidecar_data["input_bias"], (int, float)):
-                    current_input_bias = float(sidecar_data["input_bias"])
-                    logger.debug(f"==> Using input_bias from sidecar JSON '{json_sidecar_path}': {current_input_bias:.2f}")
-
+                        # Frame Overlap and Input Bias (No GUI toggle, always use sidecar if present)
+                        elif internal_key in ["FRAME_OVERLAP", "INPUT_BIAS"]:
+                            if isinstance(value, (int, float)):
+                                if internal_key == "FRAME_OVERLAP":
+                                    current_params["frame_overlap"] = int(value)
+                                elif internal_key == "INPUT_BIAS":
+                                    current_params["input_bias"] = float(value)
+                                logger.debug(f"==> Using sidecar {sidecar_key} ({internal_key}): {value}")
+                            
+                # --- END MAPPING LOGIC ---
+            
             except json.JSONDecodeError:
-                logger.error(f"==> Error: Could not parse sidecar JSON '{json_sidecar_path}'. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Error: Could not parse sidecar '{json_sidecar_path}'. Using GUI defaults.")
             except Exception as e:
-                logger.error(f"==> Unexpected error reading sidecar JSON '{json_sidecar_path}': {e}. Using GUI anchor and max_disp. Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+                logger.error(f"==> Unexpected error reading sidecar '{json_sidecar_path}': {e}. Using GUI defaults.")
         else:
-            logger.debug(f"==> No sidecar JSON '{json_sidecar_path}' found for depth map. Using GUI anchor and max_disp: Anchor={current_zero_disparity_anchor:.2f}, MaxDisp={current_max_disparity_percentage:.1f}%")
+            logger.debug(f"==> No sidecar '{json_sidecar_path}' found. Using GUI defaults.")
 
         return {
             "actual_depth_map_path": actual_depth_map_path,
-            "convergence_plane": current_zero_disparity_anchor,
-            "max_disparity_percentage": current_max_disparity_percentage,
-            "frame_overlap": current_frame_overlap,
-            "input_bias": current_input_bias,
+            "convergence_plane": current_params["convergence_plane"],
+            "max_disparity_percentage": current_params["max_disparity_percentage"],
+            "frame_overlap": current_params["frame_overlap"],
+            "input_bias": current_params["input_bias"],
+            "depth_gamma": current_params["depth_gamma"],
+            "depth_dilate_size": current_params["depth_dilate_size"],
+            "depth_blur_size": current_params["depth_blur_size"],
             "anchor_source": anchor_source,
-            "max_disp_source": max_disp_source
+            "max_disp_source": max_disp_source,
+            "gamma_source": gamma_source,
         }
     
     def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
@@ -731,7 +1095,7 @@ class SplatterGUI(ThemedTk):
             self.help_texts = {}
 
     def _move_processed_files(self, video_path, actual_depth_map_path, finished_source_folder, finished_depth_folder):
-        """Moves source video, depth map, and its sidecar JSON to 'finished' folders."""
+        """Moves source video, depth map, and its sidecar file to 'finished' folders."""
         max_retries = 5
         retry_delay_sec = 0.5 # Wait half a second between retries
 
@@ -757,7 +1121,7 @@ class SplatterGUI(ThemedTk):
         else:
             logger.warning(f"==> Cannot move source video '{os.path.basename(video_path)}': 'finished_source_folder' is not set (not in batch mode).")
 
-        # Move depth map and its sidecar JSON
+        # Move depth map and its sidecar file
         if actual_depth_map_path and finished_depth_folder:
             dest_path_depth = os.path.join(finished_depth_folder, os.path.basename(actual_depth_map_path))
             # --- Retry for Depth Map ---
@@ -778,33 +1142,95 @@ class SplatterGUI(ThemedTk):
             else:
                 logger.error(f"==> Failed to move depth map '{os.path.basename(actual_depth_map_path)}' after {max_retries} attempts due to PermissionError.")
 
-            # --- Retry for Sidecar JSON (if it exists) ---
+            # --- Retry for Sidecar file (if it exists) ---
             depth_map_dirname = os.path.dirname(actual_depth_map_path)
             depth_map_basename_without_ext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.json")
-            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}.json")
+            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.fssidecar")
+            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}.fssidecar")
 
             if os.path.exists(json_sidecar_path_to_move):
                 for attempt in range(max_retries):
                     try:
                         if os.path.exists(dest_path_json):
-                            logger.warning(f"Sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' already exists in '{finished_depth_folder}'. Overwriting.")
+                            logger.warning(f"Sidecar file '{os.path.basename(json_sidecar_path_to_move)}' already exists in '{finished_depth_folder}'. Overwriting.")
                             os.remove(dest_path_json)
                         shutil.move(json_sidecar_path_to_move, finished_depth_folder)
-                        logger.debug(f"==> Moved sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
+                        logger.debug(f"==> Moved sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}")
                         break
                     except PermissionError as e:
-                        logger.warning(f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving JSON '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s...")
+                        logger.warning(f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving file '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s...")
                         time.sleep(retry_delay_sec)
                     except Exception as e:
-                        logger.error(f"==> Failed to move sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' to '{finished_depth_folder}': {e}", exc_info=True)
+                        logger.error(f"==> Failed to move sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to '{finished_depth_folder}': {e}", exc_info=True)
                         break
                 else:
-                    logger.error(f"==> Failed to move sidecar JSON '{os.path.basename(json_sidecar_path_to_move)}' after {max_retries} attempts due to PermissionError.")
+                    logger.error(f"==> Failed to move sidecar file '{os.path.basename(json_sidecar_path_to_move)}' after {max_retries} attempts due to PermissionError.")
             else:
-                logger.debug(f"==> No sidecar JSON '{json_sidecar_path_to_move}' found to move.")
+                logger.debug(f"==> No sidecar file '{json_sidecar_path_to_move}' found to move.")
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
+
+    def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
+                              depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool, max_raw_value: float) -> np.ndarray:
+        """
+        Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
+        """
+        # 1. Grayscale Conversion (Existing logic from depthSplatting)
+        if batch_depth_numpy_raw.ndim == 4:
+            if batch_depth_numpy_raw.shape[-1] == 3: # RGB
+                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
+            else: # Grayscale with channel dim (e.g., T,H,W,1)
+                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
+        else: # If depth video is grayscale (ndim 3: T,H,W)
+            batch_depth_numpy = batch_depth_numpy_raw
+        
+        # Convert to float32 for processing
+        batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
+
+        # 2. Gamma Adjustment (always applied if gamma != 1.0)
+        if depth_gamma != 1.0 and max_raw_value > 1.0: # Only apply if raw value is > 1.0 (i.e., not already 0-1 float)
+            logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
+            
+            # Apply Gamma across the MAX RAW VALUE range for consistency!
+            # Scale to [0, 1], apply gamma, scale back to raw range.
+            normalized_chunk = batch_depth_numpy_float / max_raw_value
+            normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
+            batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
+        elif depth_gamma != 1.0:
+            logger.warning("Gamma adjustment skipped: Max expected raw value is 1.0. Gamma assumed applied to 0-1 range if needed later.")
+
+        # Dilate and Blur should ONLY be applied if it is NOT a low-res task.
+        if is_low_res_task:
+            if depth_dilate_size > 0 or depth_blur_size > 0:
+                 # Log a warning if user set a value but it's being skipped
+                 logger.debug(f"Dilate ({depth_dilate_size}) or Blur ({depth_blur_size}) skipped for low-resolution (inpaint) task as per configuration.")
+        else:
+            # This is the HI-RES path: apply Dilate and Blur based on size setting.
+
+            # 3. Dilation (if size > 0)
+            if depth_dilate_size > 0:
+                logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
+                # Create a square kernel for dilation
+                kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
+                # Apply dilation: cv2.dilate expects C-order (H, W) for image processing
+                for j in range(batch_depth_numpy_float.shape[0]):
+                    batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
+            
+            # 4. Gaussian Blur (if size > 0)
+            if depth_blur_size > 0:
+                logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
+                # Sigma is fixed at size / 6.0 as requested
+                sigma = depth_blur_size / 6.0 
+                # Apply Gaussian Blur: cv2.GaussianBlur expects C-order (H, W)
+                for j in range(batch_depth_numpy_float.shape[0]):
+                    batch_depth_numpy_float[j] = cv2.GaussianBlur(
+                        batch_depth_numpy_float[j], 
+                        (depth_blur_size, depth_blur_size), 
+                        sigmaX=sigma, 
+                        sigmaY=sigma
+                    )
+
+        return batch_depth_numpy_float
 
     def _run_batch_process(self, settings):
         """
@@ -874,8 +1300,31 @@ class SplatterGUI(ThemedTk):
                 current_input_bias = video_specific_settings["input_bias"]
                 anchor_source = video_specific_settings["anchor_source"]
                 max_disp_source = video_specific_settings["max_disp_source"]
+                gamma_source = video_specific_settings["gamma_source"]
+                current_depth_gamma = video_specific_settings["depth_gamma"]
+                current_depth_dilate_size = video_specific_settings["depth_dilate_size"]
+                current_depth_blur_size = video_specific_settings["depth_blur_size"]
+
+
 
                 processing_tasks = self._get_defined_tasks(settings)
+
+                # --- NEW: Auto-Convergence Logic (BEFORE initializing readers) ---
+                if settings["enable_auto_convergence"]:
+                    logger.info("Auto-Convergence is ENABLED. Running pre-pass...")
+
+                    new_anchor_val = self._determine_auto_convergence(
+                        actual_depth_map_path,
+                        settings["process_length"],
+                        settings["full_res_batch_size"] # Use a reasonable batch size for the pre-pass
+                    )
+                    
+                    # Update variables for current task
+                    current_zero_disparity_anchor = new_anchor_val
+                    anchor_source = "Auto"
+                    logger.info(f"Using Auto-Determined Convergence Point: {current_zero_disparity_anchor:.4f}")
+                # --- END Auto-Convergence Logic ---
+
                 if not processing_tasks:
                     logger.debug(f"==> No processing tasks configured for {video_name}. Skipping.")
                     overall_task_counter += 0
@@ -895,7 +1344,8 @@ class SplatterGUI(ThemedTk):
                     self.progress_queue.put(("update_info", {
                         "task_name": task['name'],
                         "convergence": f"{current_zero_disparity_anchor:.2f} ({anchor_source})",
-                        "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})"
+                        "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})",
+                        "gamma": f"{current_depth_gamma:.2f} ({gamma_source})",
                     }))
 
                     video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width, \
@@ -906,7 +1356,7 @@ class SplatterGUI(ThemedTk):
                         )
                     
                     # Explicitly check for None for critical components before proceeding
-                    if video_reader_input is None or depth_reader_input is None or video_stream_info is None: # <--- CHANGED HERE: Added check for video_stream_info
+                    if video_reader_input is None or depth_reader_input is None or video_stream_info is None:
                         logger.error(f"Skipping {task['name']} pass for {video_name} due to reader initialization error, frame count mismatch, or missing stream info.")
                         overall_task_counter += 1
                         self.progress_queue.put(("processed", overall_task_counter))
@@ -918,14 +1368,36 @@ class SplatterGUI(ThemedTk):
                     global_depth_max = 1.0 
 
                     if not assume_raw_input_mode: 
-                        logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass...")
-                        global_depth_min, global_depth_max = compute_global_depth_stats(
-                            depth_map_reader=depth_reader_input,
-                            total_frames=total_frames_depth,
-                            chunk_size=task["batch_size"] 
-                        )
+                        logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass with RAW reader.")
+                        
+                        # --- FIX: Use a DEDICATED, RAW reader for consistent global stats ---
+                        raw_depth_reader_temp = None
+                        try:
+                            # 1. Initialize a NON-RESIZING reader
+                            raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0))
+                            
+                            # 2. Compute stats using the RAW reader
+                            if len(raw_depth_reader_temp) > 0:
+                                global_depth_min, global_depth_max = compute_global_depth_stats(
+                                    depth_map_reader=raw_depth_reader_temp,
+                                    total_frames=total_frames_depth,
+                                    chunk_size=task["batch_size"] 
+                                )
+                                logger.debug("Successfully computed global stats from RAW reader.")
+                            else:
+                                logger.error("RAW depth reader has no frames.")
+                        except Exception as e:
+                            logger.error(f"Failed to initialize/read RAW depth reader for global stats: {e}")
+                            global_depth_min = 0.0 # Ensure min/max are reset on fatal error
+                            global_depth_max = 1.0
+                        finally:
+                            # 3. Clean up the temporary RAW reader
+                            if raw_depth_reader_temp:
+                                del raw_depth_reader_temp
+                                gc.collect()
+                        # -----------------------------------------------------------------
                     else:
-                        logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping depth stats pre-pass.")
+                        logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass.")
                         global_depth_min = 0.0
                         global_depth_max = 1.0
 
@@ -962,7 +1434,11 @@ class SplatterGUI(ThemedTk):
                         global_depth_min=global_depth_min,
                         global_depth_max=global_depth_max,
                         depth_stream_info=depth_stream_info,
-                        is_low_res_task=task["is_low_res"]
+                        is_low_res_task=task["is_low_res"],
+                        # --- NEW ARGUMENTS ---
+                        depth_gamma=current_depth_gamma,
+                        depth_dilate_size=current_depth_dilate_size,
+                        depth_blur_size=current_depth_blur_size
                     )
 
                     if self.stop_event.is_set():
@@ -1014,36 +1490,61 @@ class SplatterGUI(ThemedTk):
 
     def _save_config(self):
         """Saves current GUI settings to config_splat.json."""
-        config = {
-            # Folder Configurations
-            "input_source_clips": self.input_source_clips_var.get(),
-            "input_depth_maps": self.input_depth_maps_var.get(),
-            "output_splatted": self.output_splatted_var.get(),
-            
-            # GUI State Configurations
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "window_width": self.winfo_width(),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "debug_mode_enabled": self.debug_mode_var.get(),
-
-            "max_disp": self.max_disp_var.get(),
-            "process_length": self.process_length_var.get(),
-            "batch_size": self.batch_size_var.get(),
-            "dual_output": self.dual_output_var.get(),
-            "enable_autogain": self.enable_autogain_var.get(),
-            "enable_full_resolution": self.enable_full_res_var.get(),
-            "enable_low_resolution": self.enable_low_res_var.get(),
-            "pre_res_width": self.pre_res_width_var.get(),
-            "pre_res_height": self.pre_res_height_var.get(),
-            "low_res_batch_size": self.low_res_batch_size_var.get(),
-            "convergence_point": self.zero_disparity_anchor_var.get(),
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "output_crf": self.output_crf_var.get(),
-        }
+        config = self._get_current_config()
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
 
+    def _set_input_state(self, state):
+        """Sets the state of all input widgets to 'normal' or 'disabled'."""
+        
+        # Helper to set the state of all children in a frame
+        def set_frame_children_state(frame, state, exclude_frames=False):
+            """Recursively sets the state of all configurable widgets within a frame."""
+            for child in frame.winfo_children():
+                child_type = child.winfo_class()
+                
+                # Check if the child is a Frame/LabelFrame that we need to recurse into
+                if isinstance(child, (ttk.Frame, tk.Frame, ttk.LabelFrame)) and not exclude_frames:
+                    set_frame_children_state(child, state, exclude_frames)
+                
+                # Check for widgets that accept the 'state' configuration
+                if child_type in ('TEntry', 'TButton', 'TCheckbutton', 'TCombobox'):
+                    try:
+                        # Use a keyword argument to pass the state
+                        child.config(state=state)
+                    except tk.TclError as e:
+                        # Some buttons/labels might throw an error if they don't support 'state' directly,
+                        # but Entries, Buttons, and Checkbuttons should be fine.
+                        pass
+                
+                # Special handling for labels whose colors might need adjusting if they are linked to entry/button states
+                # (Not needed for simple ttk styles, but left for reference)
+
+
+        # --- 1. Top-level Frames ---
+        
+        # Folder Frame (Input/Output Paths)
+        set_frame_children_state(self.folder_frame, state)
+
+        # Output Settings Frame (Max Disp, CRF, etc.)
+        set_frame_children_state(self.output_settings_frame, state)
+
+        # --- 2. Depth/Resolution Frames (Containers) ---
+        
+        # Process Resolution Frame (Left Side)
+        set_frame_children_state(self.preprocessing_frame, state)
+        
+        # Depth Map Pre-processing Container (Right Side)
+        set_frame_children_state(self.depth_settings_container, state)
+
+
+        # 3. Re-apply the specific field enable/disable logic
+        # This is CRITICAL. If we set state='normal' for everything, 
+        # toggle_processing_settings_fields will correctly re-disable the Low Res W/H fields
+        # if the "Enable Low Resolution" checkbox is unchecked.
+        if state == 'normal':
+            self.toggle_processing_settings_fields()
+    
     def _set_saved_geometry(self: "SplatterGUI"):
         """Applies the saved window width and position, with dynamic height."""
         # Ensure the window is visible and all widgets are laid out for accurate height calculation
@@ -1124,12 +1625,22 @@ class SplatterGUI(ThemedTk):
 
         return input_videos, is_single_file_mode, finished_source_folder, finished_depth_folder
     
-    def _toggle_debug_mode(self):
-        """Toggles debug mode on/off and updates logging."""
-        self._configure_logging()
-        self._save_config() # Save the current debug mode state to config immediately
-        messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
-    
+    def _toggle_debug_logging(self):
+        """Toggles debug logging and updates shared logger."""
+        self._debug_logging_enabled = self.debug_logging_var.get() # Get checkbutton state
+        
+        if self._debug_logging_enabled:
+            new_level = logging.DEBUG
+            level_str = "DEBUG"
+        else:
+            new_level = logging.INFO
+            level_str = "INFO"
+
+        # Call the utility function to change the root logger level
+        set_util_logger_level(new_level)
+
+        logger.info(f"Setting application logging level to: {level_str}")
+
     def check_queue(self):
         """Periodically checks the progress queue for updates to the GUI."""
         try:
@@ -1140,9 +1651,11 @@ class SplatterGUI(ThemedTk):
                     self.start_button.config(state="normal")
                     self.stop_button.config(state="disabled")
                     self.progress_var.set(0)
+                    # --- NEW: Enable all inputs at finish ---
+                    self._set_input_state('normal')
                     logger.info(f"==> All process completed.")
-
                     break
+                
                 elif message[0] == "total":
                     total_tasks = message[1]
                     self.progress_bar.config(maximum=total_tasks)
@@ -1167,6 +1680,8 @@ class SplatterGUI(ThemedTk):
                         self.processing_disparity_var.set(info_data["disparity"])
                     if "convergence" in info_data:
                         self.processing_convergence_var.set(info_data["convergence"])
+                    if "gamma" in info_data: # <--- ADD THIS CHECK
+                        self.processing_gamma_var.set(info_data["gamma"])
                     if "task_name" in info_data:
                         self.processing_task_name_var.set(info_data["task_name"])
 
@@ -1181,6 +1696,7 @@ class SplatterGUI(ThemedTk):
         self.processing_frames_var.set("N/A")
         self.processing_disparity_var.set("N/A")
         self.processing_convergence_var.set("N/A")
+        self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
 
     def depthSplatting(
@@ -1205,7 +1721,11 @@ class SplatterGUI(ThemedTk):
             global_depth_max: float,  
             depth_stream_info: Optional[dict],
             user_output_crf: Optional[int] = None,
-            is_low_res_task: bool = False
+            is_low_res_task: bool = False,
+            # --- NEW PARAMETERS ---
+            depth_gamma: float = 1.0,
+            depth_dilate_size: int = 0,
+            depth_blur_size: int = 0
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1214,6 +1734,28 @@ class SplatterGUI(ThemedTk):
         height, width = target_output_height, target_output_width
 
         os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
+
+        # --- NEW: Determine max_expected_raw_value for consistent Gamma ---
+        max_expected_raw_value = 1.0 # Default to 1.0 (already normalized float)
+        depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
+        depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
+
+        # Prioritize 10-bit/1023.0 for all passes if the source video metadata suggests 10-bit.
+        # This overrides any 8-bit detection to prevent scaling errors.
+        is_source_10bit = False
+        if depth_pix_fmt:
+            if "10" in depth_pix_fmt or "gray10" in depth_pix_fmt or "12" in depth_pix_fmt or (depth_profile and "main10" in depth_profile):
+                is_source_10bit = True
+        
+        if is_source_10bit:
+            max_expected_raw_value = 1023.0
+        elif depth_pix_fmt and ("8" in depth_pix_fmt or depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"]):
+             max_expected_raw_value = 255.0
+        elif isinstance(depth_pix_fmt, str) and "float" in depth_pix_fmt:
+            max_expected_raw_value = 1.0
+        
+        logger.debug(f"Determined max_expected_raw_value: {max_expected_raw_value:.1f} (Source: {depth_pix_fmt}/{depth_profile})")
+        # --- END NEW ---
 
         if dual_output:
             suffix = "_splatted2"
@@ -1229,12 +1771,12 @@ class SplatterGUI(ThemedTk):
 
         frame_count = 0
         logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
-        draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
+        # draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
 
         if assume_raw_input:
-            logger.info("No Normalization (Assume Raw 0-1 Input) is ENABLED. Depth maps will be directly scaled from raw pixel values to 0-1.")
+            logger.debug("No Normalization (Assume Raw 0-1 Input) is ENABLED. Depth maps will be directly scaled from raw pixel values to 0-1.")
         else:
-            logger.info("Global Depth Normalization is ENABLED. Depth maps will be normalized using pre-computed global min/max for consistency.")
+            logger.debug("Global Depth Normalization is ENABLED. Depth maps will be normalized using pre-computed global min/max for consistency.")
 
 
         for i in range(0, num_frames, batch_size):
@@ -1255,80 +1797,35 @@ class SplatterGUI(ThemedTk):
             batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
             batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
 
-            # Process depth frames (grayscale conversion if needed)
-            if batch_depth_numpy_raw.ndim == 4: # If depth video is RGB
-                if batch_depth_numpy_raw.shape[-1] == 3: # RGB
-                    batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
-                else: # Grayscale with channel dim (e.g., T,H,W,1)
-                    batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
-            else: # If depth video is grayscale (ndim 3: T,H,W)
-                batch_depth_numpy = batch_depth_numpy_raw
+            # --- NEW: Process depth map using the helper method ---
+            batch_depth_numpy = self._process_depth_batch(
+                batch_depth_numpy_raw=batch_depth_numpy_raw,
+                depth_stream_info=depth_stream_info,
+                depth_gamma=depth_gamma,
+                depth_dilate_size=depth_dilate_size,
+                depth_blur_size=depth_blur_size,
+                is_low_res_task=is_low_res_task,
+                max_raw_value=max_expected_raw_value,
+            )
+
+            # Convert original batch frames to float 0-1 for display in grid
+            batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
             
-            # Normalize depth frames based on selected mode
+            # Final Normalization Step: This MUST be the final step before converting to tensor.
+            
             if assume_raw_input:
-                current_chunk_min_val = batch_depth_numpy.min()
-                current_chunk_max_val = batch_depth_numpy.max()
-                
-                max_expected_raw_value = None
-                depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
-                depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
-
-                # Determine max_expected_raw_value from pix_fmt and profile if available
-                if depth_pix_fmt:
-                    if "10" in depth_pix_fmt or "gray10" in depth_pix_fmt or (depth_profile and "main10" in depth_profile):
-                        max_expected_raw_value = 1023.0
-                        logger.debug(f"Depth pix_fmt '{depth_pix_fmt}' or profile '{depth_profile}' suggests 10-bit. Expected max raw: {max_expected_raw_value}")
-                    elif ("8" in depth_pix_fmt or "gray" in depth_pix_fmt or 
-                          depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"] or # Explicitly add common 8-bit YUV formats
-                          (depth_profile and ("main" in depth_profile.lower() or "high" in depth_profile.lower()))): # Make profile check case-insensitive and include 'high'
-                        max_expected_raw_value = 255.0
-                        logger.debug(f"Depth pix_fmt '{depth_pix_fmt}' or profile '{depth_profile}' suggests 8-bit. Expected max raw: {max_expected_raw_value}")
-                    elif "float" in depth_pix_fmt: # If the source video itself is a float format
-                        logger.warning(f"Depth pix_fmt '{depth_pix_fmt}' is float. Assuming values are already in 0-1 range if max <= 1.0, otherwise will be clipped. No explicit scaling by a fixed raw max value.")
-                        max_expected_raw_value = 1.0 # Will effectively cause no division if already float 0-1
-                    else:
-                        logger.warning(f"Unknown depth pix_fmt '{depth_pix_fmt}' and profile '{depth_profile}'. Attempting to guess original bit depth based on common max values if current chunk max > 1.0.")
-                else:
-                    logger.warning(f"No depth stream info (pix_fmt/profile) available. Attempting to guess original bit depth based on common max values if current chunk max > 1.0.")
-
-                # Fallback / Heuristic if pix_fmt didn't give a clear answer or it's a float dtype with values > 1
-                if max_expected_raw_value is None or (batch_depth_numpy.dtype in [np.float32, np.float64] and max_expected_raw_value == 1.0 and current_chunk_max_val > 1.01):
-                    if current_chunk_max_val > 1.01: # Values are float, but clearly not 0-1 range
-                        if current_chunk_max_val <= 255.01 and current_chunk_min_val >= 0: # Max value indicates potential 8-bit original values
-                            max_expected_raw_value = 255.0
-                            logger.debug(f"Heuristic: Float depth values (max {current_chunk_max_val:.2f}) appear to be unscaled 8-bit. Scaling by {max_expected_raw_value}.")
-                        elif current_chunk_max_val <= 1023.01 and current_chunk_min_val >= 0: # Max value indicates potential 10-bit original values
-                            max_expected_raw_value = 1023.0
-                            logger.debug(f"Heuristic: Float depth values (max {current_chunk_max_val:.2f}) appear to be unscaled 10-bit. Scaling by {max_expected_raw_value}.")
-                        else:
-                            # If it's float and still very high, or range doesn't fit typical bit depths.
-                            logger.warning(f"Depth map values are float (dtype: {batch_depth_numpy.dtype}) with max {current_chunk_max_val:.2f}, which is outside typical 8-bit (0-255) or 10-bit (0-1023) raw ranges. As 'No Normalization' is enabled, values will be directly used and clipped to 0-1, which might lead to dark output if values are very high.")
-                            max_expected_raw_value = 1.0 # Treat as already effectively normalized, will be clipped below
-                    else:
-                        # It's float and values are already <= 1.0, so assume it's already 0-1 normalized
-                        max_expected_raw_value = 1.0
-                        logger.debug(f"Depth map chunk type is float (max {current_chunk_max_val:.2f}), suggests it's already in 0-1 range. Using directly.")
-
-                # Apply scaling based on determined or guessed max_expected_raw_value
-                if max_expected_raw_value is not None and max_expected_raw_value > 1.0:
-                    batch_depth_normalized = batch_depth_numpy.astype(np.float32) / max_expected_raw_value
-                    logger.debug(f"Scaled depth chunk (dtype: {batch_depth_numpy.dtype}) from [{current_chunk_min_val:.3f}, {current_chunk_max_val:.3f}] by 1/{max_expected_raw_value} for 'No Normalization'.")
-                else:
-                    # If max_expected_raw_value is 1.0 (already float 0-1 or unknown), or no scaling was determined
-                    batch_depth_normalized = batch_depth_numpy.astype(np.float32)
-                    if current_chunk_max_val > 1.01:
-                         logger.warning(f"Could not reliably determine scaling for depth map (dtype: {batch_depth_numpy.dtype}, max: {current_chunk_max_val:.2f}) in 'No Normalization' mode. Using values directly and relying on final clip (0-1). This may result in dark output if values are high.")
-                    else:
-                         logger.debug(f"Using float depth values directly (max {current_chunk_max_val:.2f}), assuming they are already 0-1 range for 'No Normalization'.")
-
+                # RAW INPUT MODE: Normalize by the max expected raw value (determined earlier).
+                # NOTE: max_expected_raw_value is the one determined outside the loop (1023.0, 255.0, or 1.0)
+                batch_depth_normalized = batch_depth_numpy / max_expected_raw_value
+                logger.debug(f"Final normalization by {max_expected_raw_value:.1f} (Raw Input Mode).")
             else:
-                # Global normalization using pre-computed min/max (ensures consistency)
-                logger.debug(f"Applying global normalization for chunk {i}-{i+len(current_frame_indices)} using min={global_depth_min:.3f}, max={global_depth_max:.3f}.")
+                # GLOBAL NORM MODE: Normalize by the pre-computed global min/max.
+                logger.debug(f"Final normalization by global range [{global_depth_min:.3f}, {global_depth_max:.3f}] (Global Norm Mode).")
                 if global_depth_max - global_depth_min > 1e-5:
-                    batch_depth_normalized = (batch_depth_numpy.astype(np.float32) - global_depth_min) / (global_depth_max - global_depth_min)
+                    batch_depth_normalized = (batch_depth_numpy - global_depth_min) / (global_depth_max - global_depth_min)
                 else:
                     batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
-                    logger.warning(f"Global depth range for normalization is too small ({global_depth_min:.3f}-{global_depth_max:.3f}). Setting depth map to constant {zero_disparity_anchor_val} for this video.")
+                    logger.warning(f"Global depth range for normalization is too small. Setting to constant {zero_disparity_anchor_val}.")
             
             # Clip to ensure values are strictly within 0-1 range after normalization
             batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
@@ -1356,8 +1853,7 @@ class SplatterGUI(ThemedTk):
 
             # Convert to tensors for GPU processing
             left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
-            disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()
-
+            disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()        
             disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
             disp_map_tensor = disp_map_tensor * max_disp
 
@@ -1379,7 +1875,6 @@ class SplatterGUI(ThemedTk):
                     logger.debug("Skipping left-edge occlusion boundary filling for high-resolution output.")
                     right_video_tensor = right_video_tensor_raw # Use the raw warped tensor
 
-            
             right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
             occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
 
@@ -1412,183 +1907,45 @@ class SplatterGUI(ThemedTk):
         torch.cuda.empty_cache()
         gc.collect()
 
-        # --- FFmpeg encoding (already modified, keeping it here for context) ---
-        logger.debug(f"==> Encoding final video from PNG sequence using ffmpeg for '{os.path.basename(final_output_video_path)}'.")
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-framerate", str(processed_fps), 
-            "-i", os.path.join(temp_png_dir, "%05d.png"), 
-        ]
-
-        output_crf_val = 24 # Default CRF for x265 10-bit SDR (lower is better quality)
-        output_profile = "main10"
-        x265_params = [] 
-
-        nvenc_preset = "medium" 
-        nvenc_cq_val = 23 # Constant Quality value for NVENC (lower is better quality)
-
-        if user_output_crf is not None and 0 <= user_output_crf <= 51:
-            output_crf_val = user_output_crf
-            nvenc_cq_val = user_output_crf # Use same value for CQ for consistency
-            logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
+        # Determine the final output path suffix (splatted2 or splatted4)
+        if dual_output:
+            suffix = "_splatted2"
         else:
-            logger.debug(f"Using auto-determined output CRF ({output_crf_val}) / CQ ({nvenc_cq_val}).")
+            suffix = "_splatted4"
+        res_suffix = f"_{width}"
+        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
 
-        is_hdr_source = False
-        original_source_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
-        original_source_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
-        
-        is_original_source_10bit_or_higher = False
-        if original_source_pix_fmt:
-            if "10" in original_source_pix_fmt or "12" in original_source_pix_fmt or "16" in original_source_pix_fmt:
-                is_original_source_10bit_or_higher = True
-                logger.debug(f"==> Detected original video pixel format: {original_source_pix_fmt} (>= 10-bit)")
-            else:
-                logger.debug(f"==> Detected original video pixel format: {original_source_pix_fmt} (< 10-bit)")
-        else:
-            logger.debug("==> Could not detect original video pixel format.")
-
-        if video_stream_info:
-            logger.debug("==> Source video stream info detected. Attempting to match source characteristics and optimize quality.")
-
-            if video_stream_info.get("color_primaries") == "bt2020" and \
-               video_stream_info.get("transfer_characteristics") == "smpte2084":
-                is_hdr_source = True
-                logger.debug("==> Source detected as HDR. Targeting HEVC 10-bit HDR output.")
-                output_codec = "libx265"
-                if CUDA_AVAILABLE:
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "28" 
-                output_profile = "main10"
-                if video_stream_info.get("mastering_display_metadata"):
-                    md_meta = video_stream_info["mastering_display_metadata"]
-                    x265_params.append(f"mastering-display={md_meta}")
-                    logger.debug(f"==> Adding mastering display metadata: {md_meta}")
-                if video_stream_info.get("max_content_light_level"):
-                    max_cll_meta = video_stream_info["max_content_light_level"]
-                    x265_params.append(f"max-cll={max_cll_meta}")
-                    logger.debug(f"==> Adding max content light level: {max_cll_meta}")
-
-            elif original_source_codec_name == "hevc" and is_original_source_10bit_or_higher:
-                logger.debug("==> Detected 10-bit HEVC (x265) SDR source. Targeting HEVC 10-bit SDR output.")
-                output_codec = "libx265"
-                if CUDA_AVAILABLE:
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration)")
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "24" 
-                output_profile = "main10"
-
-            else:
-                logger.debug("==> No specific HEVC/HDR or 10-bit HEVC SDR source detected. Prioritizing 10-bit output due to 16-bit intermediate PNGs.")
-                if CUDA_AVAILABLE and (torch.cuda.get_device_properties(0).major >= 6): 
-                    output_codec = "hevc_nvenc"
-                    logger.debug("    (Using hevc_nvenc for hardware acceleration for 10-bit SDR output)")
-                else:
-                    output_codec = "libx265" 
-                
-                output_pix_fmt = "yuv420p10le"
-                output_crf = "24" 
-                output_profile = "main10"
-
-        else:
-            logger.debug("==> No source video stream info detected. Falling back to default HEVC (x265) 10-bit SDR output (due to 16-bit internal processing).")
-            if CUDA_AVAILABLE and (torch.cuda.get_device_properties(0).major >= 6):
-                output_codec = "hevc_nvenc"
-                logger.debug("    (Using hevc_nvenc for hardware acceleration for default 10-bit SDR output)")
-            else:
-                output_codec = "libx265"
-            
-            output_pix_fmt = "yuv420p10le"
-            output_crf = "24"
-            output_profile = "main10"
-
-
-        ffmpeg_cmd.extend(["-c:v", output_codec])
-        if "nvenc" in output_codec:
-            ffmpeg_cmd.extend(["-preset", nvenc_preset])
-            ffmpeg_cmd.extend(["-cq", str(nvenc_cq_val)]) # Use the actual NVENC CQ value
-        else:
-            ffmpeg_cmd.extend(["-crf", str(output_crf_val)]) # Use the actual CRF value
-        
-        ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-        if output_profile:
-            ffmpeg_cmd.extend(["-profile:v", output_profile])
-
-        if output_codec == "libx265" and x265_params:
-            ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
-
-        if video_stream_info:
-            if video_stream_info.get("color_primaries"):
-                ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
-            if video_stream_info.get("transfer_characteristics"):
-                ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
-            if video_stream_info.get("color_space"):
-                ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
-        else: 
-            ffmpeg_cmd.extend(["-color_primaries", "bt709"])
-            ffmpeg_cmd.extend(["-color_trc", "bt709"]) 
-            ffmpeg_cmd.extend(["-colorspace", "bt709"])
-
-
-        ffmpeg_cmd.append(final_output_video_path)
-
-        logger.debug(f"==> Executing ffmpeg command: {' '.join(ffmpeg_cmd)}")
-
-        try:
-            ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=3600*24)
-            logger.debug(f"==> FFmpeg stdout: {ffmpeg_result.stdout}")
-            logger.debug(f"==> FFmpeg stderr: {ffmpeg_result.stderr}")
-            logger.debug(f"==> Final video successfully encoded to '{os.path.basename(final_output_video_path)}'.")
-        except FileNotFoundError:
-            logger.error("==> Error: ffmpeg not found. Please ensure FFmpeg is installed and in your system's PATH. No final video generated.")
-            messagebox.showerror("FFmpeg Error", "ffmpeg not found. Please install FFmpeg and ensure it's in your system's PATH to encode from PNGs.")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"==> Error running ffmpeg for '{os.path.basename(final_output_video_path)}': {e.returncode}")
-            logger.error(f"==> FFmpeg stdout: {e.stdout}")
-            logger.error(f"==> FFmpeg stderr: {e.stderr}")
-            logger.error("==> Final video encoding failed due to ffmpeg error.")
-        except subprocess.TimeoutExpired:
-            logger.error(f"==> Error: FFmpeg encoding timed out for '{os.path.basename(final_output_video_path)}'.")
-        except Exception as e:
-            logger.error(f"==> An unexpected error occurred during ffmpeg execution: {e}")
-
-        logger.debug(f"==> Final output video written to: {final_output_video_path}")
-
+        # Prepare sidecar data (only frame_overlap and input_bias are needed for the output sidecar)
         output_sidecar_data = {}
-        output_sidecar_data["convergence_plane"] = zero_disparity_anchor_val
-        output_sidecar_data["max_disparity"] = (max_disp / width) * 100.0
-        
         if frame_overlap is not None:
             output_sidecar_data["frame_overlap"] = frame_overlap
         if input_bias is not None:
             output_sidecar_data["input_bias"] = input_bias
 
-        if frame_overlap is not None or input_bias is not None:
-            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}.json"
-            try:
-                with open(output_sidecar_path, 'w') as f:
-                    json.dump(output_sidecar_data, f, indent=4)
-                logger.debug(f"==> Created output sidecar JSON: {output_sidecar_path}")
-            except Exception as e:
-                logger.error(f"==> Error creating output sidecar JSON '{output_sidecar_path}': {e}")
+        # Determine output CRF from GUI setting
+        # NOTE: If user_output_crf is None, it will default to a sensible value inside encode_frames_to_mp4
+        output_crf = user_output_crf if user_output_crf is not None else int(self.output_crf_var.get())
 
-        if os.path.exists(temp_png_dir):
-            try:
-                shutil.rmtree(temp_png_dir)
-                logger.debug(f"==> Cleaned up temporary PNG directory: {temp_png_dir}")
-            except Exception as e:
-                logger.error(f"==> Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-                return True
-
-        logger.debug(f"==> Final output video written to: {final_output_video_path}")
-        return True
+        # Call the utility function to handle encoding, cleanup, and sidecar writing
+        encoding_successful = encode_frames_to_mp4(
+            temp_png_dir=temp_png_dir,
+            final_output_mp4_path=final_output_video_path,
+            fps=processed_fps,
+            total_output_frames=frame_count,
+            video_stream_info=video_stream_info,
+            stop_event=self.stop_event, # Pass the threading stop event
+            sidecar_json_data=output_sidecar_data, # Pass the data to be written
+            user_output_crf=output_crf,
+            output_sidecar_ext=self.APP_CONFIG_DEFAULTS['OUTPUT_SIDECAR_EXT'] 
+        )
+        
+        # Return True/False based on encoding success
+        if encoding_successful:
+            logger.debug(f"Successfully finished encoding to: {final_output_video_path}")
+            return True
+        else:
+            logger.error(f"Encoding failed or was stopped by user for {final_output_video_path}.")
+            return False
     
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
@@ -1602,16 +1959,86 @@ class SplatterGUI(ThemedTk):
         release_cuda_memory()
         self.destroy()
 
-    def show_about_dialog(self):
-        """Displays an 'About' dialog for the application."""
-        about_text = (
-            "Stereocrafter Splatting Application\n"
-            f"Version: {GUI_VERSION}\n"
-            "This tool generates right-eye views from source videos and depth maps through a process called depth splatting.\n"
-            "It supports different output resolutions, dual/quad output modes, and custom disparity settings.\n\n"
-            "Developed by [Your Name/Alias] for StereoCrafter projects." # Customize this!
+    def load_settings(self):
+        """Loads settings from a user-selected JSON file."""
+        filename = filedialog.askopenfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Load Settings from File"
         )
-        messagebox.showinfo("About Batch Video Splatting", about_text)
+        if not filename:
+            return
+
+        try:
+            with open(filename, "r") as f:
+                loaded_config = json.load(f)
+            # Apply loaded config values to the variables
+            for config_key, config_value in loaded_config.items(): # Iterate over loaded keys
+                # --- NEW MAPPING LOGIC ---
+                # Construct the expected name of the Tkinter variable
+                tk_var_attr_name = config_key + '_var'
+                
+                if hasattr(self, tk_var_attr_name):
+                    tk_var_object = getattr(self, tk_var_attr_name)
+                    
+                    if isinstance(tk_var_object, tk.BooleanVar):
+                        # Ensure value is converted to a proper boolean/int before setting BooleanVar
+                        tk_var_object.set(bool(config_value))
+                    elif isinstance(tk_var_object, tk.StringVar):
+                        # Set StringVar directly
+                        tk_var_object.set(str(config_value))
+            
+            # Apply loaded config values to the variables
+            for key, var in self.__dict__.items():
+                if key.endswith('_var') and key in loaded_config:
+                    # Logic to safely set values:
+                    # For tk.StringVar, set()
+                    # For tk.BooleanVar, use set() with the bool/int value
+                    if isinstance(var, tk.BooleanVar):
+                        var.set(bool(loaded_config[key]))
+                    elif isinstance(var, tk.StringVar):
+                        var.set(str(loaded_config[key]))
+
+            self._apply_theme() # Re-apply theme in case dark mode setting was loaded
+            self.toggle_processing_settings_fields() # Update state of dependent fields
+            messagebox.showinfo("Settings Loaded", f"Successfully loaded settings from:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings loaded.")
+
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load settings from {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings load failed.")
+    
+    def save_settings(self):
+        """Saves current GUI settings to a user-selected JSON file."""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            title="Save Settings to File"
+        )
+        if not filename:
+            return
+
+        try:
+            config_to_save = self._get_current_config()
+            with open(filename, "w") as f:
+                json.dump(config_to_save, f, indent=4)
+
+            messagebox.showinfo("Settings Saved", f"Successfully saved settings to:\n{os.path.basename(filename)}")
+            self.status_label.config(text="Settings saved.")
+
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save settings to {os.path.basename(filename)}:\n{e}")
+            self.status_label.config(text="Settings save failed.")
+    
+    def show_about(self):
+        """Displays the 'About' message box."""
+        message = (
+            f"Stereocrafter Splatting (Batch) - {GUI_VERSION}\n"
+            "A tool for generating right-eye stereo views from source video and depth maps.\n"
+            "Based on Decord, PyTorch, and OpenCV.\n"
+            "\n(C) 2024 Some Rights Reserved"
+        )
+        tk.messagebox.showinfo("About Stereocrafter Splatting", message)
 
     def start_processing(self):
         """Starts the video processing in a separate thread."""
@@ -1619,6 +2046,8 @@ class SplatterGUI(ThemedTk):
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.status_label.config(text="Starting processing...")
+        # --- NEW: Disable all inputs at start ---
+        self._set_input_state('disabled')
 
         # Input validation for all fields
         try:
@@ -1646,6 +2075,23 @@ class SplatterGUI(ThemedTk):
 
             if not (self.enable_full_res_var.get() or self.enable_low_res_var.get()):
                 raise ValueError("At least one resolution (Full or Low) must be enabled to start processing.")
+            
+            # --- NEW: Depth Pre-processing Validation ---
+            depth_gamma_val = float(self.depth_gamma_var.get())
+            if depth_gamma_val <= 0:
+                raise ValueError("Depth Gamma must be positive.")
+            
+            depth_dilate_size_val = int(self.depth_dilate_size_var.get())
+            if depth_dilate_size_val < 0:
+                raise ValueError("Depth Dilate Size must be non-negative.")
+            
+            depth_blur_size_val = int(self.depth_blur_size_var.get())
+            if depth_blur_size_val < 0:
+                raise ValueError("Depth Blur Size must be non-negative.")
+            if depth_blur_size_val > 0 and depth_blur_size_val % 2 == 0:
+                raise ValueError("Depth Blur Size must be 0 or an odd number.")
+            # --- END NEW Validation ---
+
 
         except ValueError as e:
             self.status_label.config(text=f"Error: {e}")
@@ -1670,6 +2116,13 @@ class SplatterGUI(ThemedTk):
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
             "output_crf": int(self.output_crf_var.get()),
+            # --- NEW: Depth Pre-processing Settings ---
+            "depth_gamma": depth_gamma_val,
+            "depth_dilate_size": depth_dilate_size_val,
+            "depth_blur_size": depth_blur_size_val,
+            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
+            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
+            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
         self.processing_thread = threading.Thread(target=self._run_batch_process, args=(settings,))
         self.processing_thread.start()
@@ -1840,12 +2293,8 @@ def compute_global_depth_stats(
         
         # draw_progress_bar(i + len(current_indices), total_frames, prefix="  Depth Stats:", suffix="Complete")
 
-    logger.info(f"\n==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
+    logger.info(f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
     return float(global_min), float(global_max)
-
-def round_to_nearest_64(value):
-    """Rounds a given value up to the nearest multiple of 64, with a minimum of 64."""
-    return max(64, round(value / 64) * 64)
 
 def read_video_frames(
         video_path: str,
