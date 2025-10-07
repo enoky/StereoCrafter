@@ -1373,7 +1373,7 @@ class InpaintingGUI(ThemedTk):
         self.start_button.pack(side="left", padx=5)
         self.stop_button = ttk.Button(inner_buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5)
-        ttk.Button(inner_buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
+        # ttk.Button(inner_buttons_frame, text="Help", command=self.show_general_help).pack(side="left", padx=5)
         ttk.Button(inner_buttons_frame, text="Exit", command=self.exit_application).pack(side="left", padx=5)
 
         # --- INFO FRAME (no change) ---
