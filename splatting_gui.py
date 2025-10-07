@@ -546,19 +546,19 @@ class SplatterGUI(ThemedTk):
         self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
         self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
-        current_row += 1
 
         self.auto_convergence_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Auto-Determine Convergence (Video Avg)", variable=self.enable_auto_convergence_var)
         self.auto_convergence_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.auto_convergence_checkbox, "auto_convergence_toggle")
-
-        # self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
-        # self.autogain_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        # self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+        current_row += 1
 
         self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
         self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
+
+        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
+        self.autogain_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
 
         current_row = 0 # Reset for next frame
 
@@ -778,7 +778,7 @@ class SplatterGUI(ThemedTk):
             "depth_gamma": self.depth_gamma_var.get(),
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
-            # "enable_autogain": self.enable_autogain_var.get(),
+            "enable_autogain": self.enable_autogain_var.get(),
         }
         return config
 
@@ -999,7 +999,7 @@ class SplatterGUI(ThemedTk):
                     # Fallback: Use the last valid column (W-1) to ensure we always get *some* pixels.
                     # This might replicate a black pixel if the whole row is black, but avoids IndexError.
                     source_col_for_boundary_fill = W - 1
-                    logger.debug(f"Row {h_idx} in batch {b_idx} is fully occluded or near-fully. Using last column for boundary fill source.")
+                    # logger.debug(f"Row {h_idx} in batch {b_idx} is fully occluded or near-fully. Using last column for boundary fill source.")
                 
                 # Get the pixel values from this 'source column' to use for the boundary.
                 # Pylance should now correctly infer source_col_for_boundary_fill as an int.
@@ -1171,11 +1171,15 @@ class SplatterGUI(ThemedTk):
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
     def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
-                              depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool, max_raw_value: float) -> np.ndarray:
+                              depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool, max_raw_value: float,
+                              global_depth_min: float, global_depth_max: float) -> np.ndarray:
         """
         Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
+        
+        Note: If Global Normalization is active, Gamma is SKIPPED here and applied later
+        in depthSplatting (post-normalization) to maintain correct 0-1 range.
         """
-        # 1. Grayscale Conversion (Existing logic from depthSplatting)
+        # 1. Grayscale Conversion
         if batch_depth_numpy_raw.ndim == 4:
             if batch_depth_numpy_raw.shape[-1] == 3: # RGB
                 batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
@@ -1187,41 +1191,45 @@ class SplatterGUI(ThemedTk):
         # Convert to float32 for processing
         batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
 
-        # 2. Gamma Adjustment (always applied if gamma != 1.0)
-        if depth_gamma != 1.0 and max_raw_value > 1.0: # Only apply if raw value is > 1.0 (i.e., not already 0-1 float)
-            logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
-            
-            # Apply Gamma across the MAX RAW VALUE range for consistency!
-            # Scale to [0, 1], apply gamma, scale back to raw range.
-            normalized_chunk = batch_depth_numpy_float / max_raw_value
-            normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
-            batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
-        elif depth_gamma != 1.0:
-            logger.warning("Gamma adjustment skipped: Max expected raw value is 1.0. Gamma assumed applied to 0-1 range if needed later.")
+        # Determine if we are in GLOBAL NORM mode (if so, we skip pre-scaling Gamma)
+        is_global_norm_active = (global_depth_min != 0.0 or global_depth_max != 1.0) and not (global_depth_min == 0.0 and global_depth_max == 0.0)
 
-        # Dilate and Blur should ONLY be applied if it is NOT a low-res task.
+        # --- 2. Gamma Adjustment ---
+        if depth_gamma != 1.0:
+            if is_global_norm_active:
+                # Skip in helper. Gamma will be applied post-normalization in depthSplatting.
+                logger.debug("Gamma adjustment SKIPPED in helper: Applied post-normalization (Global Norm Mode).")
+            else:
+                # RAW INPUT MODE: Apply Gamma across the MAX RAW VALUE range.
+                logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
+                
+                if max_raw_value > 1.0:
+                    # Scale to [0, 1] using max_raw_value, apply gamma, scale back to raw range.
+                    normalized_chunk = batch_depth_numpy_float / max_raw_value
+                    normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
+                    batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
+                else:
+                    # Fallback for floats/errors: Apply to 0-1 range directly
+                    batch_depth_numpy_float = np.power(batch_depth_numpy_float, depth_gamma)
+
+        # --- 3. Dilate and Blur (Conditional on is_low_res_task) ---
         if is_low_res_task:
             if depth_dilate_size > 0 or depth_blur_size > 0:
-                 # Log a warning if user set a value but it's being skipped
                  logger.debug(f"Dilate ({depth_dilate_size}) or Blur ({depth_blur_size}) skipped for low-resolution (inpaint) task as per configuration.")
         else:
             # This is the HI-RES path: apply Dilate and Blur based on size setting.
 
-            # 3. Dilation (if size > 0)
+            # 3a. Dilation (if size > 0)
             if depth_dilate_size > 0:
                 logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
-                # Create a square kernel for dilation
                 kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
-                # Apply dilation: cv2.dilate expects C-order (H, W) for image processing
                 for j in range(batch_depth_numpy_float.shape[0]):
                     batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
             
-            # 4. Gaussian Blur (if size > 0)
+            # 3b. Gaussian Blur (if size > 0)
             if depth_blur_size > 0:
                 logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
-                # Sigma is fixed at size / 6.0 as requested
                 sigma = depth_blur_size / 6.0 
-                # Apply Gaussian Blur: cv2.GaussianBlur expects C-order (H, W)
                 for j in range(batch_depth_numpy_float.shape[0]):
                     batch_depth_numpy_float[j] = cv2.GaussianBlur(
                         batch_depth_numpy_float[j], 
@@ -1367,6 +1375,30 @@ class SplatterGUI(ThemedTk):
                     global_depth_min = 0.0 
                     global_depth_max = 1.0 
 
+                    # --- NEW: UNCONDITIONAL Max Content Value Scan ---
+                    max_content_value = 1.0 # Default fallback
+                    raw_depth_reader_temp = None
+                    try:
+                        raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0))
+                        
+                        if len(raw_depth_reader_temp) > 0:
+                            # We only need the max raw value of the content here
+                            _, max_content_value = compute_global_depth_stats(
+                                depth_map_reader=raw_depth_reader_temp,
+                                total_frames=total_frames_depth,
+                                chunk_size=task["batch_size"] 
+                            )
+                            logger.debug(f"Max content depth scanned: {max_content_value:.3f}.")
+                        else:
+                            logger.error("RAW depth reader has no frames for content scan.")
+                    except Exception as e:
+                        logger.error(f"Failed to scan max content depth: {e}")
+                    finally:
+                        if raw_depth_reader_temp:
+                            del raw_depth_reader_temp
+                            gc.collect()
+                    # --- END UNCONDITIONAL SCAN ---
+
                     if not assume_raw_input_mode: 
                         logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass with RAW reader.")
                         
@@ -1398,8 +1430,29 @@ class SplatterGUI(ThemedTk):
                         # -----------------------------------------------------------------
                     else:
                         logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass.")
-                        global_depth_min = 0.0
-                        global_depth_max = 1.0
+
+                        # Determine the scaling factor:
+                        # --- FIX: RAW INPUT MODE SCALING ---
+                        final_scaling_factor = 1.0 # Default to 1.0 if scan fails
+
+                        if max_content_value <= 256.0 and max_content_value > 1.0:
+                            # 8-bit content saved in 10-bit container. Scale by 255.0 for correct 0-1 range.
+                            final_scaling_factor = 255.0
+                            logger.debug(f"Content Max {max_content_value:.2f} <= 8-bit. SCALING BY 255.0.")
+                        elif max_content_value > 256.0 and max_content_value <= 1024.0:
+                             # 9-10bit content. Scale by its actual max value to make it 0-1.
+                            final_scaling_factor = max_content_value
+                            logger.debug(f"Content Max {max_content_value:.2f} (9-10bit). SCALING BY CONTENT MAX.")
+                        else:
+                             # Fallback: Use 10-bit theoretical max as the safest upper bound (avoids massive weak shift)
+                            final_scaling_factor = 1023.0 
+                            logger.warning(f"Max content value is too high/low ({max_content_value:.2f}). Using fallback 1023.0.")
+
+                        # Set global_depth_max to the determined scaling factor.
+                        global_depth_max = final_scaling_factor
+                        global_depth_min = 0.0 # Raw input assumes 0 min
+                        
+                        logger.debug(f"Raw Input Final Scaling Factor set to: {global_depth_max:.3f}")
 
                     if not (actual_depth_height == current_processed_height and actual_depth_width == current_processed_width):
                         logger.warning(f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned.")
@@ -1494,6 +1547,23 @@ class SplatterGUI(ThemedTk):
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
 
+    def _save_debug_numpy(self, data: np.ndarray, filename_tag: str, batch_index: int, frame_index: int, task_name: str):
+        """Saves a NumPy array to a debug folder if debug logging is enabled."""
+        if not self._debug_logging_enabled:
+            return
+
+        debug_dir = os.path.join(os.path.dirname(self.input_source_clips_var.get()), "splat_debug", task_name)
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Create a filename that includes frame index, batch index, and tag
+        filename = os.path.join(debug_dir, f"{frame_index:05d}_B{batch_index:02d}_{filename_tag}.npz")
+        
+        try:
+            np.savez_compressed(filename, data=data)
+            logger.debug(f"Saved debug array {filename_tag} (Shape: {data.shape}) to {os.path.basename(debug_dir)}")
+        except Exception as e:
+            logger.error(f"Failed to save debug array {filename_tag}: {e}")
+    
     def _set_input_state(self, state):
         """Sets the state of all input widgets to 'normal' or 'disabled'."""
         
@@ -1797,6 +1867,10 @@ class SplatterGUI(ThemedTk):
             batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
             batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
 
+            # DEBUG 1: Raw Input
+            self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+            # --- END OF BATCH READS ---
+
             # --- NEW: Process depth map using the helper method ---
             batch_depth_numpy = self._process_depth_batch(
                 batch_depth_numpy_raw=batch_depth_numpy_raw,
@@ -1806,50 +1880,80 @@ class SplatterGUI(ThemedTk):
                 depth_blur_size=depth_blur_size,
                 is_low_res_task=is_low_res_task,
                 max_raw_value=max_expected_raw_value,
+                global_depth_min=global_depth_min, # <--- ADDED
+                global_depth_max=global_depth_max,  # <--- ADDED
             )
+            
+            # DEBUG 2: Processed (Pre-Normalization)
+            self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
 
             # Convert original batch frames to float 0-1 for display in grid
             batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
             
-            # Final Normalization Step: This MUST be the final step before converting to tensor.
+            # This must be the float version of the batch, in case all logic below fails.
+            batch_depth_normalized = batch_depth_numpy.copy() 
+
+            # --- Final Normalization Step: This MUST be the final step before converting to tensor. ---
             
             if assume_raw_input:
-                # RAW INPUT MODE: Normalize by the max expected raw value (determined earlier).
-                # NOTE: max_expected_raw_value is the one determined outside the loop (1023.0, 255.0, or 1.0)
-                batch_depth_normalized = batch_depth_numpy / max_expected_raw_value
-                logger.debug(f"Final normalization by {max_expected_raw_value:.1f} (Raw Input Mode).")
+                # RAW INPUT MODE: Normalize by the calculated maximum scaling factor (which is now in global_depth_max).
+                
+                # DEBUG 2.5: RAW INPUT PRE-CALC
+                self._save_debug_numpy(batch_depth_numpy, "02_5_RAW_PRE_CALC", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+                
+                if global_depth_max > 1.0: # Check that it's an actual raw range (e.g., 255, 1023)
+                    batch_depth_normalized = batch_depth_numpy / global_depth_max
+                    logger.debug(f"Final normalization by Max Scaling Value {global_depth_max:.3f} (Raw Input Mode).")
+                else:
+                    # Fallback for errors or already-normalized floats
+                    batch_depth_normalized = batch_depth_numpy.copy()
+                    logger.debug(f"Final fallback normalization by Theoretical Max {max_expected_raw_value:.1f}.")
+
             else:
                 # GLOBAL NORM MODE: Normalize by the pre-computed global min/max.
                 logger.debug(f"Final normalization by global range [{global_depth_min:.3f}, {global_depth_max:.3f}] (Global Norm Mode).")
+                
+                # DEBUG 2.5: GLOBAL NORM PRE-CALC
+                self._save_debug_numpy(batch_depth_numpy, "02_5_GLOBAL_PRE_CALC", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+                
                 if global_depth_max - global_depth_min > 1e-5:
                     batch_depth_normalized = (batch_depth_numpy - global_depth_min) / (global_depth_max - global_depth_min)
                 else:
                     batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
                     logger.warning(f"Global depth range for normalization is too small. Setting to constant {zero_disparity_anchor_val}.")
-            
+
             # Clip to ensure values are strictly within 0-1 range after normalization
             batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
 
-            # Convert original batch frames to float 0-1 for display in grid
-            batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
+            # --- Final Gamma Adjustment (Only if Global Norm was used and Gamma is not 1.0) ---
+            if not assume_raw_input and depth_gamma != 1.0:
+                 logger.debug(f"Applying final post-normalization gamma adjustment: {depth_gamma:.2f}")
+                 batch_depth_normalized = np.power(batch_depth_normalized, depth_gamma)
+            # ----------------------------------------------------------------------------------
 
-            # Generate depth visualization for the current chunk (MODIFIED)
+            # DEBUG 3: Final Normalized (Post-Clip/Pre-Tensor) - THIS IS THE FINAL DATA STATE!
+            self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+            
+            # --- Final Unified Visualization Logic (Run for Both Low-Res and Hi-Res) ---
             batch_depth_vis_list = []
+            
             for d_frame in batch_depth_normalized:
-                # IMPORTANT: Create a copy for visualization, so we don't modify the actual depth data used for splatting
                 d_frame_vis = d_frame.copy()
-
-                # Normalize the visualization frame to use the full 0-1 range for visualization.
-                # This makes the depth variations more visible within the colormap, regardless of the original data's actual range.
-                if d_frame_vis.max() > d_frame_vis.min(): # Avoid division by zero if all values are identical
+                
+                # Auto-level the brightness/contrast of the visualization
+                if d_frame_vis.max() > d_frame_vis.min(): 
                     cv2.normalize(d_frame_vis, d_frame_vis, 0, 1, cv2.NORM_MINMAX)
                 
-                # Scale to 0-255 and apply colormap.
-                # COLORMAP_VIRIDIS often provides a more perceptually uniform and visually appealing gradient,
-                # starting with darker blues/greens instead of magenta for low values.
-                vis_frame = cv2.applyColorMap((d_frame_vis * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+                # Apply Colormap (Fix for Cyan Screen included in this block)
+                vis_frame_uint8 = (d_frame_vis * 255).astype(np.uint8)
+                vis_frame = cv2.applyColorMap(vis_frame_uint8, cv2.COLORMAP_VIRIDIS)
                 batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
-            batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) # [T, H, W, 3]
+            
+            # Define final variable
+            batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) 
+            # --- END Final Unified Visualization Logic ---
+
+
 
             # Convert to tensors for GPU processing
             left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
