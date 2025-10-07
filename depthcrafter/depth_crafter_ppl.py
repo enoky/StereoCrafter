@@ -95,7 +95,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         guidance_scale: float = 1.0,
         window_size: Optional[int] = 110,
         noise_aug_strength: float = 0.02,
-        decode_chunk_size: Optional[int] = None,
+        decode_chunk_size: Optional[int] = 4,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
