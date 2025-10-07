@@ -49,7 +49,7 @@ from typing import Optional, Tuple, List, Dict, Union
 _ENABLE_XFORMERS_ATTENTION = True # Set to True or False to enable/disable xFormers.
 
 class DepthCrafterDemo:
-    def __init__(self, unet_path: str, pre_train_path: str, cpu_offload: str = "model", use_cudnn_benchmark: bool = False, local_files_only: bool = False):
+    def __init__(self, unet_path: str, pre_train_path: str, cpu_offload: str = "model", use_cudnn_benchmark: bool = False, local_files_only: bool = False, disable_xformers=False):
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
@@ -75,23 +75,35 @@ class DepthCrafterDemo:
             self.pipe.enable_attention_slicing()
             _logger.debug("DepthCrafterPipeline initialized successfully.")
 
-            if _ENABLE_XFORMERS_ATTENTION:
+            # Decide if xFormers should be enabled:
+            # It's only enabled if the global flag is True AND the GUI flag (disable_xformers) is False.
+            should_enable_xformers = _ENABLE_XFORMERS_ATTENTION and not disable_xformers
+            
+            if should_enable_xformers:
                 try:
-                    from diffusers.utils.logging import set_verbosity_info # For xFormers init messages
-                    set_verbosity_info() # Temporarily set to INFO to catch xFormers messages
+                    from diffusers.utils.logging import set_verbosity_info
+                    set_verbosity_info() 
 
                     self.pipe.enable_xformers_memory_efficient_attention()
-                    _logger.info("xFormers memory-efficient attention enabled successfully (controlled by global flag).")
+                    _logger.info("xFormers memory-efficient attention ENABLED (Globally ON, GUI OFF).")
                 except ImportError:
-                    _logger.warning("xFormers library not found...")
+                    _logger.warning("xFormers library not found, cannot enable.")
                 except Exception as e:
-                    _logger.warning(f"Failed to enable xFormers memory-efficient attention due to an unexpected error: {e}. Falling back to standard attention.")
+                    _logger.warning(f"Failed to enable xFormers: {e}. Falling back to standard attention.")
                 finally:
-                    # Restore logging verbosity if needed (though our logger is independent)
-                    pass # No explicit reset needed if our logger is independent.
+                    pass 
             else:
-                _logger.info("xFormers memory-efficient attention disabled by user setting.")
-            # --- END XFORMERS INTEGRATION BLOCK ---
+                # Even if the global flag was True, if disable_xformers is True, we explicitly disable it
+                if disable_xformers:
+                    try:
+                        # Explicitly call disable_xformers_memory_efficient_attention to ensure standard kernels are used.
+                        self.pipe.disable_xformers_memory_efficient_attention()
+                        _logger.info("xFormers memory-efficient attention DISABLED by GUI setting (VRAM Save Mode).")
+                    except Exception:
+                        _logger.debug("Attempt to disable xformers failed, likely already disabled or not present.")
+                        pass
+                else: # This block handles the case where _ENABLE_XFORMERS_ATTENTION was False
+                    _logger.info("xFormers memory-efficient attention disabled by global setting.")
 
             _logger.info("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
         except Exception as e:

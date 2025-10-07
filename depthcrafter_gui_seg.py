@@ -188,7 +188,8 @@ class DepthCrafterGUI:
         self.robust_norm_output_min = tk.DoubleVar(value=0.0)
         self.robust_norm_output_max = tk.DoubleVar(value=1.0)
         self.robust_output_suffix = tk.StringVar(value="_clipped_depth")
-        self.is_depth_far_black = tk.BooleanVar(value=True)
+        self.is_depth_far_black = tk.BooleanVar(value=True)        
+        self.disable_xformers_var = tk.BooleanVar(value=True)
 
         self.all_tk_vars = {
             "input_dir_or_file_var": self.input_dir_or_file_var,
@@ -228,6 +229,7 @@ class DepthCrafterGUI:
             "robust_output_suffix": self.robust_output_suffix,
             "is_depth_far_black": self.is_depth_far_black,
             "dark_mode_var": self.dark_mode_var,
+            "disable_xformers_var": self.disable_xformers_var,
         }
         self.initial_default_settings = self._collect_all_settings()
         self._help_data = None
@@ -1063,12 +1065,15 @@ class DepthCrafterGUI:
             else:
                 _logger.info("Attempting to load local model.")
 
+            disable_xformers_for_run = self.disable_xformers_var.get()
+
             demo = DepthCrafterDemo(
                 unet_path="tencent/DepthCrafter",
                 pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
                 cpu_offload=self.cpu_offload.get(),
                 use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
-                local_files_only=self.use_local_models_only_var.get()
+                local_files_only=self.use_local_models_only_var.get(),
+                disable_xformers=disable_xformers_for_run,
             )
         except Exception as e:
             _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
@@ -1500,6 +1505,7 @@ class DepthCrafterGUI:
         self.file_menu.add_command(label="Restore Failed Input Files...", command=lambda: self._restore_input_files(folder_type="failed"))
         self.file_menu.add_separator()
         self.file_menu.add_checkbutton(label="Use Local Models Only", variable=self.use_local_models_only_var, onvalue=True, offvalue=False)
+        self.file_menu.add_checkbutton(label="Disable xFormers (VRAM Save)", variable=self.disable_xformers_var, onvalue=True, offvalue=False)
         if THEMEDTK_AVAILABLE:
             self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu.add_separator()
