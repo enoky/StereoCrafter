@@ -289,55 +289,51 @@ def read_video_frames_decord(
 
     return frames_numpy, actual_output_fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info
 
-def encode_frames_to_mp4(
-    temp_png_dir: str,
+# ======================================================================================
+# NEW FUNCTION FOR DIRECT PIPING TO FFmpeg
+# ======================================================================================
+def start_ffmpeg_pipe_process(
+    output_width: int,
+    output_height: int,
     final_output_mp4_path: str,
     fps: float,
-    total_output_frames: int,
     video_stream_info: Optional[dict],
-    stop_event: Optional[threading.Event] = None,
-    sidecar_json_data: Optional[dict] = None,
-    user_output_crf: Optional[int] = None, # NEW: Add this parameter
-    output_sidecar_ext: str = ".json",
-) -> bool:
+    user_output_crf: Optional[int] = None
+) -> Optional[subprocess.Popen]:
     """
-    Encodes a sequence of 16-bit PNG frames from a temporary directory into an MP4 video
-    using FFmpeg, attempting to preserve color metadata and using NVENC if available.
-    Also creates a sidecar JSON file if sidecar_json_data is provided.
-    Returns True on success, False on failure or stop.
+    Builds an FFmpeg command and starts a subprocess configured to accept
+    raw 16-bit BGR video frames from stdin.
+
+    Returns the Popen object on success, None on failure.
     """
-    if total_output_frames == 0:
-        logger.warning(f"No frames to encode for {os.path.basename(final_output_mp4_path)}. Skipping encoding.")
-        if os.path.exists(temp_png_dir):
-            shutil.rmtree(temp_png_dir)
-        return False
-
-    logger.debug(f"Starting FFmpeg encoding from PNG sequence to {os.path.basename(final_output_mp4_path)}")
-    logger.debug(f"Input PNG directory: {temp_png_dir}")
-
+    logger.debug(f"Starting FFmpeg pipe process for {os.path.basename(final_output_mp4_path)}")
+    
+    # --- This command-building logic is adapted from the original encode_frames_to_mp4 ---
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner",
-        "-y", # Overwrite output files without asking
-        "-framerate", str(fps), # Input framerate for the PNG sequence
-        "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
+        "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{output_width}x{output_height}",
+        "-pix_fmt", "bgr48le",  # Input is 16-bit BGR from OpenCV
+        "-r", str(fps),
+        "-i", "-",  # Read input from stdin pipe
     ]
 
     # --- Determine Output Codec, Bit-Depth, and Quality ---
-    output_codec = "libx264" # Default to H.264 CPU encoder
-    output_pix_fmt = "yuv420p" # Default to 8-bit
-    default_cpu_crf = "23" # Default CRF for H.264 (lower is better quality)
+    output_codec = "libx264"
+    output_pix_fmt = "yuv420p"
+    default_cpu_crf = "23"
     output_profile = "main"
-    x265_params = [] # For specific x265 parameters
+    x265_params = []
+    nvenc_preset = "medium"
+    default_nvenc_cq = "23"
 
-    nvenc_preset = "medium" # Default NVENC preset (e.g., fast, medium, slow, quality)
-    default_nvenc_cq = "23" # Constant Quality value for NVENC (lower is better quality)
-
-    # NEW: Apply user-specified CRF if provided
     if user_output_crf is not None and user_output_crf >= 0:
-        logger.debug(f"Using user-specified output CRF: {user_output_crf}")
+        logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
         default_cpu_crf = str(user_output_crf)
-        default_nvenc_cq = str(user_output_crf) # Assume user CRF applies to NVENC CQ as well for simplicity
+        default_nvenc_cq = str(user_output_crf)
     else:
         logger.debug("Using auto-determined output CRF.")
 
@@ -360,42 +356,34 @@ def encode_frames_to_mp4(
         output_codec = "libx265"
         if CUDA_AVAILABLE:
             output_codec = "hevc_nvenc"
-            logger.debug("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = "28" # For CPU x265 (HDR often needs higher CRF to look "good")
+            default_cpu_crf = "28"
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
             x265_params.append(f"master-display={video_stream_info['mastering_display_metadata']}")
         if video_stream_info.get("max_content_light_level"):
             x265_params.append(f"max-cll={video_stream_info['max_content_light_level']}")
     elif original_codec_name == "hevc" and is_original_10bit_or_higher:
-        logger.debug("Detected SDR 10-bit HEVC source. Targeting HEVC 10-bit SDR output.")
         output_codec = "libx265"
         if CUDA_AVAILABLE:
             output_codec = "hevc_nvenc"
-            logger.debug("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = "24" # For CPU x265 (SDR 10-bit)
+            default_cpu_crf = "24"
         output_profile = "main10"
-    else: # Default to H.264 8-bit, or if no info
-        logger.debug("Detected SDR (8-bit H.264 or other) source or no specific info. Targeting H.264 8-bit.")
+    else:
         output_codec = "libx264"
         if CUDA_AVAILABLE:
             output_codec = "h264_nvenc"
-            logger.debug("    (Using h264_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p"
         if user_output_crf is None:
-            default_cpu_crf = "18" # For CPU x264 (SDR 8-bit, higher quality)
+            default_cpu_crf = "18"
         output_profile = "main"
 
-    logger.debug("default_cpu_crf = {default_cpu_crf}")
-    # Add codec, profile, pix_fmt
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
-        ffmpeg_cmd.extend(["-preset", nvenc_preset])
-        ffmpeg_cmd.extend(["-cq", default_nvenc_cq]) # NVENC uses CQ, not CRF
+        ffmpeg_cmd.extend(["-preset", nvenc_preset, "-cq", default_nvenc_cq])
     else:
         ffmpeg_cmd.extend(["-crf", default_cpu_crf])
     
@@ -403,80 +391,31 @@ def encode_frames_to_mp4(
     if output_profile:
         ffmpeg_cmd.extend(["-profile:v", output_profile])
 
-    # Add x265-params if using libx265 and params are available
     if output_codec == "libx265" and x265_params:
         ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
 
-    # Add general color flags if present in source info
-    if video_stream_info:
-        if video_stream_info.get("color_primaries"):
-            ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
-        if video_stream_info.get("transfer_characteristics"):
-            ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
-        if video_stream_info.get("color_space"):
-            ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
+    # --- MODIFIED: Add default color space tags for robustness ---
+    # Use a dictionary's .get() with a default value to prevent errors if tags are missing.
+    # The most common standard for SDR HD video is BT.709.
+    color_primaries = video_stream_info.get("color_primaries", "bt709") if video_stream_info else "bt709"
+    transfer_characteristics = video_stream_info.get("transfer_characteristics", "bt709") if video_stream_info else "bt709"
+    color_space = video_stream_info.get("color_space", "bt709") if video_stream_info else "bt709"
 
-    # Final output path
+    # Add the determined or default flags to the command
+    ffmpeg_cmd.extend(["-color_primaries", color_primaries])
+    ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
+    ffmpeg_cmd.extend(["-colorspace", color_space])
+    # --- END MODIFICATION ---
+
     ffmpeg_cmd.append(final_output_mp4_path)
-    logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")    
-    process = None
+    logger.debug(f"FFmpeg pipe command: {' '.join(ffmpeg_cmd)}")
 
     try:
-        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
-        
-        while process.poll() is None: # While process is still running
-            if stop_event and stop_event.is_set(): 
-                logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_mp4_path)}.")
-                process.terminate() # or process.kill()
-                process.wait(timeout=5)
-                return False
-            time.sleep(0.1) # Check stop_event frequently
-
-        stdout, stderr = process.communicate(timeout=60) # A final communicate in case something was buffered
-        
-        if process.returncode != 0:
-            logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)} (return code {process.returncode}):\n{stderr}\n{stdout}")
-            return False
-        else:
-            logger.debug(f"Successfully encoded video to {final_output_mp4_path}")
-            logger.debug(f"FFmpeg stdout:\n{stdout}")
-            logger.debug(f"FFmpeg stderr:\n{stderr}")
-
+        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return process
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
-        return False
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)}: {e.stderr}\n{e.stdout}")
-        return False
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"FFmpeg encoding timed out for {os.path.basename(final_output_mp4_path)}: {e.stderr}")
-        process.kill()
-        process.wait() # Ensure the process is cleaned up
-        return False
+        return None
     except Exception as e:
-        logger.error(f"An unexpected error occurred during encoding for {os.path.basename(final_output_mp4_path)}: {str(e)}", exc_info=True)
-        return False
-    finally:
-        # Cleanup temporary PNGs
-        if os.path.exists(temp_png_dir):
-            try:
-                shutil.rmtree(temp_png_dir)
-                logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
-            except Exception as e:
-                logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
-
-    # Write sidecar JSON if data is provided
-    if sidecar_json_data:
-        output_sidecar_path = f"{os.path.splitext(final_output_mp4_path)[0]}{output_sidecar_ext}"
-        try:
-            with open(output_sidecar_path, 'w', encoding='utf-8') as f:
-                json.dump(sidecar_json_data, f, indent=4)
-            logger.info(f"Created output sidecar file: {output_sidecar_path}")
-        except Exception as e:
-            logger.error(f"Error creating output sidecar file '{output_sidecar_path}': {e}")
-            # This is not a critical error for video encoding, so don't return False here.
-
-    logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
-    return True
-
-# --- END OF FILE dependency/stereocrafter_util.py ---
+        logger.error(f"Failed to start FFmpeg pipe process: {e}", exc_info=True)
+        return None

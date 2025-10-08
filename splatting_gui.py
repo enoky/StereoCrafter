@@ -22,8 +22,10 @@ from typing import Optional, Tuple, Optional
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
+# --- MODIFIED IMPORT ---
 from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
-    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level, encode_frames_to_mp4
+    check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
+    start_ffmpeg_pipe_process # <-- IMPORT THE NEW PIPE FUNCTION
 )
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
@@ -153,6 +155,8 @@ class SplatterGUI(ThemedTk):
         self.processing_disparity_var = tk.StringVar(value="N/A")
         self.processing_convergence_var = tk.StringVar(value="N/A")
         self.processing_task_name_var = tk.StringVar(value="N/A")
+        self.processing_gamma_var = tk.StringVar(value="N/A")
+
 
         # --- Processing control variables ---
         self.stop_event = threading.Event()
@@ -636,7 +640,6 @@ class SplatterGUI(ThemedTk):
         self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
 
         # --- NEW ROW 6: Gamma ---
-        self.processing_gamma_var = tk.StringVar(value="N/A") # <-- ADD this variable to __init__
         lbl_gamma_static = tk.Label(self.info_frame, text="Gamma:")
         lbl_gamma_static.grid(row=6, column=0, sticky="e", padx=5, pady=1)
         lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w")
@@ -1487,6 +1490,7 @@ class SplatterGUI(ThemedTk):
                         global_depth_min=global_depth_min,
                         global_depth_max=global_depth_max,
                         depth_stream_info=depth_stream_info,
+                        user_output_crf=settings["output_crf"], # Pass CRF from settings
                         is_low_res_task=task["is_low_res"],
                         # --- NEW ARGUMENTS ---
                         depth_gamma=current_depth_gamma,
@@ -1769,6 +1773,9 @@ class SplatterGUI(ThemedTk):
         self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
 
+    # ======================================================================================
+    # REFACTORED depthSplatting FUNCTION
+    # ======================================================================================
     def depthSplatting(
             self: "SplatterGUI",
             input_video_reader: VideoReader,
@@ -1792,7 +1799,6 @@ class SplatterGUI(ThemedTk):
             depth_stream_info: Optional[dict],
             user_output_crf: Optional[int] = None,
             is_low_res_task: bool = False,
-            # --- NEW PARAMETERS ---
             depth_gamma: float = 1.0,
             depth_dilate_size: int = 0,
             depth_blur_size: int = 0
@@ -1802,255 +1808,188 @@ class SplatterGUI(ThemedTk):
 
         num_frames = total_frames_to_process
         height, width = target_output_height, target_output_width
-
         os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
+        
+        # --- Determine output grid dimensions and final path ---
+        grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
+        suffix = "_splatted2" if dual_output else "_splatted4"
+        res_suffix = f"_{width}"
+        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
 
-        # --- NEW: Determine max_expected_raw_value for consistent Gamma ---
-        max_expected_raw_value = 1.0 # Default to 1.0 (already normalized float)
+        # --- Start FFmpeg pipe process ---
+        ffmpeg_process = start_ffmpeg_pipe_process(
+            output_width=grid_width,
+            output_height=grid_height,
+            final_output_mp4_path=final_output_video_path,
+            fps=processed_fps,
+            video_stream_info=video_stream_info,
+            user_output_crf=user_output_crf
+        )
+        if ffmpeg_process is None:
+            logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
+            return False
+
+        # --- Determine max_expected_raw_value for consistent Gamma ---
+        max_expected_raw_value = 1.0
         depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
         depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
-
-        # Prioritize 10-bit/1023.0 for all passes if the source video metadata suggests 10-bit.
-        # This overrides any 8-bit detection to prevent scaling errors.
         is_source_10bit = False
         if depth_pix_fmt:
             if "10" in depth_pix_fmt or "gray10" in depth_pix_fmt or "12" in depth_pix_fmt or (depth_profile and "main10" in depth_profile):
                 is_source_10bit = True
-        
         if is_source_10bit:
             max_expected_raw_value = 1023.0
         elif depth_pix_fmt and ("8" in depth_pix_fmt or depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"]):
              max_expected_raw_value = 255.0
         elif isinstance(depth_pix_fmt, str) and "float" in depth_pix_fmt:
             max_expected_raw_value = 1.0
-        
         logger.debug(f"Determined max_expected_raw_value: {max_expected_raw_value:.1f} (Source: {depth_pix_fmt}/{depth_profile})")
-        # --- END NEW ---
-
-        if dual_output:
-            suffix = "_splatted2"
-        else:
-            suffix = "_splatted4"
-
-        res_suffix = f"_{width}"
-        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
-
-        temp_png_dir = os.path.join(os.path.dirname(final_output_video_path), "temp_splat_pngs_" + os.path.basename(os.path.splitext(output_video_path_base)[0]))
-        os.makedirs(temp_png_dir, exist_ok=True)
-        logger.debug(f"==> Writing temporary PNG sequence to: {temp_png_dir}")
 
         frame_count = 0
-        logger.debug(f"==> Generating PNG sequence for {os.path.basename(final_output_video_path)}")
-        # draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
+        encoding_successful = True # Assume success unless an error occurs
 
-        if assume_raw_input:
-            logger.debug("No Normalization (Assume Raw 0-1 Input) is ENABLED. Depth maps will be directly scaled from raw pixel values to 0-1.")
-        else:
-            logger.debug("Global Depth Normalization is ENABLED. Depth maps will be normalized using pre-computed global min/max for consistency.")
+        try:
+            for i in range(0, num_frames, batch_size):
+                if self.stop_event.is_set() or ffmpeg_process.poll() is not None:
+                    if ffmpeg_process.poll() is not None:
+                        logger.error("FFmpeg process terminated unexpectedly. Stopping frame processing.")
+                    else:
+                        logger.warning("Stop event received. Terminating FFmpeg process.")
+                    encoding_successful = False
+                    break
 
+                current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
+                if not current_frame_indices:
+                    break
 
-        for i in range(0, num_frames, batch_size):
-            if self.stop_event.is_set():
-                draw_progress_bar(frame_count, num_frames, suffix='Stopped')
-                print()
-                del stereo_projector
+                batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
+                batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
+                self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+                
+                batch_depth_numpy = self._process_depth_batch(
+                    batch_depth_numpy_raw=batch_depth_numpy_raw,
+                    depth_stream_info=depth_stream_info,
+                    depth_gamma=depth_gamma,
+                    depth_dilate_size=depth_dilate_size,
+                    depth_blur_size=depth_blur_size,
+                    is_low_res_task=is_low_res_task,
+                    max_raw_value=max_expected_raw_value,
+                    global_depth_min=global_depth_min,
+                    global_depth_max=global_depth_max
+                )
+                self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+
+                batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
+                batch_depth_normalized = batch_depth_numpy.copy()
+
+                if assume_raw_input:
+                    if global_depth_max > 1.0:
+                        batch_depth_normalized = batch_depth_numpy / global_depth_max
+                else:
+                    if global_depth_max - global_depth_min > 1e-5:
+                        batch_depth_normalized = (batch_depth_numpy - global_depth_min) / (global_depth_max - global_depth_min)
+                    else:
+                        batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
+
+                batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
+
+                if not assume_raw_input and depth_gamma != 1.0:
+                     batch_depth_normalized = np.power(batch_depth_normalized, depth_gamma)
+                
+                self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
+                
+                batch_depth_vis_list = []
+                for d_frame in batch_depth_normalized:
+                    d_frame_vis = d_frame.copy()
+                    if d_frame_vis.max() > d_frame_vis.min(): 
+                        cv2.normalize(d_frame_vis, d_frame_vis, 0, 1, cv2.NORM_MINMAX)
+                    vis_frame_uint8 = (d_frame_vis * 255).astype(np.uint8)
+                    vis_frame = cv2.applyColorMap(vis_frame_uint8, cv2.COLORMAP_VIRIDIS)
+                    batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
+                batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) 
+
+                left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
+                disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()        
+                disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
+                disp_map_tensor = disp_map_tensor * max_disp
+
+                with torch.no_grad():
+                    right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
+                    if is_low_res_task:
+                        right_video_tensor = self._fill_left_edge_occlusions(right_video_tensor_raw, occlusion_mask_tensor, boundary_width_pixels=3)
+                    else:
+                        right_video_tensor = right_video_tensor_raw
+
+                right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
+                occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
+
+                for j in range(len(batch_frames_numpy)):
+                    if dual_output:
+                        video_grid = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
+                    else:
+                        video_grid_top = np.concatenate([batch_frames_float[j], batch_depth_vis[j]], axis=1)
+                        video_grid_bottom = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
+                        video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
+
+                    video_grid_uint16 = (np.clip(video_grid, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                    video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
+                    
+                    # --- SEND FRAME TO FFMPEG PIPE ---
+                    ffmpeg_process.stdin.write(video_grid_bgr.tobytes())
+                    frame_count += 1
+
+                del left_video_tensor, disp_map_tensor, right_video_tensor, occlusion_mask_tensor
                 torch.cuda.empty_cache()
-                gc.collect()
-                if os.path.exists(temp_png_dir):
-                    shutil.rmtree(temp_png_dir)
-                return
-
-            current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
-            if not current_frame_indices:
-                break
-
-            batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
-            batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
-
-            # DEBUG 1: Raw Input
-            self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
-            # --- END OF BATCH READS ---
-
-            # --- NEW: Process depth map using the helper method ---
-            batch_depth_numpy = self._process_depth_batch(
-                batch_depth_numpy_raw=batch_depth_numpy_raw,
-                depth_stream_info=depth_stream_info,
-                depth_gamma=depth_gamma,
-                depth_dilate_size=depth_dilate_size,
-                depth_blur_size=depth_blur_size,
-                is_low_res_task=is_low_res_task,
-                max_raw_value=max_expected_raw_value,
-                global_depth_min=global_depth_min, # <--- ADDED
-                global_depth_max=global_depth_max,  # <--- ADDED
-            )
-            
-            # DEBUG 2: Processed (Pre-Normalization)
-            self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
-
-            # Convert original batch frames to float 0-1 for display in grid
-            batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
-            
-            # This must be the float version of the batch, in case all logic below fails.
-            batch_depth_normalized = batch_depth_numpy.copy() 
-
-            # --- Final Normalization Step: This MUST be the final step before converting to tensor. ---
-            
-            if assume_raw_input:
-                # RAW INPUT MODE: Normalize by the calculated maximum scaling factor (which is now in global_depth_max).
-                
-                # DEBUG 2.5: RAW INPUT PRE-CALC
-                self._save_debug_numpy(batch_depth_numpy, "02_5_RAW_PRE_CALC", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
-                
-                if global_depth_max > 1.0: # Check that it's an actual raw range (e.g., 255, 1023)
-                    batch_depth_normalized = batch_depth_numpy / global_depth_max
-                    logger.debug(f"Final normalization by Max Scaling Value {global_depth_max:.3f} (Raw Input Mode).")
-                else:
-                    # Fallback for errors or already-normalized floats
-                    batch_depth_normalized = batch_depth_numpy.copy()
-                    logger.debug(f"Final fallback normalization by Theoretical Max {max_expected_raw_value:.1f}.")
-
-            else:
-                # GLOBAL NORM MODE: Normalize by the pre-computed global min/max.
-                logger.debug(f"Final normalization by global range [{global_depth_min:.3f}, {global_depth_max:.3f}] (Global Norm Mode).")
-                
-                # DEBUG 2.5: GLOBAL NORM PRE-CALC
-                self._save_debug_numpy(batch_depth_numpy, "02_5_GLOBAL_PRE_CALC", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
-                
-                if global_depth_max - global_depth_min > 1e-5:
-                    batch_depth_normalized = (batch_depth_numpy - global_depth_min) / (global_depth_max - global_depth_min)
-                else:
-                    batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
-                    logger.warning(f"Global depth range for normalization is too small. Setting to constant {zero_disparity_anchor_val}.")
-
-            # Clip to ensure values are strictly within 0-1 range after normalization
-            batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
-
-            # --- Final Gamma Adjustment (Only if Global Norm was used and Gamma is not 1.0) ---
-            if not assume_raw_input and depth_gamma != 1.0:
-                 logger.debug(f"Applying final post-normalization gamma adjustment: {depth_gamma:.2f}")
-                 batch_depth_normalized = np.power(batch_depth_normalized, depth_gamma)
-            # ----------------------------------------------------------------------------------
-
-            # DEBUG 3: Final Normalized (Post-Clip/Pre-Tensor) - THIS IS THE FINAL DATA STATE!
-            self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, current_frame_indices[0], task_name="LowRes" if is_low_res_task else "HiRes")
-            
-            # --- Final Unified Visualization Logic (Run for Both Low-Res and Hi-Res) ---
-            batch_depth_vis_list = []
-            
-            for d_frame in batch_depth_normalized:
-                d_frame_vis = d_frame.copy()
-                
-                # Auto-level the brightness/contrast of the visualization
-                if d_frame_vis.max() > d_frame_vis.min(): 
-                    cv2.normalize(d_frame_vis, d_frame_vis, 0, 1, cv2.NORM_MINMAX)
-                
-                # Apply Colormap (Fix for Cyan Screen included in this block)
-                vis_frame_uint8 = (d_frame_vis * 255).astype(np.uint8)
-                vis_frame = cv2.applyColorMap(vis_frame_uint8, cv2.COLORMAP_VIRIDIS)
-                batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
-            
-            # Define final variable
-            batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) 
-            # --- END Final Unified Visualization Logic ---
-
-
-
-            # Convert to tensors for GPU processing
-            left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
-            disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()        
-            disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
-            disp_map_tensor = disp_map_tensor * max_disp
-
-            with torch.no_grad():
-                # Perform the forward warp to get the raw right-eye view and occlusion mask
-                right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
-                
-                # --- Conditional Left-Edge Occlusion Filling (Mask Boundary) ---
-                if is_low_res_task:
-                    logger.debug("Applying left-edge occlusion boundary filling for low-resolution output.")
-                    # 'boundary_width_pixels' controls how many columns at the very left edge
-                    # will be filled. A small value like 1, 2, or 3 is usually good for a boundary.
-                    right_video_tensor = self._fill_left_edge_occlusions(
-                        right_video_tensor_raw,
-                        occlusion_mask_tensor,
-                        boundary_width_pixels=3 # <--- ADJUST THIS VALUE as needed (e.g., 1, 2, 3, or 4)
-                    )
-                else:
-                    logger.debug("Skipping left-edge occlusion boundary filling for high-resolution output.")
-                    right_video_tensor = right_video_tensor_raw # Use the raw warped tensor
-
-            right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
-            occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
-
-            for j in range(len(batch_frames_numpy)):
-                if dual_output:
-                    video_grid = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
-                else:
-                    video_grid_top = np.concatenate([batch_frames_float[j], batch_depth_vis[j]], axis=1)
-                    video_grid_bottom = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
-                    video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
-
-                video_grid_uint16 = np.clip(video_grid, 0.0, 1.0) * 65535.0
-                video_grid_uint16 = video_grid_uint16.astype(np.uint16)
-                video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
-
-                png_filename = os.path.join(temp_png_dir, f"{frame_count:05d}.png")
-                cv2.imwrite(png_filename, video_grid_bgr)
-
-                frame_count += 1
-
-            del left_video_tensor, disp_map_tensor, right_video_tensor, occlusion_mask_tensor
+                draw_progress_bar(frame_count, num_frames, prefix=f"  Encoding:")
+        
+        except (IOError, BrokenPipeError) as e:
+            logger.error(f"FFmpeg pipe error: {e}. Encoding may have failed.")
+            encoding_successful = False
+        finally:
+            del stereo_projector
             torch.cuda.empty_cache()
             gc.collect()
+
+            # --- Finalize FFmpeg process ---
+            if ffmpeg_process.stdin:
+                ffmpeg_process.stdin.close() # Close the pipe to signal end of input
             
-            draw_progress_bar(frame_count, num_frames, prefix=f"  Progress:")
-
-        logger.debug(f"==> Temporary PNG sequence generation completed ({frame_count} frames).")
+            # Wait for the process to finish and get output
+            stdout, stderr = ffmpeg_process.communicate(timeout=120)
+            
+            if self.stop_event.is_set():
+                ffmpeg_process.terminate()
+                logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_video_path)}.")
+                encoding_successful = False
+            elif ffmpeg_process.returncode != 0:
+                logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_video_path)} (return code {ffmpeg_process.returncode}):\n{stderr.decode()}")
+                encoding_successful = False
+            else:
+                logger.info(f"Successfully encoded video to {final_output_video_path}")
+                logger.debug(f"FFmpeg stderr log:\n{stderr.decode()}")
         
-        del stereo_projector
-        torch.cuda.empty_cache()
-        gc.collect()
+        if not encoding_successful:
+            return False
 
-        # Determine the final output path suffix (splatted2 or splatted4)
-        if dual_output:
-            suffix = "_splatted2"
-        else:
-            suffix = "_splatted4"
-        res_suffix = f"_{width}"
-        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
-
-        # Prepare sidecar data (only frame_overlap and input_bias are needed for the output sidecar)
+        # --- Write sidecar JSON after successful encoding ---
         output_sidecar_data = {}
         if frame_overlap is not None:
             output_sidecar_data["frame_overlap"] = frame_overlap
         if input_bias is not None:
             output_sidecar_data["input_bias"] = input_bias
-
-        # Determine output CRF from GUI setting
-        # NOTE: If user_output_crf is None, it will default to a sensible value inside encode_frames_to_mp4
-        output_crf = user_output_crf if user_output_crf is not None else int(self.output_crf_var.get())
-
-        # Call the utility function to handle encoding, cleanup, and sidecar writing
-        encoding_successful = encode_frames_to_mp4(
-            temp_png_dir=temp_png_dir,
-            final_output_mp4_path=final_output_video_path,
-            fps=processed_fps,
-            total_output_frames=frame_count,
-            video_stream_info=video_stream_info,
-            stop_event=self.stop_event, # Pass the threading stop event
-            sidecar_json_data=output_sidecar_data, # Pass the data to be written
-            user_output_crf=output_crf,
-            output_sidecar_ext=self.APP_CONFIG_DEFAULTS['OUTPUT_SIDECAR_EXT'] 
-        )
         
-        # Return True/False based on encoding success
-        if encoding_successful:
-            logger.debug(f"Successfully finished encoding to: {final_output_video_path}")
-            return True
-        else:
-            logger.error(f"Encoding failed or was stopped by user for {final_output_video_path}.")
-            return False
-    
+        if output_sidecar_data:
+            sidecar_ext = self.APP_CONFIG_DEFAULTS.get('OUTPUT_SIDECAR_EXT', '.spsidecar')
+            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}{sidecar_ext}"
+            try:
+                with open(output_sidecar_path, 'w', encoding='utf-8') as f:
+                    json.dump(output_sidecar_data, f, indent=4)
+                logger.info(f"Created output sidecar file: {output_sidecar_path}")
+            except Exception as e:
+                logger.error(f"Error creating output sidecar file '{output_sidecar_path}': {e}")
+        
+        return True
+
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
         self._save_config()
