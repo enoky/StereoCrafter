@@ -647,20 +647,23 @@ class SplatterGUI(ThemedTk):
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
 
-    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int) -> float:
+    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float) -> float:
         """
         Calculates the Auto Convergence point (average depth value) for the entire video.
         Uses a hard blur and crops to the center 75% to eliminate noise/edge artifacts.
 
+        Args:
+            float: fallback_value: The current GUI/Sidecar value to return if auto-convergence fails.
+
         Returns:
-            float: The new zero_disparity_anchor_val (0.0 to 1.0).
+            float: The new zero_disparity_anchor_val (0.0 to 1.0) or fallback_value.
         """
         logger.info("==> Starting Auto-Convergence pre-pass to determine global average depth.")
         
         # --- Constants for Auto-Convergence Logic ---
         BLUR_KERNEL_SIZE = 9  # Hard blur to capture bulk depth, must be odd
         CENTER_CROP_PERCENT = 0.75 # Use the center 75% of the frame (1 - 0.75 = 0.25 margin total)
-        MIN_VALID_PIXELS = 100 # Minimum number of non-zero/non-max pixels to consider a frame valid
+        MIN_VALID_PIXELS = 5 # Minimum number of non-zero/non-max pixels to consider a frame valid
         INTERNAL_ANCHOR_OFFSET = 0.1 # <--- ADJUST THIS VALUE FOR TESTING (e.g., 0.02, 0.05, 0.1)
         # -------------------------------------------
 
@@ -671,10 +674,10 @@ class SplatterGUI(ThemedTk):
             depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
             if len(depth_reader) == 0:
                  logger.error("Depth map reader has no frames. Cannot calculate Auto-Convergence.")
-                 return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+                 return fallback_value # Fallback to user/sidecar default
         except Exception as e:
             logger.error(f"Error initializing depth map reader for Auto-Convergence: {e}")
-            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+            return fallback_value # Fallback to user/sidecar default
 
 
         # 2. Iterate and Average
@@ -683,7 +686,7 @@ class SplatterGUI(ThemedTk):
         for i in range(0, num_frames, batch_size):
             if self.stop_event.is_set():
                 logger.warning("Auto-Convergence pre-pass stopped by user.")
-                return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback
+                return fallback_value # Fallback
 
             current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
             if not current_frame_indices:
@@ -712,7 +715,10 @@ class SplatterGUI(ThemedTk):
                 batch_depth_normalized = np.full_like(batch_depth_float, fill_value=0.5, dtype=np.float32)
 
             # Frame-by-Frame Processing (Blur & Crop)
-            for frame in batch_depth_normalized:
+            for j, frame in enumerate(batch_depth_normalized):
+                
+                # --- NEW DEBUG LOGGING START ---
+                current_frame_idx = current_frame_indices[j]
                 H, W = frame.shape
                 
                 # a) Blur
@@ -728,9 +734,13 @@ class SplatterGUI(ThemedTk):
                 # Use a small epsilon to catch near-zero/near-one
                 valid_pixels = cropped_frame[(cropped_frame > 0.001) & (cropped_frame < 0.999)] 
                 
+                logger.debug(f"  [AutoConv Frame {current_frame_idx:03d}] Res: {W}x{H}, Crop Margins: {margin_w}x{margin_h}. Cropped Size: {cropped_frame.size}. Valid Pixels: {valid_pixels.size}")
+                # --- NEW DEBUG LOGGING END ---
+
                 if valid_pixels.size > MIN_VALID_PIXELS:
                     all_valid_frame_averages.append(valid_pixels.mean())
-                # else: frame is likely too empty or uniform, skip for averaging
+                else:
+                    logger.warning(f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}).")
 
             draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
         
@@ -747,8 +757,8 @@ class SplatterGUI(ThemedTk):
             logger.info(f"\n==> Auto-Convergence Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
             return float(final_anchor)
         else:
-            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI default.")
-            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI/Sidecar value as fallback.")
+            return fallback_value # Fallback to user/sidecar default
 
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
@@ -1327,13 +1337,17 @@ class SplatterGUI(ThemedTk):
                     new_anchor_val = self._determine_auto_convergence(
                         actual_depth_map_path,
                         settings["process_length"],
-                        settings["full_res_batch_size"] # Use a reasonable batch size for the pre-pass
+                        settings["full_res_batch_size"],
+                        current_zero_disparity_anchor,
                     )
                     
                     # Update variables for current task
-                    current_zero_disparity_anchor = new_anchor_val
-                    anchor_source = "Auto"
-                    logger.info(f"Using Auto-Determined Convergence Point: {current_zero_disparity_anchor:.4f}")
+                    # If new_anchor_val == current_zero_disparity_anchor, it means the function failed and returned the fallback.
+                    if new_anchor_val != current_zero_disparity_anchor:
+                        current_zero_disparity_anchor = new_anchor_val
+                        anchor_source = "Auto"
+                    
+                    logger.info(f"Using Convergence Point: {current_zero_disparity_anchor:.4f} (Source: {anchor_source})")
                 # --- END Auto-Convergence Logic ---
 
                 if not processing_tasks:
