@@ -26,7 +26,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25.10.06"
+GUI_VERSION = "25.10.09"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1004,7 +1004,7 @@ class InpaintingGUI(ThemedTk):
 
         # 2. Morphological Closing
         try:
-            morph_kernel_size = int(self.mask_morph_kernel_size_var.get())
+            morph_kernel_size = int(float(self.mask_morph_kernel_size_var.get()))
             if morph_kernel_size != 0: # Step enabled if kernel size is not 0
                 current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
                 logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
