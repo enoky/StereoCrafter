@@ -681,8 +681,20 @@ class SplatterGUI(ThemedTk):
 
 
         # 2. Iterate and Average
-        num_frames = min(total_frames_to_process, len(depth_reader))
         
+        # Determine the number of frames to process
+        video_length = len(depth_reader)
+        if total_frames_to_process <= 0 or total_frames_to_process > video_length:
+             num_frames = video_length
+        else:
+             num_frames = total_frames_to_process
+            
+        logger.debug(f"  AutoConv determined actual frames to process: {num_frames} (from input length {total_frames_to_process}).")
+
+
+        # Original line: num_frames = min(total_frames_to_process, len(depth_reader))
+        
+        # Now use the determined num_frames for the loop:
         for i in range(0, num_frames, batch_size):
             if self.stop_event.is_set():
                 logger.warning("Auto-Convergence pre-pass stopped by user.")
@@ -740,7 +752,10 @@ class SplatterGUI(ThemedTk):
                 if valid_pixels.size > MIN_VALID_PIXELS:
                     all_valid_frame_averages.append(valid_pixels.mean())
                 else:
-                    logger.warning(f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}).")
+                    # FALLBACK FOR THE FRAME: If filter is too strict, just use the mean of the WHOLE cropped, blurred frame
+                    all_valid_frame_averages.append(cropped_frame.mean())
+                    # Note: We still log the failure using a warning, but we count the frame.
+                    logger.warning(f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}). Forcing mean from full cropped frame.")
 
             draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
         
