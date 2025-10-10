@@ -13,9 +13,10 @@ import torch
 import torch.nn.functional as F
 import cv2
 from PIL import Image, ImageTk
+from decord import VideoReader, cpu
 import logging
 import time
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord, start_ffmpeg_pipe_process
 
 GUI_VERSION = "1.0.0"
 
@@ -87,6 +88,47 @@ def apply_stamp_blur(mask: torch.Tensor, shift_per_step: int, start_opacity: flo
             canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
         return torch.from_numpy(canvas_np).unsqueeze(0).to(mask.device)
 
+def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
+    """
+    Transfers the color statistics from the source_frame to the target_frame using LAB color space.
+    Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
+    Returns the color-adjusted target_frame in [C, H, W] float [0, 1] format.
+    """
+    try:
+        # Ensure tensors are on CPU and convert to numpy arrays in HWC format
+        source_np = source_frame.permute(1, 2, 0).numpy()  # [H, W, C]
+        target_np = target_frame.permute(1, 2, 0).numpy()  # [H, W, C]
+
+        # Scale from [0, 1] to [0, 255] and convert to uint8
+        source_np_uint8 = (np.clip(source_np, 0.0, 1.0) * 255).astype(np.uint8)
+        target_np_uint8 = (np.clip(target_np, 0.0, 1.0) * 255).astype(np.uint8)
+
+        # Convert to LAB color space
+        source_lab = cv2.cvtColor(source_np_uint8, cv2.COLOR_RGB2LAB)
+        target_lab = cv2.cvtColor(target_np_uint8, cv2.COLOR_RGB2LAB)
+
+        src_mean, src_std = cv2.meanStdDev(source_lab)
+        tgt_mean, tgt_std = cv2.meanStdDev(target_lab)
+
+        src_mean = src_mean.flatten()
+        src_std = src_std.flatten()
+        tgt_mean = tgt_mean.flatten()
+        tgt_std = tgt_std.flatten()
+
+        src_std = np.clip(src_std, 1e-6, None)
+        tgt_std = np.clip(tgt_std, 1e-6, None)
+
+        target_lab_float = target_lab.astype(np.float32)
+        for i in range(3): # For L, A, B channels
+            target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[i]
+
+        adjusted_lab_uint8 = np.clip(target_lab_float, 0, 255).astype(np.uint8)
+        adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
+        return torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
+    except Exception as e:
+        logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
+        return target_frame
+
 class MergingGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="clam")
@@ -99,9 +141,16 @@ class MergingGUI(ThemedTk):
         self.is_processing = False
         
         # --- Preview State ---
-        self.preview_inpainted_frame = None
-        self.preview_original_frame = None
-        self.preview_warped_frame = None # NEW: To store the warped frame for blending
+        # Store VideoReader objects instead of full numpy arrays to save memory
+        self.preview_inpainted_reader = None
+        self.preview_original_reader = None
+        self.preview_splatted_reader = None
+        self.preview_is_splatted_dual = False
+        self.wiggle_after_id = None # For managing the wigglegram animation
+
+        self.preview_video_list = []
+        self.current_preview_video_index = -1
+        self.is_sbs_preview = False # NEW: To track if the preview source is an SBS file
         self.preview_mask_frame = None
         self.preview_image_tk = None # To prevent garbage collection
         self.preview_loaded_file = None
@@ -123,31 +172,120 @@ class MergingGUI(ThemedTk):
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", True))
         self.use_sbs_output_var = tk.BooleanVar(value=self.app_config.get("use_sbs_output", True))
+        self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
+        self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", 32)))
+        self.frame_scrubber_var = tk.DoubleVar(value=0)
+        self.video_jump_to_var = tk.StringVar(value="1")
+        self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
+        self.preview_source_var = tk.StringVar(value="Blended Image")
+        self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", 512)))
 
         # --- GUI Status Variables ---
         self.status_label_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
 
         self.create_widgets()
+
+        # Define a custom style for the loading button
+        self.style = ttk.Style(self)
+        self.style.configure('Loading.TButton', foreground='red', font=('Helvetica', '9', 'bold'))
+
+        self._apply_theme()
         self.protocol("WM_DELETE_WINDOW", self.exit_application)
         self.update_status_label("Ready.")
 
+    def create_menubar(self):
+        """Creates the main menu bar for the application."""
+        self.menubar = tk.Menu(self)
+        self.config(menu=self.menubar)
+
+        # --- File Menu ---
+        self.file_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="File", menu=self.file_menu)
+        self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
+        self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
+        self.file_menu.add_separator()
+        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.exit_application)
+
+        # --- Help Menu ---
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_command(label="About", command=self.show_about_dialog)
+
+    def _apply_theme(self):
+        """Applies the selected theme (dark or light) to the GUI."""
+        if self.dark_mode_var.get():
+            bg_color, fg_color, entry_bg = "#2b2b2b", "white", "#3c3c3c"
+            self.style.theme_use("black")
+        else:
+            bg_color, fg_color, entry_bg = "#d9d9d9", "black", "#ffffff"
+            self.style.theme_use("clam")
+
+        self.configure(bg=bg_color)
+        self.style.configure("TFrame", background=bg_color)
+        self.style.configure("TLabel", background=bg_color, foreground=fg_color)
+        self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
+        self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
+        self.style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
+        self.style.map('TCheckbutton',
+            foreground=[('active', fg_color)],
+            background=[('active', bg_color)]
+        )
+        self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
+
+    def show_about_dialog(self):
+        """Displays an 'About' dialog for the application."""
+        about_text = (
+            f"Stereocrafter Merging GUI\n"
+            f"Version: {GUI_VERSION}\n\n"
+            "This tool blends inpainted right-eye videos with their corresponding "
+            "high-resolution source files to create final stereoscopic videos.\n\n"
+            "It provides interactive controls for mask processing and color matching."
+        )
+        messagebox.showinfo("About Merging GUI", about_text)
+
+    def reset_to_defaults(self):
+        """Resets all GUI parameters to their default hardcoded values."""
+        if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
+            return
+
+        # Set default values for all your configuration variables
+        self.inpainted_folder_var.set("./completed_output")
+        self.original_folder_var.set("./input_source_clips")
+        self.mask_folder_var.set("./output_splatted/hires")
+        self.output_folder_var.set("./final_videos")
+        self.mask_dilate_kernel_size_var.set(15.0)
+        self.mask_blur_kernel_size_var.set(25.0)
+        self.stamp_shift_var.set(2.0)
+        self.stamp_start_opacity_var.set(0.8)
+        self.stamp_opacity_decay_var.set(0.1)
+        self.stamp_min_opacity_var.set(0.2)
+        self.stamp_decay_gamma_var.set(2.0)
+        self.use_gpu_var.set(True)
+        self.use_sbs_output_var.set(True)
+        self.enable_color_transfer_var.set(True)
+        self.batch_chunk_size_var.set("32")
+        self.preview_size_var.set("512")
+
+        self.save_config()
+        messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
+        logger.info("GUI settings reset to defaults.")
+
     def create_widgets(self):
-        # --- Main Paned Window for resizable layout ---
-        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True)
-
-        # --- Left Pane for Controls ---
-        left_pane = ttk.Frame(main_pane, padding=5)
-        main_pane.add(left_pane, weight=1)
-
-        # --- Right Pane for Preview ---
-        right_pane = ttk.LabelFrame(main_pane, text="Live Preview", padding=10)
-        main_pane.add(right_pane, weight=2)
+        self.create_menubar()
+        # The main window will now be a simple vertical layout.
+        # We will pack frames directly into `self`.
 
         # --- FOLDER FRAME ---
-        folder_frame = ttk.LabelFrame(left_pane, text="Folders", padding=10)
-        folder_frame.pack(fill="x", padx=10, pady=5, anchor="n")
+        folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
+        folder_frame.pack(fill="x", padx=10, pady=5)
         folder_frame.grid_columnconfigure(1, weight=1)
 
         # Inpainted Video Folder
@@ -170,9 +308,53 @@ class MergingGUI(ThemedTk):
         ttk.Entry(folder_frame, textvariable=self.output_folder_var).grid(row=3, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var)).grid(row=3, column=2, padx=5)
 
+        # --- PREVIEW FRAME (Moved here) ---
+        preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=10)
+        preview_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.preview_label = ttk.Label(preview_frame, text="Load a video to see preview", anchor="center")
+        self.preview_label.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Scrubber Frame
+        scrubber_frame = ttk.Frame(preview_frame)
+        scrubber_frame.pack(fill="x", pady=5)
+        scrubber_frame.grid_columnconfigure(1, weight=1)
+
+        self.frame_label = ttk.Label(scrubber_frame, textvariable=self.frame_label_var, width=15)
+        self.frame_label.grid(row=0, column=0, padx=5)
+        self.frame_scrubber = ttk.Scale(scrubber_frame, from_=0, to=0, variable=self.frame_scrubber_var, orient="horizontal")
+        self.frame_scrubber.grid(row=0, column=1, sticky="ew")
+        self.frame_scrubber.bind("<ButtonRelease-1>", self.on_slider_release)
+        self.frame_scrubber.configure(command=self.on_scrubber_move)
+
+        # --- NEW: Video Navigation Frame ---
+        preview_button_frame = ttk.Frame(preview_frame)
+        preview_button_frame.pack(fill="x", pady=5)
+
+        # Add Preview Source dropdown
+        ttk.Label(preview_button_frame, text="Preview Source:").pack(side="left", padx=(0, 5))
+        self.preview_source_combo = ttk.Combobox(preview_button_frame, textvariable=self.preview_source_var, state="readonly", width=18)
+        self.preview_source_combo.pack(side="left", padx=5)
+        self.preview_source_combo.bind("<<ComboboxSelected>>", lambda event: self.on_slider_release(event))
+        
+        self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._refresh_preview_video_list, width=20)
+        self.load_preview_button.pack(side="left", padx=5)
+
+        self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1))
+        self.prev_video_button.pack(side="left", padx=5)
+
+        self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1))
+        self.next_video_button.pack(side="left", padx=5)
+
+        ttk.Label(preview_button_frame, text="Jump to:").pack(side="left", padx=(15, 2))
+        self.video_jump_entry = ttk.Entry(preview_button_frame, textvariable=self.video_jump_to_var, width=5)
+        self.video_jump_entry.pack(side="left")
+        self.video_jump_entry.bind("<Return>", self._jump_to_video)
+        ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
+
         # --- MASK PROCESSING PARAMETERS ---
-        param_frame = ttk.LabelFrame(left_pane, text="Mask Processing Parameters", padding=10)
-        param_frame.pack(fill="x", padx=10, pady=5, anchor="n")
+        param_frame = ttk.LabelFrame(self, text="Mask Processing Parameters", padding=10)
+        param_frame.pack(fill="x", padx=10, pady=5)
         param_frame.grid_columnconfigure(1, weight=1)
 
         # Helper to create a slider with a label
@@ -197,35 +379,35 @@ class MergingGUI(ThemedTk):
         create_slider(param_frame, "Stamp Opacity Min:", self.stamp_min_opacity_var, 0.0, 1.0, 6, decimals=2)
 
         # --- OPTIONS FRAME ---
-        options_frame = ttk.LabelFrame(left_pane, text="Options", padding=10)
-        options_frame.pack(fill="x", padx=10, pady=5, anchor="n")
+        options_frame = ttk.LabelFrame(self, text="Options", padding=10)
+        options_frame.pack(fill="x", padx=10, pady=5)
 
         ttk.Checkbutton(options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var).pack(side="left", padx=5)
         ttk.Checkbutton(options_frame, text="Create Side-by-Side (SBS) Output", variable=self.use_sbs_output_var).pack(side="left", padx=5)
+        ttk.Checkbutton(options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var).pack(side="left", padx=5)
+        
+        # Add Preview Size option
+        ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
+        ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7).pack(side="left")
+        # Add Batch Chunk Size option
+        ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
+        ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7).pack(side="left")
+
 
         # --- PROGRESS & BUTTONS ---
-        progress_frame = ttk.LabelFrame(left_pane, text="Progress", padding=10)
-        progress_frame.pack(fill="x", padx=10, pady=5, anchor="n")
+        progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
+        progress_frame.pack(fill="x", padx=10, pady=5)
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, length=400, mode='determinate')
         self.progress_bar.pack(fill="x")
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
         self.status_label.pack(pady=5)
 
-        buttons_frame = ttk.Frame(left_pane, padding=10)
-        buttons_frame.pack(fill="x", anchor="n")
+        buttons_frame = ttk.Frame(self, padding=10)
+        buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(buttons_frame, text="Start Blending", command=self.start_processing)
         self.start_button.pack(side="left", padx=5, expand=True)
         self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5, expand=True)
-
-        # --- PREVIEW WIDGETS (in right_pane) ---
-        self.preview_label = ttk.Label(right_pane, text="Load a video to see preview", anchor="center")
-        self.preview_label.pack(fill="both", expand=True, padx=5, pady=5)
-
-        preview_button_frame = ttk.Frame(right_pane)
-        preview_button_frame.pack(fill="x", pady=5)
-        self.load_preview_button = ttk.Button(preview_button_frame, text="Load First Video for Preview", command=self.load_for_preview)
-        self.load_preview_button.pack()
 
     def _browse_folder(self, var: tk.StringVar):
         folder = filedialog.askdirectory(initialdir=var.get())
@@ -234,8 +416,20 @@ class MergingGUI(ThemedTk):
 
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
-        if self.preview_inpainted_frame is not None:
+        self._stop_wigglegram_animation()
+        if self.preview_inpainted_reader is not None:
             self.update_preview()
+
+    def _stop_wigglegram_animation(self):
+        if self.wiggle_after_id:
+            self.after_cancel(self.wiggle_after_id)
+            self.wiggle_after_id = None
+
+    def on_scrubber_move(self, value):
+        """Called continuously as the frame scrubber moves to update the label."""
+        frame_idx = int(float(value))
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+        self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
 
     def update_status_label(self, message):
         self.status_label_var.set(message)
@@ -274,9 +468,22 @@ class MergingGUI(ThemedTk):
         self.stop_button.config(state="disabled")
         message = "Processing stopped." if stopped else "Processing completed."
         self.update_status_label(message)
+        release_cuda_memory() # Explicitly release VRAM
         self.progress_var.set(0)
 
     def get_current_settings(self):
+        # --- NEW: Define a helper to read FFmpeg's output without blocking ---
+        def _read_ffmpeg_output(pipe, log_level):
+            try:
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        logger.log(log_level, f"FFmpeg: {line.strip()}")
+            except Exception as e:
+                logger.error(f"Error reading FFmpeg pipe: {e}")
+            finally:
+                pipe.close()
+
+        self.save_config() # Save settings on every run
         """Collects all GUI settings into a dictionary."""
         try:
             settings = {
@@ -286,6 +493,9 @@ class MergingGUI(ThemedTk):
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
                 "use_sbs": self.use_sbs_output_var.get(),
+                "batch_chunk_size": int(self.batch_chunk_size_var.get()),
+                "enable_color_transfer": self.enable_color_transfer_var.get(),
+                "preview_size": int(self.preview_size_var.get()),
                 # Mask params
                 "dilate_kernel": int(self.mask_dilate_kernel_size_var.get()),
                 "blur_kernel": int(self.mask_blur_kernel_size_var.get()),
@@ -299,6 +509,19 @@ class MergingGUI(ThemedTk):
         except (ValueError, TypeError) as e:
             messagebox.showerror("Invalid Settings", f"Please check your parameter values. They must be valid numbers.\n\nError: {e}")
             return None
+
+    def _read_ffmpeg_output(self, pipe, log_level):
+        """Helper method to read FFmpeg's output without blocking."""
+        try:
+            # Use iter to read line by line
+            for line in iter(pipe.readline, ''):
+                if line:
+                    logger.log(log_level, f"FFmpeg: {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg pipe: {e}")
+        finally:
+            if pipe:
+                pipe.close()
 
     def run_batch_process(self, settings):
         """
@@ -325,47 +548,297 @@ class MergingGUI(ThemedTk):
             base_name = os.path.basename(inpainted_video_path)
             self.after(0, self.update_status_label, f"Processing {i+1}/{total_videos}: {base_name}")
 
+            original_video_path_to_move = None # To track which original file to move
             try:
-                # =================================================================
-                # TODO: CORE LOGIC WILL GO HERE
-                # 1. Find matching original video and mask video
-                # 2. Load all three videos as tensors
-                # 3. Process the mask tensor using the functions from test.py and GUI settings
-                # 4. Blend the inpainted video and original video using the processed mask
-                # 5. If SBS is enabled, find and concatenate the left eye
-                # 6. Encode the final result to the output folder
-                # =================================================================
-                logger.info(f"Simulating processing for {base_name}")
-                time.sleep(2) # Placeholder for actual work
+                # --- 1. Find corresponding files (same logic as preview) ---
+                inpaint_suffix = "_inpainted_right_eye.mp4"
+                sbs_suffix = "_inpainted_sbs.mp4"
+                is_sbs_input = base_name.endswith(sbs_suffix)
+                core_name_with_width = base_name[:-len(sbs_suffix)] if is_sbs_input else base_name[:-len(inpaint_suffix)]
+                core_name = core_name_with_width[:core_name_with_width.rfind('_')]
+
+                mask_folder = settings["mask_folder"]
+                splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
+                splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
+                splatted4_matches = glob.glob(splatted4_pattern)
+                splatted2_matches = glob.glob(splatted2_pattern)
+
+                if splatted4_matches:
+                    splatted_file_path = splatted4_matches[0]
+                    is_dual_input = False
+                elif splatted2_matches:
+                    splatted_file_path = splatted2_matches[0]
+                    is_dual_input = True
+                else:
+                    raise FileNotFoundError(f"Could not find a matching splatted file for '{core_name}'")
+
+                # 2. Open readers, don't load all frames
+                inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
+                splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
+                original_reader = None
+
+                if is_dual_input:
+                    original_video_path = os.path.join(settings["original_folder"], f"{core_name}.mp4")
+                    original_video_path_to_move = original_video_path # Track for moving later
+                    original_reader = VideoReader(original_video_path, ctx=cpu(0))
+
+                # 3. Setup encoder pipe
+                num_frames = len(inpainted_reader)
+                fps = inpainted_reader.get_avg_fps()
+                video_stream_info = get_video_stream_info(inpainted_video_path)
+                
+                # Determine output dimensions from a sample frame
+                sample_splatted_np = splatted_reader.get_batch([0]).asnumpy()
+                _, H_splat, W_splat, _ = sample_splatted_np.shape
+                if is_dual_input:
+                    hires_H, hires_W = H_splat, W_splat // 2
+                else:
+                    hires_H, hires_W = H_splat // 2, W_splat // 2
+                
+                output_width = hires_W * 2 if settings["use_sbs"] else hires_W
+                output_height = hires_H
+
+                output_suffix = "_merged_sbs.mp4" if settings["use_sbs"] else "_merged_right_eye.mp4"
+                output_filename = f"{core_name_with_width}{output_suffix}"
+                output_path = os.path.join(settings["output_folder"], output_filename)
+
+                ffmpeg_process = start_ffmpeg_pipe_process(output_width, output_height, output_path, fps, video_stream_info)
+                if ffmpeg_process is None:
+                    raise RuntimeError("Failed to start FFmpeg pipe process.")
+
+                # --- NEW: Start threads to read stdout and stderr to prevent deadlock ---
+                stdout_thread = threading.Thread(
+                    target=self._read_ffmpeg_output,
+                    args=(ffmpeg_process.stdout, logging.DEBUG),
+                    daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=self._read_ffmpeg_output,
+                    args=(ffmpeg_process.stderr, logging.INFO),
+                    daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+                # 4. Loop through chunks
+                chunk_size = settings.get("batch_chunk_size", 32)
+                for frame_start in range(0, num_frames, chunk_size):
+                    if self.stop_event.is_set(): break
+                    
+                    frame_end = min(frame_start + chunk_size, num_frames)
+                    frame_indices = list(range(frame_start, frame_end))
+                    if not frame_indices: break
+
+                    self.after(0, self.update_status_label, f"Processing frames {frame_start+1}-{frame_end}/{num_frames}...")
+
+                    # Load current chunk
+                    inpainted_np = inpainted_reader.get_batch(frame_indices).asnumpy()
+                    splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
+                    
+                    # Convert to tensors and extract parts (same logic as preview)
+                    # ... (this logic is identical to update_preview's frame loading part)
+                    inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+                    splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+                    inpainted = inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3]//2:] if is_sbs_input else inpainted_tensor_full
+                    _, _, H, W = splatted_tensor.shape
+                    if is_dual_input:
+                        original_np = original_reader.get_batch(frame_indices).asnumpy()
+                        original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+                        mask_raw = splatted_tensor[:, :, :, :W//2]
+                        warped_original = splatted_tensor[:, :, :, W//2:]
+                    else:
+                        original_left = splatted_tensor[:, :, :H//2, :W//2]
+                        mask_raw = splatted_tensor[:, :, H//2:, :W//2]
+                        warped_original = splatted_tensor[:, :, H//2:, W//2:]
+                    mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
+                    mask_gray_np = np.mean(mask_np, axis=3)
+                    mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
+
+                    # Process chunk
+                    use_gpu = settings["use_gpu"] and torch.cuda.is_available()
+                    device = "cuda" if use_gpu else "cpu"
+                    mask, inpainted, original_left, warped_original = mask.to(device), inpainted.to(device), original_left.to(device), warped_original.to(device)
+                    
+                    if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                        inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
+                        mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
+
+                    if settings["enable_color_transfer"]:
+                        adjusted_frames = []
+                        for frame_idx in range(inpainted.shape[0]):
+                            adjusted_frame = apply_color_transfer(original_left[frame_idx].cpu(), inpainted[frame_idx].cpu())
+                            adjusted_frames.append(adjusted_frame.to(device))
+                        inpainted = torch.stack(adjusted_frames)
+
+                    processed_mask = mask.clone()
+                    if settings["dilate_kernel"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
+                    if settings["blur_kernel"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["blur_kernel"], use_gpu)
+                    if settings["stamp_shift"] > 0: processed_mask = apply_stamp_blur(processed_mask, settings["stamp_shift"], settings["stamp_start_opacity"], settings["stamp_opacity_decay"], settings["stamp_min_opacity"], settings["stamp_decay_gamma"], use_gpu)
+
+                    blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
+
+                    # Assemble and write to pipe
+                    if settings["use_sbs"]:
+                        final_chunk = torch.cat([original_left, blended_right_eye], dim=3)
+                    else:
+                        final_chunk = blended_right_eye
+
+                    cpu_chunk = final_chunk.cpu()
+                    for frame_tensor in cpu_chunk:
+                        frame_np = frame_tensor.permute(1, 2, 0).numpy()
+                        frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                        frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
+                        ffmpeg_process.stdin.write(frame_bgr.tobytes())
+
+                # 5. Finalize FFmpeg process
+                if ffmpeg_process.stdin:
+                    ffmpeg_process.stdin.close()
+                stdout_thread.join(timeout=5) # Wait for reader threads to finish
+                stderr_thread.join(timeout=5)
+                ffmpeg_process.wait()
+                if ffmpeg_process.returncode != 0:
+                    logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
+                else:
+                    logger.info(f"Successfully encoded video to {output_path}")
+                    # --- NEW: Move files on success ---
+                    self._move_processed_file(inpainted_video_path, settings["inpainted_folder"])
+                    self._move_processed_file(splatted_file_path, settings["mask_folder"])
+                    if original_video_path_to_move:
+                        self._move_processed_file(original_video_path_to_move, settings["original_folder"])
+                # --- END: CHUNK-BASED PROCESSING ---
 
             except Exception as e:
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
-                self.after(0, lambda: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
+                self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
 
             self.after(0, self.progress_var.set, i + 1)
 
         self.after(0, self.processing_done, self.stop_event.is_set())
 
-    def load_for_preview(self):
-        """Loads the first frame of the first found video for live previewing."""
-        inpainted_folder = self.inpainted_folder_var.get()
-        inpainted_videos = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
-        if not inpainted_videos:
-            messagebox.showwarning("Not Found", "No .mp4 files found in the Inpainted Video Folder to load for preview.")
+    def _move_processed_file(self, file_path, base_folder):
+        """Moves a single file to a 'finished' subfolder within its base folder."""
+        if not file_path or not os.path.exists(file_path):
+            return
+        try:
+            finished_dir = os.path.join(base_folder, "finished")
+            os.makedirs(finished_dir, exist_ok=True)
+            shutil.move(file_path, finished_dir)
+            logger.info(f"Moved processed file to finished folder: {os.path.basename(file_path)}")
+        except Exception as e:
+            logger.error(f"Failed to move file {os.path.basename(file_path)} to finished folder: {e}")
+
+    def restore_finished_files(self):
+        """Moves all files from 'finished' subfolders back to their parent directories."""
+        if not messagebox.askyesno("Restore Finished Files", "Are you sure you want to move all processed videos from the 'finished' folders back to their respective input directories?"):
             return
 
-        inpainted_video_path = inpainted_videos[0]
+        folders_to_check = [
+            self.inpainted_folder_var.get(),
+            self.original_folder_var.get(),
+            self.mask_folder_var.get()
+        ]
+        restored_count = 0
+        for folder in set(folders_to_check): # Use set to avoid duplicates
+            finished_dir = os.path.join(folder, "finished")
+            if os.path.isdir(finished_dir):
+                for filename in os.listdir(finished_dir):
+                    src_path = os.path.join(finished_dir, filename)
+                    dest_path = os.path.join(folder, filename)
+                    try:
+                        shutil.move(src_path, dest_path)
+                        restored_count += 1
+                        logger.info(f"Restored '{filename}' to '{folder}'")
+                    except Exception as e:
+                        logger.error(f"Error restoring file '{filename}': {e}")
+        messagebox.showinfo("Restore Complete", f"Restored {restored_count} files.")
+
+    def _refresh_preview_video_list(self):
+        """Scans the inpainted folder for valid videos and loads the first one."""
+        self.preview_source_combo.set("Blended Image") # Reset preview mode when loading a new list
+        inpainted_folder = self.inpainted_folder_var.get()
+        if not os.path.isdir(inpainted_folder):
+            messagebox.showerror("Error", "Inpainted Video Folder is not a valid directory.")
+            return
+
+        # Find all valid inpainted videos
+        all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
+        self.preview_video_list = [
+            f for f in all_mp4s 
+            if f.endswith("_inpainted_right_eye.mp4") or f.endswith("_inpainted_sbs.mp4")
+        ]
+
+        if not self.preview_video_list:
+            messagebox.showwarning("Not Found", "No validly named inpainted videos found (*_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4).")
+            self.current_preview_video_index = -1
+            self._update_nav_controls()
+            return
+
+        self.current_preview_video_index = 0
+        self._load_preview_by_index(self.current_preview_video_index)
+
+    def _nav_preview_video(self, direction: int):
+        """Navigate to the previous or next video in the preview list."""
+        if not self.preview_video_list:
+            return
+        
+        new_index = self.current_preview_video_index + direction
+        if 0 <= new_index < len(self.preview_video_list):
+            self._load_preview_by_index(new_index)
+
+    def _jump_to_video(self, event=None):
+        """Jump to a specific video number in the preview list."""
+        if not self.preview_video_list:
+            return
+        try:
+            target_index = int(self.video_jump_to_var.get()) - 1
+            if 0 <= target_index < len(self.preview_video_list):
+                self._load_preview_by_index(target_index)
+            else:
+                messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.preview_video_list)}.")
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid number.")
+
+    def _load_preview_by_index(self, index: int):
+        """Loads a specific video from the preview list by its index."""
+        self._stop_wigglegram_animation()
+        if not (0 <= index < len(self.preview_video_list)):
+            return
+
+        self.current_preview_video_index = index
+        self._update_nav_controls()
+
+        inpainted_video_path = self.preview_video_list[index]
         base_name = os.path.basename(inpainted_video_path)
         self.preview_loaded_file = base_name
         self.update_status_label(f"Loading preview for: {base_name}")
 
-        try: # --- START: NEW FILE FINDING & EXTRACTION LOGIC ---
+        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        self.update_idletasks()
+
+        # --- NEW: Close any previously opened video readers to release file handles ---
+        if self.preview_inpainted_reader: del self.preview_inpainted_reader
+        if self.preview_original_reader: del self.preview_original_reader
+        if self.preview_splatted_reader: del self.preview_splatted_reader
+        self.preview_inpainted_reader = None
+        self.preview_original_reader = None
+        self.preview_splatted_reader = None
+        # -----------------------------------------------------------------------------
+
+        try:
             # 1. Parse the inpainted video name to get the base and width
             inpaint_suffix = "_inpainted_right_eye.mp4"
-            if not base_name.endswith(inpaint_suffix):
-                raise ValueError(f"Inpainted file '{base_name}' does not have the expected '{inpaint_suffix}' suffix.")
-            
-            core_name_with_width = base_name[:-len(inpaint_suffix)]
+            sbs_suffix = "_inpainted_sbs.mp4"
+
+            if base_name.endswith(inpaint_suffix):
+                core_name_with_width = base_name[:-len(inpaint_suffix)]
+                self.is_sbs_preview = False
+            elif base_name.endswith(sbs_suffix):
+                core_name_with_width = base_name[:-len(sbs_suffix)]
+                self.is_sbs_preview = True
+                logger.info("Detected pre-blended SBS input for preview.")
+            else:
+                raise ValueError(f"Inpainted file '{base_name}' does not have an expected suffix ('{inpaint_suffix}' or '{sbs_suffix}').")
+
             last_underscore_idx = core_name_with_width.rfind('_')
             if last_underscore_idx == -1:
                 raise ValueError(f"Could not determine width from '{core_name_with_width}'. Expected format '..._WIDTH'.")
@@ -394,47 +867,29 @@ class MergingGUI(ThemedTk):
             else:
                 raise FileNotFoundError(f"Could not find a matching _splatted4 or _splatted2 file for '{core_name}' in {mask_folder}")
 
-            # 3. Load the necessary frames
-            inpainted_frames_np, _, _, _, _, _, _ = read_video_frames_decord(inpainted_video_path, process_length=1)
-            splatted_frames_np, _, _, _, _, _, _ = read_video_frames_decord(splatted_file_path, process_length=1)
+            # 3. Initialize VideoReader objects for all sources
+            self.preview_inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
+            self.preview_splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
+            self.preview_is_splatted_dual = is_dual_input
 
-            # Convert to tensors [T, C, H, W]
-            inpainted_tensor = torch.from_numpy(inpainted_frames_np).permute(0, 3, 1, 2)
-            splatted_tensor = torch.from_numpy(splatted_frames_np).permute(0, 3, 1, 2)
-
-            # 4. Extract the correct parts based on splat type
-            _, _, H, W = splatted_tensor.shape
-            
             if is_dual_input:
-                # Dual input: _splatted2
-                half_w = W // 2
-                mask_raw = splatted_tensor[:, :, :, :half_w]
-                warped_original = splatted_tensor[:, :, :, half_w:]
-                
-                # For dual, the "original" left eye comes from a separate file
                 original_video_path = os.path.join(self.original_folder_var.get(), f"{core_name}.mp4") # Assumes original is named without width
                 if not os.path.exists(original_video_path):
                     raise FileNotFoundError(f"Dual input requires original video, but not found: {original_video_path}")
-                original_frames_np, _, _, _, _, _, _ = read_video_frames_decord(original_video_path, process_length=1)
-                original_tensor = torch.from_numpy(original_frames_np).permute(0, 3, 1, 2)
-                left_eye_original = original_tensor
-            else:
-                # Quad input: _splatted4
-                half_h, half_w = H // 2, W // 2
-                left_eye_original = splatted_tensor[:, :, :half_h, :half_w]
-                mask_raw = splatted_tensor[:, :, half_h:, :half_w]
-                warped_original = splatted_tensor[:, :, half_h:, half_w:]
+                self.preview_original_reader = VideoReader(original_video_path, ctx=cpu(0))
+            # For quad input, the original_reader will be None, as the left-eye comes from the splatted file itself.
 
-            # 5. Store the frames for the preview function
-            self.preview_inpainted_frame = inpainted_tensor
-            self.preview_original_frame = left_eye_original # This is the left eye for SBS
-            self.preview_warped_frame = warped_original # Store the warped frame
-            
-            # Convert mask to grayscale and store
-            mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            mask_gray_np = np.mean(mask_frame_np, axis=2)
-            self.preview_mask_frame = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
-            # --- END: NEW LOGIC ---
+            # Configure the scrubber
+            num_frames = len(self.preview_inpainted_reader)
+            self.frame_scrubber.config(to=num_frames - 1)
+            self.frame_scrubber_var.set(0)
+            self.on_scrubber_move(0) # Update label
+
+            # Configure preview source dropdown
+            preview_options = ["Blended Image", "Original (Left Eye)", "Warped (Right BG)", "Processed Mask", "Anaglyph 3D", "Wigglegram"]
+            if not is_dual_input: # Depth map is only in quad-splatted files
+                preview_options.append("Depth Map")
+            self.preview_source_combo['values'] = preview_options
 
             self.update_preview()
             self.update_status_label(f"Preview loaded for: {base_name}")
@@ -442,11 +897,30 @@ class MergingGUI(ThemedTk):
         except Exception as e:
             messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
             self.update_status_label("Preview load failed.")
+            logger.error("Preview load failed", exc_info=True)
+        finally:
+            # Revert button to normal state
+            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _update_nav_controls(self):
+        """Updates the state and labels of the video navigation controls."""
+        total_videos = len(self.preview_video_list)
+        current_index = self.current_preview_video_index
+
+        self.video_status_label_var.set(f"Video: {current_index + 1} / {total_videos}" if total_videos > 0 else "Video: 0 / 0")
+        self.video_jump_to_var.set(str(current_index + 1) if total_videos > 0 else "1")
+
+        self.prev_video_button.config(state="normal" if current_index > 0 else "disabled")
+        self.next_video_button.config(state="normal" if 0 <= current_index < total_videos - 1 else "disabled")
+        self.video_jump_entry.config(state="normal" if total_videos > 0 else "disabled")
 
     def update_preview(self):
         """Processes and displays the preview frame based on current slider values."""
+        self._stop_wigglegram_animation()
+        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        self.update_idletasks()
         # Add checks to ensure all required preview frames are loaded.
-        if self.preview_inpainted_frame is None or self.preview_warped_frame is None or self.preview_mask_frame is None:
+        if self.preview_inpainted_reader is None or self.preview_splatted_reader is None:
             return
 
         try:
@@ -457,11 +931,52 @@ class MergingGUI(ThemedTk):
             use_gpu = settings["use_gpu"] and torch.cuda.is_available()
             device = "cuda" if use_gpu else "cpu"
 
-            # Move tensors to device
-            mask = self.preview_mask_frame.to(device)
-            inpainted = self.preview_inpainted_frame.to(device)
-            # The warped frame is the correct background for blending
-            right_eye_original = self.preview_warped_frame.to(device)
+            # Get the current frame index from the scrubber
+            frame_idx = int(self.frame_scrubber_var.get())
+
+            # --- NEW: Load a single frame from each reader ---
+            inpainted_np = self.preview_inpainted_reader.get_batch([frame_idx]).asnumpy()
+            splatted_np = self.preview_splatted_reader.get_batch([frame_idx]).asnumpy()
+
+            inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+            splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+
+            # Extract inpainted right-eye if source is SBS
+            if self.is_sbs_preview:
+                _, _, _, sbs_W = inpainted_tensor_full.shape
+                inpainted = inpainted_tensor_full[:, :, :, sbs_W//2:]
+            else:
+                inpainted = inpainted_tensor_full
+
+            # Extract parts from the splatted frame
+            _, _, H, W = splatted_tensor.shape
+            if self.preview_is_splatted_dual:
+                half_w = W // 2
+                mask_raw = splatted_tensor[:, :, :, :half_w]
+                right_eye_original = splatted_tensor[:, :, :, half_w:]
+                
+                # Load left eye from its separate reader
+                original_np = self.preview_original_reader.get_batch([frame_idx]).asnumpy()
+                original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+                depth_map_vis = None
+            else: # Quad
+                half_h, half_w = H // 2, W // 2
+                original_left = splatted_tensor[:, :, :half_h, :half_w]
+                depth_map_vis = splatted_tensor[:, :, :half_h, half_w:]
+                mask_raw = splatted_tensor[:, :, half_h:, :half_w]
+                right_eye_original = splatted_tensor[:, :, half_h:, half_w:]
+
+            # Convert mask to grayscale
+            mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            mask_gray_np = np.mean(mask_frame_np, axis=2)
+            mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
+            # ----------------------------------------------------
+
+            # Move tensors to the processing device
+            mask = mask.to(device)
+            inpainted = inpainted.to(device)
+            original_left = original_left.to(device)
+            right_eye_original = right_eye_original.to(device)
 
             # --- FIX: Upscale low-res inpainted frame and mask to match hi-res warped frame ---
             hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
@@ -479,17 +994,62 @@ class MergingGUI(ThemedTk):
             if settings["stamp_shift"] > 0:
                 processed_mask = apply_stamp_blur(processed_mask, settings["stamp_shift"], settings["stamp_start_opacity"], settings["stamp_opacity_decay"], settings["stamp_min_opacity"], settings["stamp_decay_gamma"], use_gpu)
 
-            # --- Blend the frames ---
+            # --- Apply Color Transfer if enabled ---
+            if settings["enable_color_transfer"]:
+                # Ensure frames are on CPU for the numpy conversion in the function
+                # The function expects [C, H, W] so we squeeze the batch dim
+                if original_left is not None:
+                    logger.debug("Applying color transfer to preview frame...")
+                    source_cpu = original_left.squeeze(0).cpu()
+                else: # Should not happen with current logic, but as a fallback
+                    source_cpu = right_eye_original.squeeze(0).cpu()
+                target_cpu = inpainted.squeeze(0).cpu()
+                
+                adjusted_target_cpu = apply_color_transfer(source_cpu, target_cpu)
+                # Move back to device and add batch dim back for blending
+                inpainted = adjusted_target_cpu.unsqueeze(0).to(device)
+
             blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
+            # --- Select the final frame to display based on the dropdown ---
+            preview_source = self.preview_source_var.get()
+            if preview_source == "Blended Image":
+                final_frame = blended_frame
+            elif preview_source == "Original (Left Eye)":
+                final_frame = original_left
+            elif preview_source == "Warped (Right BG)":
+                final_frame = right_eye_original
+            elif preview_source == "Processed Mask":
+                final_frame = processed_mask.repeat(1, 3, 1, 1) # Convert grayscale mask to 3-channel for display
+            elif preview_source == "Anaglyph 3D":
+                # Convert left eye to grayscale for a cleaner half-color anaglyph
+                left_gray_np = cv2.cvtColor((original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = right_np.copy()
+                # Use the grayscale left eye for the red channel to reduce retinal rivalry
+                anaglyph_np[:, :, 0] = left_gray_np # Red channel from grayscale left eye
+                final_frame = torch.from_numpy(anaglyph_np).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+            elif preview_source == "Wigglegram":
+                # For wigglegram, we start the animation loop instead of setting a static frame
+                self._start_wigglegram_animation(original_left, blended_frame)
+                # We can return here as the animation will handle updates
+                self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+                return
+            elif preview_source == "Depth Map" and depth_map_vis is not None:
+                final_frame = depth_map_vis.to(device)
+            else: # Fallback to blended
+                final_frame = blended_frame
+
             # --- Convert to displayable image ---
-            blended_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            # Ensure final_frame is on CPU before numpy conversion
+            final_frame_cpu = final_frame.cpu()
+            blended_np = (final_frame_cpu.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             
             # Resize for display if too large, maintaining aspect ratio
-            max_h, max_w = 512, 512
-            if blended_np.shape[0] > max_h or blended_np.shape[1] > max_w:
+            max_size = settings.get("preview_size", 512)
+            if blended_np.shape[0] > max_size or blended_np.shape[1] > max_size:
                 pil_img = Image.fromarray(blended_np)
-                pil_img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+                pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
                 self.preview_image_tk = ImageTk.PhotoImage(pil_img)
             else:
                 self.preview_image_tk = ImageTk.PhotoImage(Image.fromarray(blended_np))
@@ -499,6 +1059,33 @@ class MergingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error updating preview: {e}", exc_info=True)
             self.status_label_var.set("Error updating preview.")
+        finally:
+            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _start_wigglegram_animation(self, left_frame, right_frame):
+        """Starts the wigglegram animation loop."""
+        self._stop_wigglegram_animation() # Ensure any previous loop is stopped
+
+        # Pre-convert frames to PhotoImage to make the loop faster
+        max_size = int(self.preview_size_var.get())
+        
+        left_np = (left_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        left_pil = Image.fromarray(left_np)
+        left_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        self.wiggle_left_tk = ImageTk.PhotoImage(left_pil)
+
+        right_np = (right_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        right_pil = Image.fromarray(right_np)
+        right_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        self.wiggle_right_tk = ImageTk.PhotoImage(right_pil)
+
+        self._wiggle_step(True) # Start with the first frame
+
+    def _wiggle_step(self, show_left):
+        """A single step in the wigglegram animation."""
+        self.preview_label.config(image=self.wiggle_left_tk if show_left else self.wiggle_right_tk)
+        # Schedule the next flip after ~125ms (for 8fps)
+        self.wiggle_after_id = self.after(60, self._wiggle_step, not show_left)
 
     def save_config(self):
         """Saves the current GUI configuration to a JSON file."""
@@ -509,6 +1096,661 @@ class MergingGUI(ThemedTk):
             "output_folder": self.output_folder_var.get(),
             "use_gpu": self.use_gpu_var.get(),
             "use_sbs_output": self.use_sbs_output_var.get(),
+            "batch_chunk_size": self.batch_chunk_size_var.get(),
+            "enable_color_transfer": self.enable_color_transfer_var.get(),
+            "dark_mode_enabled": self.dark_mode_var.get(),
+            "preview_size": self.preview_size_var.get(),
+            "mask_dilate_kernel_size": str(self.mask_dilate_kernel_size_var.get()),
+            "mask_blur_kernel_size": str(self.mask_blur_kernel_size_var.get()),
+            "stamp_shift": str(self.stamp_shift_var.get()),
+            "stamp_start_opacity": str(self.stamp_start_opacity_var.get()),
+            "stamp_opacity_decay": str(self.stamp_opacity_decay_var.get()),
+            "stamp_min_opacity": str(self.stamp_min_opacity_var.get()),
+            "stamp_decay_gamma": str(self.stamp_decay_gamma_var.get()),
+        }
+        try:
+            with open("config_merging.mergecfg", "w") as f:
+                json.dump(config, f, indent=4)
+            logger.info("Merging GUI configuration saved.")
+        except Exception as e:
+            logger.error(f"Failed to save merging GUI config: {e}")
+
+    def load_config(self):
+        """Loads configuration from a JSON file."""
+        try:
+            with open("config_merging.mergecfg", "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load merging GUI config: {e}")
+            return {}
+
+    def load_settings_dialog(self):
+        """Loads settings from a user-selected JSON file."""
+        filepath = filedialog.askopenfilename(
+            defaultextension=".mergecfg",
+            filetypes=[("Merge Config Files", "*.mergecfg"), ("All files", "*.*")],
+            title="Load Settings from File"
+        )
+        if not filepath: return
+        try:
+            with open(filepath, "r") as f:
+                config = json.load(f)
+            # Apply settings
+            for key, value in config.items():
+                var_name = key + "_var"
+                if hasattr(self, var_name):
+                    getattr(self, var_name).set(value)
+            self._apply_theme()
+            logger.info(f"Settings loaded from {filepath}")
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load settings from {filepath}:\n{e}")
+
+    def save_settings_dialog(self):
+        """Saves current GUI settings to a user-selected JSON file."""
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".mergecfg",
+            filetypes=[("Merge Config Files", "*.mergecfg"), ("All files", "*.*")],
+            title="Save Settings to File"
+        )
+        if not filepath: return
+        self.save_config() # First save to internal config to gather all current values
+        # Now copy the saved config to the new location
+        try:
+            shutil.copyfile("config_merging.mergecfg", filepath)
+            logger.info(f"Settings saved to {filepath}")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Failed to save settings to {filepath}:\n{e}")
+
+    def exit_application(self):
+        """Handles application exit gracefully."""
+        if self.is_processing:
+            if messagebox.askyesno("Confirm Exit", "Processing is in progress. Are you sure you want to stop and exit?"):
+                self.stop_processing()
+                self.save_config()
+                self.destroy()
+        else:
+            self.save_config()
+            self.destroy()
+
+if __name__ == "__main__":
+    # Basic logging setup
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    app = MergingGUI()
+    app.mainloop()
+        self.save_config() # Save settings on every run
+        """Collects all GUI settings into a dictionary."""
+        try:
+            settings = {
+                "inpainted_folder": self.inpainted_folder_var.get(),
+                "original_folder": self.original_folder_var.get(),
+                "mask_folder": self.mask_folder_var.get(),
+                "output_folder": self.output_folder_var.get(),
+                "use_gpu": self.use_gpu_var.get(),
+                "use_sbs": self.use_sbs_output_var.get(),
+                "batch_chunk_size": int(self.batch_chunk_size_var.get()),
+                "enable_color_transfer": self.enable_color_transfer_var.get(),
+                "preview_size": int(self.preview_size_var.get()),
+                # Mask params
+                "dilate_kernel": int(self.mask_dilate_kernel_size_var.get()),
+                "blur_kernel": int(self.mask_blur_kernel_size_var.get()),
+                "stamp_shift": int(self.stamp_shift_var.get()),
+                "stamp_start_opacity": float(self.stamp_start_opacity_var.get()),
+                "stamp_opacity_decay": float(self.stamp_opacity_decay_var.get()),
+                "stamp_min_opacity": float(self.stamp_min_opacity_var.get()),
+                "stamp_decay_gamma": float(self.stamp_decay_gamma_var.get()),
+            }
+            return settings
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Invalid Settings", f"Please check your parameter values. They must be valid numbers.\n\nError: {e}")
+            return None
+
+    def _read_ffmpeg_output(self, pipe, log_level):
+        """Helper method to read FFmpeg's output without blocking."""
+        try:
+            # Use iter to read line by line
+            for line in iter(pipe.readline, ''):
+                if line:
+                    logger.log(log_level, f"FFmpeg: {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg pipe: {e}")
+        finally:
+            if pipe:
+                pipe.close()
+
+    def run_batch_process(self, settings):
+        """
+        This is the main logic that will run in a background thread.
+        """
+        if settings is None:
+            self.after(0, self.processing_done, True)
+            return
+
+        inpainted_videos = sorted(glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4")))
+        if not inpainted_videos:
+            self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in the inpainted video folder."))
+            self.after(0, self.processing_done)
+            return
+
+        total_videos = len(inpainted_videos)
+        self.progress_bar.config(maximum=total_videos)
+
+        for i, inpainted_video_path in enumerate(inpainted_videos):
+            if self.stop_event.is_set():
+                logger.info("Processing stopped by user.")
+                break
+
+            base_name = os.path.basename(inpainted_video_path)
+            self.after(0, self.update_status_label, f"Processing {i+1}/{total_videos}: {base_name}")
+
+            try:
+                # --- 1. Find corresponding files (same logic as preview) ---
+                inpaint_suffix = "_inpainted_right_eye.mp4"
+                sbs_suffix = "_inpainted_sbs.mp4"
+                is_sbs_input = base_name.endswith(sbs_suffix)
+                core_name_with_width = base_name[:-len(sbs_suffix)] if is_sbs_input else base_name[:-len(inpaint_suffix)]
+                core_name = core_name_with_width[:core_name_with_width.rfind('_')]
+
+                mask_folder = settings["mask_folder"]
+                splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
+                splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
+                splatted4_matches = glob.glob(splatted4_pattern)
+                splatted2_matches = glob.glob(splatted2_pattern)
+
+                if splatted4_matches:
+                    splatted_file_path = splatted4_matches[0]
+                    is_dual_input = False
+                elif splatted2_matches:
+                    splatted_file_path = splatted2_matches[0]
+                    is_dual_input = True
+                else:
+                    raise FileNotFoundError(f"Could not find a matching splatted file for '{core_name}'")
+
+                # 2. Open readers, don't load all frames
+                inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
+                splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
+                original_reader = None
+
+                if is_dual_input:
+                    original_video_path = os.path.join(settings["original_folder"], f"{core_name}.mp4")
+                    original_reader = VideoReader(original_video_path, ctx=cpu(0))
+
+                # 3. Setup encoder pipe
+                num_frames = len(inpainted_reader)
+                fps = inpainted_reader.get_avg_fps()
+                video_stream_info = get_video_stream_info(inpainted_video_path)
+                
+                # Determine output dimensions from a sample frame
+                sample_splatted_np = splatted_reader.get_batch([0]).asnumpy()
+                _, H_splat, W_splat, _ = sample_splatted_np.shape
+                if is_dual_input:
+                    hires_H, hires_W = H_splat, W_splat // 2
+                else:
+                    hires_H, hires_W = H_splat // 2, W_splat // 2
+                
+                output_width = hires_W * 2 if settings["use_sbs"] else hires_W
+                output_height = hires_H
+
+                output_suffix = "_merged_sbs.mp4" if settings["use_sbs"] else "_merged_right_eye.mp4"
+                output_filename = f"{core_name_with_width}{output_suffix}"
+                output_path = os.path.join(settings["output_folder"], output_filename)
+
+                ffmpeg_process = start_ffmpeg_pipe_process(output_width, output_height, output_path, fps, video_stream_info)
+                if ffmpeg_process is None:
+                    raise RuntimeError("Failed to start FFmpeg pipe process.")
+
+                # --- NEW: Start threads to read stdout and stderr to prevent deadlock ---
+                stdout_thread = threading.Thread(
+                    target=self._read_ffmpeg_output,
+                    args=(ffmpeg_process.stdout, logging.DEBUG),
+                    daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=self._read_ffmpeg_output,
+                    args=(ffmpeg_process.stderr, logging.INFO),
+                    daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
+
+                # 4. Loop through chunks
+                chunk_size = settings.get("batch_chunk_size", 32)
+                for frame_start in range(0, num_frames, chunk_size):
+                    if self.stop_event.is_set(): break
+                    
+                    frame_end = min(frame_start + chunk_size, num_frames)
+                    frame_indices = list(range(frame_start, frame_end))
+                    if not frame_indices: break
+
+                    self.after(0, self.update_status_label, f"Processing frames {frame_start+1}-{frame_end}/{num_frames}...")
+
+                    # Load current chunk
+                    inpainted_np = inpainted_reader.get_batch(frame_indices).asnumpy()
+                    splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
+                    
+                    # Convert to tensors and extract parts (same logic as preview)
+                    # ... (this logic is identical to update_preview's frame loading part)
+                    inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+                    splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+                    inpainted = inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3]//2:] if is_sbs_input else inpainted_tensor_full
+                    _, _, H, W = splatted_tensor.shape
+                    if is_dual_input:
+                        original_np = original_reader.get_batch(frame_indices).asnumpy()
+                        original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+                        mask_raw = splatted_tensor[:, :, :, :W//2]
+                        warped_original = splatted_tensor[:, :, :, W//2:]
+                    else:
+                        original_left = splatted_tensor[:, :, :H//2, :W//2]
+                        mask_raw = splatted_tensor[:, :, H//2:, :W//2]
+                        warped_original = splatted_tensor[:, :, H//2:, W//2:]
+                    mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
+                    mask_gray_np = np.mean(mask_np, axis=3)
+                    mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
+
+                    # Process chunk
+                    use_gpu = settings["use_gpu"] and torch.cuda.is_available()
+                    device = "cuda" if use_gpu else "cpu"
+                    mask, inpainted, original_left, warped_original = mask.to(device), inpainted.to(device), original_left.to(device), warped_original.to(device)
+                    
+                    if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                        inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
+                        mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
+
+                    if settings["enable_color_transfer"]:
+                        adjusted_frames = []
+                        for frame_idx in range(inpainted.shape[0]):
+                            adjusted_frame = apply_color_transfer(original_left[frame_idx].cpu(), inpainted[frame_idx].cpu())
+                            adjusted_frames.append(adjusted_frame.to(device))
+                        inpainted = torch.stack(adjusted_frames)
+
+                    processed_mask = mask.clone()
+                    if settings["dilate_kernel"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
+                    if settings["blur_kernel"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["blur_kernel"], use_gpu)
+                    if settings["stamp_shift"] > 0: processed_mask = apply_stamp_blur(processed_mask, settings["stamp_shift"], settings["stamp_start_opacity"], settings["stamp_opacity_decay"], settings["stamp_min_opacity"], settings["stamp_decay_gamma"], use_gpu)
+
+                    blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
+
+                    # Assemble and write to pipe
+                    if settings["use_sbs"]:
+                        final_chunk = torch.cat([original_left, blended_right_eye], dim=3)
+                    else:
+                        final_chunk = blended_right_eye
+
+                    cpu_chunk = final_chunk.cpu()
+                    for frame_tensor in cpu_chunk:
+                        frame_np = frame_tensor.permute(1, 2, 0).numpy()
+                        frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                        frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
+                        ffmpeg_process.stdin.write(frame_bgr.tobytes())
+
+                # 5. Finalize FFmpeg process
+                if ffmpeg_process.stdin:
+                    ffmpeg_process.stdin.close()
+                stdout_thread.join(timeout=5) # Wait for reader threads to finish
+                stderr_thread.join(timeout=5)
+                ffmpeg_process.wait()
+                if ffmpeg_process.returncode != 0:
+                    logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
+                else:
+                    logger.info(f"Successfully encoded video to {output_path}")
+                # --- END: CHUNK-BASED PROCESSING ---
+
+            except Exception as e:
+                logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
+                self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
+
+            self.after(0, self.progress_var.set, i + 1)
+
+        self.after(0, self.processing_done, self.stop_event.is_set())
+
+    def _refresh_preview_video_list(self):
+        """Scans the inpainted folder for valid videos and loads the first one."""
+        self.preview_source_combo.set("Blended Image") # Reset preview mode when loading a new list
+        inpainted_folder = self.inpainted_folder_var.get()
+        if not os.path.isdir(inpainted_folder):
+            messagebox.showerror("Error", "Inpainted Video Folder is not a valid directory.")
+            return
+
+        # Find all valid inpainted videos
+        all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
+        self.preview_video_list = [
+            f for f in all_mp4s 
+            if f.endswith("_inpainted_right_eye.mp4") or f.endswith("_inpainted_sbs.mp4")
+        ]
+
+        if not self.preview_video_list:
+            messagebox.showwarning("Not Found", "No validly named inpainted videos found (*_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4).")
+            self.current_preview_video_index = -1
+            self._update_nav_controls()
+            return
+
+        self.current_preview_video_index = 0
+        self._load_preview_by_index(self.current_preview_video_index)
+
+    def _nav_preview_video(self, direction: int):
+        """Navigate to the previous or next video in the preview list."""
+        if not self.preview_video_list:
+            return
+        
+        new_index = self.current_preview_video_index + direction
+        if 0 <= new_index < len(self.preview_video_list):
+            self._load_preview_by_index(new_index)
+
+    def _jump_to_video(self, event=None):
+        """Jump to a specific video number in the preview list."""
+        if not self.preview_video_list:
+            return
+        try:
+            target_index = int(self.video_jump_to_var.get()) - 1
+            if 0 <= target_index < len(self.preview_video_list):
+                self._load_preview_by_index(target_index)
+            else:
+                messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.preview_video_list)}.")
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid number.")
+
+    def _load_preview_by_index(self, index: int):
+        """Loads a specific video from the preview list by its index."""
+        self._stop_wigglegram_animation()
+        if not (0 <= index < len(self.preview_video_list)):
+            return
+
+        self.current_preview_video_index = index
+        self._update_nav_controls()
+
+        inpainted_video_path = self.preview_video_list[index]
+        base_name = os.path.basename(inpainted_video_path)
+        self.preview_loaded_file = base_name
+        self.update_status_label(f"Loading preview for: {base_name}")
+
+        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        self.update_idletasks()
+
+        # --- NEW: Close any previously opened video readers to release file handles ---
+        if self.preview_inpainted_reader: del self.preview_inpainted_reader
+        if self.preview_original_reader: del self.preview_original_reader
+        if self.preview_splatted_reader: del self.preview_splatted_reader
+        self.preview_inpainted_reader = None
+        self.preview_original_reader = None
+        self.preview_splatted_reader = None
+        # -----------------------------------------------------------------------------
+
+        try:
+            # 1. Parse the inpainted video name to get the base and width
+            inpaint_suffix = "_inpainted_right_eye.mp4"
+            sbs_suffix = "_inpainted_sbs.mp4"
+
+            if base_name.endswith(inpaint_suffix):
+                core_name_with_width = base_name[:-len(inpaint_suffix)]
+                self.is_sbs_preview = False
+            elif base_name.endswith(sbs_suffix):
+                core_name_with_width = base_name[:-len(sbs_suffix)]
+                self.is_sbs_preview = True
+                logger.info("Detected pre-blended SBS input for preview.")
+            else:
+                raise ValueError(f"Inpainted file '{base_name}' does not have an expected suffix ('{inpaint_suffix}' or '{sbs_suffix}').")
+
+            last_underscore_idx = core_name_with_width.rfind('_')
+            if last_underscore_idx == -1:
+                raise ValueError(f"Could not determine width from '{core_name_with_width}'. Expected format '..._WIDTH'.")
+            
+            core_name = core_name_with_width[:last_underscore_idx]
+            
+            # 2. Find the corresponding splatted file (_splatted4 or _splatted2)
+            # Use glob to find the file with a wildcard for the resolution part.
+            mask_folder = self.mask_folder_var.get()
+            splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
+            splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
+
+            splatted4_matches = glob.glob(splatted4_pattern)
+            splatted2_matches = glob.glob(splatted2_pattern)
+
+            splatted_file_path = None
+            is_dual_input = False
+            if splatted4_matches:
+                splatted_file_path = splatted4_matches[0] # Use the first match
+                is_dual_input = False
+                logger.info(f"Found quad-splatted file: {os.path.basename(splatted_file_path)}")
+            elif splatted2_matches:
+                splatted_file_path = splatted2_matches[0] # Use the first match
+                is_dual_input = True
+                logger.info(f"Found dual-splatted file: {os.path.basename(splatted_file_path)}")
+            else:
+                raise FileNotFoundError(f"Could not find a matching _splatted4 or _splatted2 file for '{core_name}' in {mask_folder}")
+
+            # 3. Initialize VideoReader objects for all sources
+            self.preview_inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
+            self.preview_splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
+            self.preview_is_splatted_dual = is_dual_input
+
+            if is_dual_input:
+                original_video_path = os.path.join(self.original_folder_var.get(), f"{core_name}.mp4") # Assumes original is named without width
+                if not os.path.exists(original_video_path):
+                    raise FileNotFoundError(f"Dual input requires original video, but not found: {original_video_path}")
+                self.preview_original_reader = VideoReader(original_video_path, ctx=cpu(0))
+            # For quad input, the original_reader will be None, as the left-eye comes from the splatted file itself.
+
+            # Configure the scrubber
+            num_frames = len(self.preview_inpainted_reader)
+            self.frame_scrubber.config(to=num_frames - 1)
+            self.frame_scrubber_var.set(0)
+            self.on_scrubber_move(0) # Update label
+
+            # Configure preview source dropdown
+            preview_options = ["Blended Image", "Original (Left Eye)", "Warped (Right BG)", "Processed Mask", "Anaglyph 3D", "Wigglegram"]
+            if not is_dual_input: # Depth map is only in quad-splatted files
+                preview_options.append("Depth Map")
+            self.preview_source_combo['values'] = preview_options
+
+            self.update_preview()
+            self.update_status_label(f"Preview loaded for: {base_name}")
+
+        except Exception as e:
+            messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
+            self.update_status_label("Preview load failed.")
+            logger.error("Preview load failed", exc_info=True)
+        finally:
+            # Revert button to normal state
+            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _update_nav_controls(self):
+        """Updates the state and labels of the video navigation controls."""
+        total_videos = len(self.preview_video_list)
+        current_index = self.current_preview_video_index
+
+        self.video_status_label_var.set(f"Video: {current_index + 1} / {total_videos}" if total_videos > 0 else "Video: 0 / 0")
+        self.video_jump_to_var.set(str(current_index + 1) if total_videos > 0 else "1")
+
+        self.prev_video_button.config(state="normal" if current_index > 0 else "disabled")
+        self.next_video_button.config(state="normal" if 0 <= current_index < total_videos - 1 else "disabled")
+        self.video_jump_entry.config(state="normal" if total_videos > 0 else "disabled")
+
+    def update_preview(self):
+        """Processes and displays the preview frame based on current slider values."""
+        self._stop_wigglegram_animation()
+        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        self.update_idletasks()
+        # Add checks to ensure all required preview frames are loaded.
+        if self.preview_inpainted_reader is None or self.preview_splatted_reader is None:
+            return
+
+        try:
+            # Get settings
+            settings = self.get_current_settings()
+            if settings is None: return
+
+            use_gpu = settings["use_gpu"] and torch.cuda.is_available()
+            device = "cuda" if use_gpu else "cpu"
+
+            # Get the current frame index from the scrubber
+            frame_idx = int(self.frame_scrubber_var.get())
+
+            # --- NEW: Load a single frame from each reader ---
+            inpainted_np = self.preview_inpainted_reader.get_batch([frame_idx]).asnumpy()
+            splatted_np = self.preview_splatted_reader.get_batch([frame_idx]).asnumpy()
+
+            inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+            splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+
+            # Extract inpainted right-eye if source is SBS
+            if self.is_sbs_preview:
+                _, _, _, sbs_W = inpainted_tensor_full.shape
+                inpainted = inpainted_tensor_full[:, :, :, sbs_W//2:]
+            else:
+                inpainted = inpainted_tensor_full
+
+            # Extract parts from the splatted frame
+            _, _, H, W = splatted_tensor.shape
+            if self.preview_is_splatted_dual:
+                half_w = W // 2
+                mask_raw = splatted_tensor[:, :, :, :half_w]
+                right_eye_original = splatted_tensor[:, :, :, half_w:]
+                
+                # Load left eye from its separate reader
+                original_np = self.preview_original_reader.get_batch([frame_idx]).asnumpy()
+                original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+                depth_map_vis = None
+            else: # Quad
+                half_h, half_w = H // 2, W // 2
+                original_left = splatted_tensor[:, :, :half_h, :half_w]
+                depth_map_vis = splatted_tensor[:, :, :half_h, half_w:]
+                mask_raw = splatted_tensor[:, :, half_h:, :half_w]
+                right_eye_original = splatted_tensor[:, :, half_h:, half_w:]
+
+            # Convert mask to grayscale
+            mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            mask_gray_np = np.mean(mask_frame_np, axis=2)
+            mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
+            # ----------------------------------------------------
+
+            # Move tensors to the processing device
+            mask = mask.to(device)
+            inpainted = inpainted.to(device)
+            original_left = original_left.to(device)
+            right_eye_original = right_eye_original.to(device)
+
+            # --- FIX: Upscale low-res inpainted frame and mask to match hi-res warped frame ---
+            hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
+            if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                logger.debug(f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}")
+                inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
+                mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
+
+            # --- Process the mask (using a simplified chain from test.py) ---
+            processed_mask = mask.clone()
+            if settings["dilate_kernel"] > 0:
+                processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
+            if settings["blur_kernel"] > 0:
+                processed_mask = apply_gaussian_blur(processed_mask, settings["blur_kernel"], use_gpu)
+            if settings["stamp_shift"] > 0:
+                processed_mask = apply_stamp_blur(processed_mask, settings["stamp_shift"], settings["stamp_start_opacity"], settings["stamp_opacity_decay"], settings["stamp_min_opacity"], settings["stamp_decay_gamma"], use_gpu)
+
+            # --- Apply Color Transfer if enabled ---
+            if settings["enable_color_transfer"]:
+                # Ensure frames are on CPU for the numpy conversion in the function
+                # The function expects [C, H, W] so we squeeze the batch dim
+                if original_left is not None:
+                    logger.debug("Applying color transfer to preview frame...")
+                    source_cpu = original_left.squeeze(0).cpu()
+                else: # Should not happen with current logic, but as a fallback
+                    source_cpu = right_eye_original.squeeze(0).cpu()
+                target_cpu = inpainted.squeeze(0).cpu()
+                
+                adjusted_target_cpu = apply_color_transfer(source_cpu, target_cpu)
+                # Move back to device and add batch dim back for blending
+                inpainted = adjusted_target_cpu.unsqueeze(0).to(device)
+
+            blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
+
+            # --- Select the final frame to display based on the dropdown ---
+            preview_source = self.preview_source_var.get()
+            if preview_source == "Blended Image":
+                final_frame = blended_frame
+            elif preview_source == "Original (Left Eye)":
+                final_frame = original_left
+            elif preview_source == "Warped (Right BG)":
+                final_frame = right_eye_original
+            elif preview_source == "Processed Mask":
+                final_frame = processed_mask.repeat(1, 3, 1, 1) # Convert grayscale mask to 3-channel for display
+            elif preview_source == "Anaglyph 3D":
+                # Convert left eye to grayscale for a cleaner half-color anaglyph
+                left_gray_np = cv2.cvtColor((original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = right_np.copy()
+                # Use the grayscale left eye for the red channel to reduce retinal rivalry
+                anaglyph_np[:, :, 0] = left_gray_np # Red channel from grayscale left eye
+                final_frame = torch.from_numpy(anaglyph_np).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+            elif preview_source == "Wigglegram":
+                # For wigglegram, we start the animation loop instead of setting a static frame
+                self._start_wigglegram_animation(original_left, blended_frame)
+                # We can return here as the animation will handle updates
+                self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+                return
+            elif preview_source == "Depth Map" and depth_map_vis is not None:
+                final_frame = depth_map_vis.to(device)
+            else: # Fallback to blended
+                final_frame = blended_frame
+
+            # --- Convert to displayable image ---
+            # Ensure final_frame is on CPU before numpy conversion
+            final_frame_cpu = final_frame.cpu()
+            blended_np = (final_frame_cpu.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            
+            # Resize for display if too large, maintaining aspect ratio
+            max_size = settings.get("preview_size", 512)
+            if blended_np.shape[0] > max_size or blended_np.shape[1] > max_size:
+                pil_img = Image.fromarray(blended_np)
+                pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                self.preview_image_tk = ImageTk.PhotoImage(pil_img)
+            else:
+                self.preview_image_tk = ImageTk.PhotoImage(Image.fromarray(blended_np))
+
+            self.preview_label.config(image=self.preview_image_tk)
+
+        except Exception as e:
+            logger.error(f"Error updating preview: {e}", exc_info=True)
+            self.status_label_var.set("Error updating preview.")
+        finally:
+            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _start_wigglegram_animation(self, left_frame, right_frame):
+        """Starts the wigglegram animation loop."""
+        self._stop_wigglegram_animation() # Ensure any previous loop is stopped
+
+        # Pre-convert frames to PhotoImage to make the loop faster
+        max_size = int(self.preview_size_var.get())
+        
+        left_np = (left_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        left_pil = Image.fromarray(left_np)
+        left_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        self.wiggle_left_tk = ImageTk.PhotoImage(left_pil)
+
+        right_np = (right_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        right_pil = Image.fromarray(right_np)
+        right_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        self.wiggle_right_tk = ImageTk.PhotoImage(right_pil)
+
+        self._wiggle_step(True) # Start with the first frame
+
+    def _wiggle_step(self, show_left):
+        """A single step in the wigglegram animation."""
+        self.preview_label.config(image=self.wiggle_left_tk if show_left else self.wiggle_right_tk)
+        # Schedule the next flip after ~125ms (for 8fps)
+        self.wiggle_after_id = self.after(60, self._wiggle_step, not show_left)
+
+    def save_config(self):
+        """Saves the current GUI configuration to a JSON file."""
+        config = {
+            "inpainted_folder": self.inpainted_folder_var.get(),
+            "original_folder": self.original_folder_var.get(),
+            "mask_folder": self.mask_folder_var.get(),
+            "output_folder": self.output_folder_var.get(),
+            "use_gpu": self.use_gpu_var.get(),
+            "use_sbs_output": self.use_sbs_output_var.get(),
+            "batch_chunk_size": self.batch_chunk_size_var.get(),
+            "enable_color_transfer": self.enable_color_transfer_var.get(),
+            "preview_size": self.preview_size_var.get(),
             "mask_dilate_kernel_size": str(self.mask_dilate_kernel_size_var.get()),
             "mask_blur_kernel_size": str(self.mask_blur_kernel_size_var.get()),
             "stamp_shift": str(self.stamp_shift_var.get()),

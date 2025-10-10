@@ -421,9 +421,27 @@ def encode_frames_to_mp4(
     logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")    
     process = None
 
+    # --- NEW: Helper to read FFmpeg's output without blocking ---
+    def _read_ffmpeg_output(pipe, log_level):
+        try:
+            # Use iter to read line by line, which is non-blocking
+            for line in iter(pipe.readline, ''):
+                if line:
+                    logger.log(log_level, f"FFmpeg: {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg pipe: {e}")
+        finally:
+            if pipe: pipe.close()
+
     try:
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
         
+        # --- NEW: Start threads to read stdout and stderr to prevent deadlock ---
+        stdout_thread = threading.Thread(target=_read_ffmpeg_output, args=(process.stdout, logging.DEBUG), daemon=True)
+        stderr_thread = threading.Thread(target=_read_ffmpeg_output, args=(process.stderr, logging.INFO), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
         while process.poll() is None: # While process is still running
             if stop_event and stop_event.is_set(): 
                 logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_mp4_path)}.")
@@ -432,15 +450,16 @@ def encode_frames_to_mp4(
                 return False
             time.sleep(0.1) # Check stop_event frequently
 
-        stdout, stderr = process.communicate(timeout=60) # A final communicate in case something was buffered
-        
+        # Wait for the process and reader threads to complete
+        process.wait(timeout=120)
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
         if process.returncode != 0:
-            logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)} (return code {process.returncode}):\n{stderr}\n{stdout}")
+            logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)} (return code {process.returncode}). Check console for FFmpeg output.")
             return False
         else:
             logger.debug(f"Successfully encoded video to {final_output_mp4_path}")
-            logger.debug(f"FFmpeg stdout:\n{stdout}")
-            logger.debug(f"FFmpeg stderr:\n{stderr}")
 
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
@@ -587,9 +606,9 @@ def start_ffmpeg_pipe_process(
     # --- MODIFIED: Add default color space tags for robustness ---
     # Use a dictionary's .get() with a default value to prevent errors if tags are missing.
     # The most common standard for SDR HD video is BT.709.
-    color_primaries = video_stream_info.get("color_primaries", "bt709") if video_stream_info else "bt709"
-    transfer_characteristics = video_stream_info.get("transfer_characteristics", "bt709") if video_stream_info else "bt709"
-    color_space = video_stream_info.get("color_space", "bt709") if video_stream_info else "bt709"
+    color_primaries = video_stream_info.get("color_primaries", "bt709") if video_stream_info is not None else "bt709"
+    transfer_characteristics = video_stream_info.get("transfer_characteristics", "bt709") if video_stream_info is not None else "bt709"
+    color_space = video_stream_info.get("color_space", "bt709") if video_stream_info is not None else "bt709"
 
     # Add the determined or default flags to the command
     ffmpeg_cmd.extend(["-color_primaries", color_primaries])

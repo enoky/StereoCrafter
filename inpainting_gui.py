@@ -328,35 +328,31 @@ class InpaintingGUI(ThemedTk):
     def _apply_morphological_closing(self, mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
         """
         Applies morphological closing to fill small holes and smooth boundaries.
-        Expects mask in [T, C, H, W] float [0, 1] format (on CPU, or moved to CPU).
+        Expects mask in [T, C, H, W] float [0, 1] format on the GPU.
         Returns processed mask in the same format.
         """
-        # REMOVED THIS LINE: if not self.enable_morphological_closing_toggle.get():
-        # REMOVED THIS LINE:     return mask
-
         try:
-
             if kernel_size <= 0:
                 logger.warning(f"Invalid morphological closing kernel size ({kernel_size}). Skipping closing.")
                 return mask
             
-            # Ensure kernel_size is odd for symmetry (OpenCV handles even, but odd is often preferred)
+            # Ensure kernel_size is odd for symmetry
             kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1 
+            padding = kernel_val // 2
 
-            processed_masks = []
-            for t in range(mask.shape[0]):
-                frame_mask_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-
-                # Create structuring element using a single kernel_val
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_val, kernel_val))
-
-                closed_mask_np = cv2.morphologyEx(frame_mask_np, cv2.MORPH_CLOSE, kernel)
-
-                closed_mask_tensor = torch.from_numpy(closed_mask_np).float() / 255.0
-                processed_masks.append(closed_mask_tensor.unsqueeze(0))
-
+            # Dilation step of closing
+            dilated_mask = F.max_pool2d(
+                mask, kernel_size=kernel_val, stride=1, padding=padding
+            )
+            
+            # Erosion step of closing (using min_pool, which is equivalent to erosion on a binary mask)
+            # Note: min_pool is not a standard PyTorch function, but erosion is F.max_pool on the inverted mask.
+            eroded_mask = 1.0 - F.max_pool2d(
+                1.0 - dilated_mask, kernel_size=kernel_val, stride=1, padding=padding
+            )
+            
             logger.debug(f"Applied morphological closing with kernel ({kernel_val}x{kernel_val}).") # Updated log message
-            return torch.stack(processed_masks).to(mask.device)
+            return eroded_mask
         except ValueError:
             logger.error("Invalid input for morphological closing kernel size. Skipping closing.", exc_info=True) # Updated log message
             return mask
