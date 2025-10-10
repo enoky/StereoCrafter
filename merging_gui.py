@@ -3,6 +3,7 @@ import glob
 import json
 import shutil
 import threading
+import gc
 import tkinter as tk # Used for PanedWindow
 from tkinter import filedialog, messagebox, ttk
 from ttkthemes import ThemedTk
@@ -77,16 +78,19 @@ def apply_shadow_blur(mask: torch.Tensor, shift_per_step: int, start_opacity: fl
             canvas_mask = torch.max(canvas_mask, shifted_stamp * current_opacity)
         return canvas_mask
     else:
-        canvas_np = mask.squeeze(0).cpu().numpy()
-        stamp_source_np = canvas_np.copy()
-        for i in range(num_steps):
-            t = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-            curved_t = t ** decay_gamma
-            current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
-            total_shift = (i + 1) * shift_per_step
-            shifted_stamp = np.roll(stamp_source_np, total_shift, axis=2)
-            canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
-        return torch.from_numpy(canvas_np).unsqueeze(0).to(mask.device)
+        processed_frames = []
+        for t in range(mask.shape[0]):
+            canvas_np = mask[t].squeeze(0).cpu().numpy() # Process one frame at a time
+            stamp_source_np = canvas_np.copy()
+            for i in range(num_steps):
+                time_step = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
+                curved_t = time_step ** decay_gamma
+                current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
+                total_shift = (i + 1) * shift_per_step
+                shifted_stamp = np.roll(stamp_source_np, total_shift, axis=1) # axis=1 for HxW
+                canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
+            processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
+        return torch.stack(processed_frames).to(mask.device)
 
 def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
     """
@@ -133,8 +137,13 @@ class MergingGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="clam")
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
-        self.app_config = self.load_config()
-        self.help_data = {} # Simplified for now
+        self.app_config = self._load_config()
+        self.help_data = self._load_help_texts()
+
+        # --- Window Geometry ---
+        self.window_x = self.app_config.get("window_x", None)
+        self.window_y = self.app_config.get("window_y", None)
+        self.window_width = self.app_config.get("window_width", 700) # A reasonable default
 
         # --- Core App State ---
         self.stop_event = threading.Event()
@@ -162,17 +171,18 @@ class MergingGUI(ThemedTk):
         self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./final_videos"))
 
         # --- Mask Processing Parameters ---
-        self.mask_dilate_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_dilate_kernel_size", 15)))
-        self.mask_blur_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_blur_kernel_size", 25)))
-        self.shadow_shift_var = tk.DoubleVar(value=float(self.app_config.get("shadow_shift", 2)))
-        self.shadow_start_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_start_opacity", 0.8)))
-        self.shadow_opacity_decay_var = tk.DoubleVar(value=float(self.app_config.get("shadow_opacity_decay", 0.1)))
-        self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", 0.2)))
-        self.shadow_decay_gamma_var = tk.DoubleVar(value=float(self.app_config.get("shadow_decay_gamma", 2.0)))
+        self.mask_dilate_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_dilate_kernel_size", 3)))
+        self.mask_blur_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_blur_kernel_size", 5)))
+        self.shadow_shift_var = tk.DoubleVar(value=float(self.app_config.get("shadow_shift", 5)))
+        self.shadow_decay_gamma_var = tk.DoubleVar(value=float(self.app_config.get("shadow_decay_gamma", 1.3)))
+        self.shadow_start_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_start_opacity", 0.87)))
+        self.shadow_opacity_decay_var = tk.DoubleVar(value=float(self.app_config.get("shadow_opacity_decay", 0.08)))
+        self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", 0.14)))
 
-        self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", True))
+        self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", False))
         self.use_sbs_output_var = tk.BooleanVar(value=self.app_config.get("use_sbs_output", True))
         self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", 32)))
         self.frame_scrubber_var = tk.DoubleVar(value=0)
@@ -180,7 +190,7 @@ class MergingGUI(ThemedTk):
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.preview_source_var = tk.StringVar(value="Blended Image")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
-        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", 512)))
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", 1024)))
 
         # --- GUI Status Variables ---
         self.status_label_var = tk.StringVar(value="Ready")
@@ -193,8 +203,29 @@ class MergingGUI(ThemedTk):
         self.style.configure('Loading.TButton', foreground='red', font=('Helvetica', '9', 'bold'))
 
         self._apply_theme()
+        self._configure_logging() # Set initial logging level
+        self.after(0, self._set_saved_geometry) # Restore window position
         self.protocol("WM_DELETE_WINDOW", self.exit_application)
         self.update_status_label("Ready.")
+
+    def _set_saved_geometry(self):
+        """Applies the saved window width and position, with dynamic height."""
+        self.update_idletasks() 
+
+        calculated_height = self.winfo_reqheight()
+        if calculated_height < 200:
+            calculated_height = 800 # Fallback
+
+        current_width = self.window_width
+        if current_width < 300:
+            current_width = 700 # Fallback
+
+        geometry_string = f"{current_width}x{calculated_height}"
+        if self.window_x is not None and self.window_y is not None:
+            geometry_string += f"+{self.window_x}+{self.window_y}"
+
+        self.geometry(geometry_string)
+        self.window_width = current_width
 
     def create_menubar(self):
         """Creates the main menu bar for the application."""
@@ -217,7 +248,14 @@ class MergingGUI(ThemedTk):
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_checkbutton(label="Enable Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging)
+        self.help_menu.add_separator()
         self.help_menu.add_command(label="About", command=self.show_about_dialog)
+
+    def _create_hover_tooltip(self, widget, help_key):
+        """Creates a mouse-over tooltip for the given widget."""
+        if help_key in self.help_data:
+            Tooltip(widget, self.help_data[help_key])
 
     def _apply_theme(self):
         """Applies the selected theme (dark or light) to the GUI."""
@@ -285,6 +323,30 @@ class MergingGUI(ThemedTk):
         messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
         logger.info("GUI settings reset to defaults.")
 
+    def _configure_logging(self):
+        """Sets the logging level based on the debug_logging_var."""
+        if self.debug_logging_var.get():
+            level = logging.DEBUG
+        else:
+            level = logging.INFO
+        
+        set_util_logger_level(level)
+        logging.getLogger().setLevel(level)
+        logger.info(f"Logging level set to {logging.getLevelName(level)}.")
+
+    def _toggle_debug_logging(self):
+        """Callback for the debug logging checkbox."""
+        self._configure_logging()
+        self.save_config()
+
+    def _load_help_texts(self):
+        """Loads help texts from the dedicated JSON file."""
+        try:
+            with open(os.path.join("dependency", "merge_help.json"), "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
     def create_widgets(self):
         self.create_menubar()
         # The main window will now be a simple vertical layout.
@@ -297,22 +359,30 @@ class MergingGUI(ThemedTk):
 
         # Inpainted Video Folder
         ttk.Label(folder_frame, text="Inpainted Video Folder:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        ttk.Entry(folder_frame, textvariable=self.inpainted_folder_var).grid(row=0, column=1, padx=5, sticky="ew")
+        entry_inpaint = ttk.Entry(folder_frame, textvariable=self.inpainted_folder_var)
+        entry_inpaint.grid(row=0, column=1, padx=5, sticky="ew")
+        self._create_hover_tooltip(entry_inpaint, "inpainted_folder")
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.inpainted_folder_var)).grid(row=0, column=2, padx=5)
 
         # Original Video Folder (for Left Eye)
         ttk.Label(folder_frame, text="Original Video Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        ttk.Entry(folder_frame, textvariable=self.original_folder_var).grid(row=1, column=1, padx=5, sticky="ew")
+        entry_orig = ttk.Entry(folder_frame, textvariable=self.original_folder_var)
+        entry_orig.grid(row=1, column=1, padx=5, sticky="ew")
+        self._create_hover_tooltip(entry_orig, "original_folder")
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.original_folder_var)).grid(row=1, column=2, padx=5)
 
         # Mask Folder
         ttk.Label(folder_frame, text="Mask Folder:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        ttk.Entry(folder_frame, textvariable=self.mask_folder_var).grid(row=2, column=1, padx=5, sticky="ew")
+        entry_mask = ttk.Entry(folder_frame, textvariable=self.mask_folder_var)
+        entry_mask.grid(row=2, column=1, padx=5, sticky="ew")
+        self._create_hover_tooltip(entry_mask, "mask_folder")
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.mask_folder_var)).grid(row=2, column=2, padx=5)
 
         # Output Folder
         ttk.Label(folder_frame, text="Output Folder:").grid(row=3, column=0, sticky="e", padx=5, pady=2)
-        ttk.Entry(folder_frame, textvariable=self.output_folder_var).grid(row=3, column=1, padx=5, sticky="ew")
+        entry_out = ttk.Entry(folder_frame, textvariable=self.output_folder_var)
+        entry_out.grid(row=3, column=1, padx=5, sticky="ew")
+        self._create_hover_tooltip(entry_out, "output_folder")
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var)).grid(row=3, column=2, padx=5)
 
         # --- PREVIEW FRAME (Moved here) ---
@@ -343,20 +413,25 @@ class MergingGUI(ThemedTk):
         self.preview_source_combo = ttk.Combobox(preview_button_frame, textvariable=self.preview_source_var, state="readonly", width=18)
         self.preview_source_combo.pack(side="left", padx=5)
         self.preview_source_combo.bind("<<ComboboxSelected>>", lambda event: self.on_slider_release(event))
+        self._create_hover_tooltip(self.preview_source_combo, "preview_source")
         
         self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._refresh_preview_video_list, width=20)
         self.load_preview_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.load_preview_button, "load_refresh_list")
 
         self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1))
         self.prev_video_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.prev_video_button, "prev_video")
 
         self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1))
         self.next_video_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.next_video_button, "next_video")
 
         ttk.Label(preview_button_frame, text="Jump to:").pack(side="left", padx=(15, 2))
         self.video_jump_entry = ttk.Entry(preview_button_frame, textvariable=self.video_jump_to_var, width=5)
         self.video_jump_entry.pack(side="left")
         self.video_jump_entry.bind("<Return>", self._jump_to_video)
+        self._create_hover_tooltip(self.video_jump_entry, "jump_to_video")
         ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
 
         # --- MASK PROCESSING PARAMETERS ---
@@ -375,6 +450,7 @@ class MergingGUI(ThemedTk):
             # Update label continuously, update preview on release
             slider.configure(command=lambda v, label=value_label: label.config(text=f"{float(v):.{decimals}f}"))
             slider.bind("<ButtonRelease-1>", self.on_slider_release)
+            self._create_hover_tooltip(slider, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
             return slider
 
         create_slider(param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 0)
@@ -389,16 +465,28 @@ class MergingGUI(ThemedTk):
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
         options_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Checkbutton(options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var).pack(side="left", padx=5)
-        ttk.Checkbutton(options_frame, text="Create Side-by-Side (SBS) Output", variable=self.use_sbs_output_var).pack(side="left", padx=5)
-        ttk.Checkbutton(options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var).pack(side="left", padx=5)
+        gpu_check = ttk.Checkbutton(options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var)
+        gpu_check.pack(side="left", padx=5)
+        self._create_hover_tooltip(gpu_check, "use_gpu")
+
+        sbs_check = ttk.Checkbutton(options_frame, text="Create Side-by-Side (SBS) Output", variable=self.use_sbs_output_var)
+        sbs_check.pack(side="left", padx=5)
+        self._create_hover_tooltip(sbs_check, "use_sbs_output")
+
+        color_check = ttk.Checkbutton(options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var)
+        color_check.pack(side="left", padx=5)
+        self._create_hover_tooltip(color_check, "enable_color_transfer")
         
         # Add Preview Size option
         ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
-        ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7).pack(side="left")
+        entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
+        entry_preview.pack(side="left")
+        self._create_hover_tooltip(entry_preview, "preview_size")
         # Add Batch Chunk Size option
         ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
-        ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7).pack(side="left")
+        entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7)
+        entry_chunk.pack(side="left")
+        self._create_hover_tooltip(entry_chunk, "batch_chunk_size")
 
 
         # --- PROGRESS & BUTTONS ---
@@ -413,8 +501,10 @@ class MergingGUI(ThemedTk):
         buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(buttons_frame, text="Start Blending", command=self.start_processing)
         self.start_button.pack(side="left", padx=5, expand=True)
+        self._create_hover_tooltip(self.start_button, "start_blending")
         self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5, expand=True)
+        self._create_hover_tooltip(self.stop_button, "stop_blending")
 
     def _browse_folder(self, var: tk.StringVar):
         folder = filedialog.askdirectory(initialdir=var.get())
@@ -431,6 +521,11 @@ class MergingGUI(ThemedTk):
         if self.wiggle_after_id:
             self.after_cancel(self.wiggle_after_id)
             self.wiggle_after_id = None
+        # --- NEW: Explicitly clear the stored PhotoImage objects to release memory ---
+        if hasattr(self, 'wiggle_left_tk'):
+            del self.wiggle_left_tk
+        if hasattr(self, 'wiggle_right_tk'):
+            del self.wiggle_right_tk
 
     def on_scrubber_move(self, value):
         """Called continuously as the frame scrubber moves to update the label."""
@@ -467,6 +562,7 @@ class MergingGUI(ThemedTk):
     def stop_processing(self):
         if self.is_processing:
             self.stop_event.set()
+            release_cuda_memory() # Explicitly release VRAM on stop
             self.update_status_label("Stopping...")
 
     def processing_done(self, stopped=False):
@@ -544,6 +640,8 @@ class MergingGUI(ThemedTk):
             base_name = os.path.basename(inpainted_video_path)
             self.after(0, self.update_status_label, f"Processing {i+1}/{total_videos}: {base_name}")
 
+            # Initialize readers to None for robust cleanup
+            inpainted_reader, splatted_reader, original_reader = None, None, None
             original_video_path_to_move = None # To track which original file to move
             try:
                 # --- 1. Find corresponding files (same logic as preview) ---
@@ -610,7 +708,7 @@ class MergingGUI(ThemedTk):
                 )
                 stderr_thread = threading.Thread(
                     target=self._read_ffmpeg_output,
-                    args=(ffmpeg_process.stderr, logging.INFO),
+                    args=(ffmpeg_process.stderr, logging.DEBUG),
                     daemon=True
                 )
                 stdout_thread.start()
@@ -695,6 +793,16 @@ class MergingGUI(ThemedTk):
                 stdout_thread.join(timeout=5) # Wait for reader threads to finish
                 stderr_thread.join(timeout=5)
                 ffmpeg_process.wait()
+
+                # --- FIX: Explicitly close readers BEFORE moving files ---
+                if inpainted_reader: del inpainted_reader
+                if splatted_reader: del splatted_reader
+                if original_reader: del original_reader
+                inpainted_reader, splatted_reader, original_reader = None, None, None
+                gc.collect() # Encourage garbage collection
+                logger.debug("Released video reader file handles before moving.")
+                # ---------------------------------------------------------
+
                 if ffmpeg_process.returncode != 0:
                     logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
                 else:
@@ -709,22 +817,49 @@ class MergingGUI(ThemedTk):
             except Exception as e:
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
+            finally:
+                # Ensure readers are always cleaned up, even on error
+                if inpainted_reader: del inpainted_reader
+                if splatted_reader: del splatted_reader
+                if original_reader: del original_reader
 
             self.after(0, self.progress_var.set, i + 1)
 
         self.after(0, self.processing_done, self.stop_event.is_set())
 
-    def _move_processed_file(self, file_path, base_folder):
+    def _move_processed_file(self, file_path: str, base_folder: str, max_retries: int = 5, retry_delay_sec: float = 0.5):
         """Moves a single file to a 'finished' subfolder within its base folder."""
         if not file_path or not os.path.exists(file_path):
             return
-        try:
-            finished_dir = os.path.join(base_folder, "finished")
-            os.makedirs(finished_dir, exist_ok=True)
-            shutil.move(file_path, finished_dir)
-            logger.info(f"Moved processed file to finished folder: {os.path.basename(file_path)}")
-        except Exception as e:
-            logger.error(f"Failed to move file {os.path.basename(file_path)} to finished folder: {e}")
+        
+        finished_dir = os.path.join(base_folder, "finished")
+        os.makedirs(finished_dir, exist_ok=True)
+        dest_path = os.path.join(finished_dir, os.path.basename(file_path))
+
+        for attempt in range(max_retries):
+            try:
+                # --- NEW: Check if destination exists before moving ---
+                if os.path.exists(dest_path):
+                    logger.warning(f"Destination '{os.path.basename(dest_path)}' already exists. Assuming previous move was incomplete. Deleting source file.")
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Successfully removed source file: {os.path.basename(file_path)}")
+                    except Exception as e_del:
+                        logger.error(f"Failed to remove source file '{os.path.basename(file_path)}' after finding existing destination: {e_del}")
+                    return # End the operation for this file
+
+                # If destination does not exist, attempt the move
+                shutil.move(file_path, dest_path)
+                logger.info(f"Moved processed file to finished folder: {os.path.basename(file_path)}")
+                return # Success
+            except PermissionError:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries}: Could not move '{os.path.basename(file_path)}' (file in use). Retrying...")
+                time.sleep(retry_delay_sec)
+            except Exception as e:
+                logger.error(f"Failed to move file {os.path.basename(file_path)} to finished folder: {e}")
+                return # Don't retry on other errors
+
+        logger.error(f"Failed to move file '{os.path.basename(file_path)}' after {max_retries} attempts. It may still be locked.")
 
     def restore_finished_files(self):
         """Moves all files from 'finished' subfolders back to their parent directories."""
@@ -1059,6 +1194,8 @@ class MergingGUI(ThemedTk):
             logger.error(f"Error updating preview: {e}", exc_info=True)
             self.status_label_var.set("Error updating preview.")
         finally:
+            # --- NEW: Explicitly release VRAM used by the preview render ---
+            release_cuda_memory()
             self.load_preview_button.config(text="Load/Refresh List", style="TButton")
 
     def _start_wigglegram_animation(self, left_frame, right_frame):
@@ -1097,9 +1234,13 @@ class MergingGUI(ThemedTk):
             "use_sbs_output": self.use_sbs_output_var.get(),
             "batch_chunk_size": self.batch_chunk_size_var.get(),
             "enable_color_transfer": self.enable_color_transfer_var.get(),
+            "debug_logging_enabled": self.debug_logging_var.get(),
             "dark_mode_enabled": self.dark_mode_var.get(),
             "preview_size": self.preview_size_var.get(),
             "mask_dilate_kernel_size": str(self.mask_dilate_kernel_size_var.get()),
+            "window_x": self.winfo_x(),
+            "window_y": self.winfo_y(),
+            "window_width": self.winfo_width(),
             "mask_blur_kernel_size": str(self.mask_blur_kernel_size_var.get()),
             "shadow_shift": str(self.shadow_shift_var.get()),
             "shadow_start_opacity": str(self.shadow_start_opacity_var.get()),
@@ -1114,7 +1255,7 @@ class MergingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Failed to save merging GUI config: {e}")
 
-    def load_config(self):
+    def _load_config(self):
         """Loads configuration from a JSON file."""
         try:
             with open("config_merging.mergecfg", "r") as f:

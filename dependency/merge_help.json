@@ -1,0 +1,29 @@
+{
+    "inpainted_folder": "Folder containing the inpainted videos. The tool will look for files ending in '_inpainted_right_eye.mp4' or '_inpainted_sbs.mp4'.",
+    "original_folder": "Folder containing the original 2D source videos. This is required for dual-splatted inputs to provide the left-eye view.",
+    "mask_folder": "Folder containing the high-resolution splatted files (e.g., '_splatted4.mp4' or '_splatted2.mp4') which contain the mask and warped background.",
+    "output_folder": "Folder where the final merged videos will be saved.",
+
+    "mask_dilate_kernel": "Expands the white areas of the mask. Useful for covering up thin black lines at the edge of the inpainted region. Set to 0 to disable.",
+    "mask_blur_kernel": "Applies a Gaussian blur to the mask, creating a softer, more feathered blend between the original and inpainted content. Set to 0 to disable.",
+    "shadow_shift": "The number of pixels to shift the 'shadow' to the right in each step of the shadow blur effect. Set to 0 to disable.",
+    "shadow_gamma": "Controls the fade-out curve of the shadow. >1.0 starts slow and fades fast. <1.0 starts fast and fades slow. 1.0 is a linear fade.",
+    "shadow_opacity_start": "The starting opacity of the first shadow 'echo'. A value of 1.0 is fully opaque.",
+    "shadow_opacity_decay": "The amount of opacity to subtract from the shadow at each step. A larger value creates a shorter, faster fade.",
+    "shadow_min_opacity": "The opacity at which the shadow effect will stop generating new echoes.",
+
+    "use_gpu": "If checked, mask processing will be performed on the GPU for speed. Uncheck to use the CPU, which is slower but uses very little VRAM.",
+    "use_sbs_output": "If checked, the final output will be a Side-by-Side (SBS) video. If unchecked, only the blended right-eye video will be saved.",
+    "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
+    "preview_size": "The maximum size (width or height) in pixels for the preview image. Larger images may impact performance.",
+    "batch_chunk_size": "The number of frames to process in memory at one time during batch processing. Lower this value if you run out of RAM on long videos.",
+
+    "preview_source": "Select which image layer to display in the preview window for diagnostic purposes.",
+    "load_refresh_list": "Scans the 'Inpainted Video Folder' for valid files and loads the first one for preview.",
+    "prev_video": "Load the previous video in the list for preview.",
+    "next_video": "Load the next video in the list for preview.",
+    "jump_to_video": "Enter a video number and press Enter to jump directly to it in the list.",
+
+    "start_blending": "Starts the batch process to merge all found videos using the current settings.",
+    "stop_blending": "Stops the batch process after the current video chunk is finished."
+}
