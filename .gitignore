@@ -97,4 +97,4 @@ models/deploy.prototxt.txt
 convergence_tool_config.json
 sidecaredit_config.json
 config_sidecaredit.json
-config_merging.json
+config_merging.mergecfg

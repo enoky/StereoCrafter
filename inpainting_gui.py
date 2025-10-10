@@ -456,6 +456,13 @@ class InpaintingGUI(ThemedTk):
             
             # ttk.Entry widget styling
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
+            # --- NEW: Add Combobox styling ---
+            self.style.map('TCombobox',
+                fieldbackground=[('readonly', entry_field_bg)],
+                foreground=[('readonly', fg_color)],
+                selectbackground=[('readonly', entry_field_bg)],
+                selectforeground=[('readonly', fg_color)]
+            )
             self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color) # For the title text
@@ -483,6 +490,13 @@ class InpaintingGUI(ThemedTk):
                 self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
 
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
+            # --- NEW: Add Combobox styling ---
+            self.style.map('TCombobox',
+                fieldbackground=[('readonly', entry_field_bg)],
+                foreground=[('readonly', fg_color)],
+                selectbackground=[('readonly', entry_field_bg)],
+                selectforeground=[('readonly', fg_color)]
+            )
             self.style.configure("TFrame", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
