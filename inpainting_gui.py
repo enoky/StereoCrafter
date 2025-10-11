@@ -979,6 +979,20 @@ class InpaintingGUI(ThemedTk):
             output_display_h = total_h_current
             output_display_w = half_w
 
+            # --- NEW: Divisibility Check ---
+            required_divisor = 8
+            if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+                error_msg = (f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                             f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                             f"but both width and height must be divisible by {required_divisor}.\n\n"
+                             "Please crop or resize the source video. Skipping this file.")
+                logger.error(error_msg)
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+                self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+                return None
+            # --- END NEW ---
+
         else: # Quad input
             half_h = total_h_current // 2
             half_w = total_w_current // 2
@@ -993,6 +1007,21 @@ class InpaintingGUI(ThemedTk):
 
             output_display_h = half_h
             output_display_w = half_w
+            
+            # --- NEW: Divisibility Check ---
+            required_divisor = 8
+            if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+                error_msg = (f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                             f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                             f"but both width and height must be divisible by {required_divisor}.\n\n"
+                             "Please crop or resize the source video. Skipping this file.")
+                logger.error(error_msg)
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+                self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+                return None
+            # --- END NEW ---
+
 
         # --- Normalization and Grayscale Conversion (Using OpenCV) ---
         # --- FIX: Normalize the warped frames here ---
