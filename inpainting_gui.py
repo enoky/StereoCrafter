@@ -19,7 +19,7 @@ import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
 
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
@@ -699,12 +699,16 @@ class InpaintingGUI(ThemedTk):
         final_output_frames_for_encoding: Optional[torch.Tensor] = None
 
         if is_dual_input:
+            # For dual input, the only valid output is the inpainted right eye.
+            # There is no left-eye data in the source to create an SBS view.
             final_output_frames_for_encoding = frames_output_final
         else:
+            # For quad input, we have the left eye, so we can create a side-by-side view.
             if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
                 logger.error(f"Original left frames are missing or empty for non-dual input {base_video_name}. Cannot create SBS output.")
                 return None
-                    
+            
+            # Ensure dimensions match before concatenation
             if frames_left_original_cropped.shape[0] != frames_output_final.shape[0] or \
             frames_left_original_cropped.shape[1] != frames_output_final.shape[1] or \
             frames_left_original_cropped.shape[2] != frames_output_final.shape[2]:
@@ -984,13 +988,18 @@ class InpaintingGUI(ThemedTk):
             output_display_w = half_w
 
         # --- Normalization and Grayscale Conversion (Using OpenCV) ---
-        frames_warpped_normalized = frames_warpped_raw / 255.0
+        frames_warpped_normalized = frames_warpped_raw.float() / 255.0
 
         processed_masks_grayscale = []
         for t in range(frames_mask_raw.shape[0]):
             frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
             frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
             frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
+            # --- FIX: Ensure the grayscale tensor has a channel dimension ---
+            # The output from cvtColor is (H, W), but we need (1, H, W) for stacking.
+            if frame_tensor_gray.dim() == 2:
+                frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
+            # --- END FIX ---
             processed_masks_grayscale.append(frame_tensor_gray.unsqueeze(0))
         current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
         logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
