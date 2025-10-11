@@ -164,6 +164,8 @@ class MergingGUI(ThemedTk):
         self.preview_image_tk = None # To prevent garbage collection
         self.preview_loaded_file = None
 
+        self.preview_original_left_tensor = None
+        self.preview_blended_right_tensor = None
         # --- GUI Variables ---
         self.pil_image_for_preview = None # Store the PIL image for resizing
         self.inpainted_folder_var = tk.StringVar(value=self.app_config.get("inpainted_folder", "./completed_output"))
@@ -183,6 +185,7 @@ class MergingGUI(ThemedTk):
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", False))
         self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", "Full SBS (Left-Right)"))
+        self.pad_to_16_9_var = tk.BooleanVar(value=self.app_config.get("pad_to_16_9", False))
         self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
@@ -257,6 +260,7 @@ class MergingGUI(ThemedTk):
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
         self.file_menu.add_command(label="Save Preview Frame...", command=self._save_preview_frame)
+        self.file_menu.add_command(label="Save Preview as SBS...", command=self._save_preview_sbs_frame)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
@@ -389,6 +393,7 @@ class MergingGUI(ThemedTk):
         self.shadow_min_opacity_var.set(0.2)
         self.shadow_decay_gamma_var.set(2.0)
         self.use_gpu_var.set(True)
+        self.pad_to_16_9_var.set(False)
         self.output_format_var.set("Full SBS (Left-Right)")
         self.enable_color_transfer_var.set(True)
         self.batch_chunk_size_var.set("32")
@@ -579,6 +584,11 @@ class MergingGUI(ThemedTk):
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
         
+        # --- NEW: Pad to 16:9 Checkbox ---
+        pad_check = ttk.Checkbutton(options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var)
+        pad_check.pack(side="left", padx=(15, 5))
+        self._create_hover_tooltip(pad_check, "pad_to_16_9")
+        
         # Add Preview Size option
         ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
         entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
@@ -639,6 +649,28 @@ class MergingGUI(ThemedTk):
         self.status_label_var.set(message)
         self.update_idletasks()
 
+    def _clear_preview_resources(self):
+        """Closes all preview-related video readers and clears the preview display."""
+        self._stop_wigglegram_animation()
+
+        if self.preview_inpainted_reader:
+            del self.preview_inpainted_reader
+            self.preview_inpainted_reader = None
+        if self.preview_original_reader:
+            del self.preview_original_reader
+            self.preview_original_reader = None
+        if self.preview_splatted_reader:
+            del self.preview_splatted_reader
+            self.preview_splatted_reader = None
+
+        self.preview_label.config(image=None, text="Load a video to see preview")
+        self.preview_image_tk = None
+        self.pil_image_for_preview = None
+        self.preview_original_left_tensor = None
+        self.preview_blended_right_tensor = None
+        gc.collect()
+        logger.info("Preview resources and file handles have been released.")
+
     def start_processing(self):
         if self.is_processing:
             messagebox.showwarning("Busy", "Processing is already in progress.")
@@ -648,6 +680,10 @@ class MergingGUI(ThemedTk):
         self.stop_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+
+        # --- NEW: Clear preview resources before starting batch processing ---
+        self._clear_preview_resources()
+
         self.update_status_label("Starting...")
 
         # Collect settings
@@ -686,6 +722,7 @@ class MergingGUI(ThemedTk):
                 "mask_folder": self.mask_folder_var.get(),
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
+                "pad_to_16_9": self.pad_to_16_9_var.get(),
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
@@ -820,9 +857,14 @@ class MergingGUI(ThemedTk):
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
+                # --- NEW: Pass padding setting to FFmpeg ---
+                ffmpeg_process = start_ffmpeg_pipe_process(
+                    content_width=output_width,
+                    content_height=output_height,
+                    final_output_mp4_path=output_path,
+                    fps=fps, video_stream_info=video_stream_info,
+                    pad_to_16_9=settings["pad_to_16_9"])
 
-
-                ffmpeg_process = start_ffmpeg_pipe_process(output_width, output_height, output_path, fps, video_stream_info)
                 if ffmpeg_process is None:
                     raise RuntimeError("Failed to start FFmpeg pipe process.")
 
@@ -950,15 +992,6 @@ class MergingGUI(ThemedTk):
                 stderr_thread.join(timeout=5)
                 ffmpeg_process.wait()
 
-                # --- FIX: Explicitly close readers BEFORE moving files ---
-                if inpainted_reader: del inpainted_reader
-                if splatted_reader: del splatted_reader
-                if original_reader: del original_reader
-                inpainted_reader, splatted_reader, original_reader = None, None, None
-                gc.collect() # Encourage garbage collection
-                logger.debug("Released video reader file handles before moving.")
-                # ---------------------------------------------------------
-
                 if ffmpeg_process.returncode != 0:
                     logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
                 else:
@@ -968,8 +1001,6 @@ class MergingGUI(ThemedTk):
                     self._move_processed_file(splatted_file_path, settings["mask_folder"])
                     if original_video_path_to_move:
                         self._move_processed_file(original_video_path_to_move, settings["original_folder"])
-                # --- END: CHUNK-BASED PROCESSING ---
-
             except Exception as e:
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
@@ -978,6 +1009,8 @@ class MergingGUI(ThemedTk):
                 if inpainted_reader: del inpainted_reader
                 if splatted_reader: del splatted_reader
                 if original_reader: del original_reader
+                gc.collect()
+                # --- END: CHUNK-BASED PROCESSING ---
 
             self.after(0, self.progress_var.set, i + 1)
 
@@ -1306,6 +1339,10 @@ class MergingGUI(ThemedTk):
 
             blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
+            # --- NEW: Store tensors for SBS saving ---
+            self.preview_original_left_tensor = original_left.cpu()
+            self.preview_blended_right_tensor = blended_frame.cpu()
+
             # --- Select the final frame to display based on the dropdown ---
             preview_source = self.preview_source_var.get()
             if preview_source == "Blended Image":
@@ -1433,7 +1470,8 @@ class MergingGUI(ThemedTk):
             "mask_folder": self.mask_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
             "use_gpu": self.use_gpu_var.get(),            
-            "output_format": self.output_format_var.get(),
+            "output_format": self.output_format_var.get(),            
+            "pad_to_16_9": self.pad_to_16_9_var.get(),
             "batch_chunk_size": self.batch_chunk_size_var.get(),
             "enable_color_transfer": self.enable_color_transfer_var.get(),
             "debug_logging_enabled": self.debug_logging_var.get(),
@@ -1533,6 +1571,52 @@ class MergingGUI(ThemedTk):
             except Exception as e:
                 logger.error(f"Failed to save preview frame: {e}", exc_info=True)
                 messagebox.showerror("Save Error", f"An error occurred while saving the image:\n{e}")
+
+    def _save_preview_sbs_frame(self):
+        """Saves the current preview as a full side-by-side image."""
+        if self.preview_original_left_tensor is None or self.preview_blended_right_tensor is None:
+            messagebox.showwarning("No Preview Data", "There is no preview data to save. Please load and preview a video first.")
+            return
+
+        try:
+            # Convert tensors to PIL Images
+            left_np = (self.preview_original_left_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            right_np = (self.preview_blended_right_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            
+            left_pil = Image.fromarray(left_np)
+            right_pil = Image.fromarray(right_np)
+
+            # Check if dimensions match
+            if left_pil.size != right_pil.size:
+                messagebox.showerror("Dimension Mismatch", "The left and right eye images have different dimensions. Cannot create SBS image.")
+                return
+
+            # Create SBS image
+            width, height = left_pil.size
+            sbs_image = Image.new('RGB', (width * 2, height))
+            sbs_image.paste(left_pil, (0, 0))
+            sbs_image.paste(right_pil, (width, 0))
+
+            # Suggest a default filename
+            default_filename = "preview_sbs_frame.png"
+            if self.preview_loaded_file:
+                base_name = os.path.splitext(self.preview_loaded_file)[0]
+                frame_num = int(self.frame_scrubber_var.get())
+                default_filename = f"{base_name}_frame_{frame_num:05d}_SBS.png"
+
+            filepath = filedialog.asksaveasfilename(
+                title="Save SBS Preview Frame As...",
+                initialfile=default_filename,
+                defaultextension=".png",
+                filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")]
+            )
+
+            if filepath:
+                sbs_image.save(filepath)
+                logger.info(f"SBS preview frame saved to: {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save SBS preview frame: {e}", exc_info=True)
+            messagebox.showerror("Save Error", f"An error occurred while creating or saving the SBS image:\n{e}")
 
     def exit_application(self):
         """Handles application exit gracefully."""
