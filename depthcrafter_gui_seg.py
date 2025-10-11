@@ -13,6 +13,7 @@ import time
 import numpy as np
 import torch
 import logging # Import standard logging
+import random
 
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ except ImportError:
     THEMEDTK_AVAILABLE = False
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
 
-GUI_VERSION = "25.09.29"
+GUI_VERSION = "25.10.08"
 _HELP_TEXTS = {}
 
 DARK_MODE_COLORS = {
@@ -270,1111 +271,6 @@ class DepthCrafterGUI:
                 
         _logger.info("DepthCrafter GUI initialized successfully.")
 
-    def add_param(self, parent, label, var, row):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
-        entry = ttk.Entry(parent, textvariable=var, width=20)
-        entry.grid(row=row, column=1, padx=5, pady=2, sticky="w")
-        return entry
-
-    def browse_input_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.input_dir_or_file_var.get())
-        if folder:
-            self.input_dir_or_file_var.set(os.path.normpath(folder))
-            self.single_file_mode_active = False
-            if self._is_image_sequence_folder(folder):
-                self.current_input_mode = "image_sequence_folder"
-                _logger.info(f"GUI: Input mode set to Image Sequence Folder: {folder}")
-            else:
-                self.current_input_mode = "batch_folder"
-                _logger.info(f"GUI: Input mode set to Batch Folder: {folder}")
-
-    def browse_output(self):
-        folder = filedialog.askdirectory(initialdir=self.output_dir.get())
-        if folder: self.output_dir.set(os.path.normpath(folder))
-
-    def browse_single_input_file(self):
-        filetypes = [("All Supported", "*.mp4 *.avi *.mov *.mkv *.webm *.flv *.gif *.png *.jpg *.jpeg *.bmp *.tiff *.exr"),
-                     ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.flv *.gif"),
-                     ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.exr")]
-        
-        initial_dir_guess = self.input_dir_or_file_var.get()
-        if os.path.isfile(initial_dir_guess): initial_dir_guess = os.path.dirname(initial_dir_guess)
-        if not os.path.isdir(initial_dir_guess): initial_dir_guess = os.path.expanduser("~")
-
-
-        filepath = filedialog.askopenfilename(initialdir=initial_dir_guess, filetypes=filetypes)
-        if filepath:
-            self.input_dir_or_file_var.set(os.path.normpath(filepath))
-            self.single_file_mode_active = True
-            ext = os.path.splitext(filepath)[1].lower()
-            is_video = any(ext in vid_ext.replace("*", "") for vid_ext in self.VIDEO_EXTENSIONS)
-            is_image = any(ext in img_ext.replace("*", "") for img_ext in self.IMAGE_EXTENSIONS)
-
-            if is_video:
-                self.current_input_mode = "single_video_file"
-                _logger.info(f"GUI: Input mode set to Single Video File: {filepath}")
-            elif is_image:
-                self.current_input_mode = "single_image_file"
-                _logger.info(f"GUI: Input mode set to Single Image File: {filepath}")
-            else:
-                _logger.warning(f"GUI: Could not determine type of single file: {filepath}. Assuming video.")
-                self.current_input_mode = "single_video_file" 
-                messagebox.showwarning("Unknown File Type", f"Could not determine if '{os.path.basename(filepath)}' is a video or image. Assuming video.")
-
-    def create_widgets(self):
-        self.widgets_to_disable_during_processing = []
-        
-        # --- Input Source Frame ---
-        dir_frame = ttk.LabelFrame(self.root, text="Input Source")
-        dir_frame.pack(fill="x", padx=10, pady=5, expand=False)        
-        
-        ttk.Label(dir_frame, text="Input Folder/File:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        self.entry_input_dir_or_file = ttk.Entry(dir_frame, textvariable=self.input_dir_or_file_var, width=50)
-        self.entry_input_dir_or_file.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-        _create_hover_tooltip(self.entry_input_dir_or_file, "input_dir_or_file") # Tooltip for entry
-        
-        browse_buttons_frame = ttk.Frame(dir_frame)
-        browse_buttons_frame.grid(row=0, column=2, padx=5, pady=0, sticky="w")
-        
-        self.browse_input_folder_btn = ttk.Button(browse_buttons_frame, text="Browse Folder", command=self.browse_input_folder)
-        self.browse_input_folder_btn.pack(side=tk.LEFT, padx=(0,2))
-        _create_hover_tooltip(self.browse_input_folder_btn, "browse_input_folder") # Tooltip for button
-        
-        self.browse_single_file_btn = ttk.Button(browse_buttons_frame, text="Load Single File", command=self.browse_single_input_file)
-        self.browse_single_file_btn.pack(side=tk.LEFT, padx=(2,0))
-        _create_hover_tooltip(self.browse_single_file_btn, "browse_single_file") # Tooltip for button
-        
-        dir_frame.columnconfigure(1, weight=1)
-        self.widgets_to_disable_during_processing.extend([
-            self.entry_input_dir_or_file, 
-            self.browse_input_folder_btn, 
-            self.browse_single_file_btn
-        ])
-
-        ttk.Label(dir_frame, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        self.entry_output_dir = ttk.Entry(dir_frame, textvariable=self.output_dir, width=50)
-        self.entry_output_dir.grid(row=1, column=1, padx=5, pady=2)
-        _create_hover_tooltip(self.entry_output_dir, "output_dir") # Tooltip for entry
-        
-        self.browse_output_btn = ttk.Button(dir_frame, text="Browse", command=self.browse_output)
-        self.browse_output_btn.grid(row=1, column=2, padx=5, pady=2)
-        _create_hover_tooltip(self.browse_output_btn, "browse_output") # Tooltip for button
-        
-        self.widgets_to_disable_during_processing.extend([self.entry_output_dir, self.browse_output_btn])
-
-        # --- Settings Container Frame (New) ---
-        # This frame will hold the Main Params, Frame & Segment Control, Merged Output, and Secondary Output frames.
-        settings_container_frame = ttk.Frame(self.root)
-        settings_container_frame.pack(fill="x", padx=10, pady=0, expand=False)
-        settings_container_frame.columnconfigure(0, weight=1)
-        settings_container_frame.columnconfigure(1, weight=1)
-
-        # --- Main Parameters Frame ---
-        main_params_frame = ttk.LabelFrame(settings_container_frame, text="Main Parameters")
-        main_params_frame.grid(row=0, column=0, padx=(0,5), pady=5, sticky="nsew") # Placed in new container
-        row_idx = 0
-        
-        # Guidance Scale
-        ttk.Label(main_params_frame, text="Guidance Scale:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_guidance_scale = ttk.Entry(main_params_frame, textvariable=self.guidance_scale, width=18)
-        entry_guidance_scale.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_guidance_scale, "guidance_scale")
-        self.widgets_to_disable_during_processing.append(entry_guidance_scale); row_idx += 1
-        
-        # Inference Steps
-        ttk.Label(main_params_frame, text="Inference Steps:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_inference_steps = ttk.Entry(main_params_frame, textvariable=self.inference_steps, width=18)
-        entry_inference_steps.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_inference_steps, "inference_steps")
-        self.widgets_to_disable_during_processing.append(entry_inference_steps); row_idx += 1
-
-        # Target Width
-        ttk.Label(main_params_frame, text="Target Width:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_target_width = ttk.Entry(main_params_frame, textvariable=self.target_width, width=18)
-        entry_target_width.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_target_width, "target_width")
-        self.widgets_to_disable_during_processing.append(entry_target_width); row_idx += 1
-
-        # Target Height
-        ttk.Label(main_params_frame, text="Target Height:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_target_height = ttk.Entry(main_params_frame, textvariable=self.target_height, width=18)
-        entry_target_height.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_target_height, "target_height")
-        self.widgets_to_disable_during_processing.append(entry_target_height); row_idx += 1
-
-        # Seed
-        ttk.Label(main_params_frame, text="Seed:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_seed = ttk.Entry(main_params_frame, textvariable=self.seed, width=18)
-        entry_seed.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_seed, "seed")
-        self.widgets_to_disable_during_processing.append(entry_seed); row_idx += 1
-        
-        # CPU Offload Mode
-        ttk.Label(main_params_frame, text="CPU Offload Mode:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        self.combo_cpu_offload = ttk.Combobox(main_params_frame, textvariable=self.cpu_offload, values=["model", "sequential", ""], width=17, state="readonly")
-        self.combo_cpu_offload.grid(row=row_idx, column=1, padx=5, pady=2, sticky="w")
-        _create_hover_tooltip(self.combo_cpu_offload, "cpu_offload")
-        self.widgets_to_disable_during_processing.append(self.combo_cpu_offload); row_idx += 1
-
-        # --- Frame & Segment Control Frame ---
-        fs_frame = ttk.LabelFrame(settings_container_frame, text="Frame & Segment Control")
-        fs_frame.grid(row=0, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
-
-        row_idx = 0 
-        
-        # Window Size
-        ttk.Label(fs_frame, text="Window Size:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_window_size = ttk.Entry(fs_frame, textvariable=self.window_size, width=18)
-        entry_window_size.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_window_size, "window_size")
-        self.widgets_to_disable_during_processing.append(entry_window_size); row_idx += 1
-        
-        # Overlap
-        ttk.Label(fs_frame, text="Overlap:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_overlap = ttk.Entry(fs_frame, textvariable=self.overlap, width=18)
-        entry_overlap.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_overlap, "overlap")
-        self.widgets_to_disable_during_processing.append(entry_overlap); row_idx += 1
-        
-        # Target FPS
-        ttk.Label(fs_frame, text="Target FPS (-1 Original):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_target_fps = ttk.Entry(fs_frame, textvariable=self.target_fps, width=18)
-        entry_target_fps.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_target_fps, "target_fps")
-        self.widgets_to_disable_during_processing.append(entry_target_fps); row_idx += 1
-        
-        # Process Max Frames
-        ttk.Label(fs_frame, text="Process Max Frames (-1 All):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_process_length = ttk.Entry(fs_frame, textvariable=self.process_length, width=18)
-        entry_process_length.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
-        _create_hover_tooltip(entry_process_length, "process_length")
-        self.widgets_to_disable_during_processing.append(entry_process_length); row_idx += 1
-        
-        # Save Sidecar JSON for Final Output
-        self.save_final_json_cb = ttk.Checkbutton(fs_frame, text="Save Sidecar JSON for Final Output", variable=self.save_final_output_json_var)
-        self.save_final_json_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.save_final_json_cb, "save_final_json")
-        self.widgets_to_disable_during_processing.append(self.save_final_json_cb); row_idx +=1
-
-        # Process as Segments
-        self.process_as_segments_cb = ttk.Checkbutton(fs_frame, text="Process as Segments (Low VRAM Mode)", variable=self.process_as_segments_var, command=self.toggle_merge_related_options_active_state)
-        self.process_as_segments_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.process_as_segments_cb, "process_as_segments")
-        self.widgets_to_disable_during_processing.append(self.process_as_segments_cb); row_idx += 1
-
-        # --- Merged Output Options Frame ---
-        merge_opts_frame = ttk.LabelFrame(settings_container_frame, text="Merged Output Options (if segments processed)")
-        merge_opts_frame.grid(row=1, column=0, padx=(0,5), pady=5, sticky="nsew") # Placed in new container
-        merge_opts_frame.columnconfigure(0, minsize=120) # Ensure column 0 for labels is wide enough
-        self.merge_related_widgets_references = []
-        self.keep_npz_dependent_widgets = []
-        row_idx = 0
-
-        # Keep intermediate NPZ files
-        self.keep_npz_cb = ttk.Checkbutton(merge_opts_frame, text="Keep intermediate NPZ", variable=self.keep_intermediate_npz_var, command=self.toggle_keep_npz_dependent_options_state)
-        self.keep_npz_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.keep_npz_cb, "keep_npz")
-        self.merge_related_widgets_references.append(self.keep_npz_cb)
-        self.widgets_to_disable_during_processing.append(self.keep_npz_cb); row_idx += 1
-
-        # Min Orig. Vid Frames to Keep NPZ
-        self.lbl_min_frames_npz = ttk.Label(merge_opts_frame, text="  ↳ Min thesh. to Keep NPZ:")
-        self.lbl_min_frames_npz.grid(row=row_idx, column=0, sticky="e", padx=(20,2), pady=2)
-        self.entry_min_frames_npz = ttk.Entry(merge_opts_frame, textvariable=self.min_frames_to_keep_npz_var, width=7)
-        self.entry_min_frames_npz.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(self.entry_min_frames_npz, "min_frames_npz")
-        self.keep_npz_dependent_widgets.extend([self.lbl_min_frames_npz, self.entry_min_frames_npz])
-        self.widgets_to_disable_during_processing.extend([self.lbl_min_frames_npz, self.entry_min_frames_npz]); row_idx += 1
-
-        # Segment Visual Format
-        self.lbl_intermediate_fmt = ttk.Label(merge_opts_frame, text="  ↳ Segment Format:")
-        self.lbl_intermediate_fmt.grid(row=row_idx, column=0, sticky="e", padx=(20,2), pady=2)
-        combo_intermediate_fmt_values = ["png_sequence", "mp4", "main10_mp4", "none"]
-        if OPENEXR_AVAILABLE_GUI: combo_intermediate_fmt_values.extend(["exr_sequence", "exr"])
-        self.combo_intermediate_fmt = ttk.Combobox(merge_opts_frame, textvariable=self.keep_intermediate_segment_visual_format_var, values=combo_intermediate_fmt_values, width=17, state="readonly")
-        self.combo_intermediate_fmt.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(self.combo_intermediate_fmt, "segment_visual_format")
-        self.keep_npz_dependent_widgets.extend([self.lbl_intermediate_fmt, self.combo_intermediate_fmt])
-        self.widgets_to_disable_during_processing.extend([self.lbl_intermediate_fmt, self.combo_intermediate_fmt]); row_idx += 1
-        self.toggle_keep_npz_dependent_options_state()
-
-        # Dithering (MP4)
-        self.merge_dither_cb = ttk.Checkbutton(merge_opts_frame, text="Dithering", variable=self.merge_dither_var, command=self.toggle_dither_options_active_state)
-        self.merge_dither_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.merge_dither_cb, "merge_dither") # Tooltip on checkbox
-        
-        dither_details_frame = ttk.Frame(merge_opts_frame)
-        dither_details_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
-        self.lbl_dither_str = ttk.Label(dither_details_frame, text="Strength:")
-        self.lbl_dither_str.pack(side=tk.LEFT, padx=(0, 2))
-        self.entry_dither_str = ttk.Entry(dither_details_frame, textvariable=self.merge_dither_strength_var, width=7)
-        self.entry_dither_str.pack(side=tk.LEFT, padx=(0, 0))
-        _create_hover_tooltip(self.entry_dither_str, "merge_dither_strength") # Tooltip on entry
-        
-        self.merge_related_widgets_references.append((self.merge_dither_cb, dither_details_frame))
-        self.widgets_to_disable_during_processing.extend([self.merge_dither_cb, self.lbl_dither_str, self.entry_dither_str]); row_idx += 1
-        self.toggle_dither_options_active_state() # Call after creation
-
-        # Gamma Correct (MP4)
-        self.merge_gamma_cb = ttk.Checkbutton(merge_opts_frame, text="Gamma Adjust", variable=self.merge_gamma_correct_var, command=self.toggle_gamma_options_active_state)
-        self.merge_gamma_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.merge_gamma_cb, "merge_gamma") # Tooltip on checkbox
-        
-        gamma_details_frame = ttk.Frame(merge_opts_frame)
-        gamma_details_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
-        self.lbl_gamma_val = ttk.Label(gamma_details_frame, text="Value:")
-        self.lbl_gamma_val.pack(side=tk.LEFT, padx=(0, 2))
-        self.entry_gamma_val = ttk.Entry(gamma_details_frame, textvariable=self.merge_gamma_value_var, width=7)
-        self.entry_gamma_val.pack(side=tk.LEFT, padx=(0, 0))
-        _create_hover_tooltip(self.entry_gamma_val, "merge_gamma_value") # Tooltip on entry
-        
-        self.merge_related_widgets_references.append((self.merge_gamma_cb, gamma_details_frame))
-        self.widgets_to_disable_during_processing.extend([self.merge_gamma_cb, self.lbl_gamma_val, self.entry_gamma_val]); row_idx += 1
-        self.toggle_gamma_options_active_state() # Call after creation
-
-        # Percentile Normalization
-        self.merge_perc_norm_cb = ttk.Checkbutton(merge_opts_frame, text="Normalization", variable=self.merge_percentile_norm_var, command=self.toggle_percentile_norm_options_active_state)
-        self.merge_perc_norm_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.merge_perc_norm_cb, "merge_percentile_norm") # Tooltip on checkbox
-        
-        low_high_frame = ttk.Frame(merge_opts_frame)
-        low_high_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
-        self.lbl_low_perc = ttk.Label(low_high_frame, text="Low:")
-        self.lbl_low_perc.pack(side=tk.LEFT, padx=(0,2))
-        self.entry_low_perc = ttk.Entry(low_high_frame, textvariable=self.merge_norm_low_perc_var, width=7)
-        self.entry_low_perc.pack(side=tk.LEFT, padx=(0,10))
-        self.lbl_high_perc = ttk.Label(low_high_frame, text="High:")
-        self.lbl_high_perc.pack(side=tk.LEFT, padx=(0,2))
-        self.entry_high_perc = ttk.Entry(low_high_frame, textvariable=self.merge_norm_high_perc_var, width=7)
-        self.entry_high_perc.pack(side=tk.LEFT, padx=(0,0))
-        ttk.Label(merge_opts_frame, text="  ↳").grid(row=row_idx, column=0, sticky="e", padx=(10,2)) # Aligns with the checkbox
-        _create_hover_tooltip(self.entry_low_perc, "merge_norm_low_perc") # Tooltip on entry
-        _create_hover_tooltip(self.entry_high_perc, "merge_norm_high_perc") # Tooltip on entry
-        
-        self.merge_related_widgets_references.append(self.merge_perc_norm_cb)
-        self.widgets_to_disable_during_processing.extend([self.lbl_low_perc, self.entry_low_perc, self.lbl_high_perc, self.entry_high_perc]); row_idx += 1
-        self.toggle_percentile_norm_options_active_state()
-
-        # Alignment Method
-        lbl_merge_alignment = ttk.Label(merge_opts_frame, text="Alignment Method:")
-        lbl_merge_alignment.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        self.combo_merge_alignment = ttk.Combobox(merge_opts_frame, textvariable=self.merge_alignment_method_var, values=["Shift & Scale", "Linear Blend"], width=17, state="readonly")
-        self.combo_merge_alignment.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(self.combo_merge_alignment, "merge_alignment_method")
-        self.merge_related_widgets_references.append((lbl_merge_alignment, self.combo_merge_alignment))
-        self.widgets_to_disable_during_processing.extend([lbl_merge_alignment, self.combo_merge_alignment]); row_idx += 1
-        
-        # Output Format
-        lbl_merge_fmt = ttk.Label(merge_opts_frame, text="Output Format:")
-        lbl_merge_fmt.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        merge_fmt_values = ["mp4", "main10_mp4", "png_sequence"] + (["exr_sequence", "exr"] if OPENEXR_AVAILABLE_GUI else [])
-        self.combo_merge_fmt = ttk.Combobox(merge_opts_frame, textvariable=self.merge_output_format_var, values=merge_fmt_values, width=17, state="readonly")
-        self.combo_merge_fmt.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(self.combo_merge_fmt, "merge_output_format")
-        self.merge_related_widgets_references.append((lbl_merge_fmt, self.combo_merge_fmt))
-        self.widgets_to_disable_during_processing.extend([lbl_merge_fmt, self.combo_merge_fmt]); row_idx += 1
-
-        # Output Suffix
-        lbl_merge_suffix = ttk.Label(merge_opts_frame, text="Output Suffix:")
-        lbl_merge_suffix.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        self.entry_merge_suffix = ttk.Entry(merge_opts_frame, textvariable=self.merge_output_suffix_var, width=18)
-        self.entry_merge_suffix.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(self.entry_merge_suffix, "merge_output_suffix")
-        self.merge_related_widgets_references.append((lbl_merge_suffix, self.entry_merge_suffix))
-        self.widgets_to_disable_during_processing.extend([lbl_merge_suffix, self.entry_merge_suffix]); row_idx += 1
-
-        # --- NEW: Secondary Output Frame ---
-        secondary_output_frame = ttk.LabelFrame(settings_container_frame, text="Secondary Output")
-        secondary_output_frame.grid(row=1, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
-        secondary_output_frame.columnconfigure(0, minsize=140) # Adjust as needed
-        
-        row_idx = 0
-        # Enable Secondary Output Checkbox
-        self.enable_secondary_output_cb = ttk.Checkbutton(secondary_output_frame, text="Enable Secondary Output", variable=self.enable_dual_output_robust_norm, command=self.toggle_secondary_output_options_active_state)
-        self.enable_secondary_output_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        _create_hover_tooltip(self.enable_secondary_output_cb, "enable_secondary_output") # Add help_content.json entry
-        self.widgets_to_disable_during_processing.append(self.enable_secondary_output_cb); row_idx += 1
-        
-        # Depth Range (0-1) Low / High
-        ttk.Label(secondary_output_frame, text="Depth Output Range (0-1):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        depth_range_frame = ttk.Frame(secondary_output_frame)
-        depth_range_frame.grid(row=row_idx, column=1, sticky="w", padx=0, pady=0)
-        
-        lbl_out_min = ttk.Label(depth_range_frame, text="Low:")
-        lbl_out_min.pack(side=tk.LEFT, padx=(0,2))
-        entry_out_min = ttk.Entry(depth_range_frame, textvariable=self.robust_norm_output_min, width=7)
-        entry_out_min.pack(side=tk.LEFT, padx=(0,10))
-        _create_hover_tooltip(entry_out_min, "robust_norm_output_min") # Add help_content.json entry
-        
-        lbl_out_max = ttk.Label(depth_range_frame, text="High:")
-        lbl_out_max.pack(side=tk.LEFT, padx=(0,2))
-        entry_out_max = ttk.Entry(depth_range_frame, textvariable=self.robust_norm_output_max, width=7)
-        entry_out_max.pack(side=tk.LEFT, padx=(0,0))
-        _create_hover_tooltip(entry_out_max, "robust_norm_output_max") # Add help_content.json entry
-        
-        self.secondary_output_widgets_references.extend([lbl_out_min, entry_out_min, lbl_out_max, entry_out_max])
-        self.widgets_to_disable_during_processing.extend([lbl_out_min, entry_out_min, lbl_out_max, entry_out_max]); row_idx += 1
-
-        # Normalize % Low / High
-        ttk.Label(secondary_output_frame, text="Clipped Output % Range:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        norm_perc_frame = ttk.Frame(secondary_output_frame)
-        norm_perc_frame.grid(row=row_idx, column=1, sticky="w", padx=0, pady=0)
-        
-        lbl_norm_low = ttk.Label(norm_perc_frame, text="Low:")
-        lbl_norm_low.pack(side=tk.LEFT, padx=(0,2))
-        entry_norm_low = ttk.Entry(norm_perc_frame, textvariable=self.robust_norm_low_percentile, width=7)
-        entry_norm_low.pack(side=tk.LEFT, padx=(0,10))
-        _create_hover_tooltip(entry_norm_low, "robust_norm_low_percentile") # Add help_content.json entry
-        
-        lbl_norm_high = ttk.Label(norm_perc_frame, text="High:")
-        lbl_norm_high.pack(side=tk.LEFT, padx=(0,2))
-        entry_norm_high = ttk.Entry(norm_perc_frame, textvariable=self.robust_norm_high_percentile, width=7)
-        entry_norm_high.pack(side=tk.LEFT, padx=(0,0))
-        _create_hover_tooltip(entry_norm_high, "robust_norm_high_percentile") # Add help_content.json entry
-        
-        self.secondary_output_widgets_references.extend([lbl_norm_low, entry_norm_low, lbl_norm_high, entry_norm_high])
-        self.widgets_to_disable_during_processing.extend([lbl_norm_low, entry_norm_low, lbl_norm_high, entry_norm_high]); row_idx += 1
-
-        # Output Suffix
-        lbl_robust_suffix = ttk.Label(secondary_output_frame, text="Output Suffix:")
-        lbl_robust_suffix.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        entry_robust_suffix = ttk.Entry(secondary_output_frame, textvariable=self.robust_output_suffix, width=18)
-        entry_robust_suffix.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
-        _create_hover_tooltip(entry_robust_suffix, "robust_output_suffix") # Add help_content.json entry
-        self.secondary_output_widgets_references.extend([lbl_robust_suffix, entry_robust_suffix])
-        self.widgets_to_disable_during_processing.extend([lbl_robust_suffix, entry_robust_suffix]); row_idx += 1
-
-        # --- Progress Bar and Status ---
-        progress_bar_frame = ttk.Frame(self.root)
-        progress_bar_frame.pack(pady=(10, 0), padx=10, fill="x", expand=False)
-        
-        self.progress = ttk.Progressbar(progress_bar_frame, orient="horizontal", length=300, mode="determinate")
-        self.progress.pack(fill=tk.X, expand=True, padx=0, pady=0)
-
-        # Status Label (NEW)
-        self.style.configure("Status.TLabel", anchor="center") 
-        self.status_label = ttk.Label(progress_bar_frame, text="Ready")
-        self.status_label.pack(padx=0, pady=2)
-
-        # --- Control Buttons ---
-        ctrl_frame = ttk.Frame(self.root)
-        ctrl_frame.pack(pady=(5, 10), padx=10, fill="x", expand=False)
-
-        # --- Container frame for buttons to center them ---
-        button_container_frame = ttk.Frame(ctrl_frame)
-        button_container_frame.pack(anchor="center") # Centers the button_container_frame within ctrl_frame
-
-        # --- Current Processing Information Frame ---
-        processing_info_frame = ttk.LabelFrame(self.root, text="Current Processing Information")
-        processing_info_frame.pack(fill="x", padx=10, pady=5, expand=False)
-        
-        # Grid layout for labels inside this frame
-        processing_info_frame.columnconfigure(0, weight=0) # Labels
-        processing_info_frame.columnconfigure(1, weight=1) # Values
-
-        row_idx = 0
-        # Filename
-        ttk.Label(processing_info_frame, text="Filename:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        lbl_filename = ttk.Label(processing_info_frame, textvariable=self.current_filename_var, anchor=tk.W)
-        lbl_filename.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
-        _create_hover_tooltip(lbl_filename, "current_filename") # Add tooltip
-        row_idx += 1
-
-        # Resolution
-        ttk.Label(processing_info_frame, text="Resolution:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        lbl_resolution = ttk.Label(processing_info_frame, textvariable=self.current_resolution_var, anchor=tk.W)
-        lbl_resolution.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
-        _create_hover_tooltip(lbl_resolution, "current_resolution") # Add tooltip
-        row_idx += 1
-
-        # Frames
-        ttk.Label(processing_info_frame, text="Frames:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
-        lbl_frames = ttk.Label(processing_info_frame, textvariable=self.current_frames_var, anchor=tk.W)
-        lbl_frames.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
-        _create_hover_tooltip(lbl_frames, "current_frames") # Add tooltip
-        row_idx += 1
-
-        start_frame = ttk.Frame(button_container_frame); start_frame.pack(side=tk.LEFT, padx=(0,2))
-        self.start_button = ttk.Button(start_frame, text="Start", command=self.start_thread, width=10)
-        self.start_button.pack(side=tk.LEFT)
-        _create_hover_tooltip(self.start_button, "start_button")        
-
-        cancel_frame = ttk.Frame(button_container_frame); cancel_frame.pack(side=tk.LEFT, padx=(2,2))
-        self.cancel_button = ttk.Button(cancel_frame, text="Cancel", command=self.stop_processing, width=10, state=tk.DISABLED)
-        self.cancel_button.pack(side=tk.LEFT)
-        _create_hover_tooltip(self.cancel_button, "cancel_button")
-
-        remerge_frame = ttk.Frame(button_container_frame); remerge_frame.pack(side=tk.LEFT, padx=(2,2))
-        self.remerge_button = ttk.Button(remerge_frame, text="Re-Merge Segments", command=self.re_merge_from_gui, width=18)
-        self.remerge_button.pack(side=tk.LEFT)
-        _create_hover_tooltip(self.remerge_button, "remerge_button")
-
-        genvis_frame = ttk.Frame(button_container_frame); genvis_frame.pack(side=tk.LEFT, padx=(2,2))
-        self.generate_visuals_button = ttk.Button(genvis_frame, text="Generate Seg Visuals", command=self.generate_segment_visuals_from_gui, width=20)
-        self.generate_visuals_button.pack(side=tk.LEFT)
-        _create_hover_tooltip(self.generate_visuals_button, "generate_visuals_button")
-
-        self.widgets_to_disable_during_processing.extend([
-            self.start_button, self.remerge_button,
-            self.generate_visuals_button
-        ])
-
-        # self.toggle_merge_related_options_active_state()
-
-    def generate_segment_visuals_from_gui(self):
-        if self.processing_thread and self.processing_thread.is_alive():
-            messagebox.showwarning("Busy", "Another process is running. Please wait."); return
-        meta_file = filedialog.askopenfilename(title="Select Master Metadata JSON for Segment Visual Generation", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], initialdir=self.output_dir.get())
-        if not meta_file: 
-            _logger.info("Segment visual generation cancelled: No master metadata file selected.")
-            return
-        vis_fmt = self.keep_intermediate_segment_visual_format_var.get()
-        if vis_fmt == "none": 
-            messagebox.showinfo("Info", "Segment Visual Format is 'none'. Select a valid format."); return
-        if not messagebox.askyesno("Generate/Overwrite Visuals?", f"Generate '{vis_fmt}' visuals for segments in '{os.path.basename(meta_file)}'?\nThis may overwrite existing visuals."):
-            _logger.info("Segment visual generation cancelled by user.")
-            return
-        args = {"master_meta_path": meta_file, "visual_format_to_generate": vis_fmt}
-        _logger.info(f"--- Starting Segment Visual Generation for: {os.path.basename(meta_file)} (Format: {vis_fmt}) ---")
-        self._set_ui_processing_state(True)
-        self.processing_thread = threading.Thread(target=self._execute_generate_segment_visuals_wrapper, args=(args,), daemon=True); self.processing_thread.start()
-        self.root.after(100, self.process_queue)
-
-    def load_config(self):
-        if os.path.exists(self.CONFIG_FILENAME):
-            try:
-                with open(self.CONFIG_FILENAME, "r") as f: config = json.load(f)
-                loaded_settings_for_tkvars = {k: v for k, v in config.items() if k in self.all_tk_vars}
-                for key, value in loaded_settings_for_tkvars.items():
-                    if key in self.all_tk_vars:
-                        try: self.all_tk_vars[key].set(value)
-                        except tk.TclError: 
-                            _logger.warning(f"Warning (GUI load_config): Could not set var {key} during early config load.")
-                
-                self.last_settings_dir = config.get(self.LAST_SETTINGS_DIR_CONFIG_KEY, os.getcwd())
-                
-                self.current_input_mode = config.get("current_input_mode", "batch_folder")
-                self.single_file_mode_active = config.get("single_file_mode_active", False)
-                
-                _logger.info(f"GUI: Configuration loaded from '{self.CONFIG_FILENAME}'.")
-            except Exception as e:
-                _logger.warning(f"Warning (GUI load_config): Could not load config '{self.CONFIG_FILENAME}': {e}")
-                self.last_settings_dir = os.getcwd()
-                self.current_input_mode = "batch_folder"
-                self.single_file_mode_active = False
-        else: 
-            self.last_settings_dir = os.getcwd()
-            self.current_input_mode = "batch_folder"
-            self.single_file_mode_active = False
-            _logger.info(f"GUI: Configuration file '{self.CONFIG_FILENAME}' not found. Using default settings.")
-
-    def on_close(self):
-        self.save_config()
-        if self.processing_thread and self.processing_thread.is_alive():
-            _logger.info("Stopping processing before exit...")
-            self.stop_event.set()
-            self.processing_thread.join(timeout=10)
-            if self.processing_thread.is_alive(): 
-                _logger.warning("Processing thread did not terminate gracefully. Forcing exit.")
-        
-        self.root.destroy()
-
-    def process_queue(self):
-        # The message queue is still used for progress bar updates
-        while not self.message_queue.empty():
-            try:
-                msg_type, content = self.message_queue.get_nowait()
-                if msg_type == "progress":
-                    self.progress["value"] = content
-                elif msg_type == "set_ui_state":
-                    self._set_ui_processing_state(content)
-            except queue.Empty:
-                break
-            except Exception as e:
-                _logger.exception(f"Error processing GUI queue: {e}")
-        
-        self.root.after(100, self.process_queue) # Still schedule, but only for progress/UI state
-
-    def re_merge_from_gui(self):
-        if not merge_depth_segments: 
-            messagebox.showerror("Error", "Merge module not available."); return
-        meta_file = filedialog.askopenfilename(title="Select Master Metadata JSON for Re-Merging", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], initialdir=self.output_dir.get())
-        if not meta_file: return
-        
-        _logger.debug(f"DEBUG (re_merge_from_gui): enable_dual_output_robust_norm.get() is {self.enable_dual_output_robust_norm.get()}")
-        
-        base_name_from_meta = os.path.splitext(os.path.basename(meta_file))[0].replace("_master_meta", "")
-        output_suffix = self.merge_output_suffix_var.get()
-        remerge_base_name = f"{base_name_from_meta}{output_suffix}"
-
-        out_fmt = self.merge_output_format_var.get()
-        
-        def_ext_fmt = out_fmt
-        if out_fmt == "main10_mp4":
-            def_ext_fmt = "mp4"
-        elif out_fmt in ["png_sequence", "exr_sequence"]:
-            def_ext_fmt = ""
-        elif out_fmt == "exr":
-            def_ext_fmt = "exr"
-
-        def_ext = f".{def_ext_fmt}" if def_ext_fmt else ""
-
-        ftypes_map = {
-            "mp4": [("MP4 (H.264 8-bit)", "*.mp4")],
-            "main10_mp4": [("MP4 (HEVC 10-bit)", "*.mp4")],
-            "png_sequence": [("PNG Seq (Select Folder)", "")],
-            "exr_sequence": [("EXR Seq (Select Folder)", "")],
-            "exr": [("EXR File", "*.exr")]
-        }
-        curr_ftypes = ftypes_map.get(out_fmt, []) + [("All files", "*.*")]
-        out_path = None
-
-        if "sequence" in out_fmt:
-            parent_dir = filedialog.askdirectory(title=f"Select Parent Dir for Re-Merged {out_fmt.upper()} Sequence...", initialdir=self.output_dir.get())
-            if parent_dir: out_path = parent_dir
-        else:
-            initial_filename_for_dialog_actual = f"{remerge_base_name}{def_ext}"
-
-            out_path = filedialog.asksaveasfilename(
-                title=f"Save Re-Merged {out_fmt.upper()} As...", 
-                initialdir=self.output_dir.get(), 
-                initialfile=f"{remerge_base_name}{def_ext}",
-                defaultextension=def_ext, 
-                filetypes=curr_ftypes
-            )
-
-        if not out_path: 
-            _logger.info("Re-merge cancelled: No output path selected.")
-            return
-            
-        align_method = "linear_blend" if self.merge_alignment_method_var.get() == "Linear Blend" else "shift_scale"
-        
-        args = {"master_meta_path": meta_file, "output_path_arg": out_path,
-                "do_dithering": self.merge_dither_var.get(), "dither_strength_factor": self.merge_dither_strength_var.get(),
-                "apply_gamma_correction": self.merge_gamma_correct_var.get(), "gamma_value": self.merge_gamma_value_var.get(),
-                "use_percentile_norm": self.merge_percentile_norm_var.get(), "norm_low_percentile": self.merge_norm_low_perc_var.get(),
-                "norm_high_percentile": self.merge_norm_high_perc_var.get(), "output_format": out_fmt,
-                "merge_alignment_method": align_method,
-                "output_filename_override_base": remerge_base_name,
-                "enable_dual_output_robust_norm": self.enable_dual_output_robust_norm.get(),
-                "robust_norm_low_percentile": self.robust_norm_low_percentile.get(),
-                "robust_norm_high_percentile": self.robust_norm_high_percentile.get(),
-                "robust_norm_output_min": self.robust_norm_output_min.get(),
-                "robust_norm_output_max": self.robust_norm_output_max.get(),
-                "robust_output_suffix": self.robust_output_suffix.get(),
-                "is_depth_far_black": self.is_depth_far_black.get()
-                }
-
-        if self.processing_thread and self.processing_thread.is_alive():
-            messagebox.showwarning("Busy", "Another process is running. Please wait."); return
-        
-        _logger.info(f"--- Starting Re-Merge for: {os.path.basename(meta_file)} ---")
-        self._set_ui_processing_state(True)
-        self.processing_thread = threading.Thread(target=self._execute_re_merge_wrapper, args=(args,), daemon=True); self.processing_thread.start()
-        self.root.after(100, self.process_queue)
-
-    def start_thread(self):
-        if self.processing_thread and self.processing_thread.is_alive():
-            _logger.warning("Processing is already running.")
-            return
-
-        input_path_str = self.input_dir_or_file_var.get()
-        if not input_path_str or not os.path.exists(input_path_str):
-            _logger.error(f"GUI: Input path field is empty or path does not exist: {input_path_str}")
-            messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
-            return
-        
-        # --- ADD THESE LINES HERE ---
-        _logger.info("Scanning input folder: Please wait...")
-        self.status_message_var.set("Scanning input folder...")
-        self.root.update_idletasks() # Force GUI update to show "Scanning..." immediately
-        # ----------------------------
-
-        determined_mode, determined_single_source = self._determine_input_mode_from_path(input_path_str)
-        
-        self.current_input_mode = determined_mode
-        self.single_file_mode_active = determined_single_source
-
-        if not os.path.exists(input_path_str):
-            _logger.error(f"GUI: Input path is invalid or does not exist: {input_path_str}")
-            messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
-            return
-
-        sources_to_process_specs = []
-
-        if self.single_file_mode_active:
-            self.effective_move_original_on_completion = False
-            basename = ""
-            if self.current_input_mode == "image_sequence_folder":
-                basename = os.path.basename(input_path_str)
-            else:
-                basename = os.path.splitext(os.path.basename(input_path_str))[0]
-            
-            sources_to_process_specs.append({
-                "path": input_path_str,
-                "type": self.current_input_mode, 
-                "basename": basename
-            })
-        else:
-            self.effective_move_original_on_completion = self.MOVE_ORIGINAL_TO_FINISHED_FOLDER_ON_COMPLETION
-            if self.current_input_mode == "batch_folder":
-                try:
-                    for item_name in os.listdir(input_path_str):
-                        item_full_path = os.path.join(input_path_str, item_name)
-                        if os.path.isfile(item_full_path):
-                            ext = os.path.splitext(item_name)[1].lower()
-                            if any(ext in vid_ext.replace("*", "") for vid_ext in self.VIDEO_EXTENSIONS):
-                                basename = os.path.splitext(item_name)[0]
-                                sources_to_process_specs.append({
-                                    "path": item_full_path,
-                                    "type": "video_file",
-                                    "basename": basename
-                                })
-                        elif os.path.isdir(item_full_path):
-                            if self._is_image_sequence_folder(item_full_path):
-                                basename = item_name 
-                                sources_to_process_specs.append({
-                                    "path": item_full_path,
-                                    "type": "image_sequence_folder",
-                                    "basename": basename
-                                })
-                except NotADirectoryError:
-                    _logger.error(f"GUI Input: Path '{input_path_str}' is not a directory, but batch processing mode was attempted.")
-                    messagebox.showerror("Error", f"Input path is not a directory for batch processing: {input_path_str}")
-                    return
-                except OSError as e:
-                    _logger.error(f"GUI Input: OS error when trying to list directory '{input_path_str}'. Error: {e}")
-                    messagebox.showerror("Error", f"Could not read directory contents for '{input_path_str}':\n{e}")
-                    return
-            else:
-                _logger.critical(f"GUI Start Thread: Unexpected mode '{self.current_input_mode}' for path '{input_path_str}' after explicit determination. This indicates a logic error.")
-                messagebox.showerror("Internal Error", f"Unexpected input mode '{self.current_input_mode}' for path '{input_path_str}'. Please report this.")
-                return
-
-
-        if not sources_to_process_specs:
-            _logger.warning(f"GUI: No valid video files or image sequences found in '{input_path_str}' for mode '{self.current_input_mode}'.")
-            return
-        
-        final_jobs_to_process = []
-        base_job_info_map_for_run = {} 
-
-        gui_fps_setting = self.target_fps.get()
-        gui_len_setting = self.process_length.get()
-        gui_win_setting = self.window_size.get()
-        gui_ov_setting = self.overlap.get()
-
-        for source_spec in sources_to_process_specs:
-            source_path = source_spec["path"]
-            current_gui_mode = source_spec["type"] 
-            base_name = source_spec["basename"]
-
-            source_type_for_define = ""
-            if current_gui_mode == "single_video_file" or current_gui_mode == "video_file":
-                source_type_for_define = "video_file"
-            elif current_gui_mode == "image_sequence_folder":
-                source_type_for_define = "image_sequence_folder"
-            elif current_gui_mode == "single_image_file":
-                source_type_for_define = "single_image_file"
-            else:
-                _logger.error(f"GUI Start Thread: Unknown source_spec type '{current_gui_mode}' for basename '{base_name}'. Cannot map to define_video_segments source type.")
-                continue
-
-            all_potential_segments_for_video, base_job_info_initial = define_video_segments(
-                video_path_or_folder=source_path,
-                original_basename=base_name,
-                gui_target_fps_setting=gui_fps_setting,
-                gui_process_length_overall=gui_len_setting,
-                gui_segment_output_window_frames=gui_win_setting,
-                gui_segment_output_overlap_frames=gui_ov_setting,
-                source_type=source_type_for_define,
-                gui_target_height_setting=self.target_height.get(), # <--- ADD THIS
-                gui_target_width_setting=self.target_width.get(), 
-            )
-
-            if not base_job_info_initial:
-                _logger.info(f"Skipping {base_name}: Issues in segment definition (metadata error).")
-                continue
-            
-            base_job_info_map_for_run[source_path] = base_job_info_initial.copy()
-
-            if self.process_as_segments_var.get():
-                if not all_potential_segments_for_video:
-                    reason_skip = "Too short or invalid overlap/settings" if base_job_info_initial.get("original_video_raw_frame_count", 0) > 0 else "Source issue or zero frames/duration"
-                    _logger.info(f"GUI: No segments defined by settings for {base_name} (Reason: {reason_skip}). Skipping processing for this video.")
-                    continue
-
-                segment_subfolder_name = get_segment_output_folder_name(base_name)
-                segment_subfolder_path = os.path.join(self.output_dir.get(), segment_subfolder_name)
-                current_video_base_info_ref = base_job_info_map_for_run[source_path]
-                
-                segments_for_this_video, action_taken = self._get_segments_to_resume_or_overwrite(
-                    source_path, base_name, segment_subfolder_path, all_potential_segments_for_video,
-                    current_video_base_info_ref
-                )
-                _logger.debug(f"For video '{base_name}': Action '{action_taken}', {len(segments_for_this_video)} segments will be processed.")
-                if segments_for_this_video:
-                    final_jobs_to_process.extend(segments_for_this_video)
-            
-            else:
-                full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(base_name, "mp4"))
-                proceed_full = True
-                if os.path.exists(full_out_check_path):
-                    if not messagebox.askyesno("Overwrite?", f"An output file for '{base_name}' might exist (e.g., MP4):\n{full_out_check_path}\n\nOverwrite if it exists?"):
-                        _logger.info(f"Skipping {base_name} (full video processing, user chose not to overwrite).")
-                        proceed_full = False
-                
-                if proceed_full:
-                    full_source_job = {
-                        **base_job_info_initial,
-                        "is_segment": False,
-                        "gui_desired_output_window_frames": gui_win_setting, 
-                        "gui_desired_output_overlap_frames": gui_ov_setting 
-                    }
-                    final_jobs_to_process.append(full_source_job)
-
-        if final_jobs_to_process:
-            # --- ADDED THESE LINES TO RESET PREVIOUS JOB INFO ---
-            self.current_filename_var.set("N/A")
-            self.current_resolution_var.set("N/A")
-            self.current_frames_var.set("N/A")
-            # --------------------------------------------------
-            self.status_message_var.set("Starting processing...")
-            self._set_ui_processing_state(True)
-            self.processing_thread = threading.Thread(target=self._start_processing_wrapper, 
-                                                      args=(final_jobs_to_process, base_job_info_map_for_run), 
-                                                      daemon=True)
-            self.processing_thread.start()
-            self.root.after(100, self.process_queue) # Start queue processing for progress updates
-        else:
-            _logger.info("No videos/segments to process after considering existing data and user choices (or all skipped).")
-
-    def start_processing(self, video_processing_jobs, base_job_info_map):
-        self.stop_event.clear()
-        self.progress["value"] = 0
-        self.progress["maximum"] = len(video_processing_jobs)
-        _logger.info(f"Starting batch processing for {len(video_processing_jobs)} items...")
-        self.status_message_var.set("Starting processing...")
-
-        returned_job_specific_metadata_last_job = {} 
-        
-        try:
-            # Log model loading strategy
-            if not self.use_local_models_only_var.get():
-                _logger.info("Attempting to check model at Hugging Face Hub against local.")
-            else:
-                _logger.info("Attempting to load local model.")
-
-            disable_xformers_for_run = self.disable_xformers_var.get()
-
-            demo = DepthCrafterDemo(
-                unet_path="tencent/DepthCrafter",
-                pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
-                cpu_offload=self.cpu_offload.get(),
-                use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
-                local_files_only=self.use_local_models_only_var.get(),
-                disable_xformers=disable_xformers_for_run,
-            )
-        except Exception as e:
-            _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
-            self.status_message_var.set(f"Error: Model initialization failed. See console.")
-            self.current_filename_var.set("N/A")
-            self.current_resolution_var.set("N/A")
-            self.current_frames_var.set("N/A")
-            return 
-
-        all_videos_master_metadata = {} 
-        
-        for i, job_info_to_run in enumerate(video_processing_jobs):
-            if self.stop_event.is_set():
-                _logger.info("Processing cancelled by user after current item.")
-                self.status_message_var.set("Stopping...")
-                self.current_filename_var.set("N/A") # Reset immediately on stop
-                self.current_resolution_var.set("N/A") # Reset immediately on stop
-                self.current_frames_var.set("N/A") # Reset immediately on stop
-                self.root.update_idletasks() # Ensure this reset is visible
-                break
-            
-            current_video_path = job_info_to_run["video_path"] 
-            original_basename = job_info_to_run["original_basename"]
-            is_segment_job = job_info_to_run.get("is_segment", False)
-
-            log_msg_prefix = f"Segment {job_info_to_run.get('segment_id', -1)+1}/{job_info_to_run.get('total_segments', 0)}" if is_segment_job else "Full video"
-            
-            # --- START PART A: INITIAL GUI UPDATE (TARGET/EXPECTED VALUES) ---
-            _logger.debug(f"DEBUG GUI UPDATE (Initial): Starting update for {original_basename}")
-            self.current_filename_var.set(f"{original_basename} ({log_msg_prefix})") 
-            
-            # Initial Resolution (using target_height/width setting and original dimensions as a hint)
-            target_h_setting = self.target_height.get()
-            target_w_setting = self.target_width.get()
-
-            initial_display_res = "N/A"
-            if target_h_setting > 0 and target_w_setting > 0:
-                 initial_display_res = f"{target_w_setting}x{target_h_setting}"
-            else:
-                 original_h = job_info_to_run.get("original_height", "N/A")
-                 original_w = job_info_to_run.get("original_width", "N/A")
-                 if original_h != "N/A" and original_w != "N/A":
-                     initial_display_res = f"{original_w}x{original_h} (Original/Fallback)"
-            self.current_resolution_var.set(initial_display_res)
-
-            # Initial Frames (using gui settings for segment/process_length)
-            total_frames_orig_vid = job_info_to_run.get('original_video_raw_frame_count', 'N/A')
-            initial_display_frames_str = "N/A"
-            if is_segment_job:
-                window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
-                overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
-                num_frames_to_load_raw = job_info_to_run.get("num_frames_to_load_raw", "N/A")
-                if num_frames_to_load_raw != "N/A" and window_size_setting != "N/A" and overlap_size_setting != "N/A":
-                    initial_display_frames_str = f"{num_frames_to_load_raw}"
-                elif num_frames_to_load_raw != "N/A":
-                    initial_display_frames_str = f"{num_frames_to_load_raw}"
-                
-                if total_frames_orig_vid != "N/A" and str(num_frames_to_load_raw) != str(total_frames_orig_vid):
-                    initial_display_frames_str += f" of {total_frames_orig_vid}"
-            else: # Full video
-                process_length_setting = self.process_length.get()
-                if process_length_setting != -1:
-                    initial_display_frames_str = f"{process_length_setting}"
-                else:
-                    initial_display_frames_str = f"{total_frames_orig_vid}"
-            self.current_frames_var.set(initial_display_frames_str)
-
-            self.root.update_idletasks() # Force GUI update for initial display
-            # --- END PART A: INITIAL GUI UPDATE ---
-
-            if current_video_path not in all_videos_master_metadata:
-                current_video_comprehensive_base_info = base_job_info_map.get(current_video_path, {})
-                total_segments_for_this_video_overall = job_info_to_run.get("total_segments") if is_segment_job else 1
-                if total_segments_for_this_video_overall is None and is_segment_job:
-                    _logger.warning(f"Warning: 'total_segments' missing for segment job of {original_basename}. Defaulting to 1 for master_meta init.")
-
-                all_videos_master_metadata[current_video_path] = self._initialize_master_metadata_entry(
-                    original_basename, 
-                    job_info_to_run,
-                    total_segments_for_this_video_overall
-                )
-                
-                pre_existing_successful_segment_metadatas = current_video_comprehensive_base_info.get("pre_existing_successful_jobs", [])
-                if pre_existing_successful_segment_metadatas:
-                    _logger.debug(f"Loading {len(pre_existing_successful_segment_metadatas)} pre-existing successful segment metadata entries for {original_basename} into current run's master data.")
-                    all_videos_master_metadata[current_video_path]["jobs_info"].extend(pre_existing_successful_segment_metadatas)
-                    all_videos_master_metadata[current_video_path]["completed_successful_jobs"] += len(pre_existing_successful_segment_metadatas)
-            
-            master_meta_for_this_vid = all_videos_master_metadata[current_video_path]
-            
-            # _logger.info(f"Processing {original_basename} - {log_msg_prefix} ({i+1}/{len(video_processing_jobs)})")
-            _logger.info(f"Processing {original_basename} - {log_msg_prefix}")
-            self.status_message_var.set(f"Processing {i + 1} of {len(video_processing_jobs)}")
-
-            job_successful, current_job_specific_metadata = self._process_single_job(demo, job_info_to_run, master_meta_for_this_vid)
-            
-            if current_job_specific_metadata is None:
-                _logger.error(f"Error: _process_single_job for {original_basename} returned None metadata. Initializing to empty dict.")
-                current_job_specific_metadata = {}
-            
-            returned_job_specific_metadata_last_job = current_job_specific_metadata 
-
-            self.message_queue.put(("progress", i + 1)) # Update progress bar
-
-            # --- START PART B: FINAL GUI UPDATE (ACTUAL/PROCESSED VALUES) ---
-            _logger.debug(f"DEBUG GUI UPDATE (Final): Starting update for {original_basename}")
-
-            # RESOLUTION UPDATE (from actual processed values)
-            processed_h = current_job_specific_metadata.get("processed_height", "N/A")
-            processed_w = current_job_specific_metadata.get("processed_width", "N/A")
-            
-            final_display_res = "N/A"
-            if processed_h != "N/A" and processed_w != "N/A":
-                final_display_res = f"{processed_w}x{processed_h}" # This is the actual processed resolution
-            else:
-                final_display_res = self.current_resolution_var.get() + " (Failed to confirm)" # Append if couldn't get actual
-            self.current_resolution_var.set(final_display_res)
-            
-            # FRAMES UPDATE (from actual processed values)
-            processed_frames_for_job = current_job_specific_metadata.get("frames_in_output_video", "N/A")
-            
-            final_display_frames_str = "N/A"
-
-            if processed_frames_for_job != "N/A":
-                if is_segment_job:
-                    window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
-                    overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
-                    
-                    if window_size_setting != "N/A" and overlap_size_setting != "N/A":
-                         final_display_frames_str = f"{processed_frames_for_job}"
-                    else:
-                         final_display_frames_str = f"{processed_frames_for_job} (Segment)"
-
-                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
-                         final_display_frames_str += f" of {total_frames_orig_vid} total"
-                    
-                else: # Full video processing
-                    final_display_frames_str = f"{processed_frames_for_job}"
-                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
-                        final_display_frames_str += f" (of {total_frames_orig_vid} total)"
-            else:
-                final_display_frames_str = self.current_frames_var.get() + " (Failed to confirm)" # Append if couldn't get actual
-            
-            self.current_frames_var.set(final_display_frames_str)
-            self.root.update_idletasks() # Force GUI update for final display
-            # --- END PART B: FINAL GUI UPDATE ---
-
-            if is_segment_job and "segment_id" not in current_job_specific_metadata:
-                current_job_specific_metadata["segment_id"] = job_info_to_run.get("segment_id", -1)
-            
-            if "_individual_metadata_path" in current_job_specific_metadata:
-                del current_job_specific_metadata["_individual_metadata_path"]
-            
-            master_meta_for_this_vid["jobs_info"].append(current_job_specific_metadata)
-            
-            if job_successful:
-                master_meta_for_this_vid["completed_successful_jobs"] += 1
-            else:
-                master_meta_for_this_vid["completed_failed_jobs"] += 1
-                
-            total_accounted_for_vid = master_meta_for_this_vid["completed_successful_jobs"] + master_meta_for_this_vid["completed_failed_jobs"]
-            
-            if total_accounted_for_vid >= master_meta_for_this_vid["total_expected_jobs"]:
-                self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
-
-        if not self.stop_event.is_set():
-            _logger.info("All processing jobs complete!")
-            self.status_message_var.set("Processing Finished.")
-        
-        if 'demo' in locals() and demo is not None:
-            try:
-                if hasattr(demo, 'pipe') and demo.pipe is not None:
-                    if hasattr(demo.pipe, 'vae') and demo.pipe.vae is not None: del demo.pipe.vae
-                    if hasattr(demo.pipe, 'unet') and demo.pipe.unet is not None: del demo.pipe.unet
-                    del demo.pipe
-                del demo
-                _logger.debug("DepthCrafter model components released.")
-            except Exception as e_cleanup:
-                _logger.warning(f"Error during DepthCrafter model cleanup: {e_cleanup}")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            _logger.info("CUDA cache cleared.")
-
-    def stop_processing(self):
-        if self.processing_thread and self.processing_thread.is_alive():
-            _logger.info("Cancel request received. Processing will stop after current item.")
-            self.stop_event.set()
-        else: 
-            _logger.info("No processing is currently active to cancel.")
-
-    def save_config(self):
-        config = self._collect_all_settings()
-        config[self.LAST_SETTINGS_DIR_CONFIG_KEY] = self.last_settings_dir
-        
-        config["current_input_mode"] = self.current_input_mode 
-        config["single_file_mode_active"] = self.single_file_mode_active
-        
-        try:
-            with open(self.CONFIG_FILENAME, "w") as f: json.dump(config, f, indent=4)
-        except Exception as e: 
-            _logger.warning(f"Warning (GUI save_config): Could not save config: {e}")
-
-    def toggle_dither_options_active_state(self, *args):
-        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_dither_var')): return
-        active = self.process_as_segments_var.get() and self.merge_dither_var.get()
-        state = tk.NORMAL if active else tk.DISABLED
-        for attr_name in ['lbl_dither_str', 'entry_dither_str']:
-            if hasattr(self, attr_name):
-                widget = getattr(self, attr_name)
-                if widget and hasattr(widget, 'configure'):
-                    try: widget.configure(state=state)
-                    except tk.TclError: pass
-
-    def toggle_gamma_options_active_state(self, *args):
-        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_gamma_correct_var')): return
-        active = self.process_as_segments_var.get() and self.merge_gamma_correct_var.get()
-        state = tk.NORMAL if active else tk.DISABLED
-        for attr_name in ['lbl_gamma_val', 'entry_gamma_val']:
-            if hasattr(self, attr_name):
-                widget = getattr(self, attr_name)
-                if widget and hasattr(widget, 'configure'):
-                    try: widget.configure(state=state)
-                    except tk.TclError: pass
-
-    def toggle_keep_npz_dependent_options_state(self, *args):
-        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'keep_intermediate_npz_var') and hasattr(self, 'keep_npz_dependent_widgets')):
-            return
-        active = self.process_as_segments_var.get() and self.keep_intermediate_npz_var.get()
-        state = tk.NORMAL if active else tk.DISABLED
-        for widget in self.keep_npz_dependent_widgets:
-            if hasattr(widget, 'configure'):
-                try:
-                    if isinstance(widget, ttk.Combobox): widget.configure(state='readonly' if active else 'disabled')
-                    else: widget.configure(state=state)
-                except tk.TclError: pass
-
-    def toggle_merge_related_options_active_state(self, *args):
-        if not hasattr(self, 'process_as_segments_var'): return
-        active = self.process_as_segments_var.get()
-        current_processing_state = tk.DISABLED
-        if hasattr(self, 'start_button') and self.start_button and hasattr(self, 'cancel_button') and self.cancel_button:
-            try:
-                if self.start_button.cget('state') == tk.DISABLED and self.cancel_button.cget('state') == tk.NORMAL:
-                    current_processing_state = tk.DISABLED
-                else: current_processing_state = tk.NORMAL
-            except tk.TclError: pass
-        effective_state_for_merge_options = tk.DISABLED
-        if current_processing_state == tk.NORMAL and active: effective_state_for_merge_options = tk.NORMAL
-        if hasattr(self, 'merge_related_widgets_references'):
-            for widget_tuple_or_item in self.merge_related_widgets_references:
-                items_to_configure = widget_tuple_or_item if isinstance(widget_tuple_or_item, tuple) else (widget_tuple_or_item,)
-                for widget_item in items_to_configure:
-                    if hasattr(widget_item, 'configure'):
-                        try:
-                            if isinstance(widget_item, ttk.Combobox): widget_item.configure(state='readonly' if effective_state_for_merge_options == tk.NORMAL else 'disabled')
-                            else: widget_item.configure(state=effective_state_for_merge_options)
-                        except tk.TclError: pass
-        if not active:
-            if current_processing_state == tk.NORMAL:
-                for var_attr_name in ['keep_intermediate_npz_var', 'merge_dither_var', 'merge_gamma_correct_var', 'merge_percentile_norm_var']:
-                    if hasattr(self, var_attr_name):
-                        var_to_set = getattr(self, var_attr_name)
-                        if var_to_set: var_to_set.set(False)
-        self.toggle_keep_npz_dependent_options_state()
-        self.toggle_dither_options_active_state()
-        self.toggle_gamma_options_active_state()
-        self.toggle_percentile_norm_options_active_state()
-
-    def toggle_percentile_norm_options_active_state(self, *args):
-        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_percentile_norm_var')): return
-        active = self.process_as_segments_var.get() and self.merge_percentile_norm_var.get()
-        state = tk.NORMAL if active else tk.DISABLED
-        for attr_name in ['lbl_low_perc', 'entry_low_perc', 'lbl_high_perc', 'entry_high_perc']:
-            if hasattr(self, attr_name):
-                widget = getattr(self, attr_name)
-                if widget and hasattr(widget, 'configure'):
-                    try: widget.configure(state=state)
-                    except tk.TclError: pass
-    
-    def toggle_secondary_output_options_active_state(self, *args):
-        if not hasattr(self, 'enable_dual_output_robust_norm') or not hasattr(self, 'secondary_output_widgets_references'):
-            return
-
-        active = self.enable_dual_output_robust_norm.get()
-        state = tk.NORMAL if active else tk.DISABLED
-
-        for widget_item in self.secondary_output_widgets_references:
-            if isinstance(widget_item, tuple): # Handle cases where we might store (label, entry_frame)
-                for item in widget_item:
-                    if hasattr(item, 'configure'):
-                        try:
-                            if isinstance(item, ttk.Combobox): item.configure(state='readonly' if active else 'disabled')
-                            else: item.configure(state=state)
-                        except tk.TclError: pass
-            elif hasattr(widget_item, 'configure'):
-                try:
-                    if isinstance(widget_item, ttk.Combobox): widget_item.configure(state='readonly' if active else 'disabled')
-                    else: widget_item.configure(state=state)
-                except tk.TclError: pass
-                
     def _apply_all_settings(self, settings_data: dict):
         for key, value_from_json in settings_data.items():
             if key == "target_fps": # Specific debug
@@ -2412,9 +1308,9 @@ class DepthCrafterGUI:
         help_window.wait_window()
         _logger.debug(f"Displayed help overview for '{help_key}'.")
         
-    def _start_processing_wrapper(self, video_processing_jobs, base_job_info_map):
+    def _start_processing_wrapper(self, video_processing_jobs, base_job_info_map, effective_seed_for_run):
         try: 
-            self.start_processing(video_processing_jobs, base_job_info_map)
+            self.start_processing(video_processing_jobs, base_job_info_map, effective_seed_for_run)
         finally: 
             self._set_ui_processing_state(False)
 
@@ -2425,7 +1321,1125 @@ class DepthCrafterGUI:
         else:
             logging.getLogger().setLevel(logging.INFO)  # Set root logger back to INFO
             _logger.info("Debug logging DISABLED (set to INFO level).")
+
+    def add_param(self, parent, label, var, row):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry = ttk.Entry(parent, textvariable=var, width=20)
+        entry.grid(row=row, column=1, padx=5, pady=2, sticky="w")
+        return entry
+
+    def browse_input_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.input_dir_or_file_var.get())
+        if folder:
+            self.input_dir_or_file_var.set(os.path.normpath(folder))
+            self.single_file_mode_active = False
+            if self._is_image_sequence_folder(folder):
+                self.current_input_mode = "image_sequence_folder"
+                _logger.info(f"GUI: Input mode set to Image Sequence Folder: {folder}")
+            else:
+                self.current_input_mode = "batch_folder"
+                _logger.info(f"GUI: Input mode set to Batch Folder: {folder}")
+
+    def browse_output(self):
+        folder = filedialog.askdirectory(initialdir=self.output_dir.get())
+        if folder: self.output_dir.set(os.path.normpath(folder))
+
+    def browse_single_input_file(self):
+        filetypes = [("All Supported", "*.mp4 *.avi *.mov *.mkv *.webm *.flv *.gif *.png *.jpg *.jpeg *.bmp *.tiff *.exr"),
+                     ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.flv *.gif"),
+                     ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.exr")]
+        
+        initial_dir_guess = self.input_dir_or_file_var.get()
+        if os.path.isfile(initial_dir_guess): initial_dir_guess = os.path.dirname(initial_dir_guess)
+        if not os.path.isdir(initial_dir_guess): initial_dir_guess = os.path.expanduser("~")
+
+
+        filepath = filedialog.askopenfilename(initialdir=initial_dir_guess, filetypes=filetypes)
+        if filepath:
+            self.input_dir_or_file_var.set(os.path.normpath(filepath))
+            self.single_file_mode_active = True
+            ext = os.path.splitext(filepath)[1].lower()
+            is_video = any(ext in vid_ext.replace("*", "") for vid_ext in self.VIDEO_EXTENSIONS)
+            is_image = any(ext in img_ext.replace("*", "") for img_ext in self.IMAGE_EXTENSIONS)
+
+            if is_video:
+                self.current_input_mode = "single_video_file"
+                _logger.info(f"GUI: Input mode set to Single Video File: {filepath}")
+            elif is_image:
+                self.current_input_mode = "single_image_file"
+                _logger.info(f"GUI: Input mode set to Single Image File: {filepath}")
+            else:
+                _logger.warning(f"GUI: Could not determine type of single file: {filepath}. Assuming video.")
+                self.current_input_mode = "single_video_file" 
+                messagebox.showwarning("Unknown File Type", f"Could not determine if '{os.path.basename(filepath)}' is a video or image. Assuming video.")
+
+    def create_widgets(self):
+        self.widgets_to_disable_during_processing = []
+        
+        # --- Input Source Frame ---
+        dir_frame = ttk.LabelFrame(self.root, text="Input Source")
+        dir_frame.pack(fill="x", padx=10, pady=5, expand=False)        
+        
+        ttk.Label(dir_frame, text="Input Folder/File:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        self.entry_input_dir_or_file = ttk.Entry(dir_frame, textvariable=self.input_dir_or_file_var, width=50)
+        self.entry_input_dir_or_file.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+        _create_hover_tooltip(self.entry_input_dir_or_file, "input_dir_or_file") # Tooltip for entry
+        
+        browse_buttons_frame = ttk.Frame(dir_frame)
+        browse_buttons_frame.grid(row=0, column=2, padx=5, pady=0, sticky="w")
+        
+        self.browse_input_folder_btn = ttk.Button(browse_buttons_frame, text="Browse Folder", command=self.browse_input_folder)
+        self.browse_input_folder_btn.pack(side=tk.LEFT, padx=(0,2))
+        _create_hover_tooltip(self.browse_input_folder_btn, "browse_input_folder") # Tooltip for button
+        
+        self.browse_single_file_btn = ttk.Button(browse_buttons_frame, text="Load Single File", command=self.browse_single_input_file)
+        self.browse_single_file_btn.pack(side=tk.LEFT, padx=(2,0))
+        _create_hover_tooltip(self.browse_single_file_btn, "browse_single_file") # Tooltip for button
+        
+        dir_frame.columnconfigure(1, weight=1)
+        self.widgets_to_disable_during_processing.extend([
+            self.entry_input_dir_or_file, 
+            self.browse_input_folder_btn, 
+            self.browse_single_file_btn
+        ])
+
+        ttk.Label(dir_frame, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.entry_output_dir = ttk.Entry(dir_frame, textvariable=self.output_dir, width=50)
+        self.entry_output_dir.grid(row=1, column=1, padx=5, pady=2)
+        _create_hover_tooltip(self.entry_output_dir, "output_dir") # Tooltip for entry
+        
+        self.browse_output_btn = ttk.Button(dir_frame, text="Browse", command=self.browse_output)
+        self.browse_output_btn.grid(row=1, column=2, padx=5, pady=2)
+        _create_hover_tooltip(self.browse_output_btn, "browse_output") # Tooltip for button
+        
+        self.widgets_to_disable_during_processing.extend([self.entry_output_dir, self.browse_output_btn])
+
+        # --- Settings Container Frame (New) ---
+        # This frame will hold the Main Params, Frame & Segment Control, Merged Output, and Secondary Output frames.
+        settings_container_frame = ttk.Frame(self.root)
+        settings_container_frame.pack(fill="x", padx=10, pady=0, expand=False)
+        settings_container_frame.columnconfigure(0, weight=1)
+        settings_container_frame.columnconfigure(1, weight=1)
+
+        # --- Main Parameters Frame ---
+        main_params_frame = ttk.LabelFrame(settings_container_frame, text="Main Parameters")
+        main_params_frame.grid(row=0, column=0, padx=(0,5), pady=5, sticky="nsew") # Placed in new container
+        row_idx = 0
+        
+        # Guidance Scale
+        ttk.Label(main_params_frame, text="Guidance Scale:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_guidance_scale = ttk.Entry(main_params_frame, textvariable=self.guidance_scale, width=18)
+        entry_guidance_scale.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_guidance_scale, "guidance_scale")
+        self.widgets_to_disable_during_processing.append(entry_guidance_scale); row_idx += 1
+        
+        # Inference Steps
+        ttk.Label(main_params_frame, text="Inference Steps:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_inference_steps = ttk.Entry(main_params_frame, textvariable=self.inference_steps, width=18)
+        entry_inference_steps.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_inference_steps, "inference_steps")
+        self.widgets_to_disable_during_processing.append(entry_inference_steps); row_idx += 1
+
+        # Target Width
+        ttk.Label(main_params_frame, text="Target Width:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_target_width = ttk.Entry(main_params_frame, textvariable=self.target_width, width=18)
+        entry_target_width.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_target_width, "target_width")
+        self.widgets_to_disable_during_processing.append(entry_target_width); row_idx += 1
+
+        # Target Height
+        ttk.Label(main_params_frame, text="Target Height:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_target_height = ttk.Entry(main_params_frame, textvariable=self.target_height, width=18)
+        entry_target_height.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_target_height, "target_height")
+        self.widgets_to_disable_during_processing.append(entry_target_height); row_idx += 1
+
+        # Seed
+        ttk.Label(main_params_frame, text="Seed:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_seed = ttk.Entry(main_params_frame, textvariable=self.seed, width=18)
+        entry_seed.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_seed, "seed")
+        self.widgets_to_disable_during_processing.append(entry_seed); row_idx += 1
+        
+        # CPU Offload Mode
+        ttk.Label(main_params_frame, text="CPU Offload Mode:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        self.combo_cpu_offload = ttk.Combobox(main_params_frame, textvariable=self.cpu_offload, values=["model", "sequential", ""], width=17, state="readonly")
+        self.combo_cpu_offload.grid(row=row_idx, column=1, padx=5, pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_cpu_offload, "cpu_offload")
+        self.widgets_to_disable_during_processing.append(self.combo_cpu_offload); row_idx += 1
+
+        # --- Frame & Segment Control Frame ---
+        fs_frame = ttk.LabelFrame(settings_container_frame, text="Frame & Segment Control")
+        fs_frame.grid(row=0, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
+
+        row_idx = 0 
+        
+        # Window Size
+        ttk.Label(fs_frame, text="Window Size:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_window_size = ttk.Entry(fs_frame, textvariable=self.window_size, width=18)
+        entry_window_size.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_window_size, "window_size")
+        self.widgets_to_disable_during_processing.append(entry_window_size); row_idx += 1
+        
+        # Overlap
+        ttk.Label(fs_frame, text="Overlap:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_overlap = ttk.Entry(fs_frame, textvariable=self.overlap, width=18)
+        entry_overlap.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_overlap, "overlap")
+        self.widgets_to_disable_during_processing.append(entry_overlap); row_idx += 1
+        
+        # Target FPS
+        ttk.Label(fs_frame, text="Target FPS (-1 Original):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_target_fps = ttk.Entry(fs_frame, textvariable=self.target_fps, width=18)
+        entry_target_fps.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_target_fps, "target_fps")
+        self.widgets_to_disable_during_processing.append(entry_target_fps); row_idx += 1
+        
+        # Process Max Frames
+        ttk.Label(fs_frame, text="Process Max Frames (-1 All):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_process_length = ttk.Entry(fs_frame, textvariable=self.process_length, width=18)
+        entry_process_length.grid(row=row_idx, column=1, padx=(5,0), pady=2, sticky="w")
+        _create_hover_tooltip(entry_process_length, "process_length")
+        self.widgets_to_disable_during_processing.append(entry_process_length); row_idx += 1
+        
+        # Save Sidecar JSON for Final Output
+        self.save_final_json_cb = ttk.Checkbutton(fs_frame, text="Save Sidecar JSON for Final Output", variable=self.save_final_output_json_var)
+        self.save_final_json_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.save_final_json_cb, "save_final_json")
+        self.widgets_to_disable_during_processing.append(self.save_final_json_cb); row_idx +=1
+
+        # Process as Segments
+        self.process_as_segments_cb = ttk.Checkbutton(fs_frame, text="Process as Segments (Low VRAM Mode)", variable=self.process_as_segments_var, command=self.toggle_merge_related_options_active_state)
+        self.process_as_segments_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.process_as_segments_cb, "process_as_segments")
+        self.widgets_to_disable_during_processing.append(self.process_as_segments_cb); row_idx += 1
+
+        # --- Merged Output Options Frame ---
+        merge_opts_frame = ttk.LabelFrame(settings_container_frame, text="Merged Output Options (if segments processed)")
+        merge_opts_frame.grid(row=1, column=0, padx=(0,5), pady=5, sticky="nsew") # Placed in new container
+        merge_opts_frame.columnconfigure(0, minsize=120) # Ensure column 0 for labels is wide enough
+        self.merge_related_widgets_references = []
+        self.keep_npz_dependent_widgets = []
+        row_idx = 0
+
+        # Keep intermediate NPZ files
+        self.keep_npz_cb = ttk.Checkbutton(merge_opts_frame, text="Keep intermediate NPZ", variable=self.keep_intermediate_npz_var, command=self.toggle_keep_npz_dependent_options_state)
+        self.keep_npz_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.keep_npz_cb, "keep_npz")
+        self.merge_related_widgets_references.append(self.keep_npz_cb)
+        self.widgets_to_disable_during_processing.append(self.keep_npz_cb); row_idx += 1
+
+        # Min Orig. Vid Frames to Keep NPZ
+        self.lbl_min_frames_npz = ttk.Label(merge_opts_frame, text="  ↳ Min thesh. to Keep NPZ:")
+        self.lbl_min_frames_npz.grid(row=row_idx, column=0, sticky="e", padx=(20,2), pady=2)
+        self.entry_min_frames_npz = ttk.Entry(merge_opts_frame, textvariable=self.min_frames_to_keep_npz_var, width=7)
+        self.entry_min_frames_npz.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(self.entry_min_frames_npz, "min_frames_npz")
+        self.keep_npz_dependent_widgets.extend([self.lbl_min_frames_npz, self.entry_min_frames_npz])
+        self.widgets_to_disable_during_processing.extend([self.lbl_min_frames_npz, self.entry_min_frames_npz]); row_idx += 1
+
+        # Segment Visual Format
+        self.lbl_intermediate_fmt = ttk.Label(merge_opts_frame, text="  ↳ Segment Format:")
+        self.lbl_intermediate_fmt.grid(row=row_idx, column=0, sticky="e", padx=(20,2), pady=2)
+        combo_intermediate_fmt_values = ["png_sequence", "mp4", "main10_mp4", "none"]
+        if OPENEXR_AVAILABLE_GUI: combo_intermediate_fmt_values.extend(["exr_sequence", "exr"])
+        self.combo_intermediate_fmt = ttk.Combobox(merge_opts_frame, textvariable=self.keep_intermediate_segment_visual_format_var, values=combo_intermediate_fmt_values, width=17, state="readonly")
+        self.combo_intermediate_fmt.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_intermediate_fmt, "segment_visual_format")
+        self.keep_npz_dependent_widgets.extend([self.lbl_intermediate_fmt, self.combo_intermediate_fmt])
+        self.widgets_to_disable_during_processing.extend([self.lbl_intermediate_fmt, self.combo_intermediate_fmt]); row_idx += 1
+        self.toggle_keep_npz_dependent_options_state()
+
+        # Dithering (MP4)
+        self.merge_dither_cb = ttk.Checkbutton(merge_opts_frame, text="Dithering", variable=self.merge_dither_var, command=self.toggle_dither_options_active_state)
+        self.merge_dither_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.merge_dither_cb, "merge_dither") # Tooltip on checkbox
+        
+        dither_details_frame = ttk.Frame(merge_opts_frame)
+        dither_details_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
+        self.lbl_dither_str = ttk.Label(dither_details_frame, text="Strength:")
+        self.lbl_dither_str.pack(side=tk.LEFT, padx=(0, 2))
+        self.entry_dither_str = ttk.Entry(dither_details_frame, textvariable=self.merge_dither_strength_var, width=7)
+        self.entry_dither_str.pack(side=tk.LEFT, padx=(0, 0))
+        _create_hover_tooltip(self.entry_dither_str, "merge_dither_strength") # Tooltip on entry
+        
+        self.merge_related_widgets_references.append((self.merge_dither_cb, dither_details_frame))
+        self.widgets_to_disable_during_processing.extend([self.merge_dither_cb, self.lbl_dither_str, self.entry_dither_str]); row_idx += 1
+        self.toggle_dither_options_active_state() # Call after creation
+
+        # Gamma Correct (MP4)
+        self.merge_gamma_cb = ttk.Checkbutton(merge_opts_frame, text="Gamma Adjust", variable=self.merge_gamma_correct_var, command=self.toggle_gamma_options_active_state)
+        self.merge_gamma_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.merge_gamma_cb, "merge_gamma") # Tooltip on checkbox
+        
+        gamma_details_frame = ttk.Frame(merge_opts_frame)
+        gamma_details_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
+        self.lbl_gamma_val = ttk.Label(gamma_details_frame, text="Value:")
+        self.lbl_gamma_val.pack(side=tk.LEFT, padx=(0, 2))
+        self.entry_gamma_val = ttk.Entry(gamma_details_frame, textvariable=self.merge_gamma_value_var, width=7)
+        self.entry_gamma_val.pack(side=tk.LEFT, padx=(0, 0))
+        _create_hover_tooltip(self.entry_gamma_val, "merge_gamma_value") # Tooltip on entry
+        
+        self.merge_related_widgets_references.append((self.merge_gamma_cb, gamma_details_frame))
+        self.widgets_to_disable_during_processing.extend([self.merge_gamma_cb, self.lbl_gamma_val, self.entry_gamma_val]); row_idx += 1
+        self.toggle_gamma_options_active_state() # Call after creation
+
+        # Percentile Normalization
+        self.merge_perc_norm_cb = ttk.Checkbutton(merge_opts_frame, text="Normalization", variable=self.merge_percentile_norm_var, command=self.toggle_percentile_norm_options_active_state)
+        self.merge_perc_norm_cb.grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.merge_perc_norm_cb, "merge_percentile_norm") # Tooltip on checkbox
+        
+        low_high_frame = ttk.Frame(merge_opts_frame)
+        low_high_frame.grid(row=row_idx, column=1, sticky="w", padx=(0,0))
+        self.lbl_low_perc = ttk.Label(low_high_frame, text="Low:")
+        self.lbl_low_perc.pack(side=tk.LEFT, padx=(0,2))
+        self.entry_low_perc = ttk.Entry(low_high_frame, textvariable=self.merge_norm_low_perc_var, width=7)
+        self.entry_low_perc.pack(side=tk.LEFT, padx=(0,10))
+        self.lbl_high_perc = ttk.Label(low_high_frame, text="High:")
+        self.lbl_high_perc.pack(side=tk.LEFT, padx=(0,2))
+        self.entry_high_perc = ttk.Entry(low_high_frame, textvariable=self.merge_norm_high_perc_var, width=7)
+        self.entry_high_perc.pack(side=tk.LEFT, padx=(0,0))
+        ttk.Label(merge_opts_frame, text="  ↳").grid(row=row_idx, column=0, sticky="e", padx=(10,2)) # Aligns with the checkbox
+        _create_hover_tooltip(self.entry_low_perc, "merge_norm_low_perc") # Tooltip on entry
+        _create_hover_tooltip(self.entry_high_perc, "merge_norm_high_perc") # Tooltip on entry
+        
+        self.merge_related_widgets_references.append(self.merge_perc_norm_cb)
+        self.widgets_to_disable_during_processing.extend([self.lbl_low_perc, self.entry_low_perc, self.lbl_high_perc, self.entry_high_perc]); row_idx += 1
+        self.toggle_percentile_norm_options_active_state()
+
+        # Alignment Method
+        lbl_merge_alignment = ttk.Label(merge_opts_frame, text="Alignment Method:")
+        lbl_merge_alignment.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        self.combo_merge_alignment = ttk.Combobox(merge_opts_frame, textvariable=self.merge_alignment_method_var, values=["Shift & Scale", "Linear Blend"], width=17, state="readonly")
+        self.combo_merge_alignment.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_merge_alignment, "merge_alignment_method")
+        self.merge_related_widgets_references.append((lbl_merge_alignment, self.combo_merge_alignment))
+        self.widgets_to_disable_during_processing.extend([lbl_merge_alignment, self.combo_merge_alignment]); row_idx += 1
+        
+        # Output Format
+        lbl_merge_fmt = ttk.Label(merge_opts_frame, text="Output Format:")
+        lbl_merge_fmt.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        merge_fmt_values = ["mp4", "main10_mp4", "png_sequence"] + (["exr_sequence", "exr"] if OPENEXR_AVAILABLE_GUI else [])
+        self.combo_merge_fmt = ttk.Combobox(merge_opts_frame, textvariable=self.merge_output_format_var, values=merge_fmt_values, width=17, state="readonly")
+        self.combo_merge_fmt.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_merge_fmt, "merge_output_format")
+        self.merge_related_widgets_references.append((lbl_merge_fmt, self.combo_merge_fmt))
+        self.widgets_to_disable_during_processing.extend([lbl_merge_fmt, self.combo_merge_fmt]); row_idx += 1
+
+        # Output Suffix
+        lbl_merge_suffix = ttk.Label(merge_opts_frame, text="Output Suffix:")
+        lbl_merge_suffix.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        self.entry_merge_suffix = ttk.Entry(merge_opts_frame, textvariable=self.merge_output_suffix_var, width=18)
+        self.entry_merge_suffix.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(self.entry_merge_suffix, "merge_output_suffix")
+        self.merge_related_widgets_references.append((lbl_merge_suffix, self.entry_merge_suffix))
+        self.widgets_to_disable_during_processing.extend([lbl_merge_suffix, self.entry_merge_suffix]); row_idx += 1
+
+        # --- NEW: Secondary Output Frame ---
+        secondary_output_frame = ttk.LabelFrame(settings_container_frame, text="Secondary Output")
+        secondary_output_frame.grid(row=1, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
+        secondary_output_frame.columnconfigure(0, minsize=140) # Adjust as needed
+        
+        row_idx = 0
+        # Enable Secondary Output Checkbox
+        self.enable_secondary_output_cb = ttk.Checkbutton(secondary_output_frame, text="Enable Secondary Output", variable=self.enable_dual_output_robust_norm, command=self.toggle_secondary_output_options_active_state)
+        self.enable_secondary_output_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.enable_secondary_output_cb, "enable_secondary_output") # Add help_content.json entry
+        self.widgets_to_disable_during_processing.append(self.enable_secondary_output_cb); row_idx += 1
+        
+        # Depth Range (0-1) Low / High
+        ttk.Label(secondary_output_frame, text="Depth Output Range (0-1):").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        depth_range_frame = ttk.Frame(secondary_output_frame)
+        depth_range_frame.grid(row=row_idx, column=1, sticky="w", padx=0, pady=0)
+        
+        lbl_out_min = ttk.Label(depth_range_frame, text="Low:")
+        lbl_out_min.pack(side=tk.LEFT, padx=(0,2))
+        entry_out_min = ttk.Entry(depth_range_frame, textvariable=self.robust_norm_output_min, width=7)
+        entry_out_min.pack(side=tk.LEFT, padx=(0,10))
+        _create_hover_tooltip(entry_out_min, "robust_norm_output_min") # Add help_content.json entry
+        
+        lbl_out_max = ttk.Label(depth_range_frame, text="High:")
+        lbl_out_max.pack(side=tk.LEFT, padx=(0,2))
+        entry_out_max = ttk.Entry(depth_range_frame, textvariable=self.robust_norm_output_max, width=7)
+        entry_out_max.pack(side=tk.LEFT, padx=(0,0))
+        _create_hover_tooltip(entry_out_max, "robust_norm_output_max") # Add help_content.json entry
+        
+        self.secondary_output_widgets_references.extend([lbl_out_min, entry_out_min, lbl_out_max, entry_out_max])
+        self.widgets_to_disable_during_processing.extend([lbl_out_min, entry_out_min, lbl_out_max, entry_out_max]); row_idx += 1
+
+        # Normalize % Low / High
+        ttk.Label(secondary_output_frame, text="Clipped Output % Range:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        norm_perc_frame = ttk.Frame(secondary_output_frame)
+        norm_perc_frame.grid(row=row_idx, column=1, sticky="w", padx=0, pady=0)
+        
+        lbl_norm_low = ttk.Label(norm_perc_frame, text="Low:")
+        lbl_norm_low.pack(side=tk.LEFT, padx=(0,2))
+        entry_norm_low = ttk.Entry(norm_perc_frame, textvariable=self.robust_norm_low_percentile, width=7)
+        entry_norm_low.pack(side=tk.LEFT, padx=(0,10))
+        _create_hover_tooltip(entry_norm_low, "robust_norm_low_percentile") # Add help_content.json entry
+        
+        lbl_norm_high = ttk.Label(norm_perc_frame, text="High:")
+        lbl_norm_high.pack(side=tk.LEFT, padx=(0,2))
+        entry_norm_high = ttk.Entry(norm_perc_frame, textvariable=self.robust_norm_high_percentile, width=7)
+        entry_norm_high.pack(side=tk.LEFT, padx=(0,0))
+        _create_hover_tooltip(entry_norm_high, "robust_norm_high_percentile") # Add help_content.json entry
+        
+        self.secondary_output_widgets_references.extend([lbl_norm_low, entry_norm_low, lbl_norm_high, entry_norm_high])
+        self.widgets_to_disable_during_processing.extend([lbl_norm_low, entry_norm_low, lbl_norm_high, entry_norm_high]); row_idx += 1
+
+        # Output Suffix
+        lbl_robust_suffix = ttk.Label(secondary_output_frame, text="Output Suffix:")
+        lbl_robust_suffix.grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        entry_robust_suffix = ttk.Entry(secondary_output_frame, textvariable=self.robust_output_suffix, width=18)
+        entry_robust_suffix.grid(row=row_idx, column=1, padx=(0,2), pady=2, sticky="w")
+        _create_hover_tooltip(entry_robust_suffix, "robust_output_suffix") # Add help_content.json entry
+        self.secondary_output_widgets_references.extend([lbl_robust_suffix, entry_robust_suffix])
+        self.widgets_to_disable_during_processing.extend([lbl_robust_suffix, entry_robust_suffix]); row_idx += 1
+
+        # --- Progress Bar and Status ---
+        progress_bar_frame = ttk.Frame(self.root)
+        progress_bar_frame.pack(pady=(10, 0), padx=10, fill="x", expand=False)
+        
+        self.progress = ttk.Progressbar(progress_bar_frame, orient="horizontal", length=300, mode="determinate")
+        self.progress.pack(fill=tk.X, expand=True, padx=0, pady=0)
+
+        # Status Label (NEW)
+        self.style.configure("Status.TLabel", anchor="center") 
+        self.status_label = ttk.Label(progress_bar_frame, text="Ready")
+        self.status_label.pack(padx=0, pady=2)
+
+        # --- Control Buttons ---
+        ctrl_frame = ttk.Frame(self.root)
+        ctrl_frame.pack(pady=(5, 10), padx=10, fill="x", expand=False)
+
+        # --- Container frame for buttons to center them ---
+        button_container_frame = ttk.Frame(ctrl_frame)
+        button_container_frame.pack(anchor="center") # Centers the button_container_frame within ctrl_frame
+
+        # --- Current Processing Information Frame ---
+        processing_info_frame = ttk.LabelFrame(self.root, text="Current Processing Information")
+        processing_info_frame.pack(fill="x", padx=10, pady=5, expand=False)
+        
+        # Grid layout for labels inside this frame
+        processing_info_frame.columnconfigure(0, weight=0) # Labels
+        processing_info_frame.columnconfigure(1, weight=1) # Values
+
+        row_idx = 0
+        # Filename
+        ttk.Label(processing_info_frame, text="Filename:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        lbl_filename = ttk.Label(processing_info_frame, textvariable=self.current_filename_var, anchor=tk.W)
+        lbl_filename.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
+        _create_hover_tooltip(lbl_filename, "current_filename") # Add tooltip
+        row_idx += 1
+
+        # Resolution
+        ttk.Label(processing_info_frame, text="Resolution:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        lbl_resolution = ttk.Label(processing_info_frame, textvariable=self.current_resolution_var, anchor=tk.W)
+        lbl_resolution.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
+        _create_hover_tooltip(lbl_resolution, "current_resolution") # Add tooltip
+        row_idx += 1
+
+        # Frames
+        ttk.Label(processing_info_frame, text="Frames:").grid(row=row_idx, column=0, sticky="w", padx=5, pady=2)
+        lbl_frames = ttk.Label(processing_info_frame, textvariable=self.current_frames_var, anchor=tk.W)
+        lbl_frames.grid(row=row_idx, column=1, sticky="ew", padx=5, pady=2)
+        _create_hover_tooltip(lbl_frames, "current_frames") # Add tooltip
+        row_idx += 1
+
+        start_frame = ttk.Frame(button_container_frame); start_frame.pack(side=tk.LEFT, padx=(0,2))
+        self.start_button = ttk.Button(start_frame, text="Start", command=self.start_thread, width=10)
+        self.start_button.pack(side=tk.LEFT)
+        _create_hover_tooltip(self.start_button, "start_button")        
+
+        cancel_frame = ttk.Frame(button_container_frame); cancel_frame.pack(side=tk.LEFT, padx=(2,2))
+        self.cancel_button = ttk.Button(cancel_frame, text="Cancel", command=self.stop_processing, width=10, state=tk.DISABLED)
+        self.cancel_button.pack(side=tk.LEFT)
+        _create_hover_tooltip(self.cancel_button, "cancel_button")
+
+        remerge_frame = ttk.Frame(button_container_frame); remerge_frame.pack(side=tk.LEFT, padx=(2,2))
+        self.remerge_button = ttk.Button(remerge_frame, text="Re-Merge Segments", command=self.re_merge_from_gui, width=18)
+        self.remerge_button.pack(side=tk.LEFT)
+        _create_hover_tooltip(self.remerge_button, "remerge_button")
+
+        genvis_frame = ttk.Frame(button_container_frame); genvis_frame.pack(side=tk.LEFT, padx=(2,2))
+        self.generate_visuals_button = ttk.Button(genvis_frame, text="Generate Seg Visuals", command=self.generate_segment_visuals_from_gui, width=20)
+        self.generate_visuals_button.pack(side=tk.LEFT)
+        _create_hover_tooltip(self.generate_visuals_button, "generate_visuals_button")
+
+        self.widgets_to_disable_during_processing.extend([
+            self.start_button, self.remerge_button,
+            self.generate_visuals_button
+        ])
+
+        # self.toggle_merge_related_options_active_state()
+
+    def generate_segment_visuals_from_gui(self):
+        if self.processing_thread and self.processing_thread.is_alive():
+            messagebox.showwarning("Busy", "Another process is running. Please wait."); return
+        meta_file = filedialog.askopenfilename(title="Select Master Metadata JSON for Segment Visual Generation", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], initialdir=self.output_dir.get())
+        if not meta_file: 
+            _logger.info("Segment visual generation cancelled: No master metadata file selected.")
+            return
+        vis_fmt = self.keep_intermediate_segment_visual_format_var.get()
+        if vis_fmt == "none": 
+            messagebox.showinfo("Info", "Segment Visual Format is 'none'. Select a valid format."); return
+        if not messagebox.askyesno("Generate/Overwrite Visuals?", f"Generate '{vis_fmt}' visuals for segments in '{os.path.basename(meta_file)}'?\nThis may overwrite existing visuals."):
+            _logger.info("Segment visual generation cancelled by user.")
+            return
+        args = {"master_meta_path": meta_file, "visual_format_to_generate": vis_fmt}
+        _logger.info(f"--- Starting Segment Visual Generation for: {os.path.basename(meta_file)} (Format: {vis_fmt}) ---")
+        self._set_ui_processing_state(True)
+        self.processing_thread = threading.Thread(target=self._execute_generate_segment_visuals_wrapper, args=(args,), daemon=True); self.processing_thread.start()
+        self.root.after(100, self.process_queue)
+
+    def load_config(self):
+        if os.path.exists(self.CONFIG_FILENAME):
+            try:
+                with open(self.CONFIG_FILENAME, "r") as f: config = json.load(f)
+                loaded_settings_for_tkvars = {k: v for k, v in config.items() if k in self.all_tk_vars}
+                for key, value in loaded_settings_for_tkvars.items():
+                    if key in self.all_tk_vars:
+                        try: self.all_tk_vars[key].set(value)
+                        except tk.TclError: 
+                            _logger.warning(f"Warning (GUI load_config): Could not set var {key} during early config load.")
+                
+                self.last_settings_dir = config.get(self.LAST_SETTINGS_DIR_CONFIG_KEY, os.getcwd())
+                
+                self.current_input_mode = config.get("current_input_mode", "batch_folder")
+                self.single_file_mode_active = config.get("single_file_mode_active", False)
+                
+                _logger.info(f"GUI: Configuration loaded from '{self.CONFIG_FILENAME}'.")
+            except Exception as e:
+                _logger.warning(f"Warning (GUI load_config): Could not load config '{self.CONFIG_FILENAME}': {e}")
+                self.last_settings_dir = os.getcwd()
+                self.current_input_mode = "batch_folder"
+                self.single_file_mode_active = False
+        else: 
+            self.last_settings_dir = os.getcwd()
+            self.current_input_mode = "batch_folder"
+            self.single_file_mode_active = False
+            _logger.info(f"GUI: Configuration file '{self.CONFIG_FILENAME}' not found. Using default settings.")
+
+    def on_close(self):
+        self.save_config()
+        if self.processing_thread and self.processing_thread.is_alive():
+            _logger.info("Stopping processing before exit...")
+            self.stop_event.set()
+            self.processing_thread.join(timeout=10)
+            if self.processing_thread.is_alive(): 
+                _logger.warning("Processing thread did not terminate gracefully. Forcing exit.")
+        
+        self.root.destroy()
+
+    def process_queue(self):
+        # The message queue is still used for progress bar updates
+        while not self.message_queue.empty():
+            try:
+                msg_type, content = self.message_queue.get_nowait()
+                if msg_type == "progress":
+                    self.progress["value"] = content
+                elif msg_type == "set_ui_state":
+                    self._set_ui_processing_state(content)
+            except queue.Empty:
+                break
+            except Exception as e:
+                _logger.exception(f"Error processing GUI queue: {e}")
+        
+        self.root.after(100, self.process_queue) # Still schedule, but only for progress/UI state
+
+    def re_merge_from_gui(self):
+        if not merge_depth_segments: 
+            messagebox.showerror("Error", "Merge module not available."); return
+        meta_file = filedialog.askopenfilename(title="Select Master Metadata JSON for Re-Merging", filetypes=[("JSON files", "*.json"), ("All files", "*.*")], initialdir=self.output_dir.get())
+        if not meta_file: return
+        
+        _logger.debug(f"DEBUG (re_merge_from_gui): enable_dual_output_robust_norm.get() is {self.enable_dual_output_robust_norm.get()}")
+        
+        base_name_from_meta = os.path.splitext(os.path.basename(meta_file))[0].replace("_master_meta", "")
+        output_suffix = self.merge_output_suffix_var.get()
+        remerge_base_name = f"{base_name_from_meta}{output_suffix}"
+
+        out_fmt = self.merge_output_format_var.get()
+        
+        def_ext_fmt = out_fmt
+        if out_fmt == "main10_mp4":
+            def_ext_fmt = "mp4"
+        elif out_fmt in ["png_sequence", "exr_sequence"]:
+            def_ext_fmt = ""
+        elif out_fmt == "exr":
+            def_ext_fmt = "exr"
+
+        def_ext = f".{def_ext_fmt}" if def_ext_fmt else ""
+
+        ftypes_map = {
+            "mp4": [("MP4 (H.264 8-bit)", "*.mp4")],
+            "main10_mp4": [("MP4 (HEVC 10-bit)", "*.mp4")],
+            "png_sequence": [("PNG Seq (Select Folder)", "")],
+            "exr_sequence": [("EXR Seq (Select Folder)", "")],
+            "exr": [("EXR File", "*.exr")]
+        }
+        curr_ftypes = ftypes_map.get(out_fmt, []) + [("All files", "*.*")]
+        out_path = None
+
+        if "sequence" in out_fmt:
+            parent_dir = filedialog.askdirectory(title=f"Select Parent Dir for Re-Merged {out_fmt.upper()} Sequence...", initialdir=self.output_dir.get())
+            if parent_dir: out_path = parent_dir
+        else:
+            initial_filename_for_dialog_actual = f"{remerge_base_name}{def_ext}"
+
+            out_path = filedialog.asksaveasfilename(
+                title=f"Save Re-Merged {out_fmt.upper()} As...", 
+                initialdir=self.output_dir.get(), 
+                initialfile=f"{remerge_base_name}{def_ext}",
+                defaultextension=def_ext, 
+                filetypes=curr_ftypes
+            )
+
+        if not out_path: 
+            _logger.info("Re-merge cancelled: No output path selected.")
+            return
             
+        align_method = "linear_blend" if self.merge_alignment_method_var.get() == "Linear Blend" else "shift_scale"
+        
+        args = {"master_meta_path": meta_file, "output_path_arg": out_path,
+                "do_dithering": self.merge_dither_var.get(), "dither_strength_factor": self.merge_dither_strength_var.get(),
+                "apply_gamma_correction": self.merge_gamma_correct_var.get(), "gamma_value": self.merge_gamma_value_var.get(),
+                "use_percentile_norm": self.merge_percentile_norm_var.get(), "norm_low_percentile": self.merge_norm_low_perc_var.get(),
+                "norm_high_percentile": self.merge_norm_high_perc_var.get(), "output_format": out_fmt,
+                "merge_alignment_method": align_method,
+                "output_filename_override_base": remerge_base_name,
+                "enable_dual_output_robust_norm": self.enable_dual_output_robust_norm.get(),
+                "robust_norm_low_percentile": self.robust_norm_low_percentile.get(),
+                "robust_norm_high_percentile": self.robust_norm_high_percentile.get(),
+                "robust_norm_output_min": self.robust_norm_output_min.get(),
+                "robust_norm_output_max": self.robust_norm_output_max.get(),
+                "robust_output_suffix": self.robust_output_suffix.get(),
+                "is_depth_far_black": self.is_depth_far_black.get()
+                }
+
+        if self.processing_thread and self.processing_thread.is_alive():
+            messagebox.showwarning("Busy", "Another process is running. Please wait."); return
+        
+        _logger.info(f"--- Starting Re-Merge for: {os.path.basename(meta_file)} ---")
+        self._set_ui_processing_state(True)
+        self.processing_thread = threading.Thread(target=self._execute_re_merge_wrapper, args=(args,), daemon=True); self.processing_thread.start()
+        self.root.after(100, self.process_queue)
+
+    def start_thread(self):
+        if self.processing_thread and self.processing_thread.is_alive():
+            _logger.warning("Processing is already running.")
+            return
+
+        input_path_str = self.input_dir_or_file_var.get()
+        if not input_path_str or not os.path.exists(input_path_str):
+            _logger.error(f"GUI: Input path field is empty or path does not exist: {input_path_str}")
+            messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
+            return
+        
+        # --- ADD THESE LINES HERE ---
+        _logger.info("Scanning input folder: Please wait...")
+        self.status_message_var.set("Scanning input folder...")
+        self.root.update_idletasks() # Force GUI update to show "Scanning..." immediately
+        # ----------------------------
+
+        determined_mode, determined_single_source = self._determine_input_mode_from_path(input_path_str)
+        
+        self.current_input_mode = determined_mode
+        self.single_file_mode_active = determined_single_source
+
+        if not os.path.exists(input_path_str):
+            _logger.error(f"GUI: Input path is invalid or does not exist: {input_path_str}")
+            messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
+            return
+
+        sources_to_process_specs = []
+
+        if self.single_file_mode_active:
+            self.effective_move_original_on_completion = False
+            basename = ""
+            if self.current_input_mode == "image_sequence_folder":
+                basename = os.path.basename(input_path_str)
+            else:
+                basename = os.path.splitext(os.path.basename(input_path_str))[0]
+            
+            sources_to_process_specs.append({
+                "path": input_path_str,
+                "type": self.current_input_mode, 
+                "basename": basename
+            })
+        else:
+            self.effective_move_original_on_completion = self.MOVE_ORIGINAL_TO_FINISHED_FOLDER_ON_COMPLETION
+            if self.current_input_mode == "batch_folder":
+                try:
+                    for item_name in os.listdir(input_path_str):
+                        item_full_path = os.path.join(input_path_str, item_name)
+                        if os.path.isfile(item_full_path):
+                            ext = os.path.splitext(item_name)[1].lower()
+                            if any(ext in vid_ext.replace("*", "") for vid_ext in self.VIDEO_EXTENSIONS):
+                                basename = os.path.splitext(item_name)[0]
+                                sources_to_process_specs.append({
+                                    "path": item_full_path,
+                                    "type": "video_file",
+                                    "basename": basename
+                                })
+                        elif os.path.isdir(item_full_path):
+                            if self._is_image_sequence_folder(item_full_path):
+                                basename = item_name 
+                                sources_to_process_specs.append({
+                                    "path": item_full_path,
+                                    "type": "image_sequence_folder",
+                                    "basename": basename
+                                })
+                except NotADirectoryError:
+                    _logger.error(f"GUI Input: Path '{input_path_str}' is not a directory, but batch processing mode was attempted.")
+                    messagebox.showerror("Error", f"Input path is not a directory for batch processing: {input_path_str}")
+                    return
+                except OSError as e:
+                    _logger.error(f"GUI Input: OS error when trying to list directory '{input_path_str}'. Error: {e}")
+                    messagebox.showerror("Error", f"Could not read directory contents for '{input_path_str}':\n{e}")
+                    return
+            else:
+                _logger.critical(f"GUI Start Thread: Unexpected mode '{self.current_input_mode}' for path '{input_path_str}' after explicit determination. This indicates a logic error.")
+                messagebox.showerror("Internal Error", f"Unexpected input mode '{self.current_input_mode}' for path '{input_path_str}'. Please report this.")
+                return
+
+
+        if not sources_to_process_specs:
+            _logger.warning(f"GUI: No valid video files or image sequences found in '{input_path_str}' for mode '{self.current_input_mode}'.")
+            return
+        
+        # --- NEW SEED GENERATION GUARD ---
+        gui_seed_setting = self.seed.get()
+        effective_seed_for_run = gui_seed_setting
+        if effective_seed_for_run < 0:
+            effective_seed_for_run = random.randint(0, 2**32 - 1)
+            _logger.debug(f"GUI: Seed was set to {gui_seed_setting} (negative). Generating a new random seed for this run: {effective_seed_for_run}")
+        else:
+            _logger.debug(f"GUI: Using user-specified seed: {effective_seed_for_run}")
+
+        final_jobs_to_process = []
+        base_job_info_map_for_run = {} 
+
+        gui_fps_setting = self.target_fps.get()
+        gui_len_setting = self.process_length.get()
+        gui_win_setting = self.window_size.get()
+        gui_ov_setting = self.overlap.get()
+
+        for source_spec in sources_to_process_specs:
+            source_path = source_spec["path"]
+            current_gui_mode = source_spec["type"] 
+            base_name = source_spec["basename"]
+
+            source_type_for_define = ""
+            if current_gui_mode == "single_video_file" or current_gui_mode == "video_file":
+                source_type_for_define = "video_file"
+            elif current_gui_mode == "image_sequence_folder":
+                source_type_for_define = "image_sequence_folder"
+            elif current_gui_mode == "single_image_file":
+                source_type_for_define = "single_image_file"
+            else:
+                _logger.error(f"GUI Start Thread: Unknown source_spec type '{current_gui_mode}' for basename '{base_name}'. Cannot map to define_video_segments source type.")
+                continue
+
+            all_potential_segments_for_video, base_job_info_initial = define_video_segments(
+                video_path_or_folder=source_path,
+                original_basename=base_name,
+                gui_target_fps_setting=gui_fps_setting,
+                gui_process_length_overall=gui_len_setting,
+                gui_segment_output_window_frames=gui_win_setting,
+                gui_segment_output_overlap_frames=gui_ov_setting,
+                source_type=source_type_for_define,
+                gui_target_height_setting=self.target_height.get(), # <--- ADD THIS
+                gui_target_width_setting=self.target_width.get(), 
+            )
+
+            if not base_job_info_initial:
+                _logger.info(f"Skipping {base_name}: Issues in segment definition (metadata error).")
+                continue
+            
+            base_job_info_map_for_run[source_path] = base_job_info_initial.copy()
+
+            if self.process_as_segments_var.get():
+                if not all_potential_segments_for_video:
+                    reason_skip = "Too short or invalid overlap/settings" if base_job_info_initial.get("original_video_raw_frame_count", 0) > 0 else "Source issue or zero frames/duration"
+                    _logger.info(f"GUI: No segments defined by settings for {base_name} (Reason: {reason_skip}). Skipping processing for this video.")
+                    continue
+
+                segment_subfolder_name = get_segment_output_folder_name(base_name)
+                segment_subfolder_path = os.path.join(self.output_dir.get(), segment_subfolder_name)
+                current_video_base_info_ref = base_job_info_map_for_run[source_path]
+                
+                segments_for_this_video, action_taken = self._get_segments_to_resume_or_overwrite(
+                    source_path, base_name, segment_subfolder_path, all_potential_segments_for_video,
+                    current_video_base_info_ref
+                )
+                _logger.debug(f"For video '{base_name}': Action '{action_taken}', {len(segments_for_this_video)} segments will be processed.")
+                if segments_for_this_video:
+                    final_jobs_to_process.extend(segments_for_this_video)
+            
+            else:
+                full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(base_name, "mp4"))
+                proceed_full = True
+                if os.path.exists(full_out_check_path):
+                    if not messagebox.askyesno("Overwrite?", f"An output file for '{base_name}' might exist (e.g., MP4):\n{full_out_check_path}\n\nOverwrite if it exists?"):
+                        _logger.info(f"Skipping {base_name} (full video processing, user chose not to overwrite).")
+                        proceed_full = False
+                
+                if proceed_full:
+                    full_source_job = {
+                        **base_job_info_initial,
+                        "is_segment": False,
+                        "gui_desired_output_window_frames": gui_win_setting, 
+                        "gui_desired_output_overlap_frames": gui_ov_setting 
+                    }
+                    final_jobs_to_process.append(full_source_job)
+
+        if final_jobs_to_process:
+            # --- ADDED THESE LINES TO RESET PREVIOUS JOB INFO ---
+            self.current_filename_var.set("N/A")
+            self.current_resolution_var.set("N/A")
+            self.current_frames_var.set("N/A")
+            # --------------------------------------------------
+            self.status_message_var.set("Starting processing...")
+            self._set_ui_processing_state(True)
+            self.processing_thread = threading.Thread(target=self._start_processing_wrapper, 
+                                                      args=(final_jobs_to_process, base_job_info_map_for_run,
+                                                      effective_seed_for_run), 
+                                                      daemon=True)
+            self.processing_thread.start()
+            self.root.after(100, self.process_queue) # Start queue processing for progress updates
+        else:
+            _logger.info("No videos/segments to process after considering existing data and user choices (or all skipped).")
+
+    def start_processing(self, video_processing_jobs, base_job_info_map, effective_seed_for_run):
+        self.stop_event.clear()
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(video_processing_jobs)
+        _logger.info(f"Starting batch processing for {len(video_processing_jobs)} items...")
+        self.status_message_var.set("Starting processing...")
+
+        returned_job_specific_metadata_last_job = {} 
+        
+        try:
+            # Log model loading strategy
+            if not self.use_local_models_only_var.get():
+                _logger.info("Attempting to check model at Hugging Face Hub against local.")
+            else:
+                _logger.info("Attempting to load local model.")
+
+            disable_xformers_for_run = self.disable_xformers_var.get()
+
+            demo = DepthCrafterDemo(
+                unet_path="tencent/DepthCrafter",
+                pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
+                cpu_offload=self.cpu_offload.get(),
+                use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
+                local_files_only=self.use_local_models_only_var.get(),
+                disable_xformers=disable_xformers_for_run,
+            )
+        except Exception as e:
+            _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
+            self.status_message_var.set(f"Error: Model initialization failed. See console.")
+            self.current_filename_var.set("N/A")
+            self.current_resolution_var.set("N/A")
+            self.current_frames_var.set("N/A")
+            return 
+
+        all_videos_master_metadata = {} 
+        
+        for i, job_info_to_run in enumerate(video_processing_jobs):
+            if self.stop_event.is_set():
+                _logger.info("Processing cancelled by user after current item.")
+                self.status_message_var.set("Stopping...")
+                self.current_filename_var.set("N/A") # Reset immediately on stop
+                self.current_resolution_var.set("N/A") # Reset immediately on stop
+                self.current_frames_var.set("N/A") # Reset immediately on stop
+                self.root.update_idletasks() # Ensure this reset is visible
+                break
+            
+            current_video_path = job_info_to_run["video_path"] 
+            original_basename = job_info_to_run["original_basename"]
+            is_segment_job = job_info_to_run.get("is_segment", False)
+
+            log_msg_prefix = f"Segment {job_info_to_run.get('segment_id', -1)+1}/{job_info_to_run.get('total_segments', 0)}" if is_segment_job else "Full video"
+            
+            # --- START PART A: INITIAL GUI UPDATE (TARGET/EXPECTED VALUES) ---
+            _logger.debug(f"DEBUG GUI UPDATE (Initial): Starting update for {original_basename}")
+            self.current_filename_var.set(f"{original_basename} ({log_msg_prefix})") 
+            
+            # Initial Resolution (using target_height/width setting and original dimensions as a hint)
+            target_h_setting = self.target_height.get()
+            target_w_setting = self.target_width.get()
+
+            initial_display_res = "N/A"
+            if target_h_setting > 0 and target_w_setting > 0:
+                 initial_display_res = f"{target_w_setting}x{target_h_setting}"
+            else:
+                 original_h = job_info_to_run.get("original_height", "N/A")
+                 original_w = job_info_to_run.get("original_width", "N/A")
+                 if original_h != "N/A" and original_w != "N/A":
+                     initial_display_res = f"{original_w}x{original_h} (Original/Fallback)"
+            self.current_resolution_var.set(initial_display_res)
+
+            # Initial Frames (using gui settings for segment/process_length)
+            total_frames_orig_vid = job_info_to_run.get('original_video_raw_frame_count', 'N/A')
+            initial_display_frames_str = "N/A"
+            if is_segment_job:
+                window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
+                overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
+                num_frames_to_load_raw = job_info_to_run.get("num_frames_to_load_raw", "N/A")
+                if num_frames_to_load_raw != "N/A" and window_size_setting != "N/A" and overlap_size_setting != "N/A":
+                    initial_display_frames_str = f"{num_frames_to_load_raw}"
+                elif num_frames_to_load_raw != "N/A":
+                    initial_display_frames_str = f"{num_frames_to_load_raw}"
+                
+                if total_frames_orig_vid != "N/A" and str(num_frames_to_load_raw) != str(total_frames_orig_vid):
+                    initial_display_frames_str += f" of {total_frames_orig_vid}"
+            else: # Full video
+                process_length_setting = self.process_length.get()
+                if process_length_setting != -1:
+                    initial_display_frames_str = f"{process_length_setting}"
+                else:
+                    initial_display_frames_str = f"{total_frames_orig_vid}"
+            self.current_frames_var.set(initial_display_frames_str)
+
+            self.root.update_idletasks() # Force GUI update for initial display
+            # --- END PART A: INITIAL GUI UPDATE ---
+
+            if current_video_path not in all_videos_master_metadata:
+                current_video_comprehensive_base_info = base_job_info_map.get(current_video_path, {})
+                total_segments_for_this_video_overall = job_info_to_run.get("total_segments") if is_segment_job else 1
+                if total_segments_for_this_video_overall is None and is_segment_job:
+                    _logger.warning(f"Warning: 'total_segments' missing for segment job of {original_basename}. Defaulting to 1 for master_meta init.")
+
+                all_videos_master_metadata[current_video_path] = self._initialize_master_metadata_entry(
+                    original_basename, 
+                    job_info_to_run,
+                    total_segments_for_this_video_overall
+                )
+                
+                # --- UPDATE THE SNAPSHOTTED SEED HERE ---
+                all_videos_master_metadata[current_video_path]["global_processing_settings"]["seed_setting"] = effective_seed_for_run
+                
+                pre_existing_successful_segment_metadatas = current_video_comprehensive_base_info.get("pre_existing_successful_jobs", [])
+                if pre_existing_successful_segment_metadatas:
+                    _logger.debug(f"Loading {len(pre_existing_successful_segment_metadatas)} pre-existing successful segment metadata entries for {original_basename} into current run's master data.")
+                    all_videos_master_metadata[current_video_path]["jobs_info"].extend(pre_existing_successful_segment_metadatas)
+                    all_videos_master_metadata[current_video_path]["completed_successful_jobs"] += len(pre_existing_successful_segment_metadatas)
+            
+            master_meta_for_this_vid = all_videos_master_metadata[current_video_path]
+            
+            # _logger.info(f"Processing {original_basename} - {log_msg_prefix} ({i+1}/{len(video_processing_jobs)})")
+            _logger.info(f"Processing {original_basename} - {log_msg_prefix}")
+            self.status_message_var.set(f"Processing {i + 1} of {len(video_processing_jobs)}")
+
+            job_successful, current_job_specific_metadata = self._process_single_job(demo, job_info_to_run, master_meta_for_this_vid)
+            
+            if current_job_specific_metadata is None:
+                _logger.error(f"Error: _process_single_job for {original_basename} returned None metadata. Initializing to empty dict.")
+                current_job_specific_metadata = {}
+            
+            returned_job_specific_metadata_last_job = current_job_specific_metadata 
+
+            self.message_queue.put(("progress", i + 1)) # Update progress bar
+
+            # --- START PART B: FINAL GUI UPDATE (ACTUAL/PROCESSED VALUES) ---
+            _logger.debug(f"DEBUG GUI UPDATE (Final): Starting update for {original_basename}")
+
+            # RESOLUTION UPDATE (from actual processed values)
+            processed_h = current_job_specific_metadata.get("processed_height", "N/A")
+            processed_w = current_job_specific_metadata.get("processed_width", "N/A")
+            
+            final_display_res = "N/A"
+            if processed_h != "N/A" and processed_w != "N/A":
+                final_display_res = f"{processed_w}x{processed_h}" # This is the actual processed resolution
+            else:
+                final_display_res = self.current_resolution_var.get() + " (Failed to confirm)" # Append if couldn't get actual
+            self.current_resolution_var.set(final_display_res)
+            
+            # FRAMES UPDATE (from actual processed values)
+            processed_frames_for_job = current_job_specific_metadata.get("frames_in_output_video", "N/A")
+            
+            final_display_frames_str = "N/A"
+
+            if processed_frames_for_job != "N/A":
+                if is_segment_job:
+                    window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
+                    overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
+                    
+                    if window_size_setting != "N/A" and overlap_size_setting != "N/A":
+                         final_display_frames_str = f"{processed_frames_for_job}"
+                    else:
+                         final_display_frames_str = f"{processed_frames_for_job} (Segment)"
+
+                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
+                         final_display_frames_str += f" of {total_frames_orig_vid} total"
+                    
+                else: # Full video processing
+                    final_display_frames_str = f"{processed_frames_for_job}"
+                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
+                        final_display_frames_str += f" (of {total_frames_orig_vid} total)"
+            else:
+                final_display_frames_str = self.current_frames_var.get() + " (Failed to confirm)" # Append if couldn't get actual
+            
+            self.current_frames_var.set(final_display_frames_str)
+            self.root.update_idletasks() # Force GUI update for final display
+            # --- END PART B: FINAL GUI UPDATE ---
+
+            if is_segment_job and "segment_id" not in current_job_specific_metadata:
+                current_job_specific_metadata["segment_id"] = job_info_to_run.get("segment_id", -1)
+            
+            if "_individual_metadata_path" in current_job_specific_metadata:
+                del current_job_specific_metadata["_individual_metadata_path"]
+            
+            master_meta_for_this_vid["jobs_info"].append(current_job_specific_metadata)
+            
+            if job_successful:
+                master_meta_for_this_vid["completed_successful_jobs"] += 1
+            else:
+                master_meta_for_this_vid["completed_failed_jobs"] += 1
+                
+            total_accounted_for_vid = master_meta_for_this_vid["completed_successful_jobs"] + master_meta_for_this_vid["completed_failed_jobs"]
+            
+            if total_accounted_for_vid >= master_meta_for_this_vid["total_expected_jobs"]:
+                self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
+
+        if not self.stop_event.is_set():
+            _logger.info("All processing jobs complete!")
+            self.status_message_var.set("Processing Finished.")
+        
+        if 'demo' in locals() and demo is not None:
+            try:
+                if hasattr(demo, 'pipe') and demo.pipe is not None:
+                    if hasattr(demo.pipe, 'vae') and demo.pipe.vae is not None: del demo.pipe.vae
+                    if hasattr(demo.pipe, 'unet') and demo.pipe.unet is not None: del demo.pipe.unet
+                    del demo.pipe
+                del demo
+                _logger.debug("DepthCrafter model components released.")
+            except Exception as e_cleanup:
+                _logger.warning(f"Error during DepthCrafter model cleanup: {e_cleanup}")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            _logger.info("CUDA cache cleared.")
+
+    def stop_processing(self):
+        if self.processing_thread and self.processing_thread.is_alive():
+            _logger.info("Cancel request received. Processing will stop after current item.")
+            self.stop_event.set()
+        else: 
+            _logger.info("No processing is currently active to cancel.")
+
+    def save_config(self):
+        config = self._collect_all_settings()
+        config[self.LAST_SETTINGS_DIR_CONFIG_KEY] = self.last_settings_dir
+        
+        config["current_input_mode"] = self.current_input_mode 
+        config["single_file_mode_active"] = self.single_file_mode_active
+        
+        try:
+            with open(self.CONFIG_FILENAME, "w") as f: json.dump(config, f, indent=4)
+        except Exception as e: 
+            _logger.warning(f"Warning (GUI save_config): Could not save config: {e}")
+
+    def toggle_dither_options_active_state(self, *args):
+        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_dither_var')): return
+        active = self.process_as_segments_var.get() and self.merge_dither_var.get()
+        state = tk.NORMAL if active else tk.DISABLED
+        for attr_name in ['lbl_dither_str', 'entry_dither_str']:
+            if hasattr(self, attr_name):
+                widget = getattr(self, attr_name)
+                if widget and hasattr(widget, 'configure'):
+                    try: widget.configure(state=state)
+                    except tk.TclError: pass
+
+    def toggle_gamma_options_active_state(self, *args):
+        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_gamma_correct_var')): return
+        active = self.process_as_segments_var.get() and self.merge_gamma_correct_var.get()
+        state = tk.NORMAL if active else tk.DISABLED
+        for attr_name in ['lbl_gamma_val', 'entry_gamma_val']:
+            if hasattr(self, attr_name):
+                widget = getattr(self, attr_name)
+                if widget and hasattr(widget, 'configure'):
+                    try: widget.configure(state=state)
+                    except tk.TclError: pass
+
+    def toggle_keep_npz_dependent_options_state(self, *args):
+        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'keep_intermediate_npz_var') and hasattr(self, 'keep_npz_dependent_widgets')):
+            return
+        active = self.process_as_segments_var.get() and self.keep_intermediate_npz_var.get()
+        state = tk.NORMAL if active else tk.DISABLED
+        for widget in self.keep_npz_dependent_widgets:
+            if hasattr(widget, 'configure'):
+                try:
+                    if isinstance(widget, ttk.Combobox): widget.configure(state='readonly' if active else 'disabled')
+                    else: widget.configure(state=state)
+                except tk.TclError: pass
+
+    def toggle_merge_related_options_active_state(self, *args):
+        if not hasattr(self, 'process_as_segments_var'): return
+        active = self.process_as_segments_var.get()
+        current_processing_state = tk.DISABLED
+        if hasattr(self, 'start_button') and self.start_button and hasattr(self, 'cancel_button') and self.cancel_button:
+            try:
+                if self.start_button.cget('state') == tk.DISABLED and self.cancel_button.cget('state') == tk.NORMAL:
+                    current_processing_state = tk.DISABLED
+                else: current_processing_state = tk.NORMAL
+            except tk.TclError: pass
+        effective_state_for_merge_options = tk.DISABLED
+        if current_processing_state == tk.NORMAL and active: effective_state_for_merge_options = tk.NORMAL
+        if hasattr(self, 'merge_related_widgets_references'):
+            for widget_tuple_or_item in self.merge_related_widgets_references:
+                items_to_configure = widget_tuple_or_item if isinstance(widget_tuple_or_item, tuple) else (widget_tuple_or_item,)
+                for widget_item in items_to_configure:
+                    if hasattr(widget_item, 'configure'):
+                        try:
+                            if isinstance(widget_item, ttk.Combobox): widget_item.configure(state='readonly' if effective_state_for_merge_options == tk.NORMAL else 'disabled')
+                            else: widget_item.configure(state=effective_state_for_merge_options)
+                        except tk.TclError: pass
+        if not active:
+            if current_processing_state == tk.NORMAL:
+                for var_attr_name in ['keep_intermediate_npz_var', 'merge_dither_var', 'merge_gamma_correct_var', 'merge_percentile_norm_var']:
+                    if hasattr(self, var_attr_name):
+                        var_to_set = getattr(self, var_attr_name)
+                        if var_to_set: var_to_set.set(False)
+        self.toggle_keep_npz_dependent_options_state()
+        self.toggle_dither_options_active_state()
+        self.toggle_gamma_options_active_state()
+        self.toggle_percentile_norm_options_active_state()
+
+    def toggle_percentile_norm_options_active_state(self, *args):
+        if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_percentile_norm_var')): return
+        active = self.process_as_segments_var.get() and self.merge_percentile_norm_var.get()
+        state = tk.NORMAL if active else tk.DISABLED
+        for attr_name in ['lbl_low_perc', 'entry_low_perc', 'lbl_high_perc', 'entry_high_perc']:
+            if hasattr(self, attr_name):
+                widget = getattr(self, attr_name)
+                if widget and hasattr(widget, 'configure'):
+                    try: widget.configure(state=state)
+                    except tk.TclError: pass
+
+    def toggle_secondary_output_options_active_state(self, *args):
+        if not hasattr(self, 'enable_dual_output_robust_norm') or not hasattr(self, 'secondary_output_widgets_references'):
+            return
+
+        active = self.enable_dual_output_robust_norm.get()
+        state = tk.NORMAL if active else tk.DISABLED
+
+        for widget_item in self.secondary_output_widgets_references:
+            if isinstance(widget_item, tuple): # Handle cases where we might store (label, entry_frame)
+                for item in widget_item:
+                    if hasattr(item, 'configure'):
+                        try:
+                            if isinstance(item, ttk.Combobox): item.configure(state='readonly' if active else 'disabled')
+                            else: item.configure(state=state)
+                        except tk.TclError: pass
+            elif hasattr(widget_item, 'configure'):
+                try:
+                    if isinstance(widget_item, ttk.Combobox): widget_item.configure(state='readonly' if active else 'disabled')
+                    else: widget_item.configure(state=state)
+                except tk.TclError: pass
+
 if __name__ == "__main__":
     # Configure basic logging for console output
     logging.basicConfig(level=logging.DEBUG, # Default to INFO level

@@ -30,7 +30,7 @@ from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_in
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.06"
+GUI_VERSION = "25.10.09"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -136,8 +136,8 @@ class SplatterGUI(ThemedTk):
         self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "512"))
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
-        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
-        self.enable_auto_convergence_var = tk.BooleanVar(value=self.app_config.get("enable_auto_convergence", False))
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))        
+        self.auto_convergence_mode_var = tk.StringVar(value=self.app_config.get("auto_convergence_mode", "Off"))
 
         # --- Depth Pre-processing Variables ---
         self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"]))
@@ -178,64 +178,56 @@ class SplatterGUI(ThemedTk):
         # Bind closing protocol
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
 
-    def _apply_theme(self: "SplatterGUI", is_startup: bool = False):
-        """Applies the selected theme (dark or light) to the GUI, and adjusts window height."""
+    def _apply_theme(self, is_startup: bool = False):
+        """Applies the selected theme (dark or light) to the GUI."""
+        # 1. Define color palettes
+        dark_colors = {
+            "bg": "#2b2b2b", "fg": "white", "entry_bg": "#3c3c3c",
+            "menu_bg": "#3c3c3c", "menu_fg": "white", "active_bg": "#555555", "active_fg": "white",
+            "theme": "black"
+        }
+        light_colors = {
+            "bg": "#d9d9d9", "fg": "black", "entry_bg": "#ffffff",
+            "menu_bg": "#f0f0f0", "menu_fg": "black", "active_bg": "#dddddd", "active_fg": "black",
+            "theme": "default"
+        }
+
+        # 2. Select the current palette and theme
         if self.dark_mode_var.get():
-            # --- Dark Theme ---
-            bg_color = "#2b2b2b"
-            fg_color = "white"
-            entry_bg = "#3c3c3c"
-            
-            self.style.theme_use("black")
-            self.configure(bg=bg_color)
-
-            if hasattr(self, 'menubar'): 
-                menu_bg = "#3c3c3c"
-                menu_fg = "white"
-                active_bg = "#555555"
-                active_fg = "white"
-                self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-            
-            self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
-            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
-            
-            if hasattr(self, 'info_frame'):
-                for label in self.info_labels:
-                    label.config(bg=bg_color, fg=fg_color)
-
+            colors = dark_colors
         else:
-            # --- Light Theme ---
-            bg_color = "#d9d9d9"
-            fg_color = "black"
-            entry_bg = "#f0f0f0"
+            colors = light_colors
 
-            self.style.theme_use("default")
-            self.configure(bg=bg_color)
+        self.style.theme_use(colors["theme"])
+        self.configure(bg=colors["bg"])
 
-            if hasattr(self, 'menubar'):
-                menu_bg = "#f0f0f0"
-                menu_fg = "black"
-                active_bg = "#dddddd"
-                active_fg = "black"
-                self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
-                self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+        # 3. Apply styles to ttk widgets
+        self.style.configure("TFrame", background=colors["bg"], foreground=colors["fg"])
+        self.style.configure("TLabelframe", background=colors["bg"], foreground=colors["fg"])
+        self.style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["fg"])
+        self.style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
+        self.style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"])
+        self.style.map('TCheckbutton', foreground=[('active', colors["fg"])], background=[('active', colors["bg"])])
 
-            self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
-            self.style.configure("TFrame", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
-            self.style.configure("TLabel", background=bg_color, foreground=fg_color)
-            
-            if hasattr(self, 'info_frame'):
-                for label in self.info_labels:
-                    label.config(bg=bg_color, fg=fg_color)
+        # 4. Configure Entry and Combobox widgets using style.map for robust background override
+        self.style.map('TEntry', fieldbackground=[('', colors["entry_bg"])], foreground=[('', colors["fg"])])
+        self.style.configure("TEntry", insertcolor=colors["fg"])
+        self.style.map('TCombobox',
+            fieldbackground=[('readonly', colors["entry_bg"])],
+            foreground=[('readonly', colors["fg"])],
+            selectbackground=[('readonly', colors["entry_bg"])],
+            selectforeground=[('readonly', colors["fg"])]
+        )
 
+        # 5. Manually configure non-ttk widgets (Menu, tk.Label)
+        if hasattr(self, 'menubar'):
+            for menu in [self.menubar, self.file_menu, self.help_menu]:
+                menu.config(bg=colors["menu_bg"], fg=colors["menu_fg"], activebackground=colors["active_bg"], activeforeground=colors["active_fg"])
+        if hasattr(self, 'info_frame'):
+            for label in self.info_labels:
+                label.config(bg=colors["bg"], fg=colors["fg"])
+
+        # 6. Handle window geometry adjustment (only after startup)
         self.update_idletasks() # Ensure all theme changes are rendered for accurate reqheight
 
         # --- Apply geometry only if not during startup (NEW conditional block) ---
@@ -249,7 +241,7 @@ class SplatterGUI(ThemedTk):
             # Apply the current (potentially user-adjusted) width and the new calculated height
             self.geometry(f"{current_actual_width}x{new_height}")
             logger.debug(f"Theme change applied geometry: {current_actual_width}x{new_height}")
-
+            
             # Update the stored width for next time save_config is called.
             self.window_width = current_actual_width
 
@@ -551,9 +543,13 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
         self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
 
-        self.auto_convergence_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Auto-Determine Convergence (Video Avg)", variable=self.enable_auto_convergence_var)
-        self.auto_convergence_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.auto_convergence_checkbox, "auto_convergence_toggle")
+        # --- MODIFIED: Added a label for the Combobox ---
+        self.lbl_auto_convergence = ttk.Label(self.output_settings_frame, text="Auto-Convergence:")
+        self.lbl_auto_convergence.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.auto_convergence_combo = ttk.Combobox(self.output_settings_frame, textvariable=self.auto_convergence_mode_var, values=["Off", "Average", "Peak"], state="readonly", width=15)
+        self.auto_convergence_combo.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
+        self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         current_row += 1
 
         self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
@@ -646,44 +642,60 @@ class SplatterGUI(ThemedTk):
         lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
-
-    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int) -> float:
+    
+    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float, mode: str) -> float:
         """
-        Calculates the Auto Convergence point (average depth value) for the entire video.
+        Calculates the Auto Convergence point for the entire video based on the selected mode.
         Uses a hard blur and crops to the center 75% to eliminate noise/edge artifacts.
 
+        Args:
+            mode (str): "Average" or "Peak".
+            float: fallback_value: The current GUI/Sidecar value to return if auto-convergence fails.
+
         Returns:
-            float: The new zero_disparity_anchor_val (0.0 to 1.0).
+            float: The new zero_disparity_anchor_val (0.0 to 1.0) or fallback_value.
         """
         logger.info("==> Starting Auto-Convergence pre-pass to determine global average depth.")
         
         # --- Constants for Auto-Convergence Logic ---
         BLUR_KERNEL_SIZE = 9  # Hard blur to capture bulk depth, must be odd
         CENTER_CROP_PERCENT = 0.75 # Use the center 75% of the frame (1 - 0.75 = 0.25 margin total)
-        MIN_VALID_PIXELS = 100 # Minimum number of non-zero/non-max pixels to consider a frame valid
+        MIN_VALID_PIXELS = 5 # Minimum number of non-zero/non-max pixels to consider a frame valid
         INTERNAL_ANCHOR_OFFSET = 0.1 # <--- ADJUST THIS VALUE FOR TESTING (e.g., 0.02, 0.05, 0.1)
         # -------------------------------------------
 
-        all_valid_frame_averages = []
+        all_valid_frame_values = []
 
         try:
             # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
             depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
             if len(depth_reader) == 0:
                  logger.error("Depth map reader has no frames. Cannot calculate Auto-Convergence.")
-                 return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+                 return fallback_value # Fallback to user/sidecar default
         except Exception as e:
             logger.error(f"Error initializing depth map reader for Auto-Convergence: {e}")
-            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+            return fallback_value # Fallback to user/sidecar default
 
 
         # 2. Iterate and Average
-        num_frames = min(total_frames_to_process, len(depth_reader))
         
+        # Determine the number of frames to process
+        video_length = len(depth_reader)
+        if total_frames_to_process <= 0 or total_frames_to_process > video_length:
+             num_frames = video_length
+        else:
+             num_frames = total_frames_to_process
+            
+        logger.debug(f"  AutoConv determined actual frames to process: {num_frames} (from input length {total_frames_to_process}).")
+
+
+        # Original line: num_frames = min(total_frames_to_process, len(depth_reader))
+        
+        # Now use the determined num_frames for the loop:
         for i in range(0, num_frames, batch_size):
             if self.stop_event.is_set():
                 logger.warning("Auto-Convergence pre-pass stopped by user.")
-                return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback
+                return fallback_value # Fallback
 
             current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
             if not current_frame_indices:
@@ -712,7 +724,10 @@ class SplatterGUI(ThemedTk):
                 batch_depth_normalized = np.full_like(batch_depth_float, fill_value=0.5, dtype=np.float32)
 
             # Frame-by-Frame Processing (Blur & Crop)
-            for frame in batch_depth_normalized:
+            for j, frame in enumerate(batch_depth_normalized):
+                
+                # --- NEW DEBUG LOGGING START ---
+                current_frame_idx = current_frame_indices[j]
                 H, W = frame.shape
                 
                 # a) Blur
@@ -728,15 +743,26 @@ class SplatterGUI(ThemedTk):
                 # Use a small epsilon to catch near-zero/near-one
                 valid_pixels = cropped_frame[(cropped_frame > 0.001) & (cropped_frame < 0.999)] 
                 
+                logger.debug(f"  [AutoConv Frame {current_frame_idx:03d}] Res: {W}x{H}, Crop Margins: {margin_w}x{margin_h}. Cropped Size: {cropped_frame.size}. Valid Pixels: {valid_pixels.size}")
+                # --- NEW DEBUG LOGGING END ---
+
                 if valid_pixels.size > MIN_VALID_PIXELS:
-                    all_valid_frame_averages.append(valid_pixels.mean())
-                # else: frame is likely too empty or uniform, skip for averaging
+                    if mode == "Average":
+                        all_valid_frame_values.append(valid_pixels.mean())
+                    elif mode == "Peak":
+                        all_valid_frame_values.append(valid_pixels.max())
+                else:
+                    # FALLBACK FOR THE FRAME: If filter is too strict, just use the mean of the WHOLE cropped, blurred frame
+                    all_valid_frame_values.append(cropped_frame.mean())
+                    # Note: We still log the failure using a warning, but we count the frame.
+                    logger.warning(f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}). Forcing mean from full cropped frame.")
 
             draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
         
         # 3. Final Temporal Average
-        if all_valid_frame_averages:
-            raw_anchor = np.mean(all_valid_frame_averages)
+        if all_valid_frame_values:
+            # Use the same aggregation (mean) for both modes for temporal stability
+            raw_anchor = np.mean(all_valid_frame_values)
             
             # --- NEW: Apply Offset and Clamping ---
             final_anchor_offset = raw_anchor + INTERNAL_ANCHOR_OFFSET
@@ -744,11 +770,11 @@ class SplatterGUI(ThemedTk):
             # Clamp to the valid range [0.0, 1.0]
             final_anchor = np.clip(final_anchor_offset, 0.0, 1.0)
             
-            logger.info(f"\n==> Auto-Convergence Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
+            logger.info(f"\n==> Auto-Convergence ({mode} mode) Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
             return float(final_anchor)
         else:
-            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI default.")
-            return float(self.APP_CONFIG_DEFAULTS['CONV_POINT']) # Fallback to default
+            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI/Sidecar value as fallback.")
+            return fallback_value # Fallback to user/sidecar default
 
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
@@ -776,7 +802,7 @@ class SplatterGUI(ThemedTk):
             "process_length": self.process_length_var.get(),
             "output_crf": self.output_crf_var.get(),
             "dual_output": self.dual_output_var.get(),
-            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
+            "auto_convergence_mode": self.auto_convergence_mode_var.get(),
             
             "depth_gamma": self.depth_gamma_var.get(),
             "max_disp": self.max_disp_var.get(),
@@ -1321,19 +1347,25 @@ class SplatterGUI(ThemedTk):
                 processing_tasks = self._get_defined_tasks(settings)
 
                 # --- NEW: Auto-Convergence Logic (BEFORE initializing readers) ---
-                if settings["enable_auto_convergence"]:
-                    logger.info("Auto-Convergence is ENABLED. Running pre-pass...")
+                auto_conv_mode = settings["auto_convergence_mode"]
+                if auto_conv_mode != "Off":
+                    logger.info(f"Auto-Convergence is ENABLED (Mode: {auto_conv_mode}). Running pre-pass...")
 
                     new_anchor_val = self._determine_auto_convergence(
                         actual_depth_map_path,
                         settings["process_length"],
-                        settings["full_res_batch_size"] # Use a reasonable batch size for the pre-pass
+                        settings["full_res_batch_size"],
+                        current_zero_disparity_anchor,
+                        mode=auto_conv_mode
                     )
                     
                     # Update variables for current task
-                    current_zero_disparity_anchor = new_anchor_val
-                    anchor_source = "Auto"
-                    logger.info(f"Using Auto-Determined Convergence Point: {current_zero_disparity_anchor:.4f}")
+                    # If new_anchor_val == current_zero_disparity_anchor, it means the function failed and returned the fallback.
+                    if new_anchor_val != current_zero_disparity_anchor:
+                        current_zero_disparity_anchor = new_anchor_val
+                        anchor_source = "Auto"
+                    
+                    logger.info(f"Using Convergence Point: {current_zero_disparity_anchor:.4f} (Source: {anchor_source})")
                 # --- END Auto-Convergence Logic ---
 
                 if not processing_tasks:
@@ -2159,11 +2191,11 @@ class SplatterGUI(ThemedTk):
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
             "output_crf": int(self.output_crf_var.get()),
-            # --- NEW: Depth Pre-processing Settings ---
+            # --- Depth Pre-processing & Auto-Convergence Settings ---
             "depth_gamma": depth_gamma_val,
             "depth_dilate_size": depth_dilate_size_val,
             "depth_blur_size": depth_blur_size_val,
-            "enable_auto_convergence": self.enable_auto_convergence_var.get(),
+            "auto_convergence_mode": self.auto_convergence_mode_var.get(),
             "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
             "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
         }
@@ -2228,7 +2260,8 @@ class SplatterGUI(ThemedTk):
         self.dual_output_var.set(False)
         self.enable_autogain_var.set(False) # Default: Global Depth Normalization
         self.zero_disparity_anchor_var.set("0.5")
-        self.output_crf_var.set("23")
+        self.output_crf_var.set("23")        
+        self.auto_convergence_mode_var.set("Off")
         
         self.toggle_processing_settings_fields()
         self._save_config()
