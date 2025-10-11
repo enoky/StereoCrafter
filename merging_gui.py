@@ -182,7 +182,7 @@ class MergingGUI(ThemedTk):
         self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", 0.14)))
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", False))
-        self.use_sbs_output_var = tk.BooleanVar(value=self.app_config.get("use_sbs_output", True))
+        self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", "Full SBS (Left-Right)"))
         self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
@@ -388,7 +388,7 @@ class MergingGUI(ThemedTk):
         self.shadow_min_opacity_var.set(0.2)
         self.shadow_decay_gamma_var.set(2.0)
         self.use_gpu_var.set(True)
-        self.use_sbs_output_var.set(True)
+        self.output_format_var.set("Full SBS (Left-Right)")
         self.enable_color_transfer_var.set(True)
         self.batch_chunk_size_var.set("32")
         self.preview_size_var.set("512")
@@ -566,10 +566,14 @@ class MergingGUI(ThemedTk):
         gpu_check.pack(side="left", padx=5)
         self._create_hover_tooltip(gpu_check, "use_gpu")
 
-        sbs_check = ttk.Checkbutton(options_frame, text="Create Side-by-Side (SBS) Output", variable=self.use_sbs_output_var)
-        sbs_check.pack(side="left", padx=5)
-        self._create_hover_tooltip(sbs_check, "use_sbs_output")
-
+        # --- NEW: Output Format Dropdown ---
+        ttk.Label(options_frame, text="Output Format:").pack(side="left", padx=(15, 5))
+        output_formats = ["Full SBS (Left-Right)", "Half SBS (Left-Right)", "Half SBS X2 Height", "Full SBS Cross-eye (Right-Left)", "Anaglyph (Red/Cyan)", "Anaglyph Half-Color", "Right-Eye Only"]
+        output_format_combo = ttk.Combobox(options_frame, textvariable=self.output_format_var, values=output_formats, state="readonly", width=32)
+        output_format_combo.pack(side="left", padx=5)
+        self._create_hover_tooltip(output_format_combo, "output_format")
+        # --- END NEW ---
+        
         color_check = ttk.Checkbutton(options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var)
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
@@ -681,7 +685,7 @@ class MergingGUI(ThemedTk):
                 "mask_folder": self.mask_folder_var.get(),
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
-                "use_sbs": self.use_sbs_output_var.get(),
+                "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": int(self.preview_size_var.get()),
@@ -787,12 +791,32 @@ class MergingGUI(ThemedTk):
                 else:
                     hires_H, hires_W = H_splat // 2, W_splat // 2
                 
-                output_width = hires_W * 2 if settings["use_sbs"] else hires_W
+                # --- NEW: Determine output dimensions and suffix based on format ---
+                output_format = settings["output_format"]
+                if output_format == "Full SBS Cross-eye (Right-Left)":
+                    output_width = hires_W * 2
+                    output_suffix = "_merged_full_sbsx.mp4"
+                elif output_format == "Full SBS (Left-Right)":
+                    output_width = hires_W * 2
+                    output_suffix = "_merged_sbs_full.mp4"
+                elif output_format in ["Half SBS (Left-Right)", "Half SBS X2 Height"]:
+                    output_width = hires_W
+                    output_suffix = "_merged_sbs_half.mp4"
+                elif output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
+                    output_width = hires_W
+                    output_suffix = "_merged_anaglyph.mp4"
+                else: # Right-Eye Only
+                    output_width = hires_W
+                    output_suffix = "_merged_right_eye.mp4"
+                
                 output_height = hires_H
-
-                output_suffix = "_merged_sbs.mp4" if settings["use_sbs"] else "_merged_right_eye.mp4"
                 output_filename = f"{core_name_with_width}{output_suffix}"
+                if output_format == "Half SBS X2 Height":
+                    output_height = hires_H * 2
                 output_path = os.path.join(settings["output_folder"], output_filename)
+                # --- END NEW ---
+
+
 
                 ffmpeg_process = start_ffmpeg_pipe_process(output_width, output_height, output_path, fps, video_stream_info)
                 if ffmpeg_process is None:
@@ -874,11 +898,35 @@ class MergingGUI(ThemedTk):
 
                     blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
 
-                    # Assemble and write to pipe
-                    if settings["use_sbs"]:
+                    # --- NEW: Assemble final frame based on output format ---
+                    if output_format == "Full SBS (Left-Right)":
                         final_chunk = torch.cat([original_left, blended_right_eye], dim=3)
+                    elif output_format == "Full SBS Cross-eye (Right-Left)":
+                        final_chunk = torch.cat([blended_right_eye, original_left], dim=3)
+                    elif output_format == "Half SBS (Left-Right)":
+                        resized_left = F.interpolate(original_left, size=(hires_H, hires_W // 2), mode='bilinear', align_corners=False)
+                        resized_right = F.interpolate(blended_right_eye, size=(hires_H, hires_W // 2), mode='bilinear', align_corners=False)
+                        final_chunk = torch.cat([resized_left, resized_right], dim=3)
+                    elif output_format == "Half SBS X2 Height":
+                        final_chunk = torch.cat([original_left, blended_right_eye], dim=2) # Concatenate vertically
+                    elif output_format == "Anaglyph (Red/Cyan)":
+                        # Red from Left, Green/Blue from Right
+                        final_chunk = torch.cat([
+                            original_left[:, 0:1, :, :],      # R channel from left
+                            blended_right_eye[:, 1:3, :, :]   # G, B channels from right
+                        ], dim=1)
+                    elif output_format == "Anaglyph Half-Color":
+                        # Convert left to grayscale for the red channel
+                        left_gray = original_left[:, 0, :, :] * 0.299 + original_left[:, 1, :, :] * 0.587 + original_left[:, 2, :, :] * 0.114
+                        left_gray = left_gray.unsqueeze(1) # Add channel dimension back
+                        final_chunk = torch.cat([
+                            left_gray,                        # R channel from grayscale left
+                            blended_right_eye[:, 1:3, :, :]   # G, B channels from right
+                        ], dim=1)
                     else:
+                        # Default to Right-Eye Only
                         final_chunk = blended_right_eye
+                    # --- END NEW ---
 
                     cpu_chunk = final_chunk.cpu()
                     for frame_tensor in cpu_chunk:
@@ -1379,8 +1427,8 @@ class MergingGUI(ThemedTk):
             "original_folder": self.original_folder_var.get(),
             "mask_folder": self.mask_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
-            "use_gpu": self.use_gpu_var.get(),
-            "use_sbs_output": self.use_sbs_output_var.get(),
+            "use_gpu": self.use_gpu_var.get(),            
+            "output_format": self.output_format_var.get(),
             "batch_chunk_size": self.batch_chunk_size_var.get(),
             "enable_color_transfer": self.enable_color_transfer_var.get(),
             "debug_logging_enabled": self.debug_logging_var.get(),

@@ -37,7 +37,7 @@ These sliders give you fine-grained control over how the mask is processed befor
 ### 4. Options
 
 -   **Use GPU for Mask Processing:** Uses the GPU for faster mask processing. Uncheck to use the CPU, which is slower but uses almost no VRAM.
--   **Create Side-by-Side (SBS) Output:** If checked, the final video will be a standard SBS 3D file. If unchecked, only the blended right-eye video is saved.
+-   **Output Format:** A dropdown menu to select the final 3D video format. Options include standard Full Side-by-Side (SBS), Half-SBS for compatibility, Over/Under (Half SBS X2 Height), Cross-eye viewing, and Anaglyph for red/cyan glasses.
 -   **Enable Color Transfer:** Corrects color shifts that may have been introduced by the inpainting model by matching the right eye's color palette to the original left eye.
 -   **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 -   **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
@@ -54,7 +54,7 @@ These sliders give you fine-grained control over how the mask is processed befor
 1.  **Set Folders:** Fill in the paths for the `Inpainted`, `Original`, `Mask`, and `Output` folders.
 2.  **Load Preview:** Click **Load/Refresh List** to load the first video.
 3.  **Adjust Settings:** Use the **Frame Scrubber** to find a representative frame. Adjust the **Mask Processing Parameters** sliders until the blend in the preview window looks seamless.
-4.  **Set Options:** Configure your output options (e.g., ensure `Use GPU` and `Create Side-by-Side Output` are checked).
+4.  **Set Options:** Configure your output options (e.g., ensure `Use GPU` is checked and select your desired `Output Format`).
 5.  **Start Processing:** Click **Start Blending** to process all videos in the batch.
 
 ## Menu Bar
