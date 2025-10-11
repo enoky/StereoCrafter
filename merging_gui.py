@@ -269,6 +269,7 @@ class MergingGUI(ThemedTk):
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
         self.help_menu.add_checkbutton(label="Enable Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging)
         self.help_menu.add_separator()
+        self.help_menu.add_command(label="User Guide", command=self.show_user_guide)
         self.help_menu.add_command(label="About", command=self.show_about_dialog)
 
     def _create_hover_tooltip(self, widget, help_key):
@@ -318,6 +319,55 @@ class MergingGUI(ThemedTk):
             "It provides interactive controls for mask processing and color matching."
         )
         messagebox.showinfo("About Merging GUI", about_text)
+
+    def show_user_guide(self):
+        """Reads and displays the user guide from a markdown file in a new window."""
+        guide_path = os.path.join("assets", "merger_gui_guide.md")
+        try:
+            with open(guide_path, "r", encoding="utf-8") as f:
+                guide_content = f.read()
+        except FileNotFoundError:
+            messagebox.showerror("File Not Found", f"The user guide file could not be found at:\n{os.path.abspath(guide_path)}")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred while reading the user guide:\n{e}")
+            return
+
+        # Determine colors based on current theme
+        if self.dark_mode_var.get():
+            bg_color, fg_color = "#2b2b2b", "white"
+        else:
+            # Use a standard light bg for text that's slightly different from the main window
+            bg_color, fg_color = "#fdfdfd", "black"
+
+        # Create a new Toplevel window
+        guide_window = tk.Toplevel(self)
+        guide_window.title("Merging GUI - User Guide")
+        guide_window.geometry("600x700")
+        guide_window.transient(self) # Keep it on top of the main window
+        guide_window.grab_set()      # Modal behavior
+        guide_window.configure(bg=bg_color)
+
+        text_frame = ttk.Frame(guide_window, padding="10")
+        text_frame.configure(style="TFrame") # Ensure it follows the theme
+        text_frame.pack(expand=True, fill="both")
+
+        # Apply theme colors to the Text widget
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, relief="flat", borderwidth=0, padx=5, pady=5, font=("Segoe UI", 9),
+                              bg=bg_color, fg=fg_color, insertbackground=fg_color)
+        text_widget.insert(tk.END, guide_content)
+        text_widget.config(state=tk.DISABLED) # Make it read-only
+
+        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget['yscrollcommand'] = scrollbar.set
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.pack(side=tk.LEFT, expand=True, fill="both")
+
+        button_frame = ttk.Frame(guide_window, padding=(0, 0, 0, 10))
+        button_frame.pack()
+        ok_button = ttk.Button(button_frame, text="Close", command=guide_window.destroy)
+        ok_button.pack(pady=10)
 
     def reset_to_defaults(self):
         """Resets all GUI parameters to their default hardcoded values."""
