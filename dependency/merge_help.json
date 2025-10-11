@@ -13,7 +13,7 @@
     "shadow_opacity_decay": "The amount of opacity to subtract from the shadow at each step. A larger value creates a shorter, faster fade.",
     "shadow_opacity_min": "The opacity at which the shadow effect will stop generating new echoes.",
 
-    "output_format": "Selects the 3D format for the final video. Full SBS is highest quality. Half SBS is more compatible but lower resolution. Anaglyph is for Red/Cyan glasses.",
+    "output_format": "Selects the 3D format for the final video. Full SBS is highest quality. Half SBS is more compatible but lower resolution. Double SBS is a vertically stretched format for some 3D displays. Anaglyph is for Red/Cyan glasses.",
     "use_gpu": "If checked, mask processing will be performed on the GPU for speed. Uncheck to use the CPU, which is slower but uses very little VRAM.",
     "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
     "preview_size": "The maximum size (width or height) in pixels for the preview image. Larger images may impact performance.",

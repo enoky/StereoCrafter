@@ -256,6 +256,7 @@ class MergingGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu)
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
+        self.file_menu.add_command(label="Save Preview Frame...", command=self._save_preview_frame)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
@@ -568,7 +569,7 @@ class MergingGUI(ThemedTk):
 
         # --- NEW: Output Format Dropdown ---
         ttk.Label(options_frame, text="Output Format:").pack(side="left", padx=(15, 5))
-        output_formats = ["Full SBS (Left-Right)", "Half SBS (Left-Right)", "Half SBS X2 Height", "Full SBS Cross-eye (Right-Left)", "Anaglyph (Red/Cyan)", "Anaglyph Half-Color", "Right-Eye Only"]
+        output_formats = ["Full SBS (Left-Right)", "Double SBS", "Half SBS (Left-Right)", "Full SBS Cross-eye (Right-Left)", "Anaglyph (Red/Cyan)", "Anaglyph Half-Color", "Right-Eye Only"]
         output_format_combo = ttk.Combobox(options_frame, textvariable=self.output_format_var, values=output_formats, state="readonly", width=32)
         output_format_combo.pack(side="left", padx=5)
         self._create_hover_tooltip(output_format_combo, "output_format")
@@ -798,10 +799,14 @@ class MergingGUI(ThemedTk):
                     output_suffix = "_merged_full_sbsx.mp4"
                 elif output_format == "Full SBS (Left-Right)":
                     output_width = hires_W * 2
-                    output_suffix = "_merged_sbs_full.mp4"
-                elif output_format in ["Half SBS (Left-Right)", "Half SBS X2 Height"]:
+                    output_suffix = "_merged_full_sbs.mp4"
+                elif output_format == "Double SBS":
+                    output_width = hires_W * 2
+                    output_height = hires_H * 2
+                    output_suffix = "_merged_half_sbs.mp4"
+                elif output_format == "Half SBS (Left-Right)":
                     output_width = hires_W
-                    output_suffix = "_merged_sbs_half.mp4"
+                    output_suffix = "_merged_half_sbs.mp4"
                 elif output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
                     output_width = hires_W
                     output_suffix = "_merged_anaglyph.mp4"
@@ -809,10 +814,9 @@ class MergingGUI(ThemedTk):
                     output_width = hires_W
                     output_suffix = "_merged_right_eye.mp4"
                 
-                output_height = hires_H
+                if 'output_height' not in locals(): # Set default height if not already set by a special format
+                    output_height = hires_H
                 output_filename = f"{core_name_with_width}{output_suffix}"
-                if output_format == "Half SBS X2 Height":
-                    output_height = hires_H * 2
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
@@ -907,8 +911,9 @@ class MergingGUI(ThemedTk):
                         resized_left = F.interpolate(original_left, size=(hires_H, hires_W // 2), mode='bilinear', align_corners=False)
                         resized_right = F.interpolate(blended_right_eye, size=(hires_H, hires_W // 2), mode='bilinear', align_corners=False)
                         final_chunk = torch.cat([resized_left, resized_right], dim=3)
-                    elif output_format == "Half SBS X2 Height":
-                        final_chunk = torch.cat([original_left, blended_right_eye], dim=2) # Concatenate vertically
+                    elif output_format == "Double SBS":
+                        sbs_chunk = torch.cat([original_left, blended_right_eye], dim=3)
+                        final_chunk = F.interpolate(sbs_chunk, size=(hires_H * 2, hires_W * 2), mode='bilinear', align_corners=False)
                     elif output_format == "Anaglyph (Red/Cyan)":
                         # Red from Left, Green/Blue from Right
                         final_chunk = torch.cat([
@@ -1500,6 +1505,34 @@ class MergingGUI(ThemedTk):
             logger.info(f"Settings saved to {filepath}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save settings to {filepath}:\n{e}")
+
+    def _save_preview_frame(self):
+        """Saves the current preview image to a file."""
+        if self.pil_image_for_preview is None:
+            messagebox.showwarning("No Preview", "There is no preview image to save. Please load a video first.")
+            return
+
+        # Suggest a default filename
+        default_filename = "preview_frame.png"
+        if self.preview_loaded_file:
+            base_name = os.path.splitext(self.preview_loaded_file)[0]
+            frame_num = int(self.frame_scrubber_var.get())
+            default_filename = f"{base_name}_frame_{frame_num:05d}.png"
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Preview Frame As...",
+            initialfile=default_filename,
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")]
+        )
+
+        if filepath:
+            try:
+                self.pil_image_for_preview.save(filepath)
+                logger.info(f"Preview frame saved to: {filepath}")
+            except Exception as e:
+                logger.error(f"Failed to save preview frame: {e}", exc_info=True)
+                messagebox.showerror("Save Error", f"An error occurred while saving the image:\n{e}")
 
     def exit_application(self):
         """Handles application exit gracefully."""
