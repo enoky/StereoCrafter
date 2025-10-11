@@ -135,6 +135,28 @@ def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor)
         return target_frame
 
 class MergingGUI(ThemedTk):
+    # --- Centralized Default Settings ---
+    APP_DEFAULTS = {
+        "inpainted_folder": "./completed_output",
+        "original_folder": "./input_source_clips",
+        "mask_folder": "./output_splatted/hires",
+        "output_folder": "./final_videos",
+        "mask_binarize_threshold": 0.3,
+        "mask_dilate_kernel_size": 3.0,
+        "mask_blur_kernel_size": 5.0,
+        "shadow_shift": 5.0,
+        "shadow_decay_gamma": 1.3,
+        "shadow_start_opacity": 0.87,
+        "shadow_opacity_decay": 0.08,
+        "shadow_min_opacity": 0.14,
+        "use_gpu": False,
+        "output_format": "Full SBS (Left-Right)",
+        "pad_to_16_9": False,
+        "enable_color_transfer": True,
+        "batch_chunk_size": "20",
+        "preview_size": "1000",
+    }
+
     def __init__(self):
         super().__init__(theme="clam")
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
@@ -170,35 +192,35 @@ class MergingGUI(ThemedTk):
         self.preview_original_left_tensor = None
         self.preview_blended_right_tensor = None
         # --- GUI Variables ---
-        self.pil_image_for_preview = None # Store the PIL image for resizing
-        self.inpainted_folder_var = tk.StringVar(value=self.app_config.get("inpainted_folder", "./completed_output"))
-        self.original_folder_var = tk.StringVar(value=self.app_config.get("original_folder", "./input_source_clips"))
-        self.mask_folder_var = tk.StringVar(value=self.app_config.get("mask_folder", "./output_splatted/hires")) # Assuming masks are in splatted folder
-        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./final_videos"))
+        self.pil_image_for_preview = None
+        self.inpainted_folder_var = tk.StringVar(value=self.app_config.get("inpainted_folder", self.APP_DEFAULTS["inpainted_folder"]))
+        self.original_folder_var = tk.StringVar(value=self.app_config.get("original_folder", self.APP_DEFAULTS["original_folder"]))
+        self.mask_folder_var = tk.StringVar(value=self.app_config.get("mask_folder", self.APP_DEFAULTS["mask_folder"]))
+        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", self.APP_DEFAULTS["output_folder"]))
 
         # --- Mask Processing Parameters ---
-        self.mask_binarize_threshold_var = tk.DoubleVar(value=float(self.app_config.get("mask_binarize_threshold", 0.30)))
-        self.mask_dilate_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_dilate_kernel_size", 3)))
-        self.mask_blur_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_blur_kernel_size", 5)))
-        self.shadow_shift_var = tk.DoubleVar(value=float(self.app_config.get("shadow_shift", 5)))
-        self.shadow_decay_gamma_var = tk.DoubleVar(value=float(self.app_config.get("shadow_decay_gamma", 1.3)))
-        self.shadow_start_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_start_opacity", 0.87)))
-        self.shadow_opacity_decay_var = tk.DoubleVar(value=float(self.app_config.get("shadow_opacity_decay", 0.08)))
-        self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", 0.14)))
+        self.mask_binarize_threshold_var = tk.DoubleVar(value=float(self.app_config.get("mask_binarize_threshold", self.APP_DEFAULTS["mask_binarize_threshold"])))
+        self.mask_dilate_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_dilate_kernel_size", self.APP_DEFAULTS["mask_dilate_kernel_size"])))
+        self.mask_blur_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_blur_kernel_size", self.APP_DEFAULTS["mask_blur_kernel_size"])))
+        self.shadow_shift_var = tk.DoubleVar(value=float(self.app_config.get("shadow_shift", self.APP_DEFAULTS["shadow_shift"])))
+        self.shadow_decay_gamma_var = tk.DoubleVar(value=float(self.app_config.get("shadow_decay_gamma", self.APP_DEFAULTS["shadow_decay_gamma"])))
+        self.shadow_start_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_start_opacity", self.APP_DEFAULTS["shadow_start_opacity"])))
+        self.shadow_opacity_decay_var = tk.DoubleVar(value=float(self.app_config.get("shadow_opacity_decay", self.APP_DEFAULTS["shadow_opacity_decay"])))
+        self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", self.APP_DEFAULTS["shadow_min_opacity"])))
 
-        self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", False))
-        self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", "Full SBS (Left-Right)"))
-        self.pad_to_16_9_var = tk.BooleanVar(value=self.app_config.get("pad_to_16_9", False))
-        self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"]))
+        self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", self.APP_DEFAULTS["output_format"]))
+        self.pad_to_16_9_var = tk.BooleanVar(value=self.app_config.get("pad_to_16_9", self.APP_DEFAULTS["pad_to_16_9"]))
+        self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", self.APP_DEFAULTS["enable_color_transfer"]))
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
-        self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", 20)))
+        self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"])))
         self.frame_scrubber_var = tk.DoubleVar(value=0)
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.preview_source_var = tk.StringVar(value="Blended Image")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
-        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", 1024)))
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", self.APP_DEFAULTS["preview_size"])))
 
         # --- GUI Status Variables ---
         self.status_label_var = tk.StringVar(value="Ready")
@@ -380,27 +402,16 @@ class MergingGUI(ThemedTk):
     def reset_to_defaults(self):
         """Resets all GUI parameters to their default hardcoded values."""
         if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
-            return
+            return # User cancelled
 
-        # Set default values for all your configuration variables
-        self.inpainted_folder_var.set("./completed_output")
-        self.original_folder_var.set("./input_source_clips")
-        self.mask_folder_var.set("./output_splatted/hires")
-        self.output_folder_var.set("./final_videos")
-        self.mask_dilate_kernel_size_var.set(15.0)
-        self.mask_blur_kernel_size_var.set(25.0)
-        self.shadow_shift_var.set(2.0)
-        self.shadow_start_opacity_var.set(0.8)
-        self.mask_binarize_threshold_var.set(-0.01)
-        self.shadow_opacity_decay_var.set(0.1)
-        self.shadow_min_opacity_var.set(0.2)
-        self.shadow_decay_gamma_var.set(2.0)
-        self.use_gpu_var.set(True)
-        self.pad_to_16_9_var.set(False)
-        self.output_format_var.set("Full SBS (Left-Right)")
-        self.enable_color_transfer_var.set(True)
-        self.batch_chunk_size_var.set("32")
-        self.preview_size_var.set("512")
+        # Set all tk variables from the centralized APP_DEFAULTS dictionary
+        for key, default_value in self.APP_DEFAULTS.items():
+            var_name = key + "_var"
+            if hasattr(self, var_name):
+                try:
+                    getattr(self, var_name).set(default_value)
+                except Exception as e:
+                    logger.warning(f"Could not reset '{key}' to default: {e}")
 
         self.save_config()
         messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
@@ -686,7 +697,7 @@ class MergingGUI(ThemedTk):
                 item = self.cleanup_queue.get(timeout=1)
 
                 if item is None:
-                    logger.info("Cleanup worker received stop signal. Will exit when queue is empty.")
+                    logger.debug("Cleanup worker received stop signal. Will exit when queue is empty.")
                     stop_signal_received = True
                     continue # Continue loop to check if queue is empty
 
@@ -702,13 +713,13 @@ class MergingGUI(ThemedTk):
                     dest_path = os.path.join(finished_dir, os.path.basename(src_path))
 
                     if os.path.exists(dest_path):
-                        logger.warning(f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source.")
+                        logger.debug(f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source.")
                         os.remove(src_path)
                     else:
                         shutil.move(src_path, finished_dir)
                     logger.info(f"Cleanup: Successfully moved '{os.path.basename(src_path)}'.")
                 except (PermissionError, OSError):
-                    logger.warning(f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds...")
+                    logger.debug(f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds...")
                     time.sleep(3)
                     self.cleanup_queue.put(item) # Put it back on the queue to retry
                 except Exception as e:
@@ -717,7 +728,7 @@ class MergingGUI(ThemedTk):
             except queue.Empty:
                 # This is expected when waiting for items. The loop condition will handle exit.
                 continue
-        logger.info("Cleanup worker has finished its queue and is now exiting.")
+        logger.debug("Cleanup worker has finished its queue and is now exiting.")
 
     def _retry_failed_moves(self):
         """Attempts to move any files that previously failed to move."""
@@ -749,7 +760,7 @@ class MergingGUI(ThemedTk):
                 else:
                     # Destination does not exist, but we know the source does. This is a true move retry.
                     shutil.move(src_path, finished_dir)
-                    logger.info(f"Successfully moved previously failed file: {os.path.basename(src_path)}")
+                    logger.debug(f"Successfully moved previously failed file: {os.path.basename(src_path)}")
 
             except (PermissionError, OSError) as e:
                 logger.warning(f"Retry failed for {os.path.basename(src_path)}: {e}. Will try again later.")
@@ -808,8 +819,7 @@ class MergingGUI(ThemedTk):
         self.progress_var.set(0)
 
     def get_current_settings(self):
-        self.save_config() # Save settings on every run
-        """Collects all GUI settings into a dictionary."""
+        """Collects all GUI settings into a dictionary, performing type conversion."""
         try:
             settings = {
                 "inpainted_folder": self.inpainted_folder_var.get(),
@@ -1557,38 +1567,24 @@ class MergingGUI(ThemedTk):
         self.wiggle_after_id = self.after(60, self._wiggle_step, not show_left)
 
     def save_config(self):
-        """Saves the current GUI configuration to a JSON file."""
-        config = {
-            "inpainted_folder": self.inpainted_folder_var.get(),
-            "original_folder": self.original_folder_var.get(),
-            "mask_folder": self.mask_folder_var.get(),
-            "output_folder": self.output_folder_var.get(),
-            "use_gpu": self.use_gpu_var.get(),            
-            "output_format": self.output_format_var.get(),            
-            "pad_to_16_9": self.pad_to_16_9_var.get(),
-            "batch_chunk_size": self.batch_chunk_size_var.get(),
-            "enable_color_transfer": self.enable_color_transfer_var.get(),
-            "debug_logging_enabled": self.debug_logging_var.get(),
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "preview_size": self.preview_size_var.get(),
-            "mask_dilate_kernel_size": str(self.mask_dilate_kernel_size_var.get()),
-            "mask_binarize_threshold": str(self.mask_binarize_threshold_var.get()),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "window_width": self.winfo_width(),
-            "mask_blur_kernel_size": str(self.mask_blur_kernel_size_var.get()),
-            "shadow_shift": str(self.shadow_shift_var.get()),
-            "shadow_start_opacity": str(self.shadow_start_opacity_var.get()),
-            "shadow_opacity_decay": str(self.shadow_opacity_decay_var.get()),
-            "shadow_min_opacity": str(self.shadow_min_opacity_var.get()),
-            "shadow_decay_gamma": str(self.shadow_decay_gamma_var.get()),
-        }
-        try:
-            with open("config_merging.mergecfg", "w") as f:
-                json.dump(config, f, indent=4)
-            logger.info("Merging GUI configuration saved.")
-        except Exception as e:
-            logger.error(f"Failed to save merging GUI config: {e}")
+        """Gathers current settings and saves them to the config file."""
+        config = self.get_current_settings()
+        if config:
+            # Add window geometry and other non-processing settings to the config dictionary
+            config["window_x"] = self.winfo_x()
+            config["window_y"] = self.winfo_y()
+            config["window_width"] = self.winfo_width()
+            config["debug_logging_enabled"] = self.debug_logging_var.get()
+            config["dark_mode_enabled"] = self.dark_mode_var.get()
+            # The following settings are already gathered by get_current_settings(),
+            # so these stray lines are removed.
+
+            try:
+                with open("config_merging.mergecfg", "w") as f:
+                    json.dump(config, f, indent=4)
+                logger.info("Merging GUI configuration saved.")
+            except Exception as e:
+                logger.error(f"Failed to save merging GUI config: {e}")
 
     def _load_config(self):
         """Loads configuration from a JSON file."""
@@ -1624,16 +1620,18 @@ class MergingGUI(ThemedTk):
 
     def save_settings_dialog(self):
         """Saves current GUI settings to a user-selected JSON file."""
+        config_to_save = self.get_current_settings()
+        if not config_to_save: return # get_current_settings failed validation
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".mergecfg",
             filetypes=[("Merge Config Files", "*.mergecfg"), ("All files", "*.*")],
             title="Save Settings to File"
         )
         if not filepath: return
-        self.save_config() # First save to internal config to gather all current values
-        # Now copy the saved config to the new location
         try:
-            shutil.copyfile("config_merging.mergecfg", filepath)
+            with open(filepath, "w") as f:
+                json.dump(config_to_save, f, indent=4)
             logger.info(f"Settings saved to {filepath}")
         except Exception as e:
             messagebox.showerror("Save Error", f"Failed to save settings to {filepath}:\n{e}")

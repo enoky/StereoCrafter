@@ -19,7 +19,7 @@ import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
 
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4
+from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
