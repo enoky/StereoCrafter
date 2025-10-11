@@ -17,6 +17,7 @@ from PIL import Image, ImageTk
 from decord import VideoReader, cpu
 import logging
 import time
+import queue
 from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord, start_ffmpeg_pipe_process
 
 GUI_VERSION = "25-10-11"
@@ -148,7 +149,8 @@ class MergingGUI(ThemedTk):
         # --- Core App State ---
         self.stop_event = threading.Event()
         self.is_processing = False
-        
+        self.cleanup_queue = queue.Queue()
+        self.cleanup_thread = None
         # --- Preview State ---
         self.failed_moves = [] # NEW: To track failed file moves for later retry
         # Store VideoReader objects instead of full numpy arrays to save memory
@@ -672,6 +674,51 @@ class MergingGUI(ThemedTk):
         gc.collect()
         logger.info("Preview resources and file handles have been released.")
 
+    def _cleanup_worker(self):
+        """
+        A worker thread that processes a queue of files to be moved.
+        It will retry moving a file until it succeeds.
+        """
+        stop_signal_received = False
+        while not stop_signal_received or not self.cleanup_queue.empty():
+            try:
+                # Wait for an item, but with a timeout so the loop can check the stop condition
+                item = self.cleanup_queue.get(timeout=1)
+
+                if item is None:
+                    logger.info("Cleanup worker received stop signal. Will exit when queue is empty.")
+                    stop_signal_received = True
+                    continue # Continue loop to check if queue is empty
+
+                src_path, dest_folder = item
+                
+                try:
+                    if not os.path.exists(src_path):
+                        logger.debug(f"Cleanup: Source file '{os.path.basename(src_path)}' no longer exists. Skipping move.")
+                        continue
+
+                    finished_dir = os.path.join(dest_folder, "finished")
+                    os.makedirs(finished_dir, exist_ok=True)
+                    dest_path = os.path.join(finished_dir, os.path.basename(src_path))
+
+                    if os.path.exists(dest_path):
+                        logger.warning(f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source.")
+                        os.remove(src_path)
+                    else:
+                        shutil.move(src_path, finished_dir)
+                    logger.info(f"Cleanup: Successfully moved '{os.path.basename(src_path)}'.")
+                except (PermissionError, OSError):
+                    logger.warning(f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds...")
+                    time.sleep(3)
+                    self.cleanup_queue.put(item) # Put it back on the queue to retry
+                except Exception as e:
+                    logger.error(f"Cleanup worker encountered an unexpected error for {os.path.basename(src_path)}: {e}", exc_info=True)
+
+            except queue.Empty:
+                # This is expected when waiting for items. The loop condition will handle exit.
+                continue
+        logger.info("Cleanup worker has finished its queue and is now exiting.")
+
     def _retry_failed_moves(self):
         """Attempts to move any files that previously failed to move."""
         if not self.failed_moves:
@@ -721,6 +768,13 @@ class MergingGUI(ThemedTk):
         self.stop_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+
+        # --- NEW: Start the cleanup worker thread ---
+        self.cleanup_queue = queue.Queue() # Clear the queue from any previous run
+        self.cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
+        logger.info("File cleanup worker thread started.")
+        # --- END NEW ---
 
         # --- NEW: Clear preview resources before starting batch processing ---
         self._clear_preview_resources()
@@ -821,9 +875,6 @@ class MergingGUI(ThemedTk):
             if self.stop_event.is_set():
                 logger.info("Processing stopped by user.")
                 break
-
-            # --- NEW: At the start of each loop, try to move files that failed in the previous loop ---
-            self._retry_failed_moves()
 
             base_name = os.path.basename(inpainted_video_path)
             self.after(0, self.update_status_label, f"Processing {i+1}/{total_videos}: {base_name}")
@@ -1060,11 +1111,11 @@ class MergingGUI(ThemedTk):
                     logger.debug("Source video file handles released.")
                     # --- END FIX ---
 
-                    # --- NEW: Move files on success ---
-                    self._move_processed_file(inpainted_video_path, settings["inpainted_folder"])
-                    self._move_processed_file(splatted_file_path, settings["mask_folder"])
+                    # --- NEW: Queue files for cleanup instead of moving directly ---
+                    self.cleanup_queue.put((inpainted_video_path, settings["inpainted_folder"]))
+                    self.cleanup_queue.put((splatted_file_path, settings["mask_folder"]))
                     if original_video_path_to_move:
-                        self._move_processed_file(original_video_path_to_move, settings["original_folder"])
+                        self.cleanup_queue.put((original_video_path_to_move, settings["original_folder"]))
             except Exception as e:
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
                 if inpainted_reader: del inpainted_reader
@@ -1087,35 +1138,11 @@ class MergingGUI(ThemedTk):
 
             self.after(0, self.progress_var.set, i + 1)
 
-        # --- NEW: One final attempt to move any remaining files after the loop finishes ---
-        logger.info("Batch loop finished. Waiting a moment before final file cleanup...")
-        time.sleep(0.5) # Give the OS a moment to release handles from the very last file.
-        self._retry_failed_moves()
+        # --- NEW: Signal the cleanup worker to stop after it finishes its queue ---
+        self.cleanup_queue.put(None)
+        logger.info("Main processing loop finished. Stop signal sent to cleanup worker.")
 
         self.after(0, self.processing_done, self.stop_event.is_set())
-
-    def _move_processed_file(self, file_path: str, base_folder: str):
-        """Attempts to move a file. If it fails due to a lock, queues it for a later retry."""
-        if file_path and os.path.exists(file_path):
-            finished_dir = os.path.join(base_folder, "finished")
-            os.makedirs(finished_dir, exist_ok=True)
-            dest_path = os.path.join(finished_dir, os.path.basename(file_path))
-            try:
-                if os.path.exists(dest_path):
-                    logger.warning(f"Destination '{os.path.basename(dest_path)}' already exists. Deleting source file.")
-                    os.remove(file_path)
-                    logger.info(f"Successfully removed source file: {os.path.basename(file_path)}")
-                    return # Success
-                
-                shutil.move(file_path, dest_path)
-                logger.info(f"Moved processed file to finished folder: {os.path.basename(file_path)}")
-                return # Success
-            except (PermissionError, OSError) as e:
-                if "being used by another process" in str(e) or isinstance(e, PermissionError):
-                    logger.warning(f"Could not move '{os.path.basename(file_path)}' (file in use). Queuing for later retry.")
-                    self.failed_moves.append((file_path, base_folder))
-                else:
-                    logger.error(f"An unexpected OS error occurred moving '{os.path.basename(file_path)}': {e}")
 
     def restore_finished_files(self):
         """Moves all files from 'finished' subfolders back to their parent directories."""
