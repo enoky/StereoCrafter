@@ -764,13 +764,17 @@ class SplatterGUI(ThemedTk):
             # Use the same aggregation (mean) for both modes for temporal stability
             raw_anchor = np.mean(all_valid_frame_values)
             
-            # --- NEW: Apply Offset and Clamping ---
-            final_anchor_offset = raw_anchor + INTERNAL_ANCHOR_OFFSET
+            # --- MODIFIED: Apply Offset only for Average mode ---
+            offset_to_apply = 0.0
+            if mode == "Average":
+                offset_to_apply = INTERNAL_ANCHOR_OFFSET
+            
+            final_anchor_offset = raw_anchor + offset_to_apply
             
             # Clamp to the valid range [0.0, 1.0]
             final_anchor = np.clip(final_anchor_offset, 0.0, 1.0)
             
-            logger.info(f"\n==> Auto-Convergence ({mode} mode) Calculated: {raw_anchor:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Anchor {final_anchor:.4f}")
+            logger.info(f"\n==> Auto-Convergence ({mode} mode) Calculated: {raw_anchor:.4f} + Offset ({offset_to_apply:.2f}) = Final Anchor {final_anchor:.4f}")
             return float(final_anchor)
         else:
             logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI/Sidecar value as fallback.")
@@ -1850,8 +1854,8 @@ class SplatterGUI(ThemedTk):
 
         # --- Start FFmpeg pipe process ---
         ffmpeg_process = start_ffmpeg_pipe_process(
-            output_width=grid_width,
-            output_height=grid_height,
+            content_width=grid_width,
+            content_height=grid_height,
             final_output_mp4_path=final_output_video_path,
             fps=processed_fps,
             video_stream_info=video_stream_info,

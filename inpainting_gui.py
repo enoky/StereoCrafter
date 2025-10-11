@@ -2090,33 +2090,14 @@ def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor,
     Reads a video using decord and returns frames as a 4D float tensor [T, C, H, W], the FPS,
     and video stream metadata.
     """
-    video_stream_info = get_video_stream_info(video_path)
+    # --- FIX: Call the correct utility function and unpack all its return values ---
+    frames_numpy, fps, _, _, _, _, video_stream_info = read_video_frames_decord(
+        video_path=video_path,
+        decord_ctx=decord_ctx
+    )
+    # --- END FIX ---
 
-    video_reader = VideoReader(video_path, ctx=decord_ctx)
-    num_frames = len(video_reader)
-
-    if num_frames == 0:
-        return torch.empty(0), 0.0, video_stream_info
-
-    # Use ffprobe's detected FPS if available and reliable, otherwise decord's
-    fps = 0.0
-    if video_stream_info and "r_frame_rate" in video_stream_info:
-        try:
-            r_frame_rate_str = video_stream_info["r_frame_rate"].split('/')
-            if len(r_frame_rate_str) == 2:
-                fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
-            else:
-                fps = float(r_frame_rate_str[0])
-            logger.debug(f"Using ffprobe FPS: {fps:.2f} for {os.path.basename(video_path)}")
-        except (ValueError, ZeroDivisionError):
-            fps = video_reader.get_avg_fps()
-            logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord FPS: {fps:.2f}")
-    else:
-        fps = video_reader.get_avg_fps()
-        logger.debug(f"Using Decord FPS: {fps:.2f} for {os.path.basename(video_path)}")
-
-    frames = video_reader.get_batch(range(num_frames))
-    frames = torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
+    frames = torch.from_numpy(frames_numpy).permute(0, 3, 1, 2).float()
 
     return frames, fps, video_stream_info
 
