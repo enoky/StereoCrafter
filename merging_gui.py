@@ -185,6 +185,7 @@ class MergingGUI(ThemedTk):
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", False))
         self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", "Full SBS (Left-Right)"))
+        self.pad_to_16_9_var = tk.BooleanVar(value=self.app_config.get("pad_to_16_9", False))
         self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
@@ -392,6 +393,7 @@ class MergingGUI(ThemedTk):
         self.shadow_min_opacity_var.set(0.2)
         self.shadow_decay_gamma_var.set(2.0)
         self.use_gpu_var.set(True)
+        self.pad_to_16_9_var.set(False)
         self.output_format_var.set("Full SBS (Left-Right)")
         self.enable_color_transfer_var.set(True)
         self.batch_chunk_size_var.set("32")
@@ -582,6 +584,11 @@ class MergingGUI(ThemedTk):
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
         
+        # --- NEW: Pad to 16:9 Checkbox ---
+        pad_check = ttk.Checkbutton(options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var)
+        pad_check.pack(side="left", padx=(15, 5))
+        self._create_hover_tooltip(pad_check, "pad_to_16_9")
+        
         # Add Preview Size option
         ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
         entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
@@ -689,6 +696,7 @@ class MergingGUI(ThemedTk):
                 "mask_folder": self.mask_folder_var.get(),
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
+                "pad_to_16_9": self.pad_to_16_9_var.get(),
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
@@ -823,9 +831,14 @@ class MergingGUI(ThemedTk):
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
+                # --- NEW: Pass padding setting to FFmpeg ---
+                ffmpeg_process = start_ffmpeg_pipe_process(
+                    content_width=output_width,
+                    content_height=output_height,
+                    final_output_mp4_path=output_path,
+                    fps=fps, video_stream_info=video_stream_info,
+                    pad_to_16_9=settings["pad_to_16_9"])
 
-
-                ffmpeg_process = start_ffmpeg_pipe_process(output_width, output_height, output_path, fps, video_stream_info)
                 if ffmpeg_process is None:
                     raise RuntimeError("Failed to start FFmpeg pipe process.")
 
@@ -1440,7 +1453,8 @@ class MergingGUI(ThemedTk):
             "mask_folder": self.mask_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
             "use_gpu": self.use_gpu_var.get(),            
-            "output_format": self.output_format_var.get(),
+            "output_format": self.output_format_var.get(),            
+            "pad_to_16_9": self.pad_to_16_9_var.get(),
             "batch_chunk_size": self.batch_chunk_size_var.get(),
             "enable_color_transfer": self.enable_color_transfer_var.get(),
             "debug_logging_enabled": self.debug_logging_var.get(),

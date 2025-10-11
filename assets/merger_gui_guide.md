@@ -39,6 +39,7 @@ These sliders give you fine-grained control over how the mask is processed befor
 -   **Use GPU for Mask Processing:** Uses the GPU for faster mask processing. Uncheck to use the CPU, which is slower but uses almost no VRAM.
 -   **Output Format:** A dropdown menu to select the final 3D video format. Options include standard Full Side-by-Side (SBS), Half-SBS for compatibility, Double SBS (anamorphic for frame-packed displays), Cross-eye viewing, and Anaglyph for red/cyan glasses.
 -   **Enable Color Transfer:** Corrects color shifts that may have been introduced by the inpainting model by matching the right eye's color palette to the original left eye.
+-   **Pad to 16:9:** If your source video is not a standard 16:9 aspect ratio (e.g., a wide 2.35:1 movie), check this to add black bars (letterbox) to the output, making it a standard 16:9 video for better player compatibility.
 -   **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 -   **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
 

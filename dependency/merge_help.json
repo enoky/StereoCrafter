@@ -15,6 +15,7 @@
 
     "output_format": "Selects the 3D format for the final video. Full SBS is highest quality. Half SBS is more compatible but lower resolution. Double SBS is a vertically stretched format for some 3D displays. Anaglyph is for Red/Cyan glasses.",
     "use_gpu": "If checked, mask processing will be performed on the GPU for speed. Uncheck to use the CPU, which is slower but uses very little VRAM.",
+    "pad_to_16_9": "If checked, adds black bars to the top and bottom of the video to force a 16:9 aspect ratio. Useful for non-standard resolutions (e.g., 1920x800) to ensure compatibility with 3D players.",
     "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
     "preview_size": "The maximum size (width or height) in pixels for the preview image. Larger images may impact performance.",
     "batch_chunk_size": "The number of frames to process in memory at one time during batch processing. Lower this value if you run out of RAM on long videos.",
