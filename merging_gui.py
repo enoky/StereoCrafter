@@ -649,6 +649,28 @@ class MergingGUI(ThemedTk):
         self.status_label_var.set(message)
         self.update_idletasks()
 
+    def _clear_preview_resources(self):
+        """Closes all preview-related video readers and clears the preview display."""
+        self._stop_wigglegram_animation()
+
+        if self.preview_inpainted_reader:
+            del self.preview_inpainted_reader
+            self.preview_inpainted_reader = None
+        if self.preview_original_reader:
+            del self.preview_original_reader
+            self.preview_original_reader = None
+        if self.preview_splatted_reader:
+            del self.preview_splatted_reader
+            self.preview_splatted_reader = None
+
+        self.preview_label.config(image=None, text="Load a video to see preview")
+        self.preview_image_tk = None
+        self.pil_image_for_preview = None
+        self.preview_original_left_tensor = None
+        self.preview_blended_right_tensor = None
+        gc.collect()
+        logger.info("Preview resources and file handles have been released.")
+
     def start_processing(self):
         if self.is_processing:
             messagebox.showwarning("Busy", "Processing is already in progress.")
@@ -658,6 +680,10 @@ class MergingGUI(ThemedTk):
         self.stop_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+
+        # --- NEW: Clear preview resources before starting batch processing ---
+        self._clear_preview_resources()
+
         self.update_status_label("Starting...")
 
         # Collect settings
@@ -966,15 +992,6 @@ class MergingGUI(ThemedTk):
                 stderr_thread.join(timeout=5)
                 ffmpeg_process.wait()
 
-                # --- FIX: Explicitly close readers BEFORE moving files ---
-                if inpainted_reader: del inpainted_reader
-                if splatted_reader: del splatted_reader
-                if original_reader: del original_reader
-                inpainted_reader, splatted_reader, original_reader = None, None, None
-                gc.collect() # Encourage garbage collection
-                logger.debug("Released video reader file handles before moving.")
-                # ---------------------------------------------------------
-
                 if ffmpeg_process.returncode != 0:
                     logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
                 else:
@@ -984,8 +1001,6 @@ class MergingGUI(ThemedTk):
                     self._move_processed_file(splatted_file_path, settings["mask_folder"])
                     if original_video_path_to_move:
                         self._move_processed_file(original_video_path_to_move, settings["original_folder"])
-                # --- END: CHUNK-BASED PROCESSING ---
-
             except Exception as e:
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
@@ -994,6 +1009,8 @@ class MergingGUI(ThemedTk):
                 if inpainted_reader: del inpainted_reader
                 if splatted_reader: del splatted_reader
                 if original_reader: del original_reader
+                gc.collect()
+                # --- END: CHUNK-BASED PROCESSING ---
 
             self.after(0, self.progress_var.set, i + 1)
 
