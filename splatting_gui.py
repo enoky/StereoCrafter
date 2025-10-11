@@ -1850,8 +1850,8 @@ class SplatterGUI(ThemedTk):
 
         # --- Start FFmpeg pipe process ---
         ffmpeg_process = start_ffmpeg_pipe_process(
-            output_width=grid_width,
-            output_height=grid_height,
+            content_width=grid_width,
+            content_height=grid_height,
             final_output_mp4_path=final_output_video_path,
             fps=processed_fps,
             video_stream_info=video_stream_info,
