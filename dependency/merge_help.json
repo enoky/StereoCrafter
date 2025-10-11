@@ -4,13 +4,14 @@
     "mask_folder": "Folder containing the high-resolution splatted files (e.g., '_splatted4.mp4' or '_splatted2.mp4') which contain the mask and warped background.",
     "output_folder": "Folder where the final merged videos will be saved.",
 
-    "mask_dilate_kernel": "Expands the white areas of the mask. Useful for covering up thin black lines at the edge of the inpainted region. Set to 0 to disable.",
-    "mask_blur_kernel": "Applies a Gaussian blur to the mask, creating a softer, more feathered blend between the original and inpainted content. Set to 0 to disable.",
+    "binarize_thresh_(<0=off)": "Converts the grayscale mask to pure black and white before other processing. Values of 0.0 or higher act as the threshold. Set to a negative value (e.g., -0.01) to disable and use the original grayscale mask.",
+    "dilate_kernel": "Expands the white areas of the mask. Useful for covering up thin black lines at the edge of the inpainted region. Set to 0 to disable.",
+    "blur_kernel": "Applies a Gaussian blur to the mask, creating a softer, more feathered blend between the original and inpainted content. Set to 0 to disable.",
     "shadow_shift": "The number of pixels to shift the 'shadow' to the right in each step of the shadow blur effect. Set to 0 to disable.",
     "shadow_gamma": "Controls the fade-out curve of the shadow. >1.0 starts slow and fades fast. <1.0 starts fast and fades slow. 1.0 is a linear fade.",
     "shadow_opacity_start": "The starting opacity of the first shadow 'echo'. A value of 1.0 is fully opaque.",
     "shadow_opacity_decay": "The amount of opacity to subtract from the shadow at each step. A larger value creates a shorter, faster fade.",
-    "shadow_min_opacity": "The opacity at which the shadow effect will stop generating new echoes.",
+    "shadow_opacity_min": "The opacity at which the shadow effect will stop generating new echoes.",
 
     "use_gpu": "If checked, mask processing will be performed on the GPU for speed. Uncheck to use the CPU, which is slower but uses very little VRAM.",
     "use_sbs_output": "If checked, the final output will be a Side-by-Side (SBS) video. If unchecked, only the blended right-eye video will be saved.",

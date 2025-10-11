@@ -19,7 +19,7 @@ import logging
 import time
 from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord, start_ffmpeg_pipe_process
 
-GUI_VERSION = "25-10-10"
+GUI_VERSION = "25-10-11"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -165,12 +165,14 @@ class MergingGUI(ThemedTk):
         self.preview_loaded_file = None
 
         # --- GUI Variables ---
+        self.pil_image_for_preview = None # Store the PIL image for resizing
         self.inpainted_folder_var = tk.StringVar(value=self.app_config.get("inpainted_folder", "./completed_output"))
         self.original_folder_var = tk.StringVar(value=self.app_config.get("original_folder", "./input_source_clips"))
         self.mask_folder_var = tk.StringVar(value=self.app_config.get("mask_folder", "./output_splatted/hires")) # Assuming masks are in splatted folder
         self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./final_videos"))
 
         # --- Mask Processing Parameters ---
+        self.mask_binarize_threshold_var = tk.DoubleVar(value=float(self.app_config.get("mask_binarize_threshold", 0.30)))
         self.mask_dilate_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_dilate_kernel_size", 3)))
         self.mask_blur_kernel_size_var = tk.DoubleVar(value=float(self.app_config.get("mask_blur_kernel_size", 5)))
         self.shadow_shift_var = tk.DoubleVar(value=float(self.app_config.get("shadow_shift", 5)))
@@ -184,7 +186,7 @@ class MergingGUI(ThemedTk):
         self.enable_color_transfer_var = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
-        self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", 32)))
+        self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", 20)))
         self.frame_scrubber_var = tk.DoubleVar(value=0)
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
@@ -209,23 +211,40 @@ class MergingGUI(ThemedTk):
         self.update_status_label("Ready.")
 
     def _set_saved_geometry(self):
-        """Applies the saved window width and position, with dynamic height."""
-        self.update_idletasks() 
+        """
+        Applies the saved window width and position, with dynamic height.
+        This is more robust than the simpler _refresh_window_geometry.
+        """
+        logger.debug("--- Setting Saved Geometry (Startup) ---")
+        self.update_idletasks()
 
+        # 1. Get the optimal height for the current content
         calculated_height = self.winfo_reqheight()
-        if calculated_height < 200:
-            calculated_height = 800 # Fallback
+        logger.debug(f"  - Initial required height: {calculated_height}")
+        if calculated_height < 200: # Fallback for initial state
+            calculated_height = 800
+            logger.debug(f"  - Height was < 200, using fallback: {calculated_height}")
 
+        # 2. Use the saved/default width, with a fallback
         current_width = self.window_width
-        if current_width < 300:
-            current_width = 700 # Fallback
+        logger.debug(f"  - Using saved/default width: {current_width}")
+        if current_width < 500: # Minimum sensible width
+            current_width = 700
+            logger.debug(f"  - Width was < 500, using fallback: {current_width}")
 
+        # 3. Construct the geometry string
         geometry_string = f"{current_width}x{calculated_height}"
         if self.window_x is not None and self.window_y is not None:
             geometry_string += f"+{self.window_x}+{self.window_y}"
+            logger.debug(f"  - Using saved position: +{self.window_x}+{self.window_y}")
 
+        # 4. Apply the geometry
         self.geometry(geometry_string)
+        logger.debug(f"  - Applied geometry string: '{geometry_string}'")
+
+        # Store the width that was actually applied for the next save operation
         self.window_width = current_width
+        logger.debug("--- End Setting Saved Geometry ---")
 
     def create_menubar(self):
         """Creates the main menu bar for the application."""
@@ -284,6 +303,10 @@ class MergingGUI(ThemedTk):
             selectbackground=[('readonly', entry_bg)],
             selectforeground=[('readonly', fg_color)]
         )
+        # --- FIX: Manually set the background for the tk.Canvas widget ---
+        if hasattr(self, 'preview_canvas'):
+            self.preview_canvas.config(bg=bg_color, highlightthickness=0)
+        # -----------------------------------------------------------------
 
     def show_about_dialog(self):
         """Displays an 'About' dialog for the application."""
@@ -310,6 +333,7 @@ class MergingGUI(ThemedTk):
         self.mask_blur_kernel_size_var.set(25.0)
         self.shadow_shift_var.set(2.0)
         self.shadow_start_opacity_var.set(0.8)
+        self.mask_binarize_threshold_var.set(-0.01)
         self.shadow_opacity_decay_var.set(0.1)
         self.shadow_min_opacity_var.set(0.2)
         self.shadow_decay_gamma_var.set(2.0)
@@ -386,15 +410,37 @@ class MergingGUI(ThemedTk):
         ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var)).grid(row=3, column=2, padx=5)
 
         # --- PREVIEW FRAME (Moved here) ---
-        preview_frame = ttk.LabelFrame(self, text="Live Preview", padding=10)
-        preview_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        preview_container_frame = ttk.LabelFrame(self, text="Live Preview", padding=10)
+        preview_container_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.preview_label = ttk.Label(preview_frame, text="Load a video to see preview", anchor="center")
-        self.preview_label.pack(fill="both", expand=True, padx=5, pady=5)
+        # Create a canvas with scrollbars
+        self.preview_canvas = tk.Canvas(preview_container_frame)
+        v_scrollbar = ttk.Scrollbar(preview_container_frame, orient="vertical", command=self.preview_canvas.yview)
+        h_scrollbar = ttk.Scrollbar(preview_container_frame, orient="horizontal", command=self.preview_canvas.xview)
+        self.preview_canvas.bind("<Configure>", lambda e: self._update_preview_layout()) # Re-center on resize
+        self.preview_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+        # Grid layout for canvas and scrollbars
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        
+        preview_container_frame.grid_rowconfigure(0, weight=1)
+        preview_container_frame.grid_columnconfigure(0, weight=1)
+
+        # Create a frame inside the canvas to hold the image label
+        self.preview_inner_frame = ttk.Frame(self.preview_canvas)
+        self.preview_canvas_window_id = self.preview_canvas.create_window((0, 0), window=self.preview_inner_frame, anchor="nw")
+        self.preview_label = ttk.Label(self.preview_inner_frame, text="Load a video to see preview", anchor="center")
+        # Store references to scrollbars to hide/show them
+        self.v_scrollbar = v_scrollbar
+        self.h_scrollbar = h_scrollbar
+
+        self.preview_label.pack(fill="both", expand=True)
 
         # Scrubber Frame
-        scrubber_frame = ttk.Frame(preview_frame)
-        scrubber_frame.pack(fill="x", pady=5)
+        scrubber_frame = ttk.Frame(preview_container_frame) # Parent is preview_container_frame
+        scrubber_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=5) # Use grid instead of pack
         scrubber_frame.grid_columnconfigure(1, weight=1)
 
         self.frame_label = ttk.Label(scrubber_frame, textvariable=self.frame_label_var, width=15)
@@ -404,9 +450,9 @@ class MergingGUI(ThemedTk):
         self.frame_scrubber.bind("<ButtonRelease-1>", self.on_slider_release)
         self.frame_scrubber.configure(command=self.on_scrubber_move)
 
-        # --- NEW: Video Navigation Frame ---
-        preview_button_frame = ttk.Frame(preview_frame)
-        preview_button_frame.pack(fill="x", pady=5)
+        # --- Video Navigation Frame ---
+        preview_button_frame = ttk.Frame(preview_container_frame) # Parent is preview_container_frame
+        preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5) # Use grid instead of pack
 
         # Add Preview Source dropdown
         ttk.Label(preview_button_frame, text="Preview Source:").pack(side="left", padx=(0, 5))
@@ -453,13 +499,14 @@ class MergingGUI(ThemedTk):
             self._create_hover_tooltip(slider, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
             return slider
 
-        create_slider(param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 0)
-        create_slider(param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 1)
-        create_slider(param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 2)
-        create_slider(param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 3, decimals=2)
-        create_slider(param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 4, decimals=2)
-        create_slider(param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 5, decimals=2)
-        create_slider(param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 6, decimals=2)
+        create_slider(param_frame, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
+        create_slider(param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
+        create_slider(param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
+        create_slider(param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
+        create_slider(param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2)
+        create_slider(param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
+        create_slider(param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
+        create_slider(param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
@@ -589,6 +636,7 @@ class MergingGUI(ThemedTk):
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": int(self.preview_size_var.get()),
                 # Mask params
+                "binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "dilate_kernel": int(self.mask_dilate_kernel_size_var.get()),
                 "blur_kernel": int(self.mask_blur_kernel_size_var.get()),
                 "shadow_shift": int(self.shadow_shift_var.get()),
@@ -767,6 +815,11 @@ class MergingGUI(ThemedTk):
                     processed_mask = mask.clone()
                     if settings["dilate_kernel"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
                     if settings["blur_kernel"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["blur_kernel"], use_gpu)
+                    
+                    # --- NEW: Binarization as the first step ---
+                    if settings["binarize_threshold"] >= 0.0:
+                        processed_mask = (mask > settings["binarize_threshold"]).float()
+
                     if settings["shadow_shift"] > 0: processed_mask = apply_shadow_blur(processed_mask, settings["shadow_shift"], settings["shadow_start_opacity"], settings["shadow_opacity_decay"], settings["shadow_min_opacity"], settings["shadow_decay_gamma"], use_gpu)
 
                     blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
@@ -1121,6 +1174,11 @@ class MergingGUI(ThemedTk):
 
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone()
+
+            # --- NEW: Binarization as the first step ---
+            if settings["binarize_threshold"] >= 0.0:
+                processed_mask = (processed_mask > settings["binarize_threshold"]).float()
+
             if settings["dilate_kernel"] > 0:
                 processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
             if settings["blur_kernel"] > 0:
@@ -1185,10 +1243,14 @@ class MergingGUI(ThemedTk):
                 pil_img = Image.fromarray(blended_np)
                 pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
                 self.preview_image_tk = ImageTk.PhotoImage(pil_img)
+                self.pil_image_for_preview = pil_img
             else:
-                self.preview_image_tk = ImageTk.PhotoImage(Image.fromarray(blended_np))
+                pil_img = Image.fromarray(blended_np)
+                self.preview_image_tk = ImageTk.PhotoImage(pil_img)
+                self.pil_image_for_preview = pil_img
 
-            self.preview_label.config(image=self.preview_image_tk)
+            self.preview_label.config(image=self.preview_image_tk, text="")
+            self._update_preview_layout()
 
         except Exception as e:
             logger.error(f"Error updating preview: {e}", exc_info=True)
@@ -1197,6 +1259,43 @@ class MergingGUI(ThemedTk):
             # --- NEW: Explicitly release VRAM used by the preview render ---
             release_cuda_memory()
             self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _update_preview_layout(self):
+        """Centers the image if it's smaller than the canvas, and hides/shows scrollbars."""
+        if not hasattr(self, 'preview_canvas'):
+            return
+
+        if not self.pil_image_for_preview:
+            # No image is loaded, so ensure scrollbars are hidden.
+            self.v_scrollbar.grid_remove()
+            self.h_scrollbar.grid_remove()
+            return
+
+        canvas_w = self.preview_canvas.winfo_width()
+        canvas_h = self.preview_canvas.winfo_height()
+        img_w = self.pil_image_for_preview.width
+        img_h = self.pil_image_for_preview.height
+
+        # Determine if scrollbars are needed
+        v_scroll_needed = img_h > canvas_h
+        h_scroll_needed = img_w > canvas_w
+
+        # Show or hide scrollbars
+        if v_scroll_needed: self.v_scrollbar.grid()
+        else: self.v_scrollbar.grid_remove()
+        if h_scroll_needed: self.h_scrollbar.grid()
+        else: self.h_scrollbar.grid_remove()
+
+        # Center the image if it's smaller than the canvas
+        x = max(0, (canvas_w - img_w) // 2)
+        y = max(0, (canvas_h - img_h) // 2)
+        
+        # Update the position of the inner frame on the canvas
+        self.preview_canvas.coords(self.preview_canvas_window_id, x, y)
+
+        # Update the scrollable region
+        self.preview_inner_frame.update_idletasks()
+        self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
 
     def _start_wigglegram_animation(self, left_frame, right_frame):
         """Starts the wigglegram animation loop."""
@@ -1238,6 +1337,7 @@ class MergingGUI(ThemedTk):
             "dark_mode_enabled": self.dark_mode_var.get(),
             "preview_size": self.preview_size_var.get(),
             "mask_dilate_kernel_size": str(self.mask_dilate_kernel_size_var.get()),
+            "mask_binarize_threshold": str(self.mask_binarize_threshold_var.get()),
             "window_x": self.winfo_x(),
             "window_y": self.winfo_y(),
             "window_width": self.winfo_width(),
