@@ -17,6 +17,7 @@ from PIL import Image, ImageTk
 from decord import VideoReader, cpu
 import logging
 import time
+import queue
 from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord, start_ffmpeg_pipe_process
 
 GUI_VERSION = "25-10-11"
@@ -148,8 +149,10 @@ class MergingGUI(ThemedTk):
         # --- Core App State ---
         self.stop_event = threading.Event()
         self.is_processing = False
-        
+        self.cleanup_queue = queue.Queue()
+        self.cleanup_thread = None
         # --- Preview State ---
+        self.failed_moves = [] # NEW: To track failed file moves for later retry
         # Store VideoReader objects instead of full numpy arrays to save memory
         self.preview_inpainted_reader = None
         self.preview_original_reader = None
@@ -671,6 +674,91 @@ class MergingGUI(ThemedTk):
         gc.collect()
         logger.info("Preview resources and file handles have been released.")
 
+    def _cleanup_worker(self):
+        """
+        A worker thread that processes a queue of files to be moved.
+        It will retry moving a file until it succeeds.
+        """
+        stop_signal_received = False
+        while not stop_signal_received or not self.cleanup_queue.empty():
+            try:
+                # Wait for an item, but with a timeout so the loop can check the stop condition
+                item = self.cleanup_queue.get(timeout=1)
+
+                if item is None:
+                    logger.info("Cleanup worker received stop signal. Will exit when queue is empty.")
+                    stop_signal_received = True
+                    continue # Continue loop to check if queue is empty
+
+                src_path, dest_folder = item
+                
+                try:
+                    if not os.path.exists(src_path):
+                        logger.debug(f"Cleanup: Source file '{os.path.basename(src_path)}' no longer exists. Skipping move.")
+                        continue
+
+                    finished_dir = os.path.join(dest_folder, "finished")
+                    os.makedirs(finished_dir, exist_ok=True)
+                    dest_path = os.path.join(finished_dir, os.path.basename(src_path))
+
+                    if os.path.exists(dest_path):
+                        logger.warning(f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source.")
+                        os.remove(src_path)
+                    else:
+                        shutil.move(src_path, finished_dir)
+                    logger.info(f"Cleanup: Successfully moved '{os.path.basename(src_path)}'.")
+                except (PermissionError, OSError):
+                    logger.warning(f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds...")
+                    time.sleep(3)
+                    self.cleanup_queue.put(item) # Put it back on the queue to retry
+                except Exception as e:
+                    logger.error(f"Cleanup worker encountered an unexpected error for {os.path.basename(src_path)}: {e}", exc_info=True)
+
+            except queue.Empty:
+                # This is expected when waiting for items. The loop condition will handle exit.
+                continue
+        logger.info("Cleanup worker has finished its queue and is now exiting.")
+
+    def _retry_failed_moves(self):
+        """Attempts to move any files that previously failed to move."""
+        if not self.failed_moves:
+            return
+
+        logger.info(f"Retrying {len(self.failed_moves)} previously failed file moves...")
+        
+        # Use a copy of the list to iterate over, so we can safely remove from the original
+        remaining_failures = []
+        for src_path, dest_folder in self.failed_moves:
+            try:
+                # --- FIX: Check for source existence FIRST ---
+                if not os.path.exists(src_path):
+                    logger.debug(f"Retry: Source file '{os.path.basename(src_path)}' no longer exists. Assuming it was moved successfully.")
+                    continue # This item is resolved, do not add to remaining_failures
+
+                finished_dir = os.path.join(dest_folder, "finished")
+                dest_path = os.path.join(finished_dir, os.path.basename(src_path))
+
+                if os.path.exists(dest_path):
+                    # Destination exists, so the move likely succeeded. We just need to delete the source.
+                    logger.info(f"Retry: Destination '{os.path.basename(dest_path)}' exists. Deleting source '{os.path.basename(src_path)}'.")
+                    try:
+                        os.remove(src_path)
+                    except Exception as e_del:
+                        logger.error(f"Retry: Failed to delete source '{os.path.basename(src_path)}' even though destination exists: {e_del}")
+                        remaining_failures.append((src_path, dest_folder)) # Keep it for the next final retry
+                else:
+                    # Destination does not exist, but we know the source does. This is a true move retry.
+                    shutil.move(src_path, finished_dir)
+                    logger.info(f"Successfully moved previously failed file: {os.path.basename(src_path)}")
+
+            except (PermissionError, OSError) as e:
+                logger.warning(f"Retry failed for {os.path.basename(src_path)}: {e}. Will try again later.")
+                remaining_failures.append((src_path, dest_folder)) # Add back to the list for the next attempt
+            except Exception as e:
+                logger.error(f"Unexpected error during retry for {os.path.basename(src_path)}: {e}", exc_info=True)
+        
+        self.failed_moves = remaining_failures
+
     def start_processing(self):
         if self.is_processing:
             messagebox.showwarning("Busy", "Processing is already in progress.")
@@ -680,6 +768,13 @@ class MergingGUI(ThemedTk):
         self.stop_event.clear()
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
+
+        # --- NEW: Start the cleanup worker thread ---
+        self.cleanup_queue = queue.Queue() # Clear the queue from any previous run
+        self.cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
+        logger.info("File cleanup worker thread started.")
+        # --- END NEW ---
 
         # --- NEW: Clear preview resources before starting batch processing ---
         self._clear_preview_resources()
@@ -746,9 +841,10 @@ class MergingGUI(ThemedTk):
         """Helper method to read FFmpeg's output without blocking."""
         try:
             # Use iter to read line by line
-            for line in iter(pipe.readline, ''):
+            for line in iter(pipe.readline, b''): # Read bytes until an empty byte string
                 if line:
-                    logger.log(log_level, f"FFmpeg: {line.strip()}")
+                    # Decode bytes to string for logging, ignoring potential decoding errors
+                    logger.log(log_level, f"FFmpeg: {line.decode('utf-8', errors='ignore').strip()}")
         except Exception as e:
             logger.error(f"Error reading FFmpeg pipe: {e}")
         finally:
@@ -768,6 +864,9 @@ class MergingGUI(ThemedTk):
             self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in the inpainted video folder."))
             self.after(0, self.processing_done)
             return
+
+        # --- NEW: Clear any failed moves from a previous run ---
+        self.failed_moves = []
 
         total_videos = len(inpainted_videos)
         self.progress_bar.config(maximum=total_videos)
@@ -989,67 +1088,61 @@ class MergingGUI(ThemedTk):
                 # 5. Finalize FFmpeg process
                 if ffmpeg_process.stdin:
                     ffmpeg_process.stdin.close()
-                stdout_thread.join(timeout=5) # Wait for reader threads to finish
-                stderr_thread.join(timeout=5)
-                ffmpeg_process.wait()
 
+                # --- FIX: Wait for the process to finish FIRST, then join threads ---
+                ffmpeg_process.wait(timeout=120) # Wait for ffmpeg to exit
+                stdout_thread.join(timeout=5)    # Wait for stdout reader to finish
+                stderr_thread.join(timeout=5)    # Wait for stderr reader to finish
+                # --- END FIX ---
+                
                 if ffmpeg_process.returncode != 0:
                     logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
                 else:
+                    del ffmpeg_process
+                    logger.debug("FFmpeg process and threads terminated, proceeding to move files.")
                     logger.info(f"Successfully encoded video to {output_path}")
-                    # --- NEW: Move files on success ---
-                    self._move_processed_file(inpainted_video_path, settings["inpainted_folder"])
-                    self._move_processed_file(splatted_file_path, settings["mask_folder"])
+
+                    # --- FIX: Explicitly close video readers BEFORE attempting to move their files ---
+                    if inpainted_reader: del inpainted_reader
+                    if splatted_reader: del splatted_reader
+                    if original_reader: del original_reader
+                    inpainted_reader, splatted_reader, original_reader = None, None, None                    
+                    time.sleep(0.1) # Give OS a moment to release file handles
+                    logger.debug("Source video file handles released.")
+                    # --- END FIX ---
+
+                    # --- NEW: Queue files for cleanup instead of moving directly ---
+                    self.cleanup_queue.put((inpainted_video_path, settings["inpainted_folder"]))
+                    self.cleanup_queue.put((splatted_file_path, settings["mask_folder"]))
                     if original_video_path_to_move:
-                        self._move_processed_file(original_video_path_to_move, settings["original_folder"])
+                        self.cleanup_queue.put((original_video_path_to_move, settings["original_folder"]))
             except Exception as e:
+                # --- FIX: Ensure readers are closed on exception before the finally block ---
+                if inpainted_reader: del inpainted_reader
+                if splatted_reader: del splatted_reader
+                if original_reader: del original_reader
+                inpainted_reader, splatted_reader, original_reader = None, None, None
+                # --- END FIX ---
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
             finally:
                 # Ensure readers are always cleaned up, even on error
-                if inpainted_reader: del inpainted_reader
-                if splatted_reader: del splatted_reader
-                if original_reader: del original_reader
-                gc.collect()
+                # This is now a secondary safety net; the primary cleanup happens before file moves.
+                if inpainted_reader: 
+                    del inpainted_reader
+                if splatted_reader: 
+                    del splatted_reader
+                if original_reader: 
+                    del original_reader
                 # --- END: CHUNK-BASED PROCESSING ---
 
             self.after(0, self.progress_var.set, i + 1)
 
+        # --- NEW: Signal the cleanup worker to stop after it finishes its queue ---
+        self.cleanup_queue.put(None)
+        logger.info("Main processing loop finished. Stop signal sent to cleanup worker.")
+
         self.after(0, self.processing_done, self.stop_event.is_set())
-
-    def _move_processed_file(self, file_path: str, base_folder: str, max_retries: int = 5, retry_delay_sec: float = 0.5):
-        """Moves a single file to a 'finished' subfolder within its base folder."""
-        if not file_path or not os.path.exists(file_path):
-            return
-        
-        finished_dir = os.path.join(base_folder, "finished")
-        os.makedirs(finished_dir, exist_ok=True)
-        dest_path = os.path.join(finished_dir, os.path.basename(file_path))
-
-        for attempt in range(max_retries):
-            try:
-                # --- NEW: Check if destination exists before moving ---
-                if os.path.exists(dest_path):
-                    logger.warning(f"Destination '{os.path.basename(dest_path)}' already exists. Assuming previous move was incomplete. Deleting source file.")
-                    try:
-                        os.remove(file_path)
-                        logger.info(f"Successfully removed source file: {os.path.basename(file_path)}")
-                    except Exception as e_del:
-                        logger.error(f"Failed to remove source file '{os.path.basename(file_path)}' after finding existing destination: {e_del}")
-                    return # End the operation for this file
-
-                # If destination does not exist, attempt the move
-                shutil.move(file_path, dest_path)
-                logger.info(f"Moved processed file to finished folder: {os.path.basename(file_path)}")
-                return # Success
-            except PermissionError:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries}: Could not move '{os.path.basename(file_path)}' (file in use). Retrying...")
-                time.sleep(retry_delay_sec)
-            except Exception as e:
-                logger.error(f"Failed to move file {os.path.basename(file_path)} to finished folder: {e}")
-                return # Don't retry on other errors
-
-        logger.error(f"Failed to move file '{os.path.basename(file_path)}' after {max_retries} attempts. It may still be locked.")
 
     def restore_finished_files(self):
         """Moves all files from 'finished' subfolders back to their parent directories."""

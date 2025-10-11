@@ -318,6 +318,7 @@ def encode_frames_to_mp4(
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-loglevel", "error",
         "-y", # Overwrite output files without asking
         "-framerate", str(fps), # Input framerate for the PNG sequence
         "-i", os.path.join(temp_png_dir, "%05d.png"), # Input PNG sequence pattern
@@ -550,6 +551,7 @@ def start_ffmpeg_pipe_process(
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-loglevel", "error",
         "-y",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
