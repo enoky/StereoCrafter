@@ -1859,7 +1859,8 @@ class SplatterGUI(ThemedTk):
             final_output_mp4_path=final_output_video_path,
             fps=processed_fps,
             video_stream_info=video_stream_info,
-            user_output_crf=user_output_crf
+            user_output_crf=user_output_crf,
+            output_format_str="splatted_grid" # Pass a placeholder for the new argument
         )
         if ffmpeg_process is None:
             logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")

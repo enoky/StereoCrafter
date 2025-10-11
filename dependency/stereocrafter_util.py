@@ -508,7 +508,7 @@ def start_ffmpeg_pipe_process(
     final_output_mp4_path: str,
     fps: float,
     video_stream_info: Optional[dict],
-    output_format_str: str, # NEW: Pass the format string to determine aspect ratio
+    output_format_str: str = "", # Make argument optional with a default value
     user_output_crf: Optional[int] = None,
     pad_to_16_9: bool = False
 ) -> Optional[subprocess.Popen]:
