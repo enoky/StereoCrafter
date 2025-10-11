@@ -680,6 +680,7 @@ class InpaintingGUI(ThemedTk):
                     adjusted_frames_output.append(adjusted_frame.to(frames_output_final.device))
                 
                 frames_output_final = torch.stack(adjusted_frames_output)
+                self._save_debug_image(frames_output_final, "08_inpainted_color_transferred", base_video_name, 0)
                 logger.debug("Color transfer complete.")
         # --- END Apply Color Transfer ---
 
@@ -693,6 +694,7 @@ class InpaintingGUI(ThemedTk):
                 mask=frames_mask_processed, # Note: using the simplified variable name
                 base_video_name=base_video_name 
             )
+            self._save_debug_image(frames_output_final, "09_final_blended_right_eye", base_video_name, 0)
             logger.debug("Post-inpainting blend complete.")
 
         # --- Final Concatenation ---
@@ -716,6 +718,7 @@ class InpaintingGUI(ThemedTk):
                 return None
 
             sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
+            self._save_debug_image(sbs_frames, "10_final_sbs_for_encoding", base_video_name, 0)
             final_output_frames_for_encoding = sbs_frames
 
         # Final check: ensure the tensor to be encoded is actually populated
@@ -904,6 +907,10 @@ class InpaintingGUI(ThemedTk):
         frames, fps, video_stream_info = read_video_frames(input_video_path)
 
         # --- Process Length Logic ---
+        # --- FIX: Ensure frames are integers (0-255) before splitting. ---
+        # The read_video_frames function now returns floats (0-1), but the
+        # splitting logic expects integers. We convert back to uint8 here.
+        frames = (frames * 255).to(torch.uint8)
         total_frames_in_video = frames.shape[0]
         actual_frames_to_process_count = total_frames_in_video
 
@@ -972,6 +979,20 @@ class InpaintingGUI(ThemedTk):
             output_display_h = total_h_current
             output_display_w = half_w
 
+            # --- NEW: Divisibility Check ---
+            required_divisor = 8
+            if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+                error_msg = (f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                             f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                             f"but both width and height must be divisible by {required_divisor}.\n\n"
+                             "Please crop or resize the source video. Skipping this file.")
+                logger.error(error_msg)
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+                self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+                return None
+            # --- END NEW ---
+
         else: # Quad input
             half_h = total_h_current // 2
             half_w = total_w_current // 2
@@ -986,13 +1007,34 @@ class InpaintingGUI(ThemedTk):
 
             output_display_h = half_h
             output_display_w = half_w
+            
+            # --- NEW: Divisibility Check ---
+            required_divisor = 8
+            if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+                error_msg = (f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                             f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                             f"but both width and height must be divisible by {required_divisor}.\n\n"
+                             "Please crop or resize the source video. Skipping this file.")
+                logger.error(error_msg)
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+                self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+                return None
+            # --- END NEW ---
+
 
         # --- Normalization and Grayscale Conversion (Using OpenCV) ---
+        # --- FIX: Normalize the warped frames here ---
         frames_warpped_normalized = frames_warpped_raw.float() / 255.0
+        self._save_debug_image(frames_warpped_normalized, "01a_warped_input", base_video_name, 0)
+        # --- END FIX ---
 
         processed_masks_grayscale = []
         for t in range(frames_mask_raw.shape[0]):
-            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            # --- FIX: Convert float tensor (0-1) to uint8 (0-255) for OpenCV ---
+            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy()
+            self._save_debug_image(frame_np_rgb.astype(np.float32) / 255.0, "01_mask_raw_color", base_video_name, t)
+            # --- END FIX ---
             frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
             frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
             # --- FIX: Ensure the grayscale tensor has a channel dimension ---
@@ -1000,9 +1042,10 @@ class InpaintingGUI(ThemedTk):
             if frame_tensor_gray.dim() == 2:
                 frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
             # --- END FIX ---
-            processed_masks_grayscale.append(frame_tensor_gray.unsqueeze(0))
+            processed_masks_grayscale.append(frame_tensor_gray)
         current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
         logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+        self._save_debug_image(current_processed_mask, "02_mask_initial_grayscale", base_video_name, 0)
 
         # --- Granular Mask Processing Steps (Direct Binarization Pipeline) ---
 
@@ -1015,6 +1058,7 @@ class InpaintingGUI(ThemedTk):
                     binarize_threshold = 0.1
                 current_processed_mask = (current_processed_mask > binarize_threshold).float()
                 logger.debug(f"Mask: Binarized (threshold > {binarize_threshold}, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+                self._save_debug_image(current_processed_mask, "03_mask_binarized", base_video_name, 0)
             else:
                 logger.debug("Mask: Binarization step skipped (threshold is 0). Using grayscale (might be unsuitable for subsequent steps).")
         except ValueError:
@@ -1027,6 +1071,7 @@ class InpaintingGUI(ThemedTk):
             if morph_kernel_size != 0: # Step enabled if kernel size is not 0
                 current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
                 logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+                self._save_debug_image(current_processed_mask, "04_mask_morph_closed", base_video_name, 0)
             else:
                 logger.debug("Mask: Morphological closing step skipped (kernel size is 0).")
         except ValueError:
@@ -1040,6 +1085,7 @@ class InpaintingGUI(ThemedTk):
             if dilate_kernel_size != 0: # Step enabled if kernel size is not 0
                 current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
                 logger.debug(f"Mask: After dilation (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+                self._save_debug_image(current_processed_mask, "05_mask_dilated", base_video_name, 0)
             else:
                 logger.debug("Mask: Dilation step skipped (kernel size is 0).")
         except ValueError:
@@ -1053,6 +1099,7 @@ class InpaintingGUI(ThemedTk):
             if blur_kernel_size != 0: # Step enabled if kernel size is not 0
                 current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size) # NEW: Pass kernel size
                 logger.debug(f"Mask: After blur (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
+                self._save_debug_image(current_processed_mask, "06_mask_final_blurred", base_video_name, 0)
             else:
                 logger.debug("Mask: Gaussian blur step skipped (kernel size is 0).")
         except ValueError:
@@ -1079,6 +1126,41 @@ class InpaintingGUI(ThemedTk):
         return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
                 num_frames_original, padded_H, padded_W, video_stream_info, fps,
                 frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
+        # This function primarily affects the GUI state.
+        logger.debug(f"Blend parameters state set to: {state}")
+    
+    def _save_debug_image(self, tensor_or_np_array, name_prefix: str, base_video_name: str, frame_idx: int):
+        """Saves a tensor or numpy array as a debug image if debug mode is enabled."""
+        if not self.debug_mode_var.get():
+            return
+
+        try:
+            debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_inpaint")
+            os.makedirs(debug_output_dir, exist_ok=True)
+            
+            video_basename = os.path.splitext(base_video_name)[0]
+            filename = os.path.join(debug_output_dir, f"{video_basename}_frame_{frame_idx:04d}_{name_prefix}.png")
+
+            if isinstance(tensor_or_np_array, torch.Tensor):
+                # Handle tensors of shape [C, H, W] or [1, H, W]
+                img_tensor = tensor_or_np_array.detach().clone().cpu()
+                if img_tensor.dim() == 4: # If it's a batch, take the first frame
+                    img_tensor = img_tensor[0]
+                
+                if img_tensor.shape[0] == 1: # Grayscale
+                    img_tensor = img_tensor.repeat(3, 1, 1) # Convert to 3-channel for saving
+                
+                # Permute from [C, H, W] to [H, W, C] for OpenCV
+                img_np = img_tensor.permute(1, 2, 0).numpy()
+            else: # Assume it's already a numpy array
+                img_np = tensor_or_np_array
+
+            # Convert to uint8 for saving
+            img_uint8 = (np.clip(img_np, 0.0, 1.0) * 255).astype(np.uint8)
+            
+            cv2.imwrite(filename, cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR))
+        except Exception as e:
+            logger.error(f"Failed to save debug image '{name_prefix}': {e}", exc_info=True)
 
     def _set_saved_geometry(self: "InpaintingGUI"):
         """Applies the saved window width and position, with dynamic height."""
@@ -1561,7 +1643,8 @@ class InpaintingGUI(ThemedTk):
             video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
             current_chunk_generated = torch.stack([
                 torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0 for img in video_frames
-            ])
+            ]).cpu()
+            self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
 
             # Append only the "new" frames
             if i == 0:
@@ -2105,10 +2188,7 @@ def read_video_frames(video_path: str, decord_ctx=cpu(0)) -> Tuple[torch.Tensor,
         decord_ctx=decord_ctx
     )
     # --- END FIX ---
-
-    frames = torch.from_numpy(frames_numpy).permute(0, 3, 1, 2).float()
-
-    return frames, fps, video_stream_info
+    return torch.from_numpy(frames_numpy).permute(0, 3, 1, 2).float(), fps, video_stream_info
 
 def blend_h(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor:
     """
