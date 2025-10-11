@@ -507,6 +507,7 @@ def start_ffmpeg_pipe_process(
     final_output_mp4_path: str,
     fps: float,
     video_stream_info: Optional[dict],
+    output_format_str: str, # NEW: Pass the format string to determine aspect ratio
     user_output_crf: Optional[int] = None,
     pad_to_16_9: bool = False
 ) -> Optional[subprocess.Popen]:
@@ -526,14 +527,22 @@ def start_ffmpeg_pipe_process(
     output_height = content_height
 
     if pad_to_16_9:
-        # Calculate the target 16:9 height for the given content width
-        target_16_9_height = int(content_width * 9 / 16)
+        # --- FIX: Calculate padding based on single-eye width ---
+        # Determine the width of a single eye based on the output format
+        if output_format_str in ["Full SBS (Left-Right)", "Full SBS Cross-eye (Right-Left)", "Double SBS"]:
+            single_eye_width = content_width // 2
+        else: # Half SBS, Anaglyph, Right-Eye Only
+            single_eye_width = content_width
+
+        # Calculate the target 16:9 height based on the single eye's width
+        target_16_9_height = int(single_eye_width * 9 / 16)
         # Ensure the height is an even number for codec compatibility
         if target_16_9_height % 2 != 0:
             target_16_9_height += 1
         
         if target_16_9_height > content_height:
             output_height = target_16_9_height
+            # The output width for padding is always the full content width
             vf_options.append(f"pad=w={output_width}:h={output_height}:x=0:y=(oh-ih)/2:color=black")
             logger.debug(f"Padding enabled. Content: {content_width}x{content_height}, Container: {output_width}x{output_height}")
 

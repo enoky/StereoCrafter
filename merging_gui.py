@@ -863,7 +863,8 @@ class MergingGUI(ThemedTk):
                     content_height=output_height,
                     final_output_mp4_path=output_path,
                     fps=fps, video_stream_info=video_stream_info,
-                    pad_to_16_9=settings["pad_to_16_9"])
+                    pad_to_16_9=settings["pad_to_16_9"],
+                    output_format_str=output_format) # Pass the format string
 
                 if ffmpeg_process is None:
                     raise RuntimeError("Failed to start FFmpeg pipe process.")
