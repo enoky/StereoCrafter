@@ -164,6 +164,8 @@ class MergingGUI(ThemedTk):
         self.preview_image_tk = None # To prevent garbage collection
         self.preview_loaded_file = None
 
+        self.preview_original_left_tensor = None
+        self.preview_blended_right_tensor = None
         # --- GUI Variables ---
         self.pil_image_for_preview = None # Store the PIL image for resizing
         self.inpainted_folder_var = tk.StringVar(value=self.app_config.get("inpainted_folder", "./completed_output"))
@@ -257,6 +259,7 @@ class MergingGUI(ThemedTk):
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
         self.file_menu.add_command(label="Save Preview Frame...", command=self._save_preview_frame)
+        self.file_menu.add_command(label="Save Preview as SBS...", command=self._save_preview_sbs_frame)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
@@ -1306,6 +1309,10 @@ class MergingGUI(ThemedTk):
 
             blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
+            # --- NEW: Store tensors for SBS saving ---
+            self.preview_original_left_tensor = original_left.cpu()
+            self.preview_blended_right_tensor = blended_frame.cpu()
+
             # --- Select the final frame to display based on the dropdown ---
             preview_source = self.preview_source_var.get()
             if preview_source == "Blended Image":
@@ -1533,6 +1540,52 @@ class MergingGUI(ThemedTk):
             except Exception as e:
                 logger.error(f"Failed to save preview frame: {e}", exc_info=True)
                 messagebox.showerror("Save Error", f"An error occurred while saving the image:\n{e}")
+
+    def _save_preview_sbs_frame(self):
+        """Saves the current preview as a full side-by-side image."""
+        if self.preview_original_left_tensor is None or self.preview_blended_right_tensor is None:
+            messagebox.showwarning("No Preview Data", "There is no preview data to save. Please load and preview a video first.")
+            return
+
+        try:
+            # Convert tensors to PIL Images
+            left_np = (self.preview_original_left_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            right_np = (self.preview_blended_right_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            
+            left_pil = Image.fromarray(left_np)
+            right_pil = Image.fromarray(right_np)
+
+            # Check if dimensions match
+            if left_pil.size != right_pil.size:
+                messagebox.showerror("Dimension Mismatch", "The left and right eye images have different dimensions. Cannot create SBS image.")
+                return
+
+            # Create SBS image
+            width, height = left_pil.size
+            sbs_image = Image.new('RGB', (width * 2, height))
+            sbs_image.paste(left_pil, (0, 0))
+            sbs_image.paste(right_pil, (width, 0))
+
+            # Suggest a default filename
+            default_filename = "preview_sbs_frame.png"
+            if self.preview_loaded_file:
+                base_name = os.path.splitext(self.preview_loaded_file)[0]
+                frame_num = int(self.frame_scrubber_var.get())
+                default_filename = f"{base_name}_frame_{frame_num:05d}_SBS.png"
+
+            filepath = filedialog.asksaveasfilename(
+                title="Save SBS Preview Frame As...",
+                initialfile=default_filename,
+                defaultextension=".png",
+                filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")]
+            )
+
+            if filepath:
+                sbs_image.save(filepath)
+                logger.info(f"SBS preview frame saved to: {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save SBS preview frame: {e}", exc_info=True)
+            messagebox.showerror("Save Error", f"An error occurred while creating or saving the SBS image:\n{e}")
 
     def exit_application(self):
         """Handles application exit gracefully."""
