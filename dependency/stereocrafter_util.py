@@ -428,7 +428,7 @@ def encode_frames_to_mp4(
             # Use iter to read line by line, which is non-blocking
             for line in iter(pipe.readline, ''):
                 if line:
-                    logger.debug(log_level, f"FFmpeg: {line.strip()}")
+                    logger.log(log_level, f"FFmpeg: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading FFmpeg pipe: {e}")
         finally:
