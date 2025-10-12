@@ -26,7 +26,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25-10-12.0"
+GUI_VERSION = "25-10-12.5"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -153,98 +153,30 @@ class InpaintingGUI(ThemedTk):
         by dilating/growing valid pixels from the right (background side) using OpenCV.
         The result is a frame chunk with clean color statistics for transfer.
         
-        Args:
-            frame_chunk: The warped frames with black occlusion holes.
-            mask_chunk: The mask (float [0,1], [T, 1, H, W]) indicating occluded areas.
-            
-        Returns:
-            The occlusion-filled frame chunk.
         """
         try:
-            # We want to fill the black holes in the frame_chunk (warped image)
-            # using the mask_chunk (processed mask).
-
             if frame_chunk.shape[0] != mask_chunk.shape[0]:
                 logger.error("Frame and mask chunks must have the same temporal dimension.")
                 return frame_chunk
                 
-            # Define the directional kernel for right-to-left growth
-            # A (1, 5) or (1, 7) kernel biases the fill horizontally from the right
-            # We use a non-symmetric kernel that is wider on the right side of the center.
-            # Example: [0, 0, 1, 1, 1, 1, 1] means 2 pixels left, 4 pixels right (or similar)
-            # For pure right-to-left growth, a simple horizontal line kernel is sufficient for dilation
-            kernel_width = 7 # Adjust as needed (e.g., 5, 7, 9)
-            kernel = np.zeros((1, kernel_width), dtype=np.uint8)
-            # Set the pixel on the right-most side (or center) to 1 to promote growth from that direction
-            kernel[0, kernel_width - 1] = 1 # Simple 1xN kernel, just for basic right-to-left bias
-
-            # Use a slightly more complex kernel for stronger right bias.
-            # Example: a 1x7 kernel where the right side has a higher influence
-            # kernel = np.array([[0, 0, 0, 0, 1, 1, 1]], dtype=np.uint8) 
-            # Dilation with a horizontal kernel:
-            # We will use the simplest, most effective one: a 1xN horizontal kernel on the valid (non-masked) pixels.
-            
-            # Convert tensors to numpy, scale to 0-255, and convert to BGR (OpenCV)
-            # Since the tensor is already float 0-1, we need to get the RGB image and the mask.
-            
             filled_frames_list = []
             device = frame_chunk.device
             
             for t in range(frame_chunk.shape[0]):
-                frame_np = (frame_chunk[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8) # [H, W, C] RGB
-                mask_np = (mask_chunk[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8) # [H, W] grayscale mask
+                # 1. Convert tensors to uint8 numpy arrays for OpenCV
+                frame_np_uint8 = (frame_chunk[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                mask_np_uint8 = (mask_chunk[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
                 
-                # Invert the mask: The mask defines the hole (1) but we want to dilate the *source* (0)
-                # No, wait, we want to fill the hole. We need to create a kernel/operation that expands the
-                # non-zero (valid) areas into the zero (black) areas.
+                # 2. Use OpenCV's inpainting to fill the holes defined by the mask
+                # cv2.INPAINT_TELEA is an advanced method that produces good results for this use case.
+                # The '3' is the inpainting radius.
+                inpainted_frame_np = cv2.inpaint(frame_np_uint8, mask_np_uint8, 3, cv2.INPAINT_TELEA)
                 
-                # Method: Simple Image Dilation on the entire image
-                # Dilation will grow bright pixels into dark ones.
-                # Since the "hole" is black (0) and the "valid area" is colored (>0),
-                # dilating the *image* will fill the black hole with surrounding color.
-                
-                # The kernel is now a simple horizontal line (e.g., 1x7)
-                dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+                # 3. Convert the result back to a float tensor
+                filled_tensor = torch.from_numpy(inpainted_frame_np).permute(2, 0, 1).float() / 255.0
+                filled_frames_list.append(filled_tensor.to(device))
 
-                # Apply dilation to the BGR frame (OpenCV uses BGR by default)
-                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                
-                # Apply dilation on the entire image. This will expand the texture from the right/left/etc.
-                # but with a strong horizontal bias from the 1xN kernel.
-                dilated_frame_bgr = cv2.dilate(frame_bgr, dilation_kernel, iterations=5) # 5 iterations for more fill depth
-
-                # The key is to only replace the masked (black) areas with the dilated result.
-                
-                # 1. Prepare mask for blending: HWC, 3 channels, float [0,1]
-                mask_float = mask_np.astype(np.float32) / 255.0
-                mask_3ch = np.stack([mask_float] * 3, axis=2) # [H, W, 3]
-                
-                # 2. Convert back to RGB
-                dilated_frame_rgb = cv2.cvtColor(dilated_frame_bgr, cv2.COLOR_BGR2RGB)
-                
-                # 3. Blend: (Original Frame * (1 - Mask)) + (Dilated Frame * Mask)
-                # This keeps the original valid pixels and only uses the dilated content for the hole.
-                
-                # Both np arrays are HWC, uint8
-                original_frame_np = frame_np 
-                dilated_frame_np = dilated_frame_rgb 
-                
-                # Use a slightly softer mask for blending by applying a small blur to the mask
-                mask_for_blend = cv2.GaussianBlur(mask_float, (21, 21), 0) # Apply blur to the 1-channel mask
-                mask_3ch_blend = np.stack([mask_for_blend] * 3, axis=2) # [H, W, 3]
-
-                # Blend (still in uint8 or convert to float 0-1)
-                # It's cleaner to convert to float 0-1 for blending
-                original_frame_float = original_frame_np.astype(np.float32) / 255.0
-                dilated_frame_float = dilated_frame_np.astype(np.float32) / 255.0
-                
-                blended_float = (original_frame_float * (1 - mask_3ch_blend)) + (dilated_frame_float * mask_3ch_blend)
-                
-                # Convert back to tensor [C, H, W] float [0, 1]
-                blended_tensor = torch.from_numpy(blended_float).permute(2, 0, 1).float().to(device)
-                filled_frames_list.append(blended_tensor)
-
-            logger.debug(f"Applied directional dilation with {kernel_width}x1 kernel for color reference.")
+            logger.debug("Created color reference using OpenCV inpainting (INPAINT_TELEA).")
             return torch.stack(filled_frames_list)
             
         except Exception as e:
@@ -586,47 +518,73 @@ class InpaintingGUI(ThemedTk):
         frames_warpped_original_unpadded_normalized = original_warped_frames
         frames_left_original_cropped = original_left_frames
         
-        # --- START: HI-RES BLENDING (If Enabled) ---
         if hires_data["is_hires_blend_enabled"]:
             hires_H, hires_W = hires_data["hires_H"], hires_data["hires_W"]
             num_frames_original = frames_output_final.shape[0]
+            hires_video_path = hires_data["hires_video_path"]
 
             logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
-            
-            # 1. Upscale Low-Res Inpainted Output
-            frames_output_final_hires = F.interpolate(
-                frames_output_final, size=(hires_H, hires_W), mode='bicubic', align_corners=False
-            ).to(frames_output_final.device)
 
-            # 2. Upscale Low-Res Mask (Bilinear for smoother blend)
-            frames_mask_processed_unpadded_original_length_hires = F.interpolate(
-                frames_mask_processed, size=(hires_H, hires_W), mode='bilinear', align_corners=False
-            ).to(frames_output_final.device)
+            # --- NEW: CHUNKED HI-RES PROCESSING ---
+            hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
+            chunk_size = int(self.frames_chunk_var.get())
             
-            # 3. Load High-Res Original/Warped Frames (The risk is here, but necessary with current read_video_frames)
-            # hires_video_path is guaranteed to be str if is_hires_blend_enabled is True here
-            hires_full_frames_torch, _, _ = read_video_frames(hires_data["hires_video_path"]) 
-            hires_full_frames_torch = hires_full_frames_torch[:num_frames_original] # Crop HR video
+            final_hires_output_chunks = []
+            final_hires_left_chunks = []
 
-            if is_dual_input:
-                half_w_hires = hires_full_frames_torch.shape[3] // 2
-                hires_warped_for_blend = hires_full_frames_torch[:, :, :, half_w_hires:] / 255.0
-                hires_left_for_concat = None
-            else:
-                half_h_hires = hires_full_frames_torch.shape[2] // 2
-                half_w_hires = hires_full_frames_torch.shape[3] // 2
-                hires_left_for_concat = hires_full_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
-                hires_warped_for_blend = hires_full_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
+            for i in range(0, num_frames_original, chunk_size):
+                start_idx, end_idx = i, min(i + chunk_size, num_frames_original)
+                frame_indices = list(range(start_idx, end_idx))
+                if not frame_indices: break
+
+                logger.debug(f"Processing Hi-Res chunk: frames {start_idx}-{end_idx}")
+
+                # 1. Get chunks of low-res data
+                inpainted_chunk = frames_output_final[start_idx:end_idx]
+                mask_chunk = frames_mask_processed[start_idx:end_idx]
+
+                # 2. Upscale low-res chunks
+                inpainted_chunk_hires = F.interpolate(inpainted_chunk, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
+                mask_chunk_hires = F.interpolate(mask_chunk, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
+
+                # 3. Load corresponding hi-res chunk
+                hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
+                hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
+
+                # 4. Split hi-res chunk and normalize
+                if is_dual_input:
+                    half_w_hires = hires_frames_torch.shape[3] // 2
+                    hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:].float() / 255.0
+                    hires_left_chunk = None
+                else: # Quad input
+                    half_h_hires, half_w_hires = hires_frames_torch.shape[2] // 2, hires_frames_torch.shape[3] // 2
+                    hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires].float() / 255.0
+                    hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:].float() / 255.0
+                    final_hires_left_chunks.append(hires_left_chunk)
+
+                # 5. Store processed chunks
+                final_hires_output_chunks.append({
+                    "inpainted": inpainted_chunk_hires,
+                    "mask": mask_chunk_hires,
+                    "warped": hires_warped_chunk
+                })
+
+            # 6. Concatenate all processed chunks back into single tensors
+            frames_output_final = torch.cat([d["inpainted"] for d in final_hires_output_chunks], dim=0)
+            frames_mask_processed = torch.cat([d["mask"] for d in final_hires_output_chunks], dim=0)
+            frames_warpped_original_unpadded_normalized = torch.cat([d["warped"] for d in final_hires_output_chunks], dim=0)
             
-            # 4. Overwrite Low-Res Variables with Hi-Res Upscaled/Loaded Variables
-            frames_output_final = frames_output_final_hires
-            frames_mask_processed = frames_mask_processed_unpadded_original_length_hires
-            frames_warpped_original_unpadded_normalized = hires_warped_for_blend.to(frames_output_final.device)
-            frames_left_original_cropped = hires_left_for_concat.to(frames_output_final.device) if hires_left_for_concat is not None else None
+            if not is_dual_input:
+                frames_left_original_cropped = torch.cat(final_hires_left_chunks, dim=0)
             
-            logger.info("Hi-Res Upscaling and Data Overwrite complete.")
-            
-        # --- END: HI-RES BLENDING ---
+            # Save a debug image of the first hi-res warped chunk
+            if final_hires_output_chunks:
+                 self._save_debug_image(final_hires_output_chunks[0]["warped"], "07a_hires_warped_input", base_video_name, 0)
+
+            del hires_reader, final_hires_output_chunks, final_hires_left_chunks
+            release_cuda_memory()
+            logger.info("Hi-Res chunk processing complete.")
+            # --- END CHUNKED HI-RES PROCESSING ---
 
         # The rest of the logic remains largely the same, but uses the now-guaranteed-to-be-set frames_output_final
         
