@@ -1,12 +1,12 @@
 import os
 import glob
 import json
-import logging
 import shutil
 import threading
 import tkinter as tk # Required for Tooltip class
 from tkinter import Toplevel, Label # Required for Tooltip class
 from typing import Optional, Tuple
+import logging
 
 import numpy as np
 import torch
@@ -23,6 +23,54 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
+    """
+    Transfers the color statistics from the source_frame to the target_frame using LAB color space.
+    Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
+    Returns the color-adjusted target_frame in [C, H, W] float [0, 1] format.
+    """
+    try:
+        # Ensure tensors are on CPU and convert to numpy arrays in HWC format
+        # --- FIX: Squeeze the batch dimension if it exists ---
+        source_for_permute = source_frame.squeeze(0) if source_frame.dim() == 4 else source_frame
+        target_for_permute = target_frame.squeeze(0) if target_frame.dim() == 4 else target_frame
+
+        source_np = source_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
+        target_np = target_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
+        # --- END FIX ---
+
+        # Scale from [0, 1] to [0, 255] and convert to uint8
+        source_np_uint8 = (np.clip(source_np, 0.0, 1.0) * 255).astype(np.uint8)
+        target_np_uint8 = (np.clip(target_np, 0.0, 1.0) * 255).astype(np.uint8)
+
+        # Convert to LAB color space
+        source_lab = cv2.cvtColor(source_np_uint8, cv2.COLOR_RGB2LAB)
+        target_lab = cv2.cvtColor(target_np_uint8, cv2.COLOR_RGB2LAB)
+
+        src_mean, src_std = cv2.meanStdDev(source_lab)
+        tgt_mean, tgt_std = cv2.meanStdDev(target_lab)
+
+        src_mean = src_mean.flatten()
+        src_std = src_std.flatten()
+        tgt_mean = tgt_mean.flatten()
+        tgt_std = tgt_std.flatten()
+
+        # Ensure no division by zero
+        src_std = np.clip(src_std, 1e-6, None)
+        tgt_std = np.clip(tgt_std, 1e-6, None)
+
+        target_lab_float = target_lab.astype(np.float32)
+        for i in range(3): # For L, A, B channels
+            target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[i]
+
+        adjusted_lab_uint8 = np.clip(target_lab_float, 0, 255).astype(np.uint8)
+        adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
+        return torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
+    except Exception as e:
+        logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
+        return target_frame
+
 
 def set_util_logger_level(level):
     """Sets the logging level for the 'stereocrafter_util' logger."""
