@@ -30,7 +30,7 @@ from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_in
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.09"
+GUI_VERSION = "25.10.12.0"
 
 class ForwardWarpStereo(nn.Module):
     """
