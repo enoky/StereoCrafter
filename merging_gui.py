@@ -24,7 +24,7 @@ from dependency.stereocrafter_util import (
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-14.0"
+GUI_VERSION = "25-10-14.1"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -67,6 +67,10 @@ def apply_gaussian_blur(mask: torch.Tensor, kernel_size: int, use_gpu: bool = Tr
 
 def apply_shadow_blur(mask: torch.Tensor, shift_per_step: int, start_opacity: float, opacity_decay_per_step: float, min_opacity: float, decay_gamma: float = 1.0, use_gpu: bool = True) -> torch.Tensor:
     if shift_per_step <= 0: return mask
+    # --- FIX: Prevent division by zero if opacity decay is zero ---
+    if opacity_decay_per_step <= 1e-6: # Use a small epsilon for float comparison
+        return mask
+    # --- END FIX ---
     num_steps = int((start_opacity - min_opacity) / opacity_decay_per_step) + 1
     if num_steps <= 0: return mask
 
@@ -170,12 +174,13 @@ class MergingGUI(ThemedTk):
         self.slider_label_updaters = []
         # --- END FIX ---
         self.progress_var = tk.DoubleVar(value=0)
+        self.widgets_to_disable = []
 
         self.create_widgets()
 
         # Define a custom style for the loading button
         self.style = ttk.Style(self)
-        self.style.configure('Loading.TButton', foreground='red', font=('Helvetica', '9', 'bold'))
+        self.style.configure('Loading.TButton', foreground='red')
 
         self._apply_theme()
         self._configure_logging() # Set initial logging level
@@ -189,9 +194,8 @@ class MergingGUI(ThemedTk):
         
         # --- FIX: Initialize the previewer AFTER the main GUI is fully built ---
         # This ensures the previewer gets the correct initial slider values.
-        initial_params = self.get_current_settings()
-        if initial_params:
-            self.previewer.set_parameters(initial_params)
+        # No longer needed, previewer will call get_current_settings() itself.
+        pass
 
     def _set_saved_geometry(self):
         """
@@ -233,6 +237,7 @@ class MergingGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu)
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
+        self.file_menu.add_separator()
         self.file_menu.add_command(label="Save Preview Frame...", command=lambda: self.previewer.save_preview_frame())
         self.file_menu.add_command(label="Save Preview as SBS...", command=self._save_preview_sbs_frame) # Keep this one here as it needs access to both eyes
         self.file_menu.add_separator()
@@ -286,6 +291,10 @@ class MergingGUI(ThemedTk):
         # Manually set the background for the previewer's canvas widget
         if hasattr(self, 'previewer') and hasattr(self.previewer, 'preview_canvas'):
             self.previewer.preview_canvas.config(bg=bg_color, highlightthickness=0)
+
+        # --- FIX: Re-apply the custom loading button style after the theme changes ---
+        # This ensures the red text color is not overridden by the theme's default button style.
+        self.style.configure('Loading.TButton', foreground='red')
 
     def show_about_dialog(self):
         """Displays an 'About' dialog for the application."""
@@ -348,33 +357,34 @@ class MergingGUI(ThemedTk):
         ok_button.pack(pady=10)
 
     def reset_to_defaults(self):
-        """Resets all GUI parameters to their default hardcoded values."""
+        """Resets all GUI parameters to their default values using the _apply_settings method."""
         if not messagebox.askyesno("Reset Settings", "Are you sure you want to reset all settings to their default values?"):
             return # User cancelled
-
-        # Set all tk variables from the centralized APP_DEFAULTS dictionary
-        self.inpainted_folder_var.set(self.APP_DEFAULTS["inpainted_folder"])
-        self.original_folder_var.set(self.APP_DEFAULTS["original_folder"])
-        self.mask_folder_var.set(self.APP_DEFAULTS["mask_folder"])
-        self.output_folder_var.set(self.APP_DEFAULTS["output_folder"])
-        self.mask_binarize_threshold_var.set(self.APP_DEFAULTS["mask_binarize_threshold"])
-        self.mask_dilate_kernel_size_var.set(self.APP_DEFAULTS["mask_dilate_kernel_size"])
-        self.mask_blur_kernel_size_var.set(self.APP_DEFAULTS["mask_blur_kernel_size"])
-        self.shadow_shift_var.set(self.APP_DEFAULTS["shadow_shift"])
-        self.shadow_decay_gamma_var.set(self.APP_DEFAULTS["shadow_decay_gamma"])
-        self.shadow_start_opacity_var.set(self.APP_DEFAULTS["shadow_start_opacity"])
-        self.shadow_opacity_decay_var.set(self.APP_DEFAULTS["shadow_opacity_decay"])
-        self.shadow_min_opacity_var.set(self.APP_DEFAULTS["shadow_min_opacity"])
-        self.use_gpu_var.set(self.APP_DEFAULTS["use_gpu"])
-        self.output_format_var.set(self.APP_DEFAULTS["output_format"])
-        self.pad_to_16_9_var.set(self.APP_DEFAULTS["pad_to_16_9"])
-        self.enable_color_transfer_var.set(self.APP_DEFAULTS["enable_color_transfer"])
-        self.batch_chunk_size_var.set(self.APP_DEFAULTS["batch_chunk_size"])
-        self.previewer.preview_size_var.set(self.APP_DEFAULTS["preview_size"])
-
+        
+        self._apply_settings(self.APP_DEFAULTS)
         self.save_config()
-        messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
+        # messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
         logger.info("GUI settings reset to defaults.")
+
+    def _apply_settings(self, settings_dict: dict):
+        """
+        A centralized function to apply a dictionary of settings to the GUI's tk.Variables.
+        This is used by both Load Settings and Reset to Defaults.
+        """
+        logger.debug(f"Applying settings dictionary:\n{json.dumps(settings_dict, indent=2)}")
+        for key, value in settings_dict.items():
+            var_name = key + "_var"
+            if hasattr(self, var_name):
+                tk_var = getattr(self, var_name)
+                try:
+                    tk_var.set(value)
+                except (ValueError, tk.TclError) as e:
+                    logger.error(f"Could not apply setting for '{key}' with value '{value}': {e}")
+
+        # After setting all variables, manually update the slider labels to match.
+        for updater in self.slider_label_updaters:
+            updater()
+        logger.info("Applied settings to GUI and updated labels.")
 
     def _configure_logging(self):
         """Sets the logging level based on the debug_logging_var."""
@@ -415,28 +425,40 @@ class MergingGUI(ThemedTk):
         entry_inpaint = ttk.Entry(folder_frame, textvariable=self.inpainted_folder_var)
         entry_inpaint.grid(row=0, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_inpaint, "inpainted_folder")
-        ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.inpainted_folder_var)).grid(row=0, column=2, padx=5)
+        btn_inpaint = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.inpainted_folder_var))
+        btn_inpaint.grid(row=0, column=2, padx=5)
+        self.widgets_to_disable.append(entry_inpaint)
+        self.widgets_to_disable.append(btn_inpaint)
 
         # Original Video Folder (for Left Eye)
         ttk.Label(folder_frame, text="Original Video Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
         entry_orig = ttk.Entry(folder_frame, textvariable=self.original_folder_var)
         entry_orig.grid(row=1, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_orig, "original_folder")
-        ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.original_folder_var)).grid(row=1, column=2, padx=5)
+        btn_orig = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.original_folder_var))
+        btn_orig.grid(row=1, column=2, padx=5)
+        self.widgets_to_disable.append(entry_orig)
+        self.widgets_to_disable.append(btn_orig)
 
         # Mask Folder
         ttk.Label(folder_frame, text="Mask Folder:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
         entry_mask = ttk.Entry(folder_frame, textvariable=self.mask_folder_var)
         entry_mask.grid(row=2, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_mask, "mask_folder")
-        ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.mask_folder_var)).grid(row=2, column=2, padx=5)
+        btn_mask = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.mask_folder_var))
+        btn_mask.grid(row=2, column=2, padx=5)
+        self.widgets_to_disable.append(entry_mask)
+        self.widgets_to_disable.append(btn_mask)
 
         # Output Folder
         ttk.Label(folder_frame, text="Output Folder:").grid(row=3, column=0, sticky="e", padx=5, pady=2)
         entry_out = ttk.Entry(folder_frame, textvariable=self.output_folder_var)
         entry_out.grid(row=3, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_out, "output_folder")
-        ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var)).grid(row=3, column=2, padx=5)
+        btn_out = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var))
+        btn_out.grid(row=3, column=2, padx=5)
+        self.widgets_to_disable.append(entry_out)
+        self.widgets_to_disable.append(btn_out)
 
         # --- PREVIEW FRAME (using the new module) ---
         # Moved back to its original position after the folder frame.
@@ -444,11 +466,16 @@ class MergingGUI(ThemedTk):
             self,
             processing_callback=self._preview_processing_callback,
             find_sources_callback=self._find_preview_sources_callback,
-            help_data=self.help_data
+            get_params_callback=self.get_current_settings, # Pass the settings getter
+            help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
-        self.previewer.preview_size_var.set(self.preview_size_var.get()) # Link the previewer's var to the main GUI's var
         
+        # --- FIX: Add previewer's buttons to the list of widgets to disable ---
+        self.widgets_to_disable.append(self.previewer.load_preview_button)
+        self.widgets_to_disable.append(self.previewer.prev_video_button)
+        self.widgets_to_disable.append(self.previewer.next_video_button)
+        self.widgets_to_disable.append(self.previewer.video_jump_entry)
         # Pack the previewer right after the folder frame
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -459,7 +486,8 @@ class MergingGUI(ThemedTk):
 
         def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
             """Creates a slider, its value label, and all necessary event bindings."""
-            ttk.Label(parent, text=text).grid(row=row, column=0, sticky="e", padx=5, pady=2)
+            label = ttk.Label(parent, text=text)
+            label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
             slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
             slider.grid(row=row, column=1, sticky="ew", padx=5)
             value_label = ttk.Label(parent, text="", width=5) # Start with empty text
@@ -473,18 +501,27 @@ class MergingGUI(ThemedTk):
                 """Programmatically sets the slider's value and updates its label."""
                 var.set(new_value)
                 value_label.config(text=f"{new_value:.{decimals}f}")
+                logger.debug(f"new_value {new_value:.{decimals}f}")
 
             slider.configure(command=update_label_and_preview)
             slider.bind("<ButtonRelease-1>", self.on_slider_release)
-            self._create_hover_tooltip(slider, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
+            self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
             self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
+            self.widgets_to_disable.append(slider)
 
             def on_trough_click(event):
                 """Handles clicks on the slider's trough for precise positioning."""
-                if slider.identify(event.x, event.y) == 'trough':
+                # Check if the click is on the trough to avoid interfering with handle drags
+                if 'trough' in slider.identify(event.x, event.y):
+                    # --- FIX: Force the widget to update its size info before calculating ---
+                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
+                    slider.update_idletasks()
                     new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
-                    set_value_and_update_label(new_value)
+                    var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
+                    # --- FIX: Manually update the label's text after setting the variable ---
+                    value_label.config(text=f"{new_value:.{decimals}f}")
                     self.on_slider_release(event) # Manually trigger preview update
+                    return "break" # IMPORTANT: Prevents the default slider click behavior
 
             slider.bind("<Button-1>", on_trough_click)
 
@@ -504,6 +541,7 @@ class MergingGUI(ThemedTk):
         gpu_check = ttk.Checkbutton(options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var)
         gpu_check.pack(side="left", padx=5)
         self._create_hover_tooltip(gpu_check, "use_gpu")
+        self.widgets_to_disable.append(gpu_check)
 
         # --- NEW: Output Format Dropdown ---
         ttk.Label(options_frame, text="Output Format:").pack(side="left", padx=(15, 5))
@@ -511,27 +549,32 @@ class MergingGUI(ThemedTk):
         output_format_combo = ttk.Combobox(options_frame, textvariable=self.output_format_var, values=output_formats, state="readonly", width=28)
         output_format_combo.pack(side="left", padx=5)
         self._create_hover_tooltip(output_format_combo, "output_format")
+        self.widgets_to_disable.append(output_format_combo)
         # --- END NEW ---
         
         color_check = ttk.Checkbutton(options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var)
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
+        self.widgets_to_disable.append(color_check)
         
         # --- NEW: Pad to 16:9 Checkbox ---
         pad_check = ttk.Checkbutton(options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var)
         pad_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
+        self.widgets_to_disable.append(pad_check)
         
         # Add Preview Size option
         ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
         entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
         entry_preview.pack(side="left")
         self._create_hover_tooltip(entry_preview, "preview_size")
+        self.widgets_to_disable.append(entry_preview)
         # Add Batch Chunk Size option
         ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
         entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7)
         entry_chunk.pack(side="left")
         self._create_hover_tooltip(entry_chunk, "batch_chunk_size")
+        self.widgets_to_disable.append(entry_chunk)
 
         # --- PROGRESS & BUTTONS ---
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
@@ -548,6 +591,8 @@ class MergingGUI(ThemedTk):
         self.start_button.pack(side="left", padx=5, expand=True)
         self._create_hover_tooltip(self.start_button, "start_blending")
         self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
+        self.widgets_to_disable.append(self.start_button) # Add to disable list
+        # Stop button is handled separately in _set_ui_processing_state
         self.stop_button.pack(side="left", padx=5, expand=True)
         self._create_hover_tooltip(self.stop_button, "stop_blending")
 
@@ -562,6 +607,27 @@ class MergingGUI(ThemedTk):
         params = self.get_current_settings()
         if params:
             self.previewer.set_parameters(params)
+
+    def _set_ui_processing_state(self, is_processing: bool):
+        """Disables or enables all interactive widgets during processing."""
+        # --- FIX: Explicitly handle start/stop button states ---
+        try:
+            self.start_button.config(state="disabled" if is_processing else "normal")
+            self.stop_button.config(state="normal" if is_processing else "disabled")
+        except tk.TclError:
+            pass # Ignore if widgets don't exist yet
+        # --- END FIX ---
+        state = "disabled" if is_processing else "normal"
+        for widget in self.widgets_to_disable:
+            try:
+                # Special handling for combobox which uses 'readonly' instead of 'normal'
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="disabled" if is_processing else "readonly")
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                # Widget might have been destroyed, ignore
+                pass
 
     def update_status_label(self, message):
         self.status_label_var.set(message)
@@ -663,8 +729,7 @@ class MergingGUI(ThemedTk):
 
         self.is_processing = True
         self.stop_event.clear()
-        self.start_button.config(state="disabled")
-        self.stop_button.config(state="normal")
+        self._set_ui_processing_state(True) # Disable UI
 
         # --- NEW: Start the cleanup worker thread ---
         self.cleanup_queue = queue.Queue() # Clear the queue from any previous run
@@ -692,17 +757,20 @@ class MergingGUI(ThemedTk):
     def stop_processing(self):
         if self.is_processing:
             self.stop_event.set()
-            release_cuda_memory() # Explicitly release VRAM on stop
             self.update_status_label("Stopping...")
 
     def processing_done(self, stopped=False):
         self.is_processing = False
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled")
+        self._set_ui_processing_state(False) # Re-enable UI
         message = "Processing stopped." if stopped else "Processing completed."
         self.update_status_label(message)
-        release_cuda_memory() # Explicitly release VRAM
         self.progress_var.set(0)
+
+        # --- NEW: Schedule VRAM release after a short delay to ensure stability ---
+        delay_ms = 2000 # 2 seconds
+        logger.info(f"Scheduling VRAM release in {delay_ms / 1000} seconds...")
+        self.after(delay_ms, release_cuda_memory)
+        # --- END NEW ---
 
     def get_current_settings(self):
         """Collects all GUI settings into a dictionary, performing type conversion."""
@@ -719,9 +787,9 @@ class MergingGUI(ThemedTk):
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": int(self.preview_size_var.get()),
                 # Mask params
-                "binarize_threshold": float(self.mask_binarize_threshold_var.get()),
-                "dilate_kernel": int(self.mask_dilate_kernel_size_var.get()),
-                "blur_kernel": int(self.mask_blur_kernel_size_var.get()),
+                "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
+                "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
+                "mask_blur_kernel_size": int(self.mask_blur_kernel_size_var.get()),
                 "shadow_shift": int(self.shadow_shift_var.get()),
                 "shadow_start_opacity": float(self.shadow_start_opacity_var.get()),
                 "shadow_opacity_decay": float(self.shadow_opacity_decay_var.get()),
@@ -817,29 +885,23 @@ class MergingGUI(ThemedTk):
 
                 inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
                 splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
-                original_reader = None
-                # --- END FIX ---
-                
+
+                # --- FIX: Determine original_reader based on input type ---
+                original_reader = None # Assume None initially
                 if is_dual_input: # splatted2
                     original_video_path = os.path.join(settings["original_folder"], f"{core_name}.mp4")
                     original_video_path_to_move = original_video_path # Track for moving later
-                    # --- MODIFIED: Make original video optional for dual input ---
                     if os.path.exists(original_video_path):
                         logger.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
                         original_reader = VideoReader(original_video_path, ctx=cpu(0))
                     else:
                         logger.warning(f"Original video not found for dual-input mode: '{original_video_path}'.")
                         logger.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
-                        original_reader = None # Explicitly set to None
-                    # --- END MODIFICATION ---
-                    if os.path.exists(original_video_path):
-                        logger.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
-                        original_reader = VideoReader(original_video_path, ctx=cpu(0))
-                    else:
-                        logger.warning(f"Original video not found for dual-input mode: '{original_video_path}'.")
-                        logger.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
-                        original_reader = None # Explicitly set to None
-                # --- END MODIFICATION ---
+                else: # splatted4 (quad)
+                    # For quad-splatted files, the splatted file itself is the source for the left eye.
+                    # We can use the splatted_reader as a placeholder to indicate a valid left-eye source exists.
+                    original_reader = splatted_reader
+                # --- END FIX ---
 
                 # 3. Setup encoder pipe
                 num_frames = len(inpainted_reader)
@@ -862,30 +924,40 @@ class MergingGUI(ThemedTk):
                 # --- END NEW ---
 
 
-                # --- NEW: Determine output dimensions and suffix based on format ---
+                # --- NEW: Determine output dimensions, perceived width for filename, and suffix ---
+                perceived_width_for_filename = hires_W # Default to single-eye width
+
                 if output_format == "Full SBS Cross-eye (Right-Left)":
                     output_width = hires_W * 2
                     output_suffix = "_merged_full_sbsx.mp4"
+                    # Perceived width is single eye
                 elif output_format == "Full SBS (Left-Right)":
                     output_width = hires_W * 2
                     output_suffix = "_merged_full_sbs.mp4"
+                    # Perceived width is single eye
                 elif output_format == "Double SBS":
                     output_width = hires_W * 2
                     output_height = hires_H * 2
                     output_suffix = "_merged_half_sbs.mp4"
+                    perceived_width_for_filename = hires_W * 2 # Use the full file width for the filename
                 elif output_format == "Half SBS (Left-Right)":
                     output_width = hires_W
                     output_suffix = "_merged_half_sbs.mp4"
+                    # Perceived width is single eye, as player will stretch it.
                 elif output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
                     output_width = hires_W
                     output_suffix = "_merged_anaglyph.mp4"
+                    # Perceived width is the full output width
                 else: # Right-Eye Only
                     output_width = hires_W
                     output_suffix = "_merged_right_eye.mp4"
+                    # Perceived width is the full output width
                 
                 if 'output_height' not in locals(): # Set default height if not already set by a special format
                     output_height = hires_H
-                output_filename = f"{core_name_with_width}{output_suffix}"
+
+                # Construct the final filename using the core name and the new perceived width
+                output_filename = f"{core_name}_{perceived_width_for_filename}{output_suffix}"
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
@@ -973,12 +1045,12 @@ class MergingGUI(ThemedTk):
                         inpainted = torch.stack(adjusted_frames)
 
                     processed_mask = mask.clone()
-                    if settings["dilate_kernel"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["dilate_kernel"], use_gpu)
-                    if settings["blur_kernel"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["blur_kernel"], use_gpu)
-                    
                     # --- NEW: Binarization as the first step ---
-                    if settings["binarize_threshold"] >= 0.0:
-                        processed_mask = (mask > settings["binarize_threshold"]).float()
+                    if settings["mask_binarize_threshold"] >= 0.0:
+                        processed_mask = (mask > settings["mask_binarize_threshold"]).float()
+
+                    if settings["mask_dilate_kernel_size"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["mask_dilate_kernel_size"], use_gpu)
+                    if settings["mask_blur_kernel_size"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["mask_blur_kernel_size"], use_gpu)
 
                     if settings["shadow_shift"] > 0: processed_mask = apply_shadow_blur(processed_mask, settings["shadow_shift"], settings["shadow_start_opacity"], settings["shadow_opacity_decay"], settings["shadow_min_opacity"], settings["shadow_decay_gamma"], use_gpu)
 
@@ -1037,6 +1109,9 @@ class MergingGUI(ThemedTk):
                 
                 if ffmpeg_process.returncode != 0:
                     logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
+                elif self.stop_event.is_set():
+                    logger.warning(f"Processing was stopped for {base_name}. Source files will not be moved.")
+                    # Do not queue files for moving if the job was stopped.
                 else:
                     logger.debug("FFmpeg process and threads terminated, proceeding to move files.")
                     logger.info(f"Successfully encoded video to {output_path}")
@@ -1062,6 +1137,9 @@ class MergingGUI(ThemedTk):
                 # --- END FIX ---
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(0, lambda base_name=base_name, e=e: messagebox.showerror("Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"))
+                # --- NEW: Stop the entire batch if one video fails critically ---
+                self.stop_event.set()
+                # --- END NEW ---
             finally:
                 # Ensure readers are always cleaned up, even on error
                 # This is now a secondary safety net; the primary cleanup happens before file moves.
@@ -1254,9 +1332,9 @@ class MergingGUI(ThemedTk):
 
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone() # No need to unsqueeze, it's already 4D
-            if params.get("binarize_threshold", -1.0) >= 0.0: processed_mask = (processed_mask > params["binarize_threshold"]).float()
-            if params.get("dilate_kernel", 0) > 0: processed_mask = apply_mask_dilation(processed_mask, int(params["dilate_kernel"]), use_gpu)
-            if params.get("blur_kernel", 0) > 0: processed_mask = apply_gaussian_blur(processed_mask, int(params["blur_kernel"]), use_gpu)
+            if params.get("mask_binarize_threshold", -1.0) >= 0.0: processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
+            if params.get("mask_dilate_kernel_size", 0) > 0: processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
+            if params.get("mask_blur_kernel_size", 0) > 0: processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
             if params.get("shadow_shift", 0) > 0: processed_mask = apply_shadow_blur(processed_mask, params["shadow_shift"], params["shadow_start_opacity"], params["shadow_opacity_decay"], params["shadow_min_opacity"], params["shadow_decay_gamma"], use_gpu)
             processed_mask = processed_mask.squeeze(0) # Remove batch dim
 
@@ -1367,12 +1445,9 @@ class MergingGUI(ThemedTk):
         if not filepath: return
         try:
             with open(filepath, "r") as f:
-                config = json.load(f)
-            # Apply settings
-            for key, value in config.items():
-                var_name = key + "_var"
-                if hasattr(self, var_name):
-                    getattr(self, var_name).set(value)
+                settings_to_load = json.load(f)
+            
+            self._apply_settings(settings_to_load)
             self._apply_theme()
             logger.info(f"Settings loaded from {filepath}")
         except Exception as e:

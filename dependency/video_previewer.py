@@ -22,7 +22,7 @@ class VideoPreviewer(ttk.Frame):
     - Loading single frames from multiple source videos.
     - Calling a user-provided processing function to generate the preview.
     """
-    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, **kwargs):
+    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, get_params_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, **kwargs):
         """
         Initializes the VideoPreviewer frame.
 
@@ -34,6 +34,8 @@ class VideoPreviewer(ttk.Frame):
                 It should return a PIL Image to be displayed.
             find_sources_callback (Callable, optional): A function that returns a list of
                 dictionaries, where each dict maps a source name to a file path.
+            get_params_callback (Callable, optional): A function that returns the current
+                dictionary of parameters from the main GUI.
             help_data (Dict[str, str], optional): A dictionary of help texts for tooltips.
         """
         super().__init__(parent, **kwargs)
@@ -41,6 +43,7 @@ class VideoPreviewer(ttk.Frame):
         self.processing_callback = processing_callback
         self.help_data = help_data if help_data else {}
         self.find_sources_callback = find_sources_callback
+        self.get_params_callback = get_params_callback
 
         # --- State ---
         self.source_readers: Dict[str, VideoReader] = {}
@@ -56,7 +59,6 @@ class VideoPreviewer(ttk.Frame):
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
-        self.preview_size_var = tk.StringVar(value="1000") # Default, can be overridden
 
         self._create_widgets()
 
@@ -99,6 +101,7 @@ class VideoPreviewer(ttk.Frame):
         self.frame_scrubber = ttk.Scale(scrubber_frame, from_=0, to=0, variable=self.frame_scrubber_var, orient="horizontal")
         self.frame_scrubber.grid(row=0, column=1, sticky="ew")
         self.frame_scrubber.bind("<ButtonRelease-1>", self.on_slider_release)
+        self.frame_scrubber.bind("<Button-1>", self._on_scrubber_trough_click)
         self.frame_scrubber.configure(command=self.on_scrubber_move)
 
         # Video Navigation Frame
@@ -136,16 +139,18 @@ class VideoPreviewer(ttk.Frame):
         Receives a dictionary of parameters from the main GUI.
         Triggers a preview update if the parameters have changed.
         """
-        if params != self.current_params:
-            self.current_params = params
-            self.update_preview()
+        # This method is now primarily for external triggers.
+        # The main way of getting params is now the get_params_callback.
+        self.update_preview()
 
     def set_preview_source_options(self, options: list):
         """Sets the available options for the preview source dropdown."""
+        current_val = self.preview_source_combo.get()
         self.preview_source_combo['values'] = options
-        # The variable is now controlled by the parent GUI, so we just check its current value
-        if self.preview_source_combo.cget('textvariable') and self.preview_source_combo.get() not in options:
-            self.preview_source_combo.set(options[0] if options else "Blended Image")
+        if current_val in options:
+            self.preview_source_combo.set(current_val)
+        elif options:
+            self.preview_source_combo.set(options[0])
 
 
     def _handle_load_refresh(self):
@@ -181,6 +186,12 @@ class VideoPreviewer(ttk.Frame):
         if not self.source_readers:
             return
 
+        # --- NEW: Get fresh parameters via callback ---
+        if self.get_params_callback:
+            self.current_params = self.get_params_callback()
+        else:
+            logger.warning("Previewer: get_params_callback not provided. Using stale parameters.")
+
         self._stop_wigglegram_animation()
         self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
         self.parent.update_idletasks()
@@ -210,7 +221,7 @@ class VideoPreviewer(ttk.Frame):
             # --- END FIX ---
 
             # Resize for display if too large, maintaining aspect ratio
-            max_size = int(self.preview_size_var.get())
+            max_size = int(self.current_params.get("preview_size", 1000))
             display_image = self.pil_image_for_preview.copy()
             if display_image.height > max_size or display_image.width > max_size:
                 display_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -241,6 +252,22 @@ class VideoPreviewer(ttk.Frame):
         total_frames = int(self.frame_scrubber.cget("to")) + 1
         self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
 
+    def _on_scrubber_trough_click(self, event):
+        """Handles clicks on the frame scrubber's trough for precise positioning."""
+        slider = self.frame_scrubber
+        # Check if the click is on the trough to avoid interfering with handle drags
+        if 'trough' in slider.identify(event.x, event.y):
+            # Force the widget to update its size info to get an accurate width
+            slider.update_idletasks()
+            from_ = slider.cget("from")
+            to = slider.cget("to")
+            
+            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+            self.frame_scrubber_var.set(new_value) # This triggers on_scrubber_move
+            self.on_slider_release(event) # Manually trigger preview update
+            
+            return "break" # Prevents the default slider click behavior
+
     def _clear_preview_resources(self):
         """Closes all preview-related video readers and clears the preview display."""
         self._stop_wigglegram_animation()
@@ -250,14 +277,16 @@ class VideoPreviewer(ttk.Frame):
                 del self.source_readers[key]
         self.source_readers.clear()
 
-        # --- FIX: Clear the widget's image reference before setting the image to None ---
-        self.preview_label.config(image=None, text="Load a video list to see preview")
-        self.preview_label.image = None
-        # --- END FIX ---
+        # --- FIX: Create a dummy image to hold the place, preventing TclError ---
+        # This is the most robust way to clear the image in Tkinter without race conditions.
+        self._dummy_image = ImageTk.PhotoImage(Image.new('RGBA', (1, 1), (0,0,0,0)))
+        self.preview_label.config(image=self._dummy_image, text="Load a video list to see preview")
+        self.preview_label.image = self._dummy_image
         self.preview_image_tk = None
+        # --- END FIX ---
         self.pil_image_for_preview = None
         gc.collect()
-        logger.info("Preview resources and file handles have been released.")
+        logger.debug("Preview resources and file handles have been released.")
 
     def _load_preview_by_index(self, index: int):
         """Loads a specific video from the preview list by its index."""
@@ -288,7 +317,7 @@ class VideoPreviewer(ttk.Frame):
                     self.source_readers[key] = reader
                 else:
                     self.source_readers[key] = None
-                    logger.warning(f"Source '{key}' not found for {base_name} at path: {path}")
+                    logger.debug(f"Source '{key}' not found for {base_name} at path: {path}")
 
             if num_frames <= 0:
                 raise ValueError("Video has no frames or could not be loaded.")

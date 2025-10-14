@@ -89,18 +89,22 @@ class Tooltip:
         self.widget = widget
         self.text = text
         self.tooltip_window = None
+        self.show_delay = 500  # milliseconds
+        self.hide_delay = 100  # milliseconds
+        self.enter_id = None
+        self.leave_id = None
         self.widget.bind("<Enter>", self.show_tooltip)
         self.widget.bind("<Leave>", self.hide_tooltip)
         self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
 
     def show_tooltip(self, event=None):
-        if self.tooltip_window or not self.text:
-            return
-        # Adjust position slightly for better visibility
-        x, y, _, _ = self.widget.bbox("insert")
-        x += self.widget.winfo_rootx() + 25
-        y += self.widget.winfo_rooty() + 20
+        if self.leave_id: self.widget.after_cancel(self.leave_id)
+        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
 
+    def _display_tooltip(self):
+        if self.tooltip_window or not self.text: return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5 # Position below the widget
         self.tooltip_window = Toplevel(self.widget)
         self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
         self.tooltip_window.wm_geometry(f"+{x}+{y}")
@@ -110,6 +114,7 @@ class Tooltip:
         label.pack(ipadx=1)
 
     def hide_tooltip(self, event=None):
+        if self.enter_id: self.widget.after_cancel(self.enter_id)
         if self.tooltip_window:
             self.tooltip_window.destroy()
         self.tooltip_window = None
