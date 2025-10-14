@@ -148,6 +148,7 @@ def check_cuda_availability():
     else:
         logger.info("PyTorch reports CUDA is NOT available. NVENC will not be used.")
         CUDA_AVAILABLE = False
+    return CUDA_AVAILABLE
 
 def release_cuda_memory():
     """Releases GPU memory and performs garbage collection."""

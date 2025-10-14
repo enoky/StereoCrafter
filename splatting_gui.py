@@ -19,6 +19,7 @@ import subprocess
 import time
 import logging
 from typing import Optional, Tuple, Optional
+from PIL import Image
 
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
@@ -28,6 +29,7 @@ from dependency.stereocrafter_util import (
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
     start_ffmpeg_pipe_process # <-- IMPORT THE NEW PIPE FUNCTION
 )
+from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
@@ -149,6 +151,10 @@ class SplatterGUI(ThemedTk):
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
 
+        # --- NEW: Previewer Variables ---
+        self.preview_source_var = tk.StringVar(value="Splat Result")
+        self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "1000"))
+
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
         self.processing_resolution_var = tk.StringVar(value="N/A")
@@ -178,6 +184,10 @@ class SplatterGUI(ThemedTk):
 
         # Bind closing protocol
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
+
+        # --- NEW: Add slider release binding for preview updates ---
+        # We will add this to the sliders in _create_widgets
+        self.slider_widgets = []
 
     def _apply_theme(self, is_startup: bool = False):
         """Applies the selected theme (dark or light) to the GUI."""
@@ -220,6 +230,10 @@ class SplatterGUI(ThemedTk):
             selectforeground=[('readonly', colors["fg"])]
         )
 
+        # Manually set the background for the previewer's canvas widget
+        if hasattr(self, 'previewer') and hasattr(self.previewer, 'preview_canvas'):
+            self.previewer.preview_canvas.config(bg=colors["bg"], highlightthickness=0)
+
         # 5. Manually configure non-ttk widgets (Menu, tk.Label)
         if hasattr(self, 'menubar'):
             for menu in [self.menubar, self.file_menu, self.help_menu]:
@@ -233,18 +247,7 @@ class SplatterGUI(ThemedTk):
 
         # --- Apply geometry only if not during startup (NEW conditional block) ---
         if not is_startup:
-            current_actual_width = self.winfo_width() # Get current width (including user resize)
-            if current_actual_width <= 1: # Fallback for very first call where winfo_width might be 1
-                current_actual_width = self.window_width # Use the saved/default width
-
-            new_height = self.winfo_reqheight() # Get the new optimal height based on content and theme
-
-            # Apply the current (potentially user-adjusted) width and the new calculated height
-            self.geometry(f"{current_actual_width}x{new_height}")
-            logger.debug(f"Theme change applied geometry: {current_actual_width}x{new_height}")
-            
-            # Update the stored width for next time save_config is called.
-            self.window_width = current_actual_width
+            self._adjust_window_height_for_content()
 
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
@@ -376,6 +379,21 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.entry_output_splatted, "output_splatted")
         self._create_hover_tooltip(self.btn_browse_output_splatted, "output_splatted")
         # Reset current_row for next frame
+        current_row = 0
+
+        # --- NEW: PREVIEW FRAME ---
+        self.previewer = VideoPreviewer(
+            self,
+            processing_callback=self._preview_processing_callback,
+            find_sources_callback=self._find_preview_sources_callback,
+            get_params_callback=self.get_current_preview_settings,
+            preview_size_var=self.preview_size_var, # Pass the preview size variable
+            resize_callback=self._adjust_window_height_for_content, # Pass the resize callback
+            help_data=self.help_texts,
+        )
+        self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
+        self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
+
         current_row = 0
 
         # --- Settings Container Frame (to hold two side-by-side frames) ---
@@ -1653,9 +1671,27 @@ class SplatterGUI(ThemedTk):
         # This is CRITICAL. If we set state='normal' for everything, 
         # toggle_processing_settings_fields will correctly re-disable the Low Res W/H fields
         # if the "Enable Low Resolution" checkbox is unchecked.
+        if hasattr(self, 'previewer'):
+            self.previewer.set_ui_processing_state(state == 'disabled')
+
         if state == 'normal':
             self.toggle_processing_settings_fields()
     
+    def _adjust_window_height_for_content(self):
+        """Adjusts the window height to fit the current content, preserving user-set width."""
+        if self._is_startup: # Don't adjust during initial setup
+            return
+
+        current_actual_width = self.winfo_width()
+        if current_actual_width <= 1: # Fallback for very first call
+            current_actual_width = self.window_width
+
+        new_height = self.winfo_reqheight()
+
+        self.geometry(f"{current_actual_width}x{new_height}")
+        logger.debug(f"Content resize applied geometry: {current_actual_width}x{new_height}")
+        self.window_width = current_actual_width # Update stored width
+
     def _set_saved_geometry(self: "SplatterGUI"):
         """Applies the saved window width and position, with dynamic height."""
         # Ensure the window is visible and all widgets are laid out for accurate height calculation
@@ -1809,6 +1845,156 @@ class SplatterGUI(ThemedTk):
         self.processing_convergence_var.set("N/A")
         self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
+
+    # --- NEW: Previewer Integration Methods ---
+
+    def _find_preview_sources_callback(self) -> list:
+        """
+        Callback for VideoPreviewer. Scans for matching source video and depth map pairs.
+        """
+        source_folder = self.input_source_clips_var.get()
+        depth_folder = self.input_depth_maps_var.get()
+
+        if not os.path.isdir(source_folder) or not os.path.isdir(depth_folder):
+            messagebox.showerror("Error", "Input Source Clips and Input Depth Maps must both be valid directories for preview.")
+            return []
+
+        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+        source_videos = []
+        for ext in video_extensions:
+            source_videos.extend(glob.glob(os.path.join(source_folder, ext)))
+
+        video_source_list = []
+        for video_path in sorted(source_videos):
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            depth_path_mp4 = os.path.join(depth_folder, f"{base_name}_depth.mp4")
+
+            if os.path.exists(depth_path_mp4):
+                logger.debug(f"Preview Scan: Found pair for '{base_name}': Video and Depth MP4.")
+                video_source_list.append({
+                    'source_video': video_path,
+                    'depth_map': depth_path_mp4
+                })
+            else:
+                logger.debug(f"Preview Scan: No matching depth map for '{base_name}'. Skipping.")
+
+        return video_source_list
+
+    def get_current_preview_settings(self) -> dict:
+        """Gathers settings from the GUI needed for the preview callback."""
+        try:
+            return {
+                "max_disp": float(self.max_disp_var.get()),
+                "convergence_point": float(self.zero_disparity_anchor_var.get()),
+                "depth_gamma": float(self.depth_gamma_var.get()),
+                "depth_dilate_size": int(self.depth_dilate_size_var.get()),
+                "depth_blur_size": int(self.depth_blur_size_var.get()),
+                "preview_size": int(self.preview_size_var.get()),
+                "enable_autogain": self.enable_autogain_var.get(),
+            }
+        except (ValueError, tk.TclError) as e:
+            logger.error(f"Invalid preview setting value: {e}")
+            return None
+
+    def _preview_processing_callback(self, source_frames: dict, params: dict) -> Optional[Image.Image]:
+        """
+        Callback for VideoPreviewer. Performs splatting on a single frame for preview.
+        """
+        if not globals()['CUDA_AVAILABLE']:
+            logger.error("Preview processing requires a CUDA-enabled GPU.")
+            return None
+        
+        logger.debug("--- Starting Preview Processing Callback ---")
+
+        left_eye_tensor = source_frames.get('source_video')
+        depth_tensor_raw = source_frames.get('depth_map')
+
+        if left_eye_tensor is None or depth_tensor_raw is None:
+            logger.error("Preview failed: Missing source video or depth map tensor.")
+            return None
+
+        # --- Get latest settings ---
+        params = self.get_current_preview_settings()
+        if not params:
+            logger.error("Preview failed: Could not get current preview settings.")
+            return None
+        logger.debug(f"Preview Params: {params}")
+
+        # --- Process Depth Frame ---
+        # --- FIX: Transpose from (C, H, W) to (H, W, C) for the helper function ---
+        depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        # --- END FIX ---
+        logger.debug(f"Raw depth numpy shape: {depth_numpy_raw.shape}, range: [{depth_numpy_raw.min():.2f}, {depth_numpy_raw.max():.2f}]")
+        depth_numpy_processed = self._process_depth_batch(
+            batch_depth_numpy_raw=np.expand_dims(depth_numpy_raw, axis=0),
+            depth_stream_info=None, # Not available for single frame
+            depth_gamma=params['depth_gamma'],
+            depth_dilate_size=params['depth_dilate_size'],
+            depth_blur_size=params['depth_blur_size'],
+            is_low_res_task=False, # Preview is always "hi-res" logic
+            max_raw_value=255.0, # Assume 8-bit for preview simplicity
+            # --- FIX: Let the helper function handle pre-processing only. Normalization will be done below. ---
+            global_depth_min=0.0,
+            global_depth_max=1.0 # Pass neutral values; we will normalize manually.
+            # --- END FIX ---
+        )
+        logger.debug(f"Processed depth numpy shape: {depth_numpy_processed.shape}, range: [{depth_numpy_processed.min():.2f}, {depth_numpy_processed.max():.2f}]")
+
+        # Normalize
+        if params['enable_autogain']:
+            # Raw input mode: The helper function applied gamma to the 0-255 range.
+            # We now normalize this result to 0-1 for the splatting operation.
+            depth_normalized = depth_numpy_processed.squeeze(0) / 255.0
+        else:
+            # Normalization enabled: The helper function did dilate/blur on the 0-255 range.
+            # Now, we perform the min/max normalization on the processed result, just like the main batch logic.
+            min_val, max_val = depth_numpy_processed.min(), depth_numpy_processed.max()
+            if max_val > min_val:
+                depth_normalized = (depth_numpy_processed.squeeze(0) - min_val) / (max_val - min_val)
+            else:
+                depth_normalized = np.zeros_like(depth_numpy_processed.squeeze(0))
+            
+            # --- FIX: Apply gamma AFTER normalization for this path ---
+            # The helper function skips gamma in this mode, so we apply it here.
+            if params['depth_gamma'] != 1.0:
+                depth_normalized = np.power(depth_normalized, params['depth_gamma'])
+                logger.debug(f"Applied gamma ({params['depth_gamma']}) post-normalization.")
+            # --- END FIX ---
+
+        depth_normalized = np.clip(depth_normalized, 0, 1)
+        logger.debug(f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]")
+
+        # --- Perform Splatting ---
+        stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+        disp_map_tensor = torch.from_numpy(depth_normalized).unsqueeze(0).unsqueeze(0).float().cuda()
+        disp_map_tensor = (disp_map_tensor - params['convergence_point']) * 2.0
+        actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * left_eye_tensor.shape[3]
+        disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
+
+        with torch.no_grad():
+            right_eye_tensor, occlusion_mask = stereo_projector(left_eye_tensor.cuda(), disp_map_tensor)
+
+        # --- Select Output for Display ---
+        preview_source = self.preview_source_var.get()
+        self.previewer.set_preview_source_options(["Splat Result", "Occlusion Mask", "Depth Map"])
+
+        if preview_source == "Splat Result":
+            final_tensor = right_eye_tensor.cpu()
+        elif preview_source == "Occlusion Mask":
+            final_tensor = occlusion_mask.repeat(1, 3, 1, 1).cpu()
+        elif preview_source == "Depth Map":
+            depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+            depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
+            final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        else:
+            final_tensor = right_eye_tensor.cpu()
+
+        pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+
+        del stereo_projector, disp_map_tensor, right_eye_tensor, occlusion_mask
+        release_cuda_memory()
+        logger.debug("--- Finished Preview Processing Callback ---")
+        return pil_img
 
     # ======================================================================================
     # REFACTORED depthSplatting FUNCTION
@@ -2034,6 +2220,9 @@ class SplatterGUI(ThemedTk):
         self.stop_event.set()
         if self.processing_thread and self.processing_thread.is_alive():
             logger.info("==> Waiting for processing thread to finish...")
+            # --- NEW: Cleanup previewer resources ---
+            if hasattr(self, 'previewer'):
+                self.previewer.cleanup()
             self.processing_thread.join(timeout=5.0)
             if self.processing_thread.is_alive():
                 logger.debug("==> Thread did not terminate gracefully within timeout.")
@@ -2129,6 +2318,10 @@ class SplatterGUI(ThemedTk):
         self.status_label.config(text="Starting processing...")
         # --- NEW: Disable all inputs at start ---
         self._set_input_state('disabled')
+        # --- NEW: Disable previewer widgets ---
+        if hasattr(self, 'previewer'):
+            self.previewer.set_ui_processing_state(True)
+            self.previewer.cleanup() # Release any loaded preview videos
 
         # Input validation for all fields
         try:
@@ -2214,6 +2407,9 @@ class SplatterGUI(ThemedTk):
         self.stop_event.set()
         self.status_label.config(text="Stopping...")
         self.stop_button.config(state="disabled")
+        # --- NEW: Re-enable previewer widgets on stop ---
+        if hasattr(self, 'previewer'):
+            self.previewer.set_ui_processing_state(False)
 
     def toggle_processing_settings_fields(self):
         """Enables/disables resolution input fields and the START button based on checkbox states."""

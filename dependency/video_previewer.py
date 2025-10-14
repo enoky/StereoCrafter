@@ -18,11 +18,11 @@ class VideoPreviewer(ttk.Frame):
     This module handles:
     - Displaying a preview image on a scrollable canvas.
     - Navigating through a list of videos.
-    - Scrubbing through the timeline of the current video.
+    - Scrubbing through the timeline of the current video. 
     - Loading single frames from multiple source videos.
     - Calling a user-provided processing function to generate the preview.
     """
-    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, get_params_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, **kwargs):
+    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, get_params_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, preview_size_var: Optional[tk.StringVar] = None, resize_callback: Optional[Callable] = None, **kwargs):
         """
         Initializes the VideoPreviewer frame.
 
@@ -37,6 +37,8 @@ class VideoPreviewer(ttk.Frame):
             get_params_callback (Callable, optional): A function that returns the current
                 dictionary of parameters from the main GUI.
             help_data (Dict[str, str], optional): A dictionary of help texts for tooltips.
+            preview_size_var (tk.StringVar, optional): The variable from the parent GUI to control preview size.
+            resize_callback (Callable, optional): A function to call to ask the parent window to resize itself.
         """
         super().__init__(parent, **kwargs)
         self.parent = parent
@@ -44,6 +46,8 @@ class VideoPreviewer(ttk.Frame):
         self.help_data = help_data if help_data else {}
         self.find_sources_callback = find_sources_callback
         self.get_params_callback = get_params_callback
+        self.preview_size_var = preview_size_var # Store the passed-in variable
+        self.resize_callback = resize_callback # Store the resize callback
 
         # --- State ---
         self.source_readers: Dict[str, VideoReader] = {}
@@ -133,6 +137,19 @@ class VideoPreviewer(ttk.Frame):
         self.video_jump_entry.bind("<Return>", self._jump_to_video)
         self._create_hover_tooltip(self.video_jump_entry, "jump_to_video")
         ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
+        
+        # --- NEW: Add Preview Size entry to the button bar ---
+        ttk.Label(preview_button_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
+        self.preview_size_entry = ttk.Entry(preview_button_frame, width=7)
+        if self.preview_size_var:
+            self.preview_size_entry.configure(textvariable=self.preview_size_var)
+        self.preview_size_entry.pack(side="left")
+        self._create_hover_tooltip(self.preview_size_entry, "preview_size")
+        # --- END NEW ---
+
+        # --- NEW: Store widgets to be disabled ---
+        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button, self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_entry]
+
 
     def set_parameters(self, params: Dict[str, Any]):
         """
@@ -151,6 +168,21 @@ class VideoPreviewer(ttk.Frame):
             self.preview_source_combo.set(current_val)
         elif options:
             self.preview_source_combo.set(options[0])
+
+    def set_ui_processing_state(self, is_processing: bool):
+        """
+        Disables or enables all interactive widgets in the previewer during batch processing.
+        """
+        state = "disabled" if is_processing else "normal"
+        for widget in self.widgets_to_disable:
+            try:
+                # Special handling for combobox which uses 'readonly' instead of 'normal'
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="disabled" if is_processing else "readonly")
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                pass # Ignore if widgets don't exist yet
 
 
     def _handle_load_refresh(self):
@@ -231,6 +263,13 @@ class VideoPreviewer(ttk.Frame):
             self.preview_label.config(image=self.preview_image_tk, text="")
             self.preview_label.image = self.preview_image_tk
             # --- END FIX ---
+
+            # --- NEW: Trigger parent window resize ---
+            if self.resize_callback:
+                # Force the parent to update its layout to see the new image size
+                self.parent.update_idletasks()
+                self.resize_callback()
+            # --- END NEW ---
             self._update_preview_layout()
 
         except Exception as e:

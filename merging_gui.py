@@ -141,6 +141,7 @@ class MergingGUI(ThemedTk):
         self.is_processing = False
         self.cleanup_queue = queue.Queue()
 
+        self._is_startup = True # Flag to prevent resizing during initialization
         self.preview_original_left_tensor = None
         self.preview_blended_right_tensor = None
         # --- GUI Variables ---
@@ -184,6 +185,7 @@ class MergingGUI(ThemedTk):
 
         self._apply_theme()
         self._configure_logging() # Set initial logging level
+        self.after(0, lambda: setattr(self, '_is_startup', False)) # Set startup flag to false after GUI is built
         self.after(0, self._set_saved_geometry) # Restore window position
         self.protocol("WM_DELETE_WINDOW", self.exit_application)
 
@@ -296,6 +298,10 @@ class MergingGUI(ThemedTk):
         # This ensures the red text color is not overridden by the theme's default button style.
         self.style.configure('Loading.TButton', foreground='red')
 
+        # Adjust window height for new theme if not starting up
+        if not self._is_startup:
+            self._adjust_window_height_for_content()
+
     def show_about_dialog(self):
         """Displays an 'About' dialog for the application."""
         about_text = (
@@ -397,6 +403,23 @@ class MergingGUI(ThemedTk):
         logging.getLogger().setLevel(level)
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
 
+    def _adjust_window_height_for_content(self):
+        """Adjusts the window height to fit the current content, preserving user-set width."""
+        if self._is_startup: # Don't adjust during initial setup
+            return
+
+        current_actual_width = self.winfo_width()
+        if current_actual_width <= 1: # Fallback for very first call
+            current_actual_width = self.window_width
+
+        new_height = self.winfo_reqheight()
+
+        self.geometry(f"{current_actual_width}x{new_height}")
+        logger.debug(f"Content resize applied geometry: {current_actual_width}x{new_height}")
+        
+        # Update stored width and height for the next time save_config is called.
+        self.window_width = current_actual_width
+
     def _toggle_debug_logging(self):
         """Callback for the debug logging checkbox."""
         self._configure_logging()
@@ -467,6 +490,8 @@ class MergingGUI(ThemedTk):
             processing_callback=self._preview_processing_callback,
             find_sources_callback=self._find_preview_sources_callback,
             get_params_callback=self.get_current_settings, # Pass the settings getter
+            preview_size_var=self.preview_size_var, # Pass the preview size variable
+            resize_callback=self._adjust_window_height_for_content, # Pass the resize callback
             help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
@@ -562,13 +587,7 @@ class MergingGUI(ThemedTk):
         pad_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
         self.widgets_to_disable.append(pad_check)
-        
-        # Add Preview Size option
-        ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
-        entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
-        entry_preview.pack(side="left")
-        self._create_hover_tooltip(entry_preview, "preview_size")
-        self.widgets_to_disable.append(entry_preview)
+
         # Add Batch Chunk Size option
         ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
         entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7)
