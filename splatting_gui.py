@@ -33,7 +33,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.14.0"
+GUI_VERSION = "25.10.15.1"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -1686,7 +1686,37 @@ class SplatterGUI(ThemedTk):
         if current_actual_width <= 1: # Fallback for very first call
             current_actual_width = self.window_width
 
-        new_height = self.winfo_reqheight()
+        # --- NEW: More accurate height calculation ---
+        # --- FIX: Calculate base_height by summing widgets *other* than the previewer ---
+        # This is more stable than subtracting a potentially out-of-sync canvas height.
+        base_height = 0
+        for widget in self.winfo_children():
+            if widget is not self.previewer:
+                # --- FIX: Correctly handle tuple and int for pady ---
+                try:
+                    pady_value = widget.pack_info().get('pady', 0)
+                    total_pady = 0
+                    if isinstance(pady_value, int):
+                        total_pady = pady_value * 2
+                    elif isinstance(pady_value, (tuple, list)):
+                        total_pady = sum(pady_value)
+                    base_height += widget.winfo_reqheight() + total_pady
+                except tk.TclError:
+                    # This widget (e.g., the menubar) is not packed, so it has no pady.
+                    base_height += widget.winfo_reqheight()
+        # --- END FIX ---
+
+        # Get the actual height of the displayed preview image, if it exists
+        preview_image_height = 0
+        if hasattr(self.previewer, 'preview_image_tk') and self.previewer.preview_image_tk:
+            preview_image_height = self.previewer.preview_image_tk.height()
+
+        # Add a small buffer for padding/borders
+        padding = 10 
+
+        # The new total height is the base UI height + the actual image height + padding
+        new_height = base_height + preview_image_height + padding
+        # --- END NEW ---
 
         self.geometry(f"{current_actual_width}x{new_height}")
         logger.debug(f"Content resize applied geometry: {current_actual_width}x{new_height}")

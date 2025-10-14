@@ -16,6 +16,8 @@ import cv2
 import gc
 import time
 
+VERSION = "25-10-15.1"
+
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
 # This prevents duplicate log messages if a calling script configures logging independently.

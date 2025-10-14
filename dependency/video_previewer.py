@@ -11,6 +11,8 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
+VERSION = "25-10-15.1"
+
 class VideoPreviewer(ttk.Frame):
     """
     A self-contained Tkinter widget for previewing video processing results.
