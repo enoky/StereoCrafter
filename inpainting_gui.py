@@ -19,14 +19,18 @@ import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
 
-from dependency.stereocrafter_util import Tooltip, logger, get_video_stream_info, draw_progress_bar, release_cuda_memory, set_util_logger_level, encode_frames_to_mp4, read_video_frames_decord
+from dependency.stereocrafter_util import (
+    Tooltip, logger, get_video_stream_info, draw_progress_bar,
+    release_cuda_memory, set_util_logger_level,
+    encode_frames_to_mp4, read_video_frames_decord
+)
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25-10-12.5"
+GUI_VERSION = "25-10-14.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1807,8 +1811,8 @@ class InpaintingGUI(ThemedTk):
         """
         try:
             self.pipeline = load_inpainting_pipeline(
-                pre_trained_path="./weights/stable-video-diffusion-img2vid-xt-1-1",
-                unet_path="./weights/StereoCrafter",
+                pre_trained_path=r"./weights/stable-video-diffusion-img2vid-xt-1-1",
+                unet_path=r"./weights/StereoCrafter",
                 device="cuda",
                 dtype=torch.float16,
                 offload_type=offload_type

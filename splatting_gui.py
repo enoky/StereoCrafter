@@ -23,14 +23,15 @@ from typing import Optional, Tuple, Optional
 # Import custom modules
 from dependency.forward_warp_pytorch import forward_warp
 # --- MODIFIED IMPORT ---
-from dependency.stereocrafter_util import ( Tooltip, logger, get_video_stream_info, draw_progress_bar,
+from dependency.stereocrafter_util import (
+    Tooltip, logger, get_video_stream_info, draw_progress_bar,
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
     start_ffmpeg_pipe_process # <-- IMPORT THE NEW PIPE FUNCTION
 )
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.12.0"
+GUI_VERSION = "25.10.14.0"
 
 class ForwardWarpStereo(nn.Module):
     """
