@@ -676,7 +676,7 @@ def start_ffmpeg_pipe_process(
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
-        ffmpeg_cmd.extend(["-preset", nvenc_preset, "-cq", default_nvenc_cq])
+        ffmpeg_cmd.extend(["-preset", nvenc_preset, "-qp", default_nvenc_cq])
     else:
         ffmpeg_cmd.extend(["-crf", default_cpu_crf])
     
