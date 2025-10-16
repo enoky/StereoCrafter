@@ -33,7 +33,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.16.1"
+GUI_VERSION = "25.10.16.2"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -1890,8 +1890,6 @@ class SplatterGUI(ThemedTk):
         self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
 
-    # --- NEW: Previewer Integration Methods ---
-
     def _find_preview_sources_callback(self) -> list:
         """
         Callback for VideoPreviewer. Scans for matching source video and depth map pairs.
@@ -2054,9 +2052,6 @@ class SplatterGUI(ThemedTk):
         logger.debug("--- Finished Preview Processing Callback ---")
         return pil_img
 
-    # ======================================================================================
-    # REFACTORED depthSplatting FUNCTION
-    # ======================================================================================
     def depthSplatting(
             self: "SplatterGUI",
             input_video_reader: VideoReader,
@@ -2081,8 +2076,10 @@ class SplatterGUI(ThemedTk):
             user_output_crf: Optional[int] = None,
             is_low_res_task: bool = False,
             depth_gamma: float = 1.0,
-            depth_dilate_size: int = 0,
-            depth_blur_size: int = 0
+            depth_dilate_size_x: int = 0,   # <--- NEW X
+            depth_dilate_size_y: int = 0,   # <--- NEW Y
+            depth_blur_size_x: int = 0,     # <--- NEW X
+            depth_blur_size_y: int = 0      # <--- NEW Y
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
