@@ -10,6 +10,7 @@ import logging
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from decord import VideoReader, cpu
 import subprocess
 import cv2
@@ -25,6 +26,77 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+    """
+    Applies dilation with separate X and Y kernel sizes to a tensor.
+    Expects a 4D tensor (B, C, H, W).
+    """
+    k_x = int(kernel_size_x)
+    k_y = int(kernel_size_y)
+    if k_x <= 0 or k_y <= 0:
+        return tensor
+
+    device = tensor.device if use_gpu and torch.cuda.is_available() else torch.device('cpu')
+    tensor = tensor.to(device)
+
+    if use_gpu and torch.cuda.is_available():
+        padding = (k_x // 2, k_y // 2)
+        return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=padding)
+    else:
+        # CPU fallback
+        processed_frames = []
+        for t in range(tensor.shape[0]):
+            # Assuming single channel for masks/depth maps
+            frame_np = (tensor[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
+            dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
+            dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
+            processed_frames.append(dilated_tensor.unsqueeze(0))
+        return torch.stack(processed_frames).to(tensor.device)
+
+def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+    """
+    Applies Gaussian blur with separate X and Y kernel sizes to a tensor.
+    Expects a 4D tensor (B, C, H, W).
+    """
+    k_x = int(kernel_size_x)
+    k_y = int(kernel_size_y)
+    if k_x <= 0 or k_y <= 0:
+        return tensor
+
+    # GaussianBlur requires odd kernel sizes
+    k_x = k_x if k_x % 2 == 1 else k_x + 1
+    k_y = k_y if k_y % 2 == 1 else k_y + 1
+    
+    device = tensor.device if use_gpu and torch.cuda.is_available() else torch.device('cpu')
+    tensor = tensor.to(device)
+
+    if use_gpu and torch.cuda.is_available():
+        # Separable Gaussian blur on GPU
+        sigma_x = k_x / 6.0
+        sigma_y = k_y / 6.0
+        
+        ax_x = torch.arange(-k_x // 2 + 1., k_x // 2 + 1., device=device)
+        gauss_x = torch.exp(-(ax_x ** 2) / (2 * sigma_x ** 2))
+        kernel_x = (gauss_x / gauss_x.sum()).view(1, 1, 1, k_x).repeat(tensor.shape[1], 1, 1, 1)
+        
+        ax_y = torch.arange(-k_y // 2 + 1., k_y // 2 + 1., device=device)
+        gauss_y = torch.exp(-(ax_y ** 2) / (2 * sigma_y ** 2))
+        kernel_y = (gauss_y / gauss_y.sum()).view(1, 1, k_y, 1).repeat(tensor.shape[1], 1, 1, 1)
+
+        blurred = F.conv2d(tensor, kernel_x, padding=(0, k_x // 2), groups=tensor.shape[1])
+        blurred = F.conv2d(blurred, kernel_y, padding=(k_y // 2, 0), groups=tensor.shape[1])
+        return torch.clamp(blurred, 0.0, 1.0)
+    else:
+        # CPU fallback
+        processed_frames = []
+        for t in range(tensor.shape[0]):
+            frame_np = (tensor[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            blurred_np = cv2.GaussianBlur(frame_np, (k_x, k_y), 0)
+            blurred_tensor = torch.from_numpy(blurred_np).float() / 255.0
+            processed_frames.append(blurred_tensor.unsqueeze(0))
+        return torch.stack(processed_frames).to(tensor.device)
 
 def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
     """
@@ -168,7 +240,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     Extracts comprehensive video stream metadata using ffprobe.
     Returns a dict with relevant color properties, codec, pixel format, and HDR mastering metadata
     or None if ffprobe fails/info not found.
-    Requires ffprobe to be installed and in PATH.
+    Requires ffprobe to be installed and in your system PATH.
     This function *does not* show messageboxes; the caller should handle errors.
     """
     cmd = [
@@ -447,7 +519,7 @@ def encode_frames_to_mp4(
             default_cpu_crf = "18" # For CPU x264 (SDR 8-bit, higher quality)
         output_profile = "main"
 
-    logger.debug("default_cpu_crf = {default_cpu_crf}")
+    logger.debug(f"default_cpu_crf = {default_cpu_crf}")
     # Add codec, profile, pix_fmt
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:

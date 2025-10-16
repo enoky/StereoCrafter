@@ -27,13 +27,13 @@ from dependency.forward_warp_pytorch import forward_warp
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
-    start_ffmpeg_pipe_process # <-- IMPORT THE NEW PIPE FUNCTION
+    start_ffmpeg_pipe_process, custom_blur, custom_dilate
 )
 from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.15.1"
+GUI_VERSION = "25.10.16.1"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -83,20 +83,22 @@ class SplatterGUI(ThemedTk):
         
         # Depth Processing Defaults
         "DEPTH_GAMMA": "1.0",
-        "DEPTH_DILATE_SIZE": "3",
-        "DEPTH_BLUR_SIZE": "7"
+        "DEPTH_DILATE_SIZE_X": "3",
+        "DEPTH_DILATE_SIZE_Y": "3",
+        "DEPTH_BLUR_SIZE_X": "7",
+        "DEPTH_BLUR_SIZE_Y": "7"
     }
-    # ---------------------------------------
-    # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
+            # ---------------------------------------
+            # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
     SIDECAR_KEY_MAP = {
         "convergence_plane": "CONV_POINT",
         "max_disparity": "MAX_DISP",
-        # Your existing key:
-        "gamma": "DEPTH_GAMMA", 
-        # Add the two new keys (using internal names for now, we'll confirm sidecar keys later)
-        "depth_dilate_size": "DEPTH_DILATE_SIZE",
-        "depth_blur_size": "DEPTH_BLUR_SIZE",
-        "frame_overlap": "FRAME_OVERLAP", # Add existing sidecar keys for completeness
+        "gamma": "DEPTH_GAMMA",
+        "depth_dilate_size_x": "DEPTH_DILATE_SIZE_X",
+        "depth_dilate_size_y": "DEPTH_DILATE_SIZE_Y",
+        "depth_blur_size_x": "DEPTH_BLUR_SIZE_X",
+        "depth_blur_size_y": "DEPTH_BLUR_SIZE_Y",
+        "frame_overlap": "FRAME_OVERLAP",
         "input_bias": "INPUT_BIAS"
     }
     # ---------------------------------------
@@ -139,14 +141,16 @@ class SplatterGUI(ThemedTk):
         self.pre_res_height_var = tk.StringVar(value=self.app_config.get("pre_res_height", "512"))
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
-        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))        
+        self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
+
         self.auto_convergence_mode_var = tk.StringVar(value=self.app_config.get("auto_convergence_mode", "Off"))
 
         # --- Depth Pre-processing Variables ---
         self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"]))
-        self.depth_dilate_size_var = tk.StringVar(value=self.app_config.get("depth_dilate_size", defaults["DEPTH_DILATE_SIZE"]))
-        self.depth_blur_size_var = tk.StringVar(value=self.app_config.get("depth_blur_size", defaults["DEPTH_BLUR_SIZE"]))
-
+        self.depth_dilate_size_x_var = tk.StringVar(value=self.app_config.get("depth_dilate_size_x", defaults["DEPTH_DILATE_SIZE_X"]))
+        self.depth_dilate_size_y_var = tk.StringVar(value=self.app_config.get("depth_dilate_size_y", defaults["DEPTH_DILATE_SIZE_Y"]))
+        self.depth_blur_size_x_var = tk.StringVar(value=self.app_config.get("depth_blur_size_x", defaults["DEPTH_BLUR_SIZE_X"]))
+        self.depth_blur_size_y_var = tk.StringVar(value=self.app_config.get("depth_blur_size_y", defaults["DEPTH_BLUR_SIZE_Y"]))
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
@@ -476,22 +480,29 @@ class SplatterGUI(ThemedTk):
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
         row_inner = 0
-        # Dilate Size
-        self.lbl_depth_dilate_size = ttk.Label(self.depth_prep_frame, text="Dilate Size (0=Off):")
-        self.lbl_depth_dilate_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
-        self.entry_depth_dilate_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_dilate_size_var, width=15)
-        self.entry_depth_dilate_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_depth_dilate_size, "depth_dilate_size")
-        self._create_hover_tooltip(self.entry_depth_dilate_size, "depth_dilate_size")
+        # Dilate Controls
         row_inner += 1
-        
-        # Blur Size (Sigma = Size/6)
-        self.lbl_depth_blur_size = ttk.Label(self.depth_prep_frame, text="Blur Size (0/Odd):")
-        self.lbl_depth_blur_size.grid(row=row_inner, column=0, sticky="e", padx=5, pady=2)
-        self.entry_depth_blur_size = ttk.Entry(self.depth_prep_frame, textvariable=self.depth_blur_size_var, width=15)
-        self.entry_depth_blur_size.grid(row=row_inner, column=1, sticky="w", padx=5, pady=2)
+        self.dilate_frame = ttk.Frame(self.depth_prep_frame)
+        self.dilate_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+        self.lbl_depth_dilate_size = ttk.Label(self.dilate_frame, text="Dilate X/Y (0=Off):")
+        self.lbl_depth_dilate_size.pack(side="left", padx=(0, 5))
+        self.entry_depth_dilate_size_x = ttk.Entry(self.dilate_frame, textvariable=self.depth_dilate_size_x_var, width=4)
+        self.entry_depth_dilate_size_x.pack(side="left")
+        self.entry_depth_dilate_size_y = ttk.Entry(self.dilate_frame, textvariable=self.depth_dilate_size_y_var, width=4)
+        self.entry_depth_dilate_size_y.pack(side="left", padx=(5, 0))
+        self._create_hover_tooltip(self.lbl_depth_dilate_size, "depth_dilate_size")
+
+        # Blur Controls
+        row_inner += 1
+        self.blur_frame = ttk.Frame(self.depth_prep_frame)
+        self.blur_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+        self.lbl_depth_blur_size = ttk.Label(self.blur_frame, text="Blur X/Y (0/Odd):")
+        self.lbl_depth_blur_size.pack(side="left", padx=(0, 5))
+        self.entry_depth_blur_size_x = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_x_var, width=4)
+        self.entry_depth_blur_size_x.pack(side="left")
+        self.entry_depth_blur_size_y = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_y_var, width=4)
+        self.entry_depth_blur_size_y.pack(side="left", padx=(5, 0))
         self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
-        self._create_hover_tooltip(self.entry_depth_blur_size, "depth_blur_size")
         row_inner = 0 # Reset for next frame
 
         current_row += 1
@@ -819,8 +830,10 @@ class SplatterGUI(ThemedTk):
             "pre_res_height": self.pre_res_height_var.get(),
             "low_res_batch_size": self.low_res_batch_size_var.get(),
             
-            "depth_dilate_size": self.depth_dilate_size_var.get(),
-            "depth_blur_size": self.depth_blur_size_var.get(),
+            "depth_dilate_size_x": self.depth_dilate_size_x_var.get(),
+            "depth_dilate_size_y": self.depth_dilate_size_y_var.get(),
+            "depth_blur_size_x": self.depth_blur_size_x_var.get(),
+            "depth_blur_size_y": self.depth_blur_size_y_var.get(),
 
             "process_length": self.process_length_var.get(),
             "output_crf": self.output_crf_var.get(),
@@ -1223,7 +1236,8 @@ class SplatterGUI(ThemedTk):
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
 
     def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
-                              depth_dilate_size: int, depth_blur_size: int, is_low_res_task: bool, max_raw_value: float,
+                              depth_dilate_size_x: int, depth_dilate_size_y: int, depth_blur_size_x: int, depth_blur_size_y: int, 
+                              is_low_res_task: bool, max_raw_value: float,
                               global_depth_min: float, global_depth_max: float) -> np.ndarray:
         """
         Loads, converts, and pre-processes the raw depth map batch (Grayscale, Gamma, Dilate, Blur).
@@ -1266,29 +1280,27 @@ class SplatterGUI(ThemedTk):
 
         # --- 3. Dilate and Blur (Conditional on is_low_res_task) ---
         if is_low_res_task:
-            if depth_dilate_size > 0 or depth_blur_size > 0:
-                 logger.debug(f"Dilate ({depth_dilate_size}) or Blur ({depth_blur_size}) skipped for low-resolution (inpaint) task as per configuration.")
+            if depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0:
+                logger.debug(f"Dilate/Blur skipped for low-resolution (inpaint) task as per configuration.")
         else:
-            # This is the HI-RES path: apply Dilate and Blur based on size setting.
+            # This is the HI-RES path: apply Dilate and Blur using tensor-based functions.
+            needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
+            if needs_processing:
+                # Convert numpy array to torch tensor (B, H, W) -> (B, 1, H, W)
+                depth_tensor = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1)
 
-            # 3a. Dilation (if size > 0)
-            if depth_dilate_size > 0:
-                logger.debug(f"Applying depth dilation with kernel size: {depth_dilate_size}")
-                kernel = np.ones((depth_dilate_size, depth_dilate_size), np.uint8)
-                for j in range(batch_depth_numpy_float.shape[0]):
-                    batch_depth_numpy_float[j] = cv2.dilate(batch_depth_numpy_float[j], kernel, iterations=1)
-            
-            # 3b. Gaussian Blur (if size > 0)
-            if depth_blur_size > 0:
-                logger.debug(f"Applying depth Gaussian Blur with kernel size: {depth_blur_size}")
-                sigma = depth_blur_size / 6.0 
-                for j in range(batch_depth_numpy_float.shape[0]):
-                    batch_depth_numpy_float[j] = cv2.GaussianBlur(
-                        batch_depth_numpy_float[j], 
-                        (depth_blur_size, depth_blur_size), 
-                        sigmaX=sigma, 
-                        sigmaY=sigma
-                    )
+                # Apply custom_dilate if needed
+                if depth_dilate_size_x > 0 and depth_dilate_size_y > 0:
+                    logger.debug(f"Applying custom depth dilation with kernel size: {depth_dilate_size_x}x{depth_dilate_size_y}")
+                    depth_tensor = custom_dilate(depth_tensor, depth_dilate_size_x, depth_dilate_size_y, use_gpu=CUDA_AVAILABLE)
+
+                # Apply custom_blur if needed
+                if depth_blur_size_x > 0 and depth_blur_size_y > 0:
+                    logger.debug(f"Applying custom depth Gaussian Blur with kernel size: {depth_blur_size_x}x{depth_blur_size_y}")
+                    depth_tensor = custom_blur(depth_tensor, depth_blur_size_x, depth_blur_size_y, use_gpu=CUDA_AVAILABLE)
+
+                # Convert back to numpy array (B, 1, H, W) -> (B, H, W)
+                batch_depth_numpy_float = depth_tensor.squeeze(1).cpu().numpy()
 
         return batch_depth_numpy_float
 
@@ -1549,8 +1561,10 @@ class SplatterGUI(ThemedTk):
                         is_low_res_task=task["is_low_res"],
                         # --- NEW ARGUMENTS ---
                         depth_gamma=current_depth_gamma,
-                        depth_dilate_size=current_depth_dilate_size,
-                        depth_blur_size=current_depth_blur_size
+                        depth_dilate_size_x=current_depth_dilate_size_x,
+                        depth_dilate_size_y=current_depth_dilate_size_y,
+                        depth_blur_size_x=current_depth_blur_size_x,
+                        depth_blur_size_y=current_depth_blur_size_y
                     )
 
                     if self.stop_event.is_set():
@@ -1917,8 +1931,10 @@ class SplatterGUI(ThemedTk):
                 "max_disp": float(self.max_disp_var.get()),
                 "convergence_point": float(self.zero_disparity_anchor_var.get()),
                 "depth_gamma": float(self.depth_gamma_var.get()),
-                "depth_dilate_size": int(self.depth_dilate_size_var.get()),
-                "depth_blur_size": int(self.depth_blur_size_var.get()),
+                "depth_dilate_size_x": int(self.depth_dilate_size_x_var.get()),
+                "depth_dilate_size_y": int(self.depth_dilate_size_y_var.get()),
+                "depth_blur_size_x": int(self.depth_blur_size_x_var.get()),
+                "depth_blur_size_y": int(self.depth_blur_size_y_var.get()),
                 "preview_size": int(self.preview_size_var.get()),
                 "enable_autogain": self.enable_autogain_var.get(),
             }
@@ -1959,14 +1975,14 @@ class SplatterGUI(ThemedTk):
             batch_depth_numpy_raw=np.expand_dims(depth_numpy_raw, axis=0),
             depth_stream_info=None, # Not available for single frame
             depth_gamma=params['depth_gamma'],
-            depth_dilate_size=params['depth_dilate_size'],
-            depth_blur_size=params['depth_blur_size'],
+            depth_dilate_size_x=params['depth_dilate_size_x'],
+            depth_dilate_size_y=params['depth_dilate_size_y'],
+            depth_blur_size_x=params['depth_blur_size_x'],
+            depth_blur_size_y=params['depth_blur_size_y'],
             is_low_res_task=False, # Preview is always "hi-res" logic
             max_raw_value=255.0, # Assume 8-bit for preview simplicity
-            # --- FIX: Let the helper function handle pre-processing only. Normalization will be done below. ---
             global_depth_min=0.0,
             global_depth_max=1.0 # Pass neutral values; we will normalize manually.
-            # --- END FIX ---
         )
         logger.debug(f"Processed depth numpy shape: {depth_numpy_processed.shape}, range: [{depth_numpy_processed.min():.2f}, {depth_numpy_processed.max():.2f}]")
 
@@ -2006,7 +2022,7 @@ class SplatterGUI(ThemedTk):
 
         # --- Select Output for Display ---
         preview_source = self.preview_source_var.get()
-        self.previewer.set_preview_source_options(["Splat Result", "Occlusion Mask", "Depth Map"])
+        self.previewer.set_preview_source_options(["Splat Result", "Original (Left Eye)", "Occlusion Mask", "Depth Map", "Anaglyph 3D", "Wigglegram"])
 
         if preview_source == "Splat Result":
             final_tensor = right_eye_tensor.cpu()
@@ -2016,6 +2032,18 @@ class SplatterGUI(ThemedTk):
             depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
             depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
             final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        elif preview_source == "Original (Left Eye)":
+            final_tensor = left_eye_tensor.cpu()
+        elif preview_source == "Anaglyph 3D":
+            left_np_anaglyph = (left_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            left_gray_np = cv2.cvtColor(left_np_anaglyph, cv2.COLOR_RGB2GRAY)
+            anaglyph_np = right_np_anaglyph.copy()
+            anaglyph_np[:, :, 0] = left_gray_np
+            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+        elif preview_source == "Wigglegram":
+            self.previewer._start_wigglegram_animation(left_eye_tensor, right_eye_tensor)
+            return None
         else:
             final_tensor = right_eye_tensor.cpu()
 
@@ -2124,8 +2152,10 @@ class SplatterGUI(ThemedTk):
                     batch_depth_numpy_raw=batch_depth_numpy_raw,
                     depth_stream_info=depth_stream_info,
                     depth_gamma=depth_gamma,
-                    depth_dilate_size=depth_dilate_size,
-                    depth_blur_size=depth_blur_size,
+                    depth_dilate_size_x=depth_dilate_size_x,
+                    depth_dilate_size_y=depth_dilate_size_y,
+                    depth_blur_size_x=depth_blur_size_x,
+                    depth_blur_size_y=depth_blur_size_y,
                     is_low_res_task=is_low_res_task,
                     max_raw_value=max_expected_raw_value,
                     global_depth_min=global_depth_min,
