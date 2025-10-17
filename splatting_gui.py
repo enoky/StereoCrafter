@@ -28,13 +28,13 @@ from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
     start_ffmpeg_pipe_process, custom_blur, custom_dilate,
-    create_single_slider_with_label_updater
+    create_single_slider_with_label_updater, create_dual_slider_layout
 )
 from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.17.2"
+GUI_VERSION = "25.10.18.1"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -470,7 +470,14 @@ class SplatterGUI(ThemedTk):
         self.entry_low_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.low_res_batch_size_var, width=15)
         self.entry_low_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
-        self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
+        self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")        
+        current_row += 1
+        
+        # Dual Output Checkbox (Row 3, Column 0/1)
+        self.dual_output_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Dual Output Only", variable=self.dual_output_var)
+        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
+
         current_row = 0 # Reset for next frame
 
         # ===================================================================
@@ -488,90 +495,10 @@ class SplatterGUI(ThemedTk):
 
         # Slider Implementation for dilate and blur
         row_inner = 0
-
-        def create_slider_with_label_updater_x_y(parent, text_x, text_y, var_x, var_y, from_, to, row, decimals=0, is_integer=True) -> None:
-            """Creates a slider, its value label, and all necessary event bindings."""
-        
-            def update_label_and_preview(value_str: str, var: tk.Variable, label: ttk.Label, self_arg=None) -> None:
-                """Updates the text label. Called by user interaction."""
-                label.config(text=f"{float(value_str):.{decimals}f}")
-
-            def on_trough_click(event):
-                """Handles clicks on the slider's trough for precise positioning."""
-                # Check if the click is on the trough to avoid interfering with handle drags
-                if 'trough' in slider_x.identify(event.x, event.y):
-                    # --- FIX: Force the widget to update its size info before calculating ---
-                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
-                    slider_x.update_idletasks()
-                    new_value = from_ + (to - from_) * (event.x / slider_x.winfo_width())
-                    
-                    # --- MODIFIED: Ensure integer value is set for DILATE/BLUR ---
-                    if is_integer:
-                        value_to_set = int(new_value)
-                    else:
-                        value_to_set = new_value
-                    var_x.set(value_to_set) # Set the tk.Variable, which triggers the command and updates the UI
-                    # --- FIX: Manually update the label's text after setting the variable ---
-                    value_label_x.config(text=f"{new_value:.{decimals}f}")
-                    self.on_slider_release(event) # Manually trigger preview update
-                    return "break" # IMPORTANT: Prevents the default slider click behavior
-            def on_trough_click_y(event):
-                """Handles clicks on the slider's trough for precise positioning."""
-                # Check if the click is on the trough to avoid interfering with handle drags
-                if 'trough' in slider_y.identify(event.x, event.y):
-                    # --- FIX: Force the widget to update its size info before calculating ---
-                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
-                    slider_y.update_idletasks()
-                    new_value = from_ + (to - from_) * (event.x / slider_y.winfo_width())
-
-                    # --- MODIFIED: Ensure integer value is set for DILATE/BLUR ---
-                    if is_integer:
-                        value_to_set = int(new_value)
-                    else:
-                        value_to_set = new_value
-                    var_y.set(value_to_set) # Set the tk.Variable, which triggers the command and updates the UI
-                    # --- FIX: Manually update the label's text after setting the variable ---
-                    value_label_y.config(text=f"{new_value:.{decimals}f}")
-                    self.on_slider_release(event) # Manually trigger preview update
-                    return "break" # IMPORTANT: Prevents the default slider click behavior
-            LABEL_FIXED_WIDTH = 7
-
-            xy_frame = ttk.Frame(parent)
-            xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-            
-            # --- MODIFIED: Apply fixed width to label_x ---
-            label_x = ttk.Label(xy_frame, text=text_x, width=LABEL_FIXED_WIDTH)
-            label_x.pack(side="left", padx=(0, 5), anchor="w")
-            
-            slider_x = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_x, orient="horizontal", length=50)
-            slider_x.pack(side="left", fill="x", expand=True, padx=(0,5))
-            value_label_x = ttk.Label(xy_frame, text="", width=2) # Start with empty text
-            value_label_x.pack(side="left", padx=(0, 5))
-            update_label_and_preview(str(var_x.get()), var_x, value_label_x)
-            label_y = ttk.Label(xy_frame, text=text_y, width=0) # Set a shorter width for the Y label
-            label_y.pack(side="left", padx=(0, 5), anchor="w")
-            slider_y = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_y, orient="horizontal", length=50)
-            slider_y.pack(side="left", fill="x", expand=True, padx=(0,0))
-            value_label_y = ttk.Label(xy_frame, text="", width=2) # Start with empty text
-            update_label_and_preview(str(var_y.get()), var_y, value_label_y)
-            value_label_y.pack(side="left", padx=(0, 5))
-
-            slider_x.bind("<Button-1>", on_trough_click)
-            slider_y.bind("<Button-1>", on_trough_click_y)
-            
-            # --- MODIFIED: Add ButtonRelease binding to trigger preview refresh on drag end ---
-            slider_x.bind("<ButtonRelease-1>", self.on_slider_release)
-            slider_y.bind("<ButtonRelease-1>", self.on_slider_release)
-            # --- END MODIFIED ---
-
-            slider_x.configure(command=lambda value: update_label_and_preview(value, var_x, value_label_x, self))
-            slider_y.configure(command=lambda value: update_label_and_preview(value, var_y, value_label_y, self))
+        create_dual_slider_layout(self, self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15, row_inner, decimals=0, is_integer=True)
 
         row_inner += 1
-        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15, row_inner, decimals=0, is_integer=True)
-
-        row_inner += 1
-        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35, row_inner, decimals=0, is_integer=True)
+        create_dual_slider_layout(self, self.depth_prep_frame, "   Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35, row_inner, decimals=0, is_integer=True)
 
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
@@ -632,12 +559,6 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
-        current_row += 1
-        
-        # Dual Output Checkbox (Row 3, Column 0/1)
-        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only", variable=self.dual_output_var)
-        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
 
         current_row = 0 # Reset for next frame
 

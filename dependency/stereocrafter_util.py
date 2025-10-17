@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-17.2"
+VERSION = "25-10-18.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -39,12 +39,13 @@ def create_single_slider_with_label_updater(
 ) -> None:
     """Creates a single slider, its value label, and all necessary event bindings."""
     
+    LABEL_FIXED_WIDTH = 8
     # 1. Widgets
-    label = ttk.Label(parent, text=text)
-    label.grid(row=row, column=0, sticky="e", padx=0, pady=2)
+    label = ttk.Label(parent, text=text, anchor="e")
+    label.grid(row=row, column=0, sticky="ew", padx=0, pady=2)
     slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
     slider.grid(row=row, column=1, sticky="ew", padx=2)
-    value_label = ttk.Label(parent, text="", width=4) # Start with empty text
+    value_label = ttk.Label(parent, text="") # Start with empty text
     value_label.grid(row=row, column=2, sticky="w", padx=0)
 
     # 2. Command/Update Logic
@@ -95,6 +96,54 @@ def create_single_slider_with_label_updater(
         
     if hasattr(GUI_self, 'widgets_to_disable'):
         GUI_self.widgets_to_disable.append(slider)
+
+def create_dual_slider_layout(
+    GUI_self,
+    parent: ttk.Frame, 
+    text_x: str, 
+    text_y: str, 
+    var_x: tk.Variable, 
+    var_y: tk.Variable, 
+    from_: float, 
+    to: float, 
+    row: int, 
+    decimals: int = 0,
+    is_integer: bool = True # Added this for consistency with previous use
+) -> None:
+    """
+    Creates a dual (X/Y) slider layout by composing two single sliders.
+    The layout uses one grid row in the parent, with two packed sub-frames.
+    
+    NOTE: The single slider helper must be adapted to use PACK for its internal widgets
+          or this function must manually place the output of the single slider.
+          Since the single slider currently uses GRID (row=row, col=0, 1, 2) this composition
+          needs to ensure the inner frames only use row 0.
+    """
+    
+    # 1. Create a container frame that will sit in the parent's grid
+    xy_frame = ttk.Frame(parent)
+    xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+    
+    # Configure the container to hold two expanding columns
+    xy_frame.grid_columnconfigure(0, weight=1)
+    xy_frame.grid_columnconfigure(1, weight=1)
+    
+    # --- X SLIDER ---
+    x_inner_frame = ttk.Frame(xy_frame)
+    x_inner_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+    x_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
+    
+    # Call the single slider creator for the X components.
+    # We pass the inner frame, and it will use its grid (row=0, col=0, 1, 2)
+    create_single_slider_with_label_updater(GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals)
+    
+    # --- Y SLIDER ---
+    y_inner_frame = ttk.Frame(xy_frame)
+    y_inner_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+    y_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
+
+    # Call the single slider creator for the Y components.
+    create_single_slider_with_label_updater(GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals)
 
 def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
     """
