@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-15.1"
+VERSION = "25-10-17.1"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -140,18 +140,32 @@ class VideoPreviewer(ttk.Frame):
         self._create_hover_tooltip(self.video_jump_entry, "jump_to_video")
         ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
         
-        # --- NEW: Add Preview Size entry to the button bar ---
-        ttk.Label(preview_button_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
-        self.preview_size_entry = ttk.Entry(preview_button_frame, width=7)
-        if self.preview_size_var:
-            self.preview_size_entry.configure(textvariable=self.preview_size_var)
-        self.preview_size_entry.pack(side="left")
-        self._create_hover_tooltip(self.preview_size_entry, "preview_size")
-        # --- END NEW ---
+        # --- MODIFIED: Add Preview Size Combobox (Percentage Scale) ---
+        PERCENTAGE_VALUES = ["200%", "150%", "100%", "75%", "50%", "25%"]
+        
+        ttk.Label(preview_button_frame, text="Preview Scale:").pack(side="left", padx=(20, 5))
+        
+        self.preview_size_combo = ttk.Combobox(
+            preview_button_frame, 
+            textvariable=self.preview_size_var, 
+            values=PERCENTAGE_VALUES, 
+            state="readonly", # Make it selection-only
+            width=7
+        )
+        self.preview_size_combo.pack(side="left")
+        
+        # We need to explicitly bind the ComboboxSelected event to update the preview
+        self.preview_size_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
+        
+        self._create_hover_tooltip(self.preview_size_combo, "preview_size")
+        
+        # Re-assign to a variable name used later for disabling/enabling
+        self.preview_size_entry = self.preview_size_combo 
+        # --- END MODIFIED ---
 
         # --- NEW: Store widgets to be disabled ---
-        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button, self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_entry]
-
+        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button,
+                                   self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_combo]
 
     def set_parameters(self, params: Dict[str, Any]):
         """
@@ -254,11 +268,24 @@ class VideoPreviewer(ttk.Frame):
                 return # The wigglegram animation loop will handle the display.
             # --- END FIX ---
 
-            # Resize for display if too large, maintaining aspect ratio
-            max_size = int(self.current_params.get("preview_size", 1000))
+            # --- MODIFIED: Calculate scale factor from percentage string and apply resizing ---
+            scale_percent_str = self.current_params.get("preview_size", "100%")
             display_image = self.pil_image_for_preview.copy()
-            if display_image.height > max_size or display_image.width > max_size:
-                display_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+            try:
+                scale_factor = float(scale_percent_str.strip('%')) / 100.0
+            except ValueError:
+                scale_factor = 1.0
+                logger.warning(f"Invalid preview scale '{scale_percent_str}', defaulting to 100%.")
+
+            if scale_factor != 1.0 and scale_factor > 0:
+                new_width = int(display_image.width * scale_factor)
+                new_height = int(display_image.height * scale_factor)
+                
+                # Use Image.resize to handle both scaling up and scaling down
+                display_image = display_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.debug(f"Preview scaled by {scale_percent_str} to {new_width}x{new_height}.")
+            # --- END MODIFIED ---
 
             self.preview_image_tk = ImageTk.PhotoImage(display_image)
             # --- FIX: Attach the image reference to the widget to prevent garbage collection ---
@@ -449,19 +476,29 @@ class VideoPreviewer(ttk.Frame):
         """Starts the wigglegram animation loop."""
         self._stop_wigglegram_animation()
 
-        max_size = int(self.preview_size_var.get())
-        
-        left_np = (left_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        left_pil = Image.fromarray(left_np)
-        if left_pil.height > max_size or left_pil.width > max_size:
-            left_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        self.wiggle_left_tk = ImageTk.PhotoImage(left_pil)
+        # --- MODIFIED: Use percentage scaling for wigglegram frames ---
+        scale_percent_str = self.preview_size_var.get()
+        try:
+            scale_factor = float(scale_percent_str.strip('%')) / 100.0
+        except ValueError:
+            scale_factor = 1.0
 
-        right_np = (right_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        right_pil = Image.fromarray(right_np)
-        if right_pil.height > max_size or right_pil.width > max_size:
-            right_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        self.wiggle_right_tk = ImageTk.PhotoImage(right_pil)
+        def scale_image_for_wiggle(frame_tensor: torch.Tensor) -> ImageTk.PhotoImage:
+            """Scales a single frame tensor to a PhotoImage using the calculated factor."""
+            frame_np = (frame_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(frame_np)
+            
+            if scale_factor != 1.0 and scale_factor > 0:
+                new_width = int(pil_img.width * scale_factor)
+                new_height = int(pil_img.height * scale_factor)
+                if new_width > 0 and new_height > 0:
+                    pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            return ImageTk.PhotoImage(pil_img)
+
+        self.wiggle_left_tk = scale_image_for_wiggle(left_frame)
+        self.wiggle_right_tk = scale_image_for_wiggle(right_frame)
+        # --- END MODIFIED ---
 
         self._wiggle_step(True)
 
@@ -495,6 +532,7 @@ class VideoPreviewer(ttk.Frame):
 
         if filepath:
             try:
+                # self.pil_image_for_preview already holds the correctly scaled image from update_preview
                 self.pil_image_for_preview.save(filepath)
                 logger.info(f"Preview frame saved to: {filepath}")
             except Exception as e:

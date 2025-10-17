@@ -24,7 +24,7 @@ from dependency.stereocrafter_util import (
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-15.1"
+GUI_VERSION = "25-10-17.1"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -121,7 +121,7 @@ class MergingGUI(ThemedTk):
         "pad_to_16_9": False,
         "enable_color_transfer": True,
         "batch_chunk_size": "20",
-        "preview_size": "1000",
+        "preview_size": "100%",
     }
 
     def __init__(self):
@@ -169,7 +169,7 @@ class MergingGUI(ThemedTk):
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"])))        
         self.preview_source_var = tk.StringVar(value="Blended Image")
-        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", self.APP_DEFAULTS["preview_size"])))
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -834,7 +834,7 @@ class MergingGUI(ThemedTk):
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
-                "preview_size": int(self.preview_size_var.get()),
+                "preview_size": self.preview_size_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),

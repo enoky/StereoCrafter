@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-15.1"
+VERSION = "25-10-17.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -41,8 +41,12 @@ def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, 
     tensor = tensor.to(device)
 
     if use_gpu and torch.cuda.is_available():
-        padding = (k_x // 2, k_y // 2)
-        return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=padding)
+        padding_x = k_x // 2
+        padding_y = k_y // 2
+        # Ensure padding is not greater than half the kernel size
+        padding_x = min(padding_x, (k_x - 1) // 2)
+        padding_y = min(padding_y, (k_y - 1) // 2)
+        return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=(padding_y, padding_x))
     else:
         # CPU fallback
         processed_frames = []

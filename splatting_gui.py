@@ -33,7 +33,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.16.2"
+GUI_VERSION = "25.10.17.1"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -157,7 +157,7 @@ class SplatterGUI(ThemedTk):
 
         # --- NEW: Previewer Variables ---
         self.preview_source_var = tk.StringVar(value="Splat Result")
-        self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "1000"))
+        self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "100%"))
 
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
@@ -1290,9 +1290,22 @@ class SplatterGUI(ThemedTk):
                 depth_tensor = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1)
 
                 # Apply custom_dilate if needed
-                if depth_dilate_size_x > 0 and depth_dilate_size_y > 0:
-                    logger.debug(f"Applying custom depth dilation with kernel size: {depth_dilate_size_x}x{depth_dilate_size_y}")
-                    depth_tensor = custom_dilate(depth_tensor, depth_dilate_size_x, depth_dilate_size_y, use_gpu=CUDA_AVAILABLE)
+                # --- MODIFIED: Enforce Odd Kernel Size for Dilate ---
+                final_k_x_dilate = depth_dilate_size_x
+                final_k_y_dilate = depth_dilate_size_y
+                
+                if final_k_x_dilate > 0 and final_k_x_dilate % 2 == 0:
+                    final_k_x_dilate += 1
+                    logger.warning(f"Dilate X kernel size was even ({depth_dilate_size_x}). Increased to {final_k_x_dilate} for centered GPU operation.")
+                
+                if final_k_y_dilate > 0 and final_k_y_dilate % 2 == 0:
+                    final_k_y_dilate += 1
+                    logger.warning(f"Dilate Y kernel size was even ({depth_dilate_size_y}). Increased to {final_k_y_dilate} for centered GPU operation.")
+                
+                # Apply custom_dilate if needed
+                if final_k_x_dilate > 0 and final_k_y_dilate > 0:
+                    logger.debug(f"Applying custom depth dilation with kernel size: {final_k_x_dilate}x{final_k_y_dilate}")
+                    depth_tensor = custom_dilate(depth_tensor, final_k_x_dilate, final_k_y_dilate, use_gpu=CUDA_AVAILABLE)
 
                 # Apply custom_blur if needed
                 if depth_blur_size_x > 0 and depth_blur_size_y > 0:
@@ -1933,7 +1946,7 @@ class SplatterGUI(ThemedTk):
                 "depth_dilate_size_y": int(self.depth_dilate_size_y_var.get()),
                 "depth_blur_size_x": int(self.depth_blur_size_x_var.get()),
                 "depth_blur_size_y": int(self.depth_blur_size_y_var.get()),
-                "preview_size": int(self.preview_size_var.get()),
+                "preview_size": self.preview_size_var.get(),
                 "enable_autogain": self.enable_autogain_var.get(),
             }
         except (ValueError, tk.TclError) as e:
@@ -2014,6 +2027,17 @@ class SplatterGUI(ThemedTk):
         disp_map_tensor = (disp_map_tensor - params['convergence_point']) * 2.0
         actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * left_eye_tensor.shape[3]
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
+
+         # --- FIX V2: Ensure Disparity Map matches Left Eye dimensions (Left Eye is the reference) ---
+        _, _, H_img, W_img = left_eye_tensor.shape
+        _, _, H_disp, W_disp = disp_map_tensor.shape
+
+        if H_img != H_disp or W_img != W_disp:
+            logger.warning(f"Resizing depth map from {W_disp}x{H_disp} to match left eye {W_img}x{H_img} before splatting.")
+            # We use bilinear interpolation for the disparity map as it preserves the flow direction and magnitude best.
+            disp_map_tensor = F.interpolate(disp_map_tensor, size=(H_img, W_img), mode='bilinear', align_corners=False)
+            
+        # --- END FIX V2 ---
 
         with torch.no_grad():
             right_eye_tensor, occlusion_mask = stereo_projector(left_eye_tensor.cuda(), disp_map_tensor)
