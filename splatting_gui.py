@@ -479,53 +479,58 @@ class SplatterGUI(ThemedTk):
         self.depth_prep_frame.grid(row=current_row, column=0, sticky="ew") # Use grid here for placement inside container
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
+        # Slider Implementation for dilate and blur
         row_inner = 0
-        # Dilate Controls
+
+        def create_slider_with_label_updater_x_y(parent, text_x, text_y, var_x, var_y, from_, to, row, decimals=0, is_integer=True) -> None:
+            """Creates a slider, its value label, and all necessary event bindings."""
+            
+            def update_label_and_preview(value_str: str, var: tk.Variable, label: ttk.Label, self_arg=None) -> None:
+                """Updates the text label. Called by user interaction."""
+                label.config(text=f"{float(value_str):.{decimals}f}")
+
+            xy_frame = ttk.Frame(parent)
+            xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+            label_x = ttk.Label(xy_frame, text=text_x)
+            label_x.grid(row=0, column=0, sticky="e", padx=(0, 5))
+            slider_x = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_x, orient="horizontal", length=50)
+            slider_x.grid(row=0, column=1, sticky="ew", padx=(0,10))
+            value_label_x = ttk.Label(xy_frame, text="", width=5) # Start with empty text
+            value_label_x.grid(row=0, column=2, sticky="w", padx=(0, 5))
+            update_label_and_preview(str(var_x.get()), var_x, value_label_x)
+            label_y = ttk.Label(xy_frame, text=text_y)
+            label_y.grid(row=1, column=0, sticky="e", padx=(0, 5))
+            slider_y = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_y, orient="horizontal", length=50)
+            slider_y.grid(row=1, column=1, sticky="ew", padx=(0,10))
+            value_label_y = ttk.Label(xy_frame, text="", width=5) # Start with empty text
+            update_label_and_preview(str(var_y.get()), var_y, value_label_y)
+            value_label_y.grid(row=1, column=2, sticky="w", padx=(0, 5))
+
+            xy_frame.columnconfigure(1, weight=1)
+        
+            slider_x.configure(command=lambda value: update_label_and_preview(value, var_x, value_label_x, self))
+            slider_y.configure(command=lambda value: update_label_and_preview(value, var_y, value_label_y, self))
+            # TODO add trough and preview and tooltips     
+
         row_inner += 1
-        self.dilate_frame = ttk.Frame(self.depth_prep_frame)
-        self.dilate_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-        self.lbl_depth_dilate_size = ttk.Label(self.dilate_frame, text="Dilate X/Y (0=Off):")
-        self.lbl_depth_dilate_size.pack(side="left", padx=(0, 5))
-        self.entry_depth_dilate_size_x = ttk.Entry(self.dilate_frame, textvariable=self.depth_dilate_size_x_var, width=4)
-        self.entry_depth_dilate_size_x.pack(side="left")
-        self.entry_depth_dilate_size_y = ttk.Entry(self.dilate_frame, textvariable=self.depth_dilate_size_y_var, width=4)
-        self.entry_depth_dilate_size_y.pack(side="left", padx=(5, 0))
-        self._create_hover_tooltip(self.lbl_depth_dilate_size, "depth_dilate_size")
+        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 50, row_inner, decimals=0, is_integer=True)
+
+        row_inner += 1
+        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 50, row_inner, decimals=0, is_integer=True)
 
         # Blur Controls
         row_inner += 1
         self.blur_frame = ttk.Frame(self.depth_prep_frame)
-        self.blur_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-        self.lbl_depth_blur_size = ttk.Label(self.blur_frame, text="Blur X/Y (0/Odd):")
-        self.lbl_depth_blur_size.pack(side="left", padx=(0, 5))
-        self.entry_depth_blur_size_x = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_x_var, width=4)
-        self.entry_depth_blur_size_x.pack(side="left")
-        self.entry_depth_blur_size_y = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_y_var, width=4)
-        self.entry_depth_blur_size_y.pack(side="left", padx=(5, 0))
-        self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
+        #self.blur_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+        #self.lbl_depth_blur_size = ttk.Label(self.blur_frame, text="Blur X/Y (0/Odd):")
+        #self.lbl_depth_blur_size.pack(side="left", padx=(0, 5))
+        #self.entry_depth_blur_size_x = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_x_var, width=4)
+        #self.entry_depth_blur_size_x.pack(side="left")
+        #self.entry_depth_blur_size_y = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_y_var, width=4)
+        #self.entry_depth_blur_size_y.pack(side="left", padx=(5, 0))
+        #self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
+
         row_inner = 0 # Reset for next frame
-
-        current_row += 1
-
-        # ===================================================================
-        # --- Sidecar Control Frame (Placed below Depth Prep Frame) ---
-        # label_text = "Sidecar (" + sidecar_ext + ") Control"
-        # self.sidecar_control_frame = ttk.LabelFrame(self.depth_settings_container, text=label_text) # <-- Already self. and using corrected text
-        # self.sidecar_control_frame.grid(row=current_row, column=0, sticky="ew", pady=(10, 0)) # Use grid here for placement inside container
-        # self.sidecar_control_frame.grid_columnconfigure(0, weight=1)
-
-        # row_inner = 0
-        # # Sidecar Toggles
-        # self.sidecar_gamma_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Depth Gamma Override", variable=self.enable_sidecar_gamma_var)
-        # self.sidecar_gamma_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
-        # self._create_hover_tooltip(self.sidecar_gamma_checkbox, "sidecar_gamma_toggle")
-        # row_inner += 1
-
-        # self.sidecar_blur_dilate_checkbox = ttk.Checkbutton(self.sidecar_control_frame, text="Enable Sidecar Blur/Dilate Override", variable=self.enable_sidecar_blur_dilate_var)
-        # self.sidecar_blur_dilate_checkbox.grid(row=row_inner, column=0, sticky="w", padx=5, pady=2)
-        # self._create_hover_tooltip(self.sidecar_blur_dilate_checkbox, "sidecar_blur_dilate_toggle")
-        # current_row = 0 # Reset for next frame
-
         # ===================================================================
         # --- Output Settings Frame (Now placed below the settings_container_frame) ---
         current_row = 0
