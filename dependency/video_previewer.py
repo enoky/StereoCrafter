@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-17.1"
+VERSION = "25-10-17.2"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -294,10 +294,10 @@ class VideoPreviewer(ttk.Frame):
             # --- END FIX ---
 
             # --- NEW: Trigger parent window resize ---
-            if self.resize_callback:
-                # Force the parent to update its layout to see the new image size
-                self.parent.update_idletasks()
-                self.resize_callback()
+            # if self.resize_callback:
+            #     # Force the parent to update its layout to see the new image size
+            #     self.parent.update_idletasks()
+            #     self.resize_callback()
             # --- END NEW ---
             self._update_preview_layout()
 

@@ -33,7 +33,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.17.1"
+GUI_VERSION = "25.10.17.2"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -157,7 +157,7 @@ class SplatterGUI(ThemedTk):
 
         # --- NEW: Previewer Variables ---
         self.preview_source_var = tk.StringVar(value="Splat Result")
-        self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "100%"))
+        self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "75%"))
 
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
@@ -250,8 +250,8 @@ class SplatterGUI(ThemedTk):
         self.update_idletasks() # Ensure all theme changes are rendered for accurate reqheight
 
         # --- Apply geometry only if not during startup (NEW conditional block) ---
-        if not is_startup:
-            self._adjust_window_height_for_content()
+        # if not is_startup:
+        #     self._adjust_window_height_for_content()
 
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
@@ -398,11 +398,19 @@ class SplatterGUI(ThemedTk):
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
 
-        current_row = 0
+        # --- NEW: MAIN LAYOUT CONTAINER (Holds Settings Left and Info Right) ---
+        self.main_layout_frame = ttk.Frame(self)
+        self.main_layout_frame.pack(pady=10, padx=10, fill="x")
+        self.main_layout_frame.grid_columnconfigure(0, weight=1) # Left settings column
+        self.main_layout_frame.grid_columnconfigure(1, weight=1) # Right info column (fixed width)
+
+        # --- LEFT COLUMN: Settings Stack Frame ---
+        self.settings_stack_frame = ttk.Frame(self.main_layout_frame)
+        self.settings_stack_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
         # --- Settings Container Frame (to hold two side-by-side frames) ---
-        self.settings_container_frame = ttk.Frame(self)
-        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
+        self.settings_container_frame = ttk.Frame(self.settings_stack_frame)
+        self.settings_container_frame.pack(pady=(0, 10), fill="x") # Pack it inside the stack frame
         self.settings_container_frame.grid_columnconfigure(0, weight=1)
         self.settings_container_frame.grid_columnconfigure(1, weight=1)
 
@@ -465,7 +473,7 @@ class SplatterGUI(ThemedTk):
         current_row = 0 # Reset for next frame
 
         # ===================================================================
-        # RIGHT SIDE: Depth Map Pre-processing Frame
+        # MIDDLE: Depth Map Pre-processing Frame
         # ===================================================================
         self.depth_settings_container = ttk.Frame(self.settings_container_frame)
         self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
@@ -484,39 +492,87 @@ class SplatterGUI(ThemedTk):
 
         def create_slider_with_label_updater_x_y(parent, text_x, text_y, var_x, var_y, from_, to, row, decimals=0, is_integer=True) -> None:
             """Creates a slider, its value label, and all necessary event bindings."""
-            
+        
             def update_label_and_preview(value_str: str, var: tk.Variable, label: ttk.Label, self_arg=None) -> None:
                 """Updates the text label. Called by user interaction."""
                 label.config(text=f"{float(value_str):.{decimals}f}")
 
+            def on_trough_click(event):
+                """Handles clicks on the slider's trough for precise positioning."""
+                # Check if the click is on the trough to avoid interfering with handle drags
+                if 'trough' in slider_x.identify(event.x, event.y):
+                    # --- FIX: Force the widget to update its size info before calculating ---
+                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
+                    slider_x.update_idletasks()
+                    new_value = from_ + (to - from_) * (event.x / slider_x.winfo_width())
+                    
+                    # --- MODIFIED: Ensure integer value is set for DILATE/BLUR ---
+                    if is_integer:
+                        value_to_set = int(new_value)
+                    else:
+                        value_to_set = new_value
+                    var_x.set(value_to_set) # Set the tk.Variable, which triggers the command and updates the UI
+                    # --- FIX: Manually update the label's text after setting the variable ---
+                    value_label_x.config(text=f"{new_value:.{decimals}f}")
+                    self.on_slider_release(event) # Manually trigger preview update
+                    return "break" # IMPORTANT: Prevents the default slider click behavior
+            def on_trough_click_y(event):
+                """Handles clicks on the slider's trough for precise positioning."""
+                # Check if the click is on the trough to avoid interfering with handle drags
+                if 'trough' in slider_y.identify(event.x, event.y):
+                    # --- FIX: Force the widget to update its size info before calculating ---
+                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
+                    slider_y.update_idletasks()
+                    new_value = from_ + (to - from_) * (event.x / slider_y.winfo_width())
+
+                    # --- MODIFIED: Ensure integer value is set for DILATE/BLUR ---
+                    if is_integer:
+                        value_to_set = int(new_value)
+                    else:
+                        value_to_set = new_value
+                    var_y.set(value_to_set) # Set the tk.Variable, which triggers the command and updates the UI
+                    # --- FIX: Manually update the label's text after setting the variable ---
+                    value_label_y.config(text=f"{new_value:.{decimals}f}")
+                    self.on_slider_release(event) # Manually trigger preview update
+                    return "break" # IMPORTANT: Prevents the default slider click behavior
+            LABEL_FIXED_WIDTH = 7
+
             xy_frame = ttk.Frame(parent)
             xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-            label_x = ttk.Label(xy_frame, text=text_x)
-            label_x.grid(row=0, column=0, sticky="e", padx=(0, 5))
+            
+            # --- MODIFIED: Apply fixed width to label_x ---
+            label_x = ttk.Label(xy_frame, text=text_x, width=LABEL_FIXED_WIDTH)
+            label_x.pack(side="left", padx=(0, 5), anchor="w")
+            
             slider_x = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_x, orient="horizontal", length=50)
-            slider_x.grid(row=0, column=1, sticky="ew", padx=(0,10))
-            value_label_x = ttk.Label(xy_frame, text="", width=5) # Start with empty text
-            value_label_x.grid(row=0, column=2, sticky="w", padx=(0, 5))
+            slider_x.pack(side="left", fill="x", expand=True, padx=(0,5))
+            value_label_x = ttk.Label(xy_frame, text="", width=2) # Start with empty text
+            value_label_x.pack(side="left", padx=(0, 5))
             update_label_and_preview(str(var_x.get()), var_x, value_label_x)
-            label_y = ttk.Label(xy_frame, text=text_y)
-            label_y.grid(row=1, column=0, sticky="e", padx=(0, 5))
+            label_y = ttk.Label(xy_frame, text=text_y, width=0) # Set a shorter width for the Y label
+            label_y.pack(side="left", padx=(0, 5), anchor="w")
             slider_y = ttk.Scale(xy_frame, from_=from_, to=to, variable=var_y, orient="horizontal", length=50)
-            slider_y.grid(row=1, column=1, sticky="ew", padx=(0,10))
-            value_label_y = ttk.Label(xy_frame, text="", width=5) # Start with empty text
+            slider_y.pack(side="left", fill="x", expand=True, padx=(0,0))
+            value_label_y = ttk.Label(xy_frame, text="", width=2) # Start with empty text
             update_label_and_preview(str(var_y.get()), var_y, value_label_y)
-            value_label_y.grid(row=1, column=2, sticky="w", padx=(0, 5))
+            value_label_y.pack(side="left", padx=(0, 5))
 
-            xy_frame.columnconfigure(1, weight=1)
-        
+            slider_x.bind("<Button-1>", on_trough_click)
+            slider_y.bind("<Button-1>", on_trough_click_y)
+            
+            # --- MODIFIED: Add ButtonRelease binding to trigger preview refresh on drag end ---
+            slider_x.bind("<ButtonRelease-1>", self.on_slider_release)
+            slider_y.bind("<ButtonRelease-1>", self.on_slider_release)
+            # --- END MODIFIED ---
+
             slider_x.configure(command=lambda value: update_label_and_preview(value, var_x, value_label_x, self))
             slider_y.configure(command=lambda value: update_label_and_preview(value, var_y, value_label_y, self))
-            # TODO add trough and preview and tooltips     
 
         row_inner += 1
-        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 50, row_inner, decimals=0, is_integer=True)
+        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15, row_inner, decimals=0, is_integer=True)
 
         row_inner += 1
-        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 50, row_inner, decimals=0, is_integer=True)
+        create_slider_with_label_updater_x_y(self.depth_prep_frame, "Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35, row_inner, decimals=0, is_integer=True)
 
         # Blur Controls
         row_inner += 1
@@ -597,34 +653,10 @@ class SplatterGUI(ThemedTk):
 
         current_row = 0 # Reset for next frame
 
-        # --- Progress frame ---
-        progress_frame = ttk.LabelFrame(self, text="Progress")
-        progress_frame.pack(pady=10, padx=10, fill="x")
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill="x", expand=True, padx=5, pady=2)
-        self.status_label = ttk.Label(progress_frame, text="Ready")
-        self.status_label.pack(padx=5, pady=2)
-
-        # --- Button frame ---
-        button_frame = ttk.Frame(self)
-        button_frame.pack(pady=10)
-        self.start_button = ttk.Button(button_frame, text="START", command=self.start_processing)
-        self.start_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.start_button, "start_button")
-
-        self.stop_button = ttk.Button(button_frame, text="STOP", command=self.stop_processing, state="disabled")
-        self.stop_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.stop_button, "stop_button")
-
-        exit_button = ttk.Button(button_frame, text="EXIT", command=self.exit_app)
-        exit_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(exit_button, "exit_button")
-
-        # --- Current Processing Information frame ---
-        self.info_frame = ttk.LabelFrame(self, text="Current Processing Information") # Store frame as instance attribute
-        self.info_frame.pack(pady=10, padx=10, fill="x")
-        self.info_frame.grid_columnconfigure(1, weight=1)
+        # --- RIGHT COLUMN: Current Processing Information frame ---
+        self.info_frame = ttk.LabelFrame(self.main_layout_frame, text="Current Processing Information") # Target main layout frame
+        self.info_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 0)) # Stick to North (Top)
+        self.info_frame.grid_columnconfigure(1, weight=1) # Allow value column to expand (if frame is stretched)
 
         self.info_labels = [] # List to hold the tk.Label widgets for easy iteration
 
@@ -677,6 +709,35 @@ class SplatterGUI(ThemedTk):
         lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
+
+        # --- Progress frame ---
+        progress_frame = ttk.LabelFrame(self, text="Progress")
+        progress_frame.pack(pady=10, padx=10, fill="x")
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill="x", expand=True, padx=5, pady=2)
+        self.status_label = ttk.Label(progress_frame, text="Ready")
+        self.status_label.pack(padx=5, pady=2)
+
+        # --- Button frame ---
+        button_frame = ttk.Frame(self)
+        button_frame.pack(pady=10)
+        self.start_button = ttk.Button(button_frame, text="START", command=self.start_processing)
+        self.start_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.start_button, "start_button")
+
+        self.stop_button = ttk.Button(button_frame, text="STOP", command=self.stop_processing, state="disabled")
+        self.stop_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.stop_button, "stop_button")
+
+        exit_button = ttk.Button(button_frame, text="EXIT", command=self.exit_app)
+        exit_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(exit_button, "exit_button")
+
+        # --- Current Processing Information frame ---
+        self.info_frame = ttk.LabelFrame(self, text="Current Processing Information") # Store frame as instance attribute
+        self.info_frame.pack(pady=10, padx=10, fill="x")
+        self.info_frame.grid_columnconfigure(1, weight=1)
     
     def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float, mode: str) -> float:
         """
@@ -913,10 +974,14 @@ class SplatterGUI(ThemedTk):
         # [NEW]: Read GUI Input Fields for defaults
         try:
             default_gamma_gui = float(self.depth_gamma_var.get())
-            default_dilate_gui = int(self.depth_dilate_size_var.get())
-            default_blur_gui = int(self.depth_blur_size_var.get())
+            default_dilate_gui_x = int(self.depth_dilate_size_x_var.get())
+            default_dilate_gui_y = int(self.depth_dilate_size_y_var.get())
+            default_blur_gui_x = int(self.depth_blur_size_x_var.get())
+            default_blur_gui_y = int(self.depth_blur_size_y_var.get())
         except ValueError:
-            default_gamma_gui, default_dilate_gui, default_blur_gui = 1.0, 0, 0
+            default_gamma_gui = 1.0
+            default_dilate_gui_x, default_dilate_gui_y = 0, 0
+            default_blur_gui_x, default_blur_gui_y = 0, 0
         
         # Initialize final parameters with GUI defaults (or passed values)
         current_params = {
@@ -925,8 +990,10 @@ class SplatterGUI(ThemedTk):
             "frame_overlap": None,
             "input_bias": None,
             "depth_gamma": default_gamma_gui,
-            "depth_dilate_size": default_dilate_gui,
-            "depth_blur_size": default_blur_gui
+            "depth_dilate_size_x": default_dilate_gui_x,
+            "depth_dilate_size_y": default_dilate_gui_y,
+            "depth_blur_size_x": default_blur_gui_x,
+            "depth_blur_size_y": default_blur_gui_y,
         }
         anchor_source = "GUI"
         max_disp_source = "GUI"
@@ -962,20 +1029,21 @@ class SplatterGUI(ThemedTk):
                                 logger.debug(f"==> Using sidecar {sidecar_key}: {value} (Override)")
                         
                         # Blur/Dilate (Check toggle: self.enable_sidecar_blur_dilate_var)
-                        elif internal_key in ["DEPTH_DILATE_SIZE", "DEPTH_BLUR_SIZE"] and self.enable_sidecar_blur_dilate_var.get():
+                        elif internal_key in ["DEPTH_DILATE_SIZE_X", "DEPTH_DILATE_SIZE_Y", "DEPTH_BLUR_SIZE_X", "DEPTH_BLUR_SIZE_Y"] and self.enable_sidecar_blur_dilate_var.get():
                             if isinstance(value, (int, float)):
                                 processed_val = max(0, int(value))
-                                
-                                if internal_key == "DEPTH_DILATE_SIZE":
-                                    current_params["depth_dilate_size"] = processed_val
+
+                                if internal_key.startswith("DEPTH_DILATE"):
+                                    # Apply dilate value for X or Y (sidecar_key will be e.g., "depth_dilate_size_x")
+                                    current_params[sidecar_key] = processed_val
                                     logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
-                                    
-                                elif internal_key == "DEPTH_BLUR_SIZE":
+
+                                elif internal_key.startswith("DEPTH_BLUR"):
                                     # Ensure blur size is odd
                                     if processed_val > 0 and processed_val % 2 == 0:
                                         processed_val += 1
-                                        logger.warning(f"==> Blur size must be odd. Increased to {processed_val}.")
-                                    current_params["depth_blur_size"] = processed_val
+                                        logger.warning(f"==> Blur size must be odd. Increased to {processed_val} for sidecar key {sidecar_key}.")
+                                    current_params[sidecar_key] = processed_val
                                     logger.debug(f"==> Using sidecar {sidecar_key}: {processed_val} (Override)")
 
                         # Frame Overlap and Input Bias (No GUI toggle, always use sidecar if present)
@@ -1301,11 +1369,11 @@ class SplatterGUI(ThemedTk):
                 
                 if final_k_x_dilate > 0 and final_k_x_dilate % 2 == 0:
                     final_k_x_dilate += 1
-                    logger.warning(f"Dilate X kernel size was even ({depth_dilate_size_x}). Increased to {final_k_x_dilate} for centered GPU operation.")
+                    logger.debug(f"Dilate X kernel size was even ({depth_dilate_size_x}). Increased to {final_k_x_dilate} for centered GPU operation.")
                 
                 if final_k_y_dilate > 0 and final_k_y_dilate % 2 == 0:
                     final_k_y_dilate += 1
-                    logger.warning(f"Dilate Y kernel size was even ({depth_dilate_size_y}). Increased to {final_k_y_dilate} for centered GPU operation.")
+                    logger.debug(f"Dilate Y kernel size was even ({depth_dilate_size_y}). Increased to {final_k_y_dilate} for centered GPU operation.")
                 
                 # Apply custom_dilate if needed
                 if final_k_x_dilate > 0 and final_k_y_dilate > 0:
@@ -1943,14 +2011,24 @@ class SplatterGUI(ThemedTk):
     def get_current_preview_settings(self) -> dict:
         """Gathers settings from the GUI needed for the preview callback."""
         try:
+            # Helper function to safely convert StringVar content to int
+            def safe_int_conversion(var: tk.StringVar) -> int:
+                try:
+                    # Convert to float first to handle fractional strings like '35.227...'
+                    return int(float(var.get()))
+                except ValueError:
+                    # If it fails (e.g., empty string), default to 0
+                    return 0
+
             return {
                 "max_disp": float(self.max_disp_var.get()),
                 "convergence_point": float(self.zero_disparity_anchor_var.get()),
                 "depth_gamma": float(self.depth_gamma_var.get()),
-                "depth_dilate_size_x": int(self.depth_dilate_size_x_var.get()),
-                "depth_dilate_size_y": int(self.depth_dilate_size_y_var.get()),
-                "depth_blur_size_x": int(self.depth_blur_size_x_var.get()),
-                "depth_blur_size_y": int(self.depth_blur_size_y_var.get()),
+                # --- MODIFIED: Use safe conversion for integer kernel sizes (float -> int) ---
+                "depth_dilate_size_x": safe_int_conversion(self.depth_dilate_size_x_var),
+                "depth_dilate_size_y": safe_int_conversion(self.depth_dilate_size_y_var),
+                "depth_blur_size_x": safe_int_conversion(self.depth_blur_size_x_var),
+                "depth_blur_size_y": safe_int_conversion(self.depth_blur_size_y_var),
                 "preview_size": self.preview_size_var.get(),
                 "enable_autogain": self.enable_autogain_var.get(),
             }
@@ -2364,6 +2442,19 @@ class SplatterGUI(ThemedTk):
             messagebox.showerror("Load Error", f"Failed to load settings from {os.path.basename(filename)}:\n{e}")
             self.status_label.config(text="Settings load failed.")
     
+    def on_slider_release(self, event):
+        """Called when a slider is released. Updates the preview."""
+        # This now just collects parameters and sends them to the previewer module.
+        params = self.get_current_preview_settings()
+        
+        # --- MODIFIED: Explicitly call the previewer's update method ---
+        if hasattr(self, 'previewer') and params is not None:
+            # The previewer's update_preview method internally calls get_current_settings 
+            # via its get_params_callback, but an explicit trigger is needed here.
+            self.previewer.update_preview()
+            # If your previewer was designed to take parameters directly, you would use:
+            # self.previewer.set_parameters(params) 
+
     def save_settings(self):
         """Saves current GUI settings to a user-selected JSON file."""
         filename = filedialog.asksaveasfilename(
@@ -2445,7 +2536,7 @@ class SplatterGUI(ThemedTk):
             if depth_dilate_size_val < 0:
                 raise ValueError("Depth Dilate Size must be non-negative.")
             
-            depth_blur_size_val = int(self.depth_blur_size_var.get())
+            depth_blur_size_val = int(self.depth_blur_size_x_var.get())
             if depth_blur_size_val < 0:
                 raise ValueError("Depth Blur Size must be non-negative.")
             if depth_blur_size_val > 0 and depth_blur_size_val % 2 == 0:
