@@ -20,11 +20,12 @@ import queue
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     release_cuda_memory, set_util_logger_level, encode_frames_to_mp4,
-    read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer
+    read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer,
+    create_single_slider_with_label_updater
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-17.1"
+GUI_VERSION = "25-10-17.2"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -539,55 +540,55 @@ class MergingGUI(ThemedTk):
         param_frame.pack(fill="x", padx=10, pady=5)
         param_frame.grid_columnconfigure(1, weight=1)
 
-        def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
-            """Creates a slider, its value label, and all necessary event bindings."""
-            label = ttk.Label(parent, text=text)
-            label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
-            slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
-            slider.grid(row=row, column=1, sticky="ew", padx=5)
-            value_label = ttk.Label(parent, text="", width=5) # Start with empty text
-            value_label.grid(row=row, column=2, sticky="w", padx=5)
+        # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
+        #     """Creates a slider, its value label, and all necessary event bindings."""
+        #     label = ttk.Label(parent, text=text)
+        #     label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        #     slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
+        #     slider.grid(row=row, column=1, sticky="ew", padx=5)
+        #     value_label = ttk.Label(parent, text="", width=5) # Start with empty text
+        #     value_label.grid(row=row, column=2, sticky="w", padx=5)
 
-            def update_label_and_preview(value_str: str) -> None:
-                """Updates the text label. Called by user interaction."""
-                value_label.config(text=f"{float(value_str):.{decimals}f}")
+        #     def update_label_and_preview(value_str: str) -> None:
+        #         """Updates the text label. Called by user interaction."""
+        #         value_label.config(text=f"{float(value_str):.{decimals}f}")
 
-            def set_value_and_update_label(new_value: float) -> None:
-                """Programmatically sets the slider's value and updates its label."""
-                var.set(new_value)
-                value_label.config(text=f"{new_value:.{decimals}f}")
-                logger.debug(f"new_value {new_value:.{decimals}f}")
+        #     def set_value_and_update_label(new_value: float) -> None:
+        #         """Programmatically sets the slider's value and updates its label."""
+        #         var.set(new_value)
+        #         value_label.config(text=f"{new_value:.{decimals}f}")
+        #         logger.debug(f"new_value {new_value:.{decimals}f}")
 
-            slider.configure(command=update_label_and_preview)
-            slider.bind("<ButtonRelease-1>", self.on_slider_release)
-            self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
-            self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
-            self.widgets_to_disable.append(slider)
+        #     slider.configure(command=update_label_and_preview)
+        #     slider.bind("<ButtonRelease-1>", self.on_slider_release)
+        #     self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
+        #     self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
+        #     self.widgets_to_disable.append(slider)
 
-            def on_trough_click(event):
-                """Handles clicks on the slider's trough for precise positioning."""
-                # Check if the click is on the trough to avoid interfering with handle drags
-                if 'trough' in slider.identify(event.x, event.y):
-                    # --- FIX: Force the widget to update its size info before calculating ---
-                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
-                    slider.update_idletasks()
-                    new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
-                    var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
-                    # --- FIX: Manually update the label's text after setting the variable ---
-                    value_label.config(text=f"{new_value:.{decimals}f}")
-                    self.on_slider_release(event) # Manually trigger preview update
-                    return "break" # IMPORTANT: Prevents the default slider click behavior
+        #     def on_trough_click(event):
+        #         """Handles clicks on the slider's trough for precise positioning."""
+        #         # Check if the click is on the trough to avoid interfering with handle drags
+        #         if 'trough' in slider.identify(event.x, event.y):
+        #             # --- FIX: Force the widget to update its size info before calculating ---
+        #             # This ensures winfo_width() is accurate, which is critical for fractional sliders.
+        #             slider.update_idletasks()
+        #             new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+        #             var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
+        #             # --- FIX: Manually update the label's text after setting the variable ---
+        #             value_label.config(text=f"{new_value:.{decimals}f}")
+        #             self.on_slider_release(event) # Manually trigger preview update
+        #             return "break" # IMPORTANT: Prevents the default slider click behavior
 
-            slider.bind("<Button-1>", on_trough_click)
+        #     slider.bind("<Button-1>", on_trough_click)
 
-        create_slider_with_label_updater(param_frame, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
-        create_slider_with_label_updater(param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
-        create_slider_with_label_updater(param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
-        create_slider_with_label_updater(param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
-        create_slider_with_label_updater(param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
+        create_single_slider_with_label_updater(self, param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)

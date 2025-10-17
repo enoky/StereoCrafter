@@ -27,7 +27,8 @@ from dependency.forward_warp_pytorch import forward_warp
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
-    start_ffmpeg_pipe_process, custom_blur, custom_dilate
+    start_ffmpeg_pipe_process, custom_blur, custom_dilate,
+    create_single_slider_with_label_updater
 )
 from dependency.video_previewer import VideoPreviewer
 
@@ -479,12 +480,10 @@ class SplatterGUI(ThemedTk):
         self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
         self.depth_settings_container.grid_columnconfigure(0, weight=1)
         
-        # # --- Depth Map Pre-processing Frame (Inner Frame) ---
-        # sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-
-        # --- Depth Map Pre-processing Frame (Inner Frame) ---
+        # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
+        current_depth_row = 0 # Use a new counter for this container
         self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
-        self.depth_prep_frame.grid(row=current_row, column=0, sticky="ew") # Use grid here for placement inside container
+        self.depth_prep_frame.grid(row=current_depth_row, column=0, sticky="ew") # Use grid here for placement inside container
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
         # Slider Implementation for dilate and blur
@@ -574,82 +573,71 @@ class SplatterGUI(ThemedTk):
         row_inner += 1
         create_slider_with_label_updater_x_y(self.depth_prep_frame, "Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35, row_inner, decimals=0, is_integer=True)
 
-        # Blur Controls
-        row_inner += 1
-        self.blur_frame = ttk.Frame(self.depth_prep_frame)
-        #self.blur_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-        #self.lbl_depth_blur_size = ttk.Label(self.blur_frame, text="Blur X/Y (0/Odd):")
-        #self.lbl_depth_blur_size.pack(side="left", padx=(0, 5))
-        #self.entry_depth_blur_size_x = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_x_var, width=4)
-        #self.entry_depth_blur_size_x.pack(side="left")
-        #self.entry_depth_blur_size_y = ttk.Entry(self.blur_frame, textvariable=self.depth_blur_size_y_var, width=4)
-        #self.entry_depth_blur_size_y.pack(side="left", padx=(5, 0))
-        #self._create_hover_tooltip(self.lbl_depth_blur_size, "depth_blur_size")
+        # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
+        current_depth_row += 1
+        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Settings (All)")
+        self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
+        self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
+        self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
+
+        all_settings_row = 0
+        
+        # Gamma Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Gamma (1.0=Off):", self.depth_gamma_var, 0.01, 3.0, all_settings_row, decimals=2)
+        all_settings_row += 1
+
+        # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Max Disparity %:", self.max_disp_var, 0.0, 100.0, all_settings_row, decimals=1)
+        all_settings_row += 1
+        
+        # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Convergence Point:", self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2)
+        all_settings_row += 1
+        
+        # Autogain Checkbox (MOVED FROM OUTPUT FRAME, placed in column 2/3)
+        self.autogain_checkbox = ttk.Checkbutton(self.depth_all_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
+        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
 
         row_inner = 0 # Reset for next frame
         # ===================================================================
-        # --- Output Settings Frame (Now placed below the settings_container_frame) ---
+        # --- Output Settings Frame (Now PACKED below settings_container_frame in the stack) ---
         current_row = 0
-        self.output_settings_frame = ttk.LabelFrame(self, text="Splatting & Output Settings")
-        self.output_settings_frame.pack(pady=10, padx=10, fill="x")
+        self.output_settings_frame = ttk.LabelFrame(self.settings_stack_frame, text="Splatting & Output Settings") # Target stack frame
+        self.output_settings_frame.pack(pady=(0, 10), fill="x") # Pack it below
         self.output_settings_frame.grid_columnconfigure(1, weight=1)
-        self.output_settings_frame.grid_columnconfigure(3, weight=1)
-        
-        # Gamma
-        self.lbl_depth_gamma = ttk.Label(self.output_settings_frame, text="Gamma (1.0=Off):")
-        self.lbl_depth_gamma.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_depth_gamma = ttk.Entry(self.output_settings_frame, textvariable=self.depth_gamma_var, width=15)
-        self.entry_depth_gamma.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_depth_gamma, "depth_gamma")
-        self._create_hover_tooltip(self.entry_depth_gamma, "depth_gamma")
-
+                
+        # Process Length (Remains Entry)
         self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length (-1 for all):")
-        self.lbl_process_length.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.lbl_process_length.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
-        self.entry_process_length.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self.entry_process_length.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_process_length, "process_length")
         self._create_hover_tooltip(self.entry_process_length, "process_length")
         current_row += 1
         
-        self.lbl_max_disp = ttk.Label(self.output_settings_frame, text="Max Disparity %:")
-        self.lbl_max_disp.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_max_disp = ttk.Entry(self.output_settings_frame, textvariable=self.max_disp_var, width=15)
-        self.entry_max_disp.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_max_disp, "max_disp")
-        self._create_hover_tooltip(self.entry_max_disp, "max_disp")
-
-        # Output CRF setting, placed on the right side
-        self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF (0-51):")
-        self.lbl_output_crf.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        # Output CRF setting (Remains Entry)
+        self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF:")
+        self.lbl_output_crf.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_output_crf = ttk.Entry(self.output_settings_frame, textvariable=self.output_crf_var, width=15)
-        self.entry_output_crf.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self.entry_output_crf.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_output_crf, "output_crf")
         self._create_hover_tooltip(self.entry_output_crf, "output_crf")
         current_row += 1
 
-        self.lbl_zero_disparity_anchor = ttk.Label(self.output_settings_frame, text="Convergence Point (0-1):")
-        self.lbl_zero_disparity_anchor.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_zero_disparity_anchor = ttk.Entry(self.output_settings_frame, textvariable=self.zero_disparity_anchor_var, width=15)
-        self.entry_zero_disparity_anchor.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_zero_disparity_anchor, "convergence_point")
-        self._create_hover_tooltip(self.entry_zero_disparity_anchor, "convergence_point")
-
-        # --- MODIFIED: Added a label for the Combobox ---
+        # Auto-Convergence Combo (Row 2, Column 0/1)
         self.lbl_auto_convergence = ttk.Label(self.output_settings_frame, text="Auto-Convergence:")
-        self.lbl_auto_convergence.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.lbl_auto_convergence.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.auto_convergence_combo = ttk.Combobox(self.output_settings_frame, textvariable=self.auto_convergence_mode_var, values=["Off", "Average", "Peak"], state="readonly", width=15)
-        self.auto_convergence_combo.grid(row=current_row, column=3, sticky="w", padx=5, pady=2)
+        self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         current_row += 1
-
-        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only (Mask & Warped)", variable=self.dual_output_var)
+        
+        # Dual Output Checkbox (Row 3, Column 0/1)
+        self.dual_output_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Dual Output Only", variable=self.dual_output_var)
         self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
-
-        self.autogain_checkbox = ttk.Checkbutton(self.output_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
-        self.autogain_checkbox.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
 
         current_row = 0 # Reset for next frame
 

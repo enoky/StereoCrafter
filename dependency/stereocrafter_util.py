@@ -4,7 +4,7 @@ import json
 import shutil
 import threading
 import tkinter as tk # Required for Tooltip class
-from tkinter import Toplevel, Label # Required for Tooltip class
+from tkinter import Toplevel, Label, ttk
 from typing import Optional, Tuple
 import logging
 
@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-17.1"
+VERSION = "25-10-17.2"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -26,6 +26,75 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+def create_single_slider_with_label_updater(
+    GUI_self,
+    parent: ttk.Frame, 
+    text: str, 
+    var: tk.Variable, 
+    from_: float, 
+    to: float, 
+    row: int, 
+    decimals: int = 0
+) -> None:
+    """Creates a single slider, its value label, and all necessary event bindings."""
+    
+    # 1. Widgets
+    label = ttk.Label(parent, text=text)
+    label.grid(row=row, column=0, sticky="e", padx=0, pady=2)
+    slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
+    slider.grid(row=row, column=1, sticky="ew", padx=2)
+    value_label = ttk.Label(parent, text="", width=4) # Start with empty text
+    value_label.grid(row=row, column=2, sticky="w", padx=0)
+
+    # 2. Command/Update Logic
+    def update_label_and_preview(value_str: str) -> None:
+        """Updates the text label. Called by user interaction."""
+        try:
+            # Handle float/int conversion for display precision
+            value_label.config(text=f"{float(value_str):.{decimals}f}")
+        except ValueError:
+            pass # Ignore if value is invalid during a fast drag/update
+
+    def set_value_and_update_label(new_value: float) -> None:
+        """Programmatically sets the slider's value and updates its label."""
+        var.set(new_value)
+        value_label.config(text=f"{new_value:.{decimals}f}")
+
+    def on_trough_click(event):
+        """Handles clicks on the slider's trough for precise positioning."""
+        if 'trough' in slider.identify(event.x, event.y):
+            slider.update_idletasks()
+            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+            
+            # If the source variable is an IntVar/DoubleVar, set the raw float.
+            # If it's a StringVar, it will accept the float.
+            var.set(new_value) 
+            
+            # Manually update the label's text
+            update_label_and_preview(str(new_value))
+            
+            # Manually trigger preview update
+            GUI_self.on_slider_release(event) 
+            return "break"
+
+    # 3. Bindings & Configuration
+    slider.configure(command=update_label_and_preview)
+    slider.bind("<ButtonRelease-1>", GUI_self.on_slider_release)
+    slider.bind("<Button-1>", on_trough_click) # Trough click handler    
+    update_label_and_preview(str(var.get()))
+
+    # --- Tooltip and State Management ---
+    # Assuming GUI_self has _create_hover_tooltip and widgets_to_disable
+    help_key = text.lower().replace(":", "").replace(" ", "_").replace(".", "")
+    if hasattr(GUI_self, '_create_hover_tooltip'):
+        GUI_self._create_hover_tooltip(label, help_key)
+        
+    if hasattr(GUI_self, 'slider_label_updaters'):
+        GUI_self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get()))
+        
+    if hasattr(GUI_self, 'widgets_to_disable'):
+        GUI_self.widgets_to_disable.append(slider)
 
 def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
     """
@@ -148,7 +217,6 @@ def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor)
     except Exception as e:
         logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
         return target_frame
-
 
 def set_util_logger_level(level):
     """Sets the logging level for the 'stereocrafter_util' logger."""
