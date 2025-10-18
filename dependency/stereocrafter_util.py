@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-18.1"
+VERSION = "25-10-18.3"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -35,7 +35,8 @@ def create_single_slider_with_label_updater(
     from_: float, 
     to: float, 
     row: int, 
-    decimals: int = 0
+    decimals: int = 0,
+    tooltip_key: Optional[str] = None,
 ) -> None:
     """Creates a single slider, its value label, and all necessary event bindings."""
     
@@ -47,6 +48,12 @@ def create_single_slider_with_label_updater(
     slider.grid(row=row, column=1, sticky="ew", padx=2)
     value_label = ttk.Label(parent, text="") # Start with empty text
     value_label.grid(row=row, column=2, sticky="w", padx=0)
+
+    # --- Tooltip and State Management ---
+    if tooltip_key and hasattr(GUI_self, '_create_hover_tooltip'):
+        # Apply tooltip to both the label and the slider for better UX
+        GUI_self._create_hover_tooltip(label, tooltip_key)
+        GUI_self._create_hover_tooltip(slider, tooltip_key) # <--- Apply to slider
 
     # 2. Command/Update Logic
     def update_label_and_preview(value_str: str) -> None:
@@ -108,7 +115,9 @@ def create_dual_slider_layout(
     to: float, 
     row: int, 
     decimals: int = 0,
-    is_integer: bool = True # Added this for consistency with previous use
+    is_integer: bool = True,
+    tooltip_key_x: Optional[str] = None,
+    tooltip_key_y: Optional[str] = None,
 ) -> None:
     """
     Creates a dual (X/Y) slider layout by composing two single sliders.
@@ -135,7 +144,9 @@ def create_dual_slider_layout(
     
     # Call the single slider creator for the X components.
     # We pass the inner frame, and it will use its grid (row=0, col=0, 1, 2)
-    create_single_slider_with_label_updater(GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals)
+    create_single_slider_with_label_updater(
+        GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals, 
+        tooltip_key=tooltip_key_x)
     
     # --- Y SLIDER ---
     y_inner_frame = ttk.Frame(xy_frame)
@@ -143,7 +154,9 @@ def create_dual_slider_layout(
     y_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
 
     # Call the single slider creator for the Y components.
-    create_single_slider_with_label_updater(GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals)
+    create_single_slider_with_label_updater(
+        GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals, 
+        tooltip_key=tooltip_key_y)
 
 def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
     """
@@ -284,7 +297,7 @@ class Tooltip:
         self.widget = widget
         self.text = text
         self.tooltip_window = None
-        self.show_delay = 500  # milliseconds
+        self.show_delay = 600  # milliseconds
         self.hide_delay = 100  # milliseconds
         self.enter_id = None
         self.leave_id = None
@@ -299,7 +312,7 @@ class Tooltip:
     def _display_tooltip(self):
         if self.tooltip_window or not self.text: return
         x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5 # Position below the widget
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() +20
         self.tooltip_window = Toplevel(self.widget)
         self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
         self.tooltip_window.wm_geometry(f"+{x}+{y}")
@@ -326,7 +339,7 @@ def check_cuda_availability():
         try:
             # Further check with nvidia-smi for robustness
             subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding='utf-8')
-            logger.info("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
+            logger.debug("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
             CUDA_AVAILABLE = True
         except FileNotFoundError:
             logger.warning("nvidia-smi not found. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")

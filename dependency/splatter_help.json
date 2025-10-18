@@ -15,8 +15,10 @@
     "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements.",
     
     "depth_gamma": "Applies a non-linear adjustment to the depth map before normalization. above 1.0 moves the midground towards the camera. Below 1.0 move further away. Set to 1.0 to disable.",
-    "depth_dilate_size": "Dilate or blur the foregound object if you see jagged edge on the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
-    "depth_blur_size": "Blur or dilate the foregound object if you see jagged edge on the left of the subject. Must be an odd number (3, 5, 7, etc.) or 0 to disable. Sigma is automatically calculated as Size/6.",
+    "depth_dilate_size_x": "Horizontal Dilate for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
+    "depth_dilate_size_y": "Vertical Dilate for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
+    "depth_blur_size_x": "Horizontal Blur for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable. Sigma is automatically calculated as Size/6.",
+    "depth_blur_size_y": "Vertical Blur for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable. Sigma is automatically calculated as Size/6.",
     
     "sidecar_gamma_toggle": "If checked, will give automated control from sidecar file to set gamma values & overiding the GUI for that specific video.",
     "sidecar_blur_dilate_toggle": "If checked, will give automated control from sidecar file to set Dilate and Blur values & overiding the GUI for that specific video.",

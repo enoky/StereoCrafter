@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-17.2"
+VERSION = "25-10-17.3"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -68,10 +68,13 @@ class VideoPreviewer(ttk.Frame):
 
         self._create_widgets()
 
-    def _create_hover_tooltip(self, widget, help_key):
+    def _create_hover_tooltip(self, widget, help_key, tooltip_info: Optional[str] = None):
         """Creates a mouse-over tooltip for the given widget."""
         if help_key in self.help_data:
             Tooltip(widget, self.help_data[help_key])
+        elif tooltip_info:
+            Tooltip(widget, tooltip_info)
+
 
     def _create_widgets(self):
         """Creates and lays out all the widgets for the previewer."""
@@ -115,35 +118,49 @@ class VideoPreviewer(ttk.Frame):
         preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
 
         # Add Preview Source dropdown
-        ttk.Label(preview_button_frame, text="Preview Source:").pack(side="left", padx=(0, 5))
+        lbl_preview_source = ttk.Label(preview_button_frame, text="Preview Source:")
+        lbl_preview_source.pack(side="left", padx=(0, 5))
         self.preview_source_combo = ttk.Combobox(preview_button_frame, state="readonly", width=18)
         self.preview_source_combo.pack(side="left", padx=5)
         self.preview_source_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
-        self._create_hover_tooltip(self.preview_source_combo, "preview_source")
+        tip_preview_source = "Select which image layer to display in the preview window for diagnostic purposes."
+        self._create_hover_tooltip(lbl_preview_source, "preview_source", tip_preview_source)
+        self._create_hover_tooltip(self.preview_source_combo, "preview_source", tip_preview_source)
 
         self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._handle_load_refresh, width=20)
         self.load_preview_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.load_preview_button, "load_refresh_list")
+        tip_load_refresh_list = "Scans the 'Inpainted Video Folder' for valid files and loads the first one for preview."
+        self._create_hover_tooltip(self.load_preview_button, "load_refresh_list", tip_load_refresh_list)
 
         self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1))
         self.prev_video_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.prev_video_button, "prev_video")
+        self._create_hover_tooltip(self.prev_video_button, "prev_video", "Load the previous video in the list for preview.")
 
         self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1))
         self.next_video_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.next_video_button, "next_video")
+        self._create_hover_tooltip(self.next_video_button, "next_video", "Load the next video in the list for preview.")
 
-        ttk.Label(preview_button_frame, text="Jump to:").pack(side="left", padx=(15, 2))
+        lbl_video_jump_entry = ttk.Label(preview_button_frame, text="Jump to:")
+        lbl_video_jump_entry.pack(side="left", padx=(15, 2))
         self.video_jump_entry = ttk.Entry(preview_button_frame, textvariable=self.video_jump_to_var, width=5)
         self.video_jump_entry.pack(side="left")
         self.video_jump_entry.bind("<Return>", self._jump_to_video)
-        self._create_hover_tooltip(self.video_jump_entry, "jump_to_video")
-        ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
+        lbl_video_jump_info = ttk.Label(preview_button_frame, textvariable=self.video_status_label_var)
+        lbl_video_jump_info.pack(side="left", padx=5)
+        tip_jump_to_video = "Enter a video number and press Enter to jump directly to it in the list."
+        tip_jump_info ="Displys which frame number from total number of frames. (Current_frame/Total_frames)"
+        self._create_hover_tooltip(lbl_video_jump_entry, "jump_to_video", tip_jump_to_video)
+        self._create_hover_tooltip(self.video_jump_entry, "jump_to_video", tip_jump_to_video)
+        self._create_hover_tooltip(lbl_video_jump_info, "jump_to_info", tip_jump_info)
+
         
         # --- MODIFIED: Add Preview Size Combobox (Percentage Scale) ---
         PERCENTAGE_VALUES = ["200%", "150%", "100%", "75%", "50%", "25%"]
         
-        ttk.Label(preview_button_frame, text="Preview Scale:").pack(side="left", padx=(20, 5))
+        lbl_preview_scale = ttk.Label(preview_button_frame, text="Preview Scale:")
+        lbl_preview_scale.pack(side="left", padx=(20, 5))
+        tip_preview_scale = "Select the size of the video preview. Larger images may impact performance."
+        self._create_hover_tooltip(lbl_preview_scale, "preview_scale", tip_preview_scale)
         
         self.preview_size_combo = ttk.Combobox(
             preview_button_frame, 
@@ -153,11 +170,12 @@ class VideoPreviewer(ttk.Frame):
             width=7
         )
         self.preview_size_combo.pack(side="left")
+        self._create_hover_tooltip(self.preview_size_combo, "preview_scale", tip_preview_scale)
         
         # We need to explicitly bind the ComboboxSelected event to update the preview
         self.preview_size_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
         
-        self._create_hover_tooltip(self.preview_size_combo, "preview_size")
+        self._create_hover_tooltip(self.preview_size_combo, "preview_size", tip_preview_scale)
         
         # Re-assign to a variable name used later for disabling/enabling
         self.preview_size_entry = self.preview_size_combo 

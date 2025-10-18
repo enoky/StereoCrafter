@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Optional
 from PIL import Image
 
 # Import custom modules
-from dependency.forward_warp_pytorch import forward_warp
+        
 # --- MODIFIED IMPORT ---
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
@@ -30,11 +30,17 @@ from dependency.stereocrafter_util import (
     start_ffmpeg_pipe_process, custom_blur, custom_dilate,
     create_single_slider_with_label_updater, create_dual_slider_layout
 )
+try:
+    from Forward_Warp import forward_warp
+    logger.info("CUDA Forward Warp is available.")
+except:
+    from dependency.forward_warp_pytorch import forward_warp
+    logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.18.1"
+GUI_VERSION = "25.10.18.3"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -306,6 +312,7 @@ class SplatterGUI(ThemedTk):
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
+
         current_row = 0
 
         # --- Menu Bar ---
@@ -418,17 +425,25 @@ class SplatterGUI(ThemedTk):
         # ===================================================================
         # LEFT SIDE: Process Resolution and Settings Frame
         # ===================================================================
-        self.preprocessing_frame = ttk.LabelFrame(self.settings_container_frame, text="Process Resolution")
-        self.preprocessing_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew")
+
+        # This container holds both the resolution settings (top) and the splatting/output settings (bottom)
+        self.process_settings_container = ttk.Frame(self.settings_container_frame)
+        self.process_settings_container.grid(row=0, column=0, padx=(5, 0), sticky="nsew")
+        self.process_settings_container.grid_columnconfigure(0, weight=1)
+
+        # --- 1. Process Resolution Frame (Top Left) ---
+        self.preprocessing_frame = ttk.LabelFrame(self.process_settings_container, text="Process Resolution")
+        self.preprocessing_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew") # <-- Grid 0,0 in process_settings_container
         self.preprocessing_frame.grid_columnconfigure(1, weight=1) # Allow Entry to expand
 
         current_row = 0
         # Enable Full Resolution Section
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Resolution Output(For Blending)", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Res Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
         self.enable_full_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
         current_row += 1
 
+        # Full Resolution Batch Size
         self.lbl_full_res_batch_size = ttk.Label(self.preprocessing_frame, text="Full Res Batch Size:")
         self.lbl_full_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_full_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.batch_size_var, width=15)
@@ -439,7 +454,7 @@ class SplatterGUI(ThemedTk):
 
 
         # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Resolution Output (For Inpainting)", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Res Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
         self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
         current_row += 1
@@ -450,12 +465,12 @@ class SplatterGUI(ThemedTk):
         
         self.pre_res_width_label = ttk.Label(self.low_res_wh_frame, text="Width:")
         self.pre_res_width_label.pack(side="left", padx=(0, 2))
-        self.pre_res_width_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_width_var, width=8)
+        self.pre_res_width_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_width_var, width=9)
         self.pre_res_width_entry.pack(side="left", padx=(0, 10))
 
-        self.pre_res_height_label = ttk.Label(self.low_res_wh_frame, text="Heigh:")
+        self.pre_res_height_label = ttk.Label(self.low_res_wh_frame, text="Height:")
         self.pre_res_height_label.pack(side="left", padx=(0, 2))
-        self.pre_res_height_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_height_var, width=8)
+        self.pre_res_height_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_height_var, width=9)
         self.pre_res_height_entry.pack(side="left", padx=(0, 0))
 
         self._create_hover_tooltip(self.pre_res_width_label, "low_res_width")
@@ -464,7 +479,7 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.pre_res_height_entry, "low_res_height")
         current_row += 1
 
-
+        # Low Res Batch Size
         self.lbl_low_res_batch_size = ttk.Label(self.preprocessing_frame, text="Low Res Batch Size:")
         self.lbl_low_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_low_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.low_res_batch_size_var, width=15)
@@ -477,61 +492,12 @@ class SplatterGUI(ThemedTk):
         self.dual_output_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Dual Output Only", variable=self.dual_output_var)
         self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
-
-        current_row = 0 # Reset for next frame
-
-        # ===================================================================
-        # MIDDLE: Depth Map Pre-processing Frame
-        # ===================================================================
-        self.depth_settings_container = ttk.Frame(self.settings_container_frame)
-        self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
-        self.depth_settings_container.grid_columnconfigure(0, weight=1)
         
-        # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
-        current_depth_row = 0 # Use a new counter for this container
-        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
-        self.depth_prep_frame.grid(row=current_depth_row, column=0, sticky="ew") # Use grid here for placement inside container
-        self.depth_prep_frame.grid_columnconfigure(1, weight=1)
-
-        # Slider Implementation for dilate and blur
-        row_inner = 0
-        create_dual_slider_layout(self, self.depth_prep_frame, "Dilate X:", "Y:", self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15, row_inner, decimals=0, is_integer=True)
-
-        row_inner += 1
-        create_dual_slider_layout(self, self.depth_prep_frame, "   Blur X:", "Y:", self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35, row_inner, decimals=0, is_integer=True)
-
-        # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
-        current_depth_row += 1
-        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Settings (All)")
-        self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
-        self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
-        self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
-
-        all_settings_row = 0
-        
-        # Gamma Slider (MOVED FROM OUTPUT FRAME)
-        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Gamma (1.0=Off):", self.depth_gamma_var, 0.01, 3.0, all_settings_row, decimals=2)
-        all_settings_row += 1
-
-        # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
-        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Max Disparity %:", self.max_disp_var, 0.0, 100.0, all_settings_row, decimals=1)
-        all_settings_row += 1
-        
-        # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
-        create_single_slider_with_label_updater(self, self.depth_all_settings_frame, "Convergence Point:", self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2)
-        all_settings_row += 1
-        
-        # Autogain Checkbox (MOVED FROM OUTPUT FRAME, placed in column 2/3)
-        self.autogain_checkbox = ttk.Checkbutton(self.depth_all_settings_frame, text="Disable Normalization (For Seamless Joining)", variable=self.enable_autogain_var)
-        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
-
-        row_inner = 0 # Reset for next frame
-        # ===================================================================
-        # --- Output Settings Frame (Now PACKED below settings_container_frame in the stack) ---
-        current_row = 0
-        self.output_settings_frame = ttk.LabelFrame(self.settings_stack_frame, text="Splatting & Output Settings") # Target stack frame
-        self.output_settings_frame.pack(pady=(0, 10), fill="x") # Pack it below
+        # --- 2. Splatting & Output Settings Frame (Bottom Left) ---
+        # *** THIS IS THE MOVED FRAME: now attached to self.process_settings_container at row=1 ***
+        current_row = 0 # Reset for internal use of output_settings_frame
+        self.output_settings_frame = ttk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings")
+        self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(10, 0)) # <-- Grid 1,0 in process_settings_container
         self.output_settings_frame.grid_columnconfigure(1, weight=1)
                 
         # Process Length (Remains Entry)
@@ -562,7 +528,84 @@ class SplatterGUI(ThemedTk):
 
         current_row = 0 # Reset for next frame
 
+        # ===================================================================
+        # RIGHT SIDE: Depth Map Pre-processing Frame
+        # ===================================================================
+        self.depth_settings_container = ttk.Frame(self.settings_container_frame)
+        self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+        self.depth_settings_container.grid_columnconfigure(0, weight=1)
+        
+        # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
+        current_depth_row = 0 # Use a new counter for this container
+        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
+        self.depth_prep_frame.grid(row=current_depth_row, column=0, sticky="ew") # Use grid here for placement inside container
+        self.depth_prep_frame.grid_columnconfigure(1, weight=1)
+
+        # Slider Implementation for dilate and blur
+        row_inner = 0
+        create_dual_slider_layout(
+            self, self.depth_prep_frame, "Dilate X:", "Y:",
+            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15,
+            row_inner, decimals=0, is_integer=True,
+            tooltip_key_x="depth_dilate_size_x",
+            tooltip_key_y="depth_dilate_size_y",
+            )
+
+        row_inner += 1
+        create_dual_slider_layout(
+            self, self.depth_prep_frame, "   Blur X:", "Y:",
+            self.depth_blur_size_x_var, self.depth_blur_size_y_var, 0, 35,
+            row_inner, decimals=0, is_integer=True,
+            tooltip_key_x="depth_blur_size_x",
+            tooltip_key_y="depth_blur_size_y",
+            )
+
+        # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
+        current_depth_row += 1
+        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Settings (All)")
+        self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
+        self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
+        self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
+
+        all_settings_row = 0
+        
+        # Gamma Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(
+            self, self.depth_all_settings_frame, "Gamma:",
+            self.depth_gamma_var, 0.1, 3.0, all_settings_row, decimals=1,
+            tooltip_key="depth_gamma",
+            )
+        all_settings_row += 1
+
+        # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(
+            self, self.depth_all_settings_frame, "Disparity:",
+            self.max_disp_var, 0.0, 100.0, all_settings_row, decimals=0,
+            tooltip_key="max_disp",
+            )
+        all_settings_row += 1
+        
+        # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
+        create_single_slider_with_label_updater(
+            self, self.depth_all_settings_frame, "Convergence:",
+            self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2,
+            tooltip_key="convergence_point",
+            )
+        all_settings_row += 1
+        
+        # Autogain Checkbox (MOVED FROM OUTPUT FRAME, placed in column 2/3)
+        self.autogain_checkbox = ttk.Checkbutton(
+            self.depth_all_settings_frame, text="Disable Normalization",
+            variable=self.enable_autogain_var
+            )
+        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+
+        current_row = 0 # Reset for next frame
+
+        # ===================================================================
         # --- RIGHT COLUMN: Current Processing Information frame ---
+        # ===================================================================
         self.info_frame = ttk.LabelFrame(self.main_layout_frame, text="Current Processing Information") # Target main layout frame
         self.info_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 0)) # Stick to North (Top)
         self.info_frame.grid_columnconfigure(1, weight=1) # Allow value column to expand (if frame is stretched)
@@ -598,14 +641,14 @@ class SplatterGUI(ThemedTk):
         self.info_labels.extend([lbl_frames_static, lbl_frames_value])
 
         # Row 4: Max Disparity
-        lbl_disparity_static = tk.Label(self.info_frame, text="Max Disparity:")
+        lbl_disparity_static = tk.Label(self.info_frame, text="Disparity:")
         lbl_disparity_static.grid(row=4, column=0, sticky="e", padx=5, pady=1)
         lbl_disparity_value = tk.Label(self.info_frame, textvariable=self.processing_disparity_var, anchor="w")
         lbl_disparity_value.grid(row=4, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_disparity_static, lbl_disparity_value])
 
         # Row 5: Convergence Point
-        lbl_convergence_static = tk.Label(self.info_frame, text="Convergence:")
+        lbl_convergence_static = tk.Label(self.info_frame, text="Converge:")
         lbl_convergence_static.grid(row=5, column=0, sticky="e", padx=5, pady=1)
         lbl_convergence_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w")
         lbl_convergence_value.grid(row=5, column=1, sticky="ew", padx=5, pady=1)
