@@ -40,7 +40,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.18.3"
+GUI_VERSION = "25.10.18.4"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -127,6 +127,7 @@ class SplatterGUI(ThemedTk):
         self.window_x = self.app_config.get("window_x", None)
         self.window_y = self.app_config.get("window_y", None)
         self.window_width = self.app_config.get("window_width", 620)
+        self.window_height = self.app_config.get("window_height", 750)
 
         # --- Variables with defaults ---
         defaults = self.APP_CONFIG_DEFAULTS # Convenience variable
@@ -442,19 +443,20 @@ class SplatterGUI(ThemedTk):
         
         # Container for Checkbox and Label/Entry
         self.full_res_control_frame = ttk.Frame(self.preprocessing_frame)
-        self.full_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+        self.full_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5)
         self.full_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
         
         # Checkbox (Left side of the container)
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.full_res_control_frame, text="Enable Full Res Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.full_res_control_frame, text="Enable Full Res", variable=self.enable_full_res_var,
+                                                        command=self.toggle_processing_settings_fields, width=15)
         self.enable_full_res_checkbox.grid(row=0, column=0, sticky="w")
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
         
         # Label/Entry (Right side of the container)
         self.lbl_full_res_batch_size = ttk.Label(self.full_res_control_frame, text="Batch Size:")
-        self.lbl_full_res_batch_size.grid(row=0, column=1, sticky="e", padx=(10, 2))
+        self.lbl_full_res_batch_size.grid(row=0, column=1, sticky="w", padx=(10, 2))
         self.entry_full_res_batch_size = ttk.Entry(self.full_res_control_frame, textvariable=self.batch_size_var, width=5)
-        self.entry_full_res_batch_size.grid(row=0, column=2, sticky="e", padx=(0, 0))
+        self.entry_full_res_batch_size.grid(row=0, column=2, sticky="w", padx=(0, 0))
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
         current_row += 1
@@ -464,19 +466,20 @@ class SplatterGUI(ThemedTk):
         
         # Container for Checkbox and Label/Entry
         self.low_res_control_frame = ttk.Frame(self.preprocessing_frame)
-        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="ew", padx=5, pady=(10, 2))
+        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
         self.low_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
 
         # Checkbox (Left side of the container)
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.low_res_control_frame, text="Enable Low Res Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.low_res_control_frame, text="Enable Low Res", variable=self.enable_low_res_var,
+                                                       command=self.toggle_processing_settings_fields, width=15)
         self.enable_low_res_checkbox.grid(row=0, column=0, sticky="w")
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
         
         # Label/Entry (Right side of the container)
         self.lbl_low_res_batch_size = ttk.Label(self.low_res_control_frame, text="Batch Size:")
-        self.lbl_low_res_batch_size.grid(row=0, column=1, sticky="e", padx=(10, 2))
+        self.lbl_low_res_batch_size.grid(row=0, column=1, sticky="w", padx=(10, 2))
         self.entry_low_res_batch_size = ttk.Entry(self.low_res_control_frame, textvariable=self.low_res_batch_size_var, width=5)
-        self.entry_low_res_batch_size.grid(row=0, column=2, sticky="e", padx=(0, 0))
+        self.entry_low_res_batch_size.grid(row=0, column=2, sticky="w", padx=(0, 0))
         self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
         self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
         current_row += 1
@@ -516,7 +519,7 @@ class SplatterGUI(ThemedTk):
         self.output_settings_frame.grid_columnconfigure(1, weight=1)
                 
         # Process Length (Remains Entry)
-        self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length (-1 for all):")
+        self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length:")
         self.lbl_process_length.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
         self.entry_process_length.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
@@ -853,6 +856,7 @@ class SplatterGUI(ThemedTk):
             
             "dark_mode_enabled": self.dark_mode_var.get(),
             "window_width": self.winfo_width(),
+            "window_height": self.winfo_height(),
             "window_x": self.winfo_x(),
             "window_y": self.winfo_y(),
 
@@ -1794,27 +1798,32 @@ class SplatterGUI(ThemedTk):
         # Ensure the window is visible and all widgets are laid out for accurate height calculation
         self.update_idletasks()
 
-        # 1. Get the optimal height for the current content
-        calculated_height = self.winfo_reqheight()
-        # Fallback in case winfo_reqheight returns a tiny value (shouldn't happen after update_idletasks)
-        if calculated_height < 100:
-            calculated_height = 750 # A reasonable fallback height if something goes wrong
-
-        # 2. Use the saved/default width
+        # 1. Use the saved/default width and height, with fallbacks
         current_width = self.window_width
+        saved_height = self.window_height
+        
+        # Recalculate height only if we are using the fallback default, otherwise respect saved size
+        if saved_height == 750: 
+            calculated_height = self.winfo_reqheight()
+            if calculated_height < 100: calculated_height = 750
+            current_height = calculated_height
+        else:
+            current_height = saved_height
+        # --- END MODIFIED ---
+
         # Fallback if saved width is invalid or too small
         if current_width < 200: # Minimum sensible width
             current_width = 620 # Use default width
 
-        # 3. Construct the geometry string
-        geometry_string = f"{current_width}x{calculated_height}"
+        # 2. Construct the geometry string
+        geometry_string = f"{current_width}x{current_height}"
         if self.window_x is not None and self.window_y is not None:
             geometry_string += f"+{self.window_x}+{self.window_y}"
         else:
             # If no saved position, let Tkinter center it initially or place it at default
             pass # No position appended, Tkinter will handle default placement
 
-        # 4. Apply the geometry
+        # 3. Apply the geometry
         self.geometry(geometry_string)
         logger.debug(f"Applied saved geometry: {geometry_string}")
 
@@ -2115,6 +2124,30 @@ class SplatterGUI(ThemedTk):
             disp_map_tensor = F.interpolate(disp_map_tensor, size=(H_img, W_img), mode='bilinear', align_corners=False)
             
         # --- END FIX V2 ---
+        
+        # --- NEW: Update Info Frame for Preview ---
+        preview_metadata = getattr(self.previewer, 'metadata', {})
+        
+        # 1. Filename: Get from the path stored in metadata if available, otherwise fallback
+        current_video_path = preview_metadata.get('source_video_path')
+        if not current_video_path:
+            # Fallback to the dictionary object from the source list (safest bet)
+            current_source_dict = getattr(self.previewer, 'current_source', {})
+            current_video_path = current_source_dict.get('source_video')
+            
+        video_filename = os.path.basename(current_video_path) if current_video_path else "N/A"
+        
+        # 2. Frames: Get total frames from metadata (assuming key 'total_frames' or similar)
+        total_frames = preview_metadata.get('total_frames')
+        frames_display = f"1/{total_frames}" if total_frames else "1 (Preview)"
+
+        self.processing_filename_var.set(video_filename)
+        self.processing_task_name_var.set("Preview")
+        self.processing_resolution_var.set(f"{W_img}x{H_img}")
+        self.processing_frames_var.set(frames_display) # <--- MODIFIED TO SHOW TOTAL
+        self.processing_disparity_var.set(f"{actual_max_disp_pixels:.2f} pixels ({params['max_disp']:.1f}%)")
+        self.processing_convergence_var.set(f"{params['convergence_point']:.2f} (GUI)")
+        self.processing_gamma_var.set(f"{params['depth_gamma']:.2f} (GUI)")
 
         with torch.no_grad():
             right_eye_tensor, occlusion_mask = stereo_projector(left_eye_tensor.cuda(), disp_map_tensor)

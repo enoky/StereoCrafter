@@ -25,7 +25,7 @@
     
     "max_disp": "Maximum disparity value as a percentage of the video's width x 20. Higher values result in more extreme parallax effects (depth shift). Example: '30.0' means a maximum of 1.5% shift horizontally at the forground.",
     "convergence_point": "Set to 1.0 will place depth inside the screen. 0.0 will give 100% pop out. StereoCrafter Default = 0.5, Recommend 0.8.",
-    "process_length": "Set how many frames to process before moving on to the next video, used for testing. -1 will process all frames.",
+    "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",
     "dual_output": "If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.",
     "no_normalization": "Use this only if your scene is too long and you have split your video/depthmap into shorter lengths to be rejoined after processing. Otherwise your cut scenes depth will not align",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",

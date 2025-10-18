@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-18.3"
+VERSION = "25-10-18.4"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -137,7 +137,7 @@ def create_dual_slider_layout(
     
     # 1. Create a container frame that will sit in the parent's grid
     xy_frame = ttk.Frame(parent)
-    xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+    xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=0)
     
     # Configure the container to hold two expanding columns
     xy_frame.grid_columnconfigure(0, weight=1)

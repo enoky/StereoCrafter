@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-17.3"
+VERSION = "25-10-17.4"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -24,7 +24,17 @@ class VideoPreviewer(ttk.Frame):
     - Loading single frames from multiple source videos.
     - Calling a user-provided processing function to generate the preview.
     """
-    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, get_params_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, preview_size_var: Optional[tk.StringVar] = None, resize_callback: Optional[Callable] = None, **kwargs):
+    def __init__(
+            self,
+            parent,
+            processing_callback: Callable,
+            find_sources_callback: Optional[Callable] = None,
+            get_params_callback: Optional[Callable] = None,
+            help_data: Dict[str, str] = None,
+            preview_size_var: Optional[tk.StringVar] = None,
+            resize_callback: Optional[Callable] = None,
+            **kwargs,
+        ):
         """
         Initializes the VideoPreviewer frame.
 
@@ -65,6 +75,7 @@ class VideoPreviewer(ttk.Frame):
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
+        self._is_dragging = False
 
         self._create_widgets()
 
@@ -74,7 +85,6 @@ class VideoPreviewer(ttk.Frame):
             Tooltip(widget, self.help_data[help_key])
         elif tooltip_info:
             Tooltip(widget, tooltip_info)
-
 
     def _create_widgets(self):
         """Creates and lays out all the widgets for the previewer."""
@@ -99,6 +109,18 @@ class VideoPreviewer(ttk.Frame):
         self.preview_canvas_window_id = self.preview_canvas.create_window((0, 0), window=self.preview_inner_frame, anchor="nw")
         self.preview_label = ttk.Label(self.preview_inner_frame, text="Load a video list to see preview", anchor="center")
         self.preview_label.pack(fill="both", expand=True)
+        
+        # self.preview_canvas.itemconfig(self.preview_canvas_window_id, tags=("content_drag_tag",))
+        # # Start: Call scan_mark and return break
+        # self.preview_label.bind("<ButtonPress-1>", 
+        #                         lambda e: (self.preview_canvas.scan_mark(e.x, e.y), "break")[1])
+        
+        # # Drag: Call scan_dragto and return break
+        # self.preview_label.bind("<B1-Motion>", 
+        #                         lambda e: (self.preview_canvas.scan_dragto(e.x, e.y, gain=1), "break")[1])
+        
+        # # End: Call the method to clear the cursor
+        # self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
 
         # Scrubber Frame
         scrubber_frame = ttk.Frame(self)
@@ -217,7 +239,6 @@ class VideoPreviewer(ttk.Frame):
                     widget.config(state=state)
             except tk.TclError:
                 pass # Ignore if widgets don't exist yet
-
 
     def _handle_load_refresh(self):
         """Internal handler for the 'Load/Refresh List' button."""
@@ -489,7 +510,54 @@ class VideoPreviewer(ttk.Frame):
             self.wiggle_after_id = None
         if hasattr(self, 'wiggle_left_tk'): del self.wiggle_left_tk
         if hasattr(self, 'wiggle_right_tk'): del self.wiggle_right_tk
+    
+    def _start_drag_scroll(self, event):
+        """Records the starting position for a drag-to-scroll operation using scan_mark."""
+        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
+            self._is_dragging = True
+            self.preview_canvas.config(cursor="fleur")
+            
+            # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+            content_x = int(self.preview_canvas.canvasx(event.x))
+            content_y = int(self.preview_canvas.canvasy(event.y))
+            
+            self.preview_canvas.scan_mark(content_x, content_y)
+            logger.debug(f"_start_drag_scroll: Scan Mark at X={content_x}, Y={content_y}")
+        else:
+            logger.debug("_start_drag_scroll: Drag ignored.")
+            
+        # Reset the jump counter/filter (if you still have it, for safety)
+        if hasattr(self, '_consecutive_jumps'):
+            self._consecutive_jumps = 0
+            
+    def _drag_scroll(self, event):
+        """Scrolls the canvas using scan_dragto."""
+        if not self._is_dragging:
+            return
 
+        # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+        content_x = int(self.preview_canvas.canvasx(event.x))
+        content_y = int(self.preview_canvas.canvasy(event.y))
+
+        # Drag the canvas view based on the current cursor position
+        self.preview_canvas.scan_dragto(content_x, content_y, gain=5) 
+        
+        logger.debug(f"_drag_scroll: Scan DragTo at X={content_x}, Y={content_y}")
+
+    def _end_drag_scroll(self, event):
+        """Ends the drag-to-scroll operation."""
+        if self._is_dragging:
+            self._is_dragging = False
+            self.preview_canvas.config(cursor="")
+            logger.debug("_end_drag_scroll: Dragging ended.")
+        
+    # AND BINDINGS (in _create_widgets):
+        self.preview_label.bind("<ButtonPress-1>", 
+                                lambda e: (self._start_drag_scroll(e), "break")[1])
+        self.preview_label.bind("<B1-Motion>", 
+                                lambda e: (self._drag_scroll(e), "break")[1])
+        self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
+                
     def _start_wigglegram_animation(self, left_frame: torch.Tensor, right_frame: torch.Tensor):
         """Starts the wigglegram animation loop."""
         self._stop_wigglegram_animation()
