@@ -1,5 +1,5 @@
 #include <ATen/ATen.h>
-#include <THC/THCAtomics.cuh>
+#include <ATen/cuda/Atomic.cuh>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -112,10 +112,10 @@ __global__ void forward_warp_cuda_backward_kernel(
           const scalar_t sw_grad = grad_output[get_im_index(b, c, y_c, x_f, C, H, W)];
           const scalar_t se_grad = grad_output[get_im_index(b, c, y_c, x_c, C, H, W)];
           const scalar_t p = im0[get_im_index(b, c, h, w, C, H, W)];
-          atomicAdd(im0_grad_p, nw_k*nw_grad);
-          atomicAdd(im0_grad_p, ne_k*ne_grad);
-          atomicAdd(im0_grad_p, sw_k*sw_grad);
-          atomicAdd(im0_grad_p, se_k*se_grad);
+          *im0_grad_p += nw_k*nw_grad;
+          *im0_grad_p += ne_k*ne_grad;
+          *im0_grad_p += sw_k*sw_grad;
+          *im0_grad_p += se_k*se_grad;
           flow_grad_x -= (y_c-y)*p*nw_grad;
           flow_grad_y -= (x_c-x)*p*nw_grad;
           flow_grad_x += (y_c-y)*p*ne_grad;
@@ -157,9 +157,9 @@ at::Tensor forward_warp_cuda_forward(
     forward_warp_cuda_forward_kernel<scalar_t>
     <<<GET_BLOCKS(total_step), CUDA_NUM_THREADS>>>(
       total_step,
-      im0.data<scalar_t>(),
-      flow.data<scalar_t>(),
-      im1.data<scalar_t>(),
+      im0.data_ptr<scalar_t>(),
+      flow.data_ptr<scalar_t>(),
+      im1.data_ptr<scalar_t>(),
       B, C, H, W,
       interpolation_mode);
   }));
@@ -180,15 +180,15 @@ std::vector<at::Tensor> forward_warp_cuda_backward(
   const int W = im0.size(3);
   const int total_step = B * H * W;
 
-  AT_DISPATCH_FLOATING_TYPES(grad_output.type(), "forward_warp_backward_cuda", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(grad_output.scalar_type(), "forward_warp_backward_cuda", ([&] {
     forward_warp_cuda_backward_kernel<scalar_t>
     <<<GET_BLOCKS(total_step), CUDA_NUM_THREADS>>>(
       total_step,
-      grad_output.data<scalar_t>(),
+      grad_output.data_ptr<scalar_t>(),
       im0.data_ptr<scalar_t>(),
-      flow.data<scalar_t>(),
-      im0_grad.data<scalar_t>(),
-      flow_grad.data<scalar_t>(),
+      flow.data_ptr<scalar_t>(),
+      im0_grad.data_ptr<scalar_t>(),
+      flow_grad.data_ptr<scalar_t>(),
       B, C, H, W,
       interpolation_mode);
   }));
