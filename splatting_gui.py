@@ -40,7 +40,7 @@ from dependency.video_previewer import VideoPreviewer
 
 # Global flag for CUDA availability (set by check_cuda_availability at runtime)
 CUDA_AVAILABLE = False
-GUI_VERSION = "25.10.18.4"
+GUI_VERSION = "25.10.18.5"
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -162,6 +162,7 @@ class SplatterGUI(ThemedTk):
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
+        self.override_sidecar_var = tk.BooleanVar(value=self.app_config.get("override_sidecar_preview", False))
 
         # --- NEW: Previewer Variables ---
         self.preview_source_var = tk.StringVar(value="Splat Result")
@@ -192,6 +193,7 @@ class SplatterGUI(ThemedTk):
         self._configure_logging() # Ensure this call is still present
 
         self.after(10, self.toggle_processing_settings_fields) # Set initial state
+        self.after(10, self._toggle_sidecar_update_button_state)
         self.after(100, self.check_queue) # Start checking progress queue
 
         # Bind closing protocol
@@ -609,18 +611,32 @@ class SplatterGUI(ThemedTk):
             self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2,
             tooltip_key="convergence_point",
             )
+        
         all_settings_row += 1
         
         # Autogain Checkbox (MOVED FROM OUTPUT FRAME, placed in column 2/3)
         self.autogain_checkbox = ttk.Checkbutton(
             self.depth_all_settings_frame, text="Disable Normalization",
-            variable=self.enable_autogain_var
+            variable=self.enable_autogain_var,
+            command=lambda: self.on_slider_release(None),
+            width=28
             )
         self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")        
+        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")   
+
+        all_settings_row += 1
+        
+        # --- NEW: Override Sidecar Checkbox ---
+        self.override_sidecar_checkbox = ttk.Checkbutton(
+            self.depth_all_settings_frame, text="Override Sidecar (Preview Only)",
+            variable=self.override_sidecar_var,
+            command=lambda: [self.on_slider_release(None), self._toggle_sidecar_update_button_state()],
+            width=28
+            )
+        self.override_sidecar_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.override_sidecar_checkbox, "override_sidecar_preview")
 
         current_row = 0 # Reset for next frame
-
         # ===================================================================
         # --- RIGHT COLUMN: Current Processing Information frame ---
         # ===================================================================
@@ -630,52 +646,54 @@ class SplatterGUI(ThemedTk):
 
         self.info_labels = [] # List to hold the tk.Label widgets for easy iteration
 
+        LABEL_VALUE_WIDTH = 25
+
         # Row 0: Filename
         lbl_filename_static = tk.Label(self.info_frame, text="Filename:")
         lbl_filename_static.grid(row=0, column=0, sticky="e", padx=5, pady=1)
-        lbl_filename_value = tk.Label(self.info_frame, textvariable=self.processing_filename_var, anchor="w")
+        lbl_filename_value = tk.Label(self.info_frame, textvariable=self.processing_filename_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_filename_value.grid(row=0, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_filename_static, lbl_filename_value])
 
         # Row 1: Task Name
         lbl_task_static = tk.Label(self.info_frame, text="Task:")
         lbl_task_static.grid(row=1, column=0, sticky="e", padx=5, pady=1)
-        lbl_task_value = tk.Label(self.info_frame, textvariable=self.processing_task_name_var, anchor="w")
+        lbl_task_value = tk.Label(self.info_frame, textvariable=self.processing_task_name_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_task_value.grid(row=1, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_task_static, lbl_task_value])
 
         # Row 2: Resolution
         lbl_resolution_static = tk.Label(self.info_frame, text="Resolution:")
         lbl_resolution_static.grid(row=2, column=0, sticky="e", padx=5, pady=1)
-        lbl_resolution_value = tk.Label(self.info_frame, textvariable=self.processing_resolution_var, anchor="w")
+        lbl_resolution_value = tk.Label(self.info_frame, textvariable=self.processing_resolution_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_resolution_value.grid(row=2, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_resolution_static, lbl_resolution_value])
 
         # Row 3: Total Frames for current task
         lbl_frames_static = tk.Label(self.info_frame, text="Frames:")
         lbl_frames_static.grid(row=3, column=0, sticky="e", padx=5, pady=1)
-        lbl_frames_value = tk.Label(self.info_frame, textvariable=self.processing_frames_var, anchor="w")
+        lbl_frames_value = tk.Label(self.info_frame, textvariable=self.processing_frames_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_frames_value.grid(row=3, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_frames_static, lbl_frames_value])
 
         # Row 4: Max Disparity
         lbl_disparity_static = tk.Label(self.info_frame, text="Disparity:")
         lbl_disparity_static.grid(row=4, column=0, sticky="e", padx=5, pady=1)
-        lbl_disparity_value = tk.Label(self.info_frame, textvariable=self.processing_disparity_var, anchor="w")
+        lbl_disparity_value = tk.Label(self.info_frame, textvariable=self.processing_disparity_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_disparity_value.grid(row=4, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_disparity_static, lbl_disparity_value])
 
         # Row 5: Convergence Point
         lbl_convergence_static = tk.Label(self.info_frame, text="Converge:")
         lbl_convergence_static.grid(row=5, column=0, sticky="e", padx=5, pady=1)
-        lbl_convergence_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w")
+        lbl_convergence_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_convergence_value.grid(row=5, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
 
         # --- NEW ROW 6: Gamma ---
         lbl_gamma_static = tk.Label(self.info_frame, text="Gamma:")
         lbl_gamma_static.grid(row=6, column=0, sticky="e", padx=5, pady=1)
-        lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w")
+        lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_gamma_value.grid(row=6, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
         # ------------------------
@@ -699,10 +717,11 @@ class SplatterGUI(ThemedTk):
         self.stop_button = ttk.Button(button_frame, text="STOP", command=self.stop_processing, state="disabled")
         self.stop_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.stop_button, "stop_button")
-
-        exit_button = ttk.Button(button_frame, text="EXIT", command=self.exit_app)
-        exit_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(exit_button, "exit_button")
+        
+        # Ensure we store the button reference
+        self.update_sidecar_button = ttk.Button(button_frame, text="Update Sidecar", command=self.update_sidecar_file)
+        self.update_sidecar_button.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.update_sidecar_button, "update_sidecar_button")
 
         # --- Current Processing Information frame ---
         self.info_frame = ttk.LabelFrame(self, text="Current Processing Information") # Store frame as instance attribute
@@ -881,6 +900,7 @@ class SplatterGUI(ThemedTk):
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
             "enable_autogain": self.enable_autogain_var.get(),
+            "override_sidecar_preview": self.override_sidecar_var.get(),
         }
         return config
 
@@ -1737,6 +1757,12 @@ class SplatterGUI(ThemedTk):
         # Depth Map Pre-processing Container (Right Side)
         set_frame_children_state(self.depth_settings_container, state)
 
+        if hasattr(self, 'update_sidecar_button'):
+            if state == 'disabled':
+                self.update_sidecar_button.config(state="disabled")
+            else: # state == 'normal'
+                # When batch is done, re-apply the sidecar override logic immediately
+                self._toggle_sidecar_update_button_state()
 
         # 3. Re-apply the specific field enable/disable logic
         # This is CRITICAL. If we set state='normal' for everything, 
@@ -1894,6 +1920,27 @@ class SplatterGUI(ThemedTk):
 
         logger.info(f"Setting application logging level to: {level_str}")
 
+    def _toggle_sidecar_update_button_state(self):
+        """
+        Controls the Update Sidecar button state based on the Override Sidecar checkbox.
+        """
+        
+        # Check if batch processing is currently active (easiest way is to check the stop button's state)
+        is_batch_processing_active = (self.stop_button.cget("state") == "normal")
+        
+        # If batch is active, the button MUST be disabled, regardless of override state.
+        if is_batch_processing_active:
+            self.update_sidecar_button.config(state="disabled")
+            return
+            
+        # If batch is NOT active, base the state entirely on the Override checkbox.
+        if self.override_sidecar_var.get():
+            # Override is checked: GUI values are active, so ENABLE saving them.
+            self.update_sidecar_button.config(state="normal")
+        else:
+            # Override is unchecked: Sidecar values are active, so DISABLE saving GUI values.
+            self.update_sidecar_button.config(state="disabled")
+
     def check_queue(self):
         """Periodically checks the progress queue for updates to the GUI."""
         try:
@@ -2016,6 +2063,8 @@ class SplatterGUI(ThemedTk):
         """
         Callback for VideoPreviewer. Performs splatting on a single frame for preview.
         """
+        self.clear_processing_info() # Clear info at the start of a new preview attempt
+
         if not globals()['CUDA_AVAILABLE']:
             logger.error("Preview processing requires a CUDA-enabled GPU.")
             return None
@@ -2029,56 +2078,173 @@ class SplatterGUI(ThemedTk):
             logger.error("Preview failed: Missing source video or depth map tensor.")
             return None
 
-        # --- Get latest settings ---
+        # --- Get latest settings and Preview Mode ---
         params = self.get_current_preview_settings()
         if not params:
             logger.error("Preview failed: Could not get current preview settings.")
             return None
+            
+        preview_source = self.preview_source_var.get()
+        is_low_res_preview = preview_source in ["Splat Result(Low)", "Occlusion Mask(Low)"]
+        
+        # Determine the target resolution for the preview tensor
+        W_orig = left_eye_tensor.shape[3]
+        H_orig = left_eye_tensor.shape[2]
+        
+        # ----------------------------------------------------------------------
+        # NEW SIDECAR LOGIC FOR PREVIEW
+        # ----------------------------------------------------------------------
+        depth_map_path = None
+        if 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
+            current_source_dict = self.previewer.video_list[self.previewer.current_video_index]
+            depth_map_path = current_source_dict.get('depth_map')
+        
+        # Initialize final variables with GUI values
+        conv_point = params['convergence_point']
+        gamma = params['depth_gamma']
+        max_disp = params['max_disp']
+        
+        conv_source = "GUI"
+        gamma_source = "GUI"
+        max_disp_source = "GUI"
+        
+        
+        # --- NEW: Check for Sidecar Override Flag ---
+        is_sidecar_overridden = self.override_sidecar_var.get()
+        if is_sidecar_overridden:
+            logger.debug("Preview: Sidecar override is ACTIVE. Using GUI values.")
+        # --- END NEW CHECK ---
+        
+        if depth_map_path and not is_sidecar_overridden: # <--- MODIFIED CONDITIONAL
+            logger.debug(f"Preview: Depth map found at: {depth_map_path}")
+            depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+            sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+            json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+            logger.debug(f"Preview: Checking sidecar path: {json_sidecar_path}")
+
+            if os.path.exists(json_sidecar_path):
+                # ... (rest of the sidecar reading logic is unchanged)
+                try:
+                    with open(json_sidecar_path, 'r') as f:
+                        sidecar_data = json.load(f)
+                        
+                    logger.debug("Preview: Sidecar found and read successfully. Applying overrides.")
+                        
+                    # 1. Convergence Point
+                    if "convergence_plane" in sidecar_data:
+                        conv_point = float(sidecar_data["convergence_plane"])
+                        conv_source = "Sidecar"
+                        logger.debug(f"Preview: Using sidecar convergence_plane: {conv_point:.4f}")
+                        
+                    # 2. Max Disparity
+                    if "max_disparity" in sidecar_data:
+                        max_disp = float(sidecar_data["max_disparity"])
+                        max_disp_source = "Sidecar"
+                        logger.debug(f"Preview: Using sidecar max_disparity: {max_disp:.1f}")
+
+                    # 3. Gamma (Check GUI toggle: self.enable_sidecar_gamma_var)
+                    if "gamma" in sidecar_data and self.enable_sidecar_gamma_var.get():
+                        if isinstance(sidecar_data["gamma"], (int, float)) and float(sidecar_data["gamma"]) > 0:
+                            gamma = float(sidecar_data["gamma"])
+                            gamma_source = "Sidecar"
+                            logger.debug(f"Preview: Using sidecar gamma: {gamma:.2f} (Override)")
+                    else:
+                         logger.debug("Preview: Sidecar gamma skipped (not present or GUI override disabled).")
+                            
+                except Exception as e:
+                    logger.error(f"Error reading sidecar '{json_sidecar_path}' for preview: {e}")
+            else:
+                logger.debug("Preview: Sidecar file NOT found. Using GUI values.")
+        else:
+            logger.debug("Preview: No depth map path available or Sidecar override is ACTIVE. Using GUI values.") # <--- MODIFIED LOG
+        
+        # Re-map the variables used in the splatting math
+        params['convergence_point'] = conv_point
+        params['max_disp'] = max_disp
+        params['depth_gamma'] = gamma
+        # ----------------------------------------------------------------------
+        # END NEW SIDECAR LOGIC FOR PREVIEW
+        # ----------------------------------------------------------------------
+        
+        W_target, H_target = W_orig, H_orig
+        
+        if is_low_res_preview:
+            try:
+                W_target_requested = int(self.pre_res_width_var.get())
+                
+                if W_target_requested <= 0:
+                    W_target_requested = W_orig # Fallback
+                
+                # 1. Calculate aspect-ratio-correct height based on the requested width
+                aspect_ratio = W_orig / H_orig
+                H_target_calculated = int(round(W_target_requested / aspect_ratio))
+                
+                # 2. Ensure both W and H are divisible by 2 for codec compatibility
+                W_target = W_target_requested if W_target_requested % 2 == 0 else W_target_requested + 1
+                H_target = H_target_calculated if H_target_calculated % 2 == 0 else H_target_calculated + 1
+                
+                # 3. Handle potential extreme fallbacks
+                if W_target <= 0 or H_target <= 0:
+                    W_target, H_target = W_orig, H_orig
+                    logger.warning("Low-Res preview: Calculated dimensions invalid, falling back to original.")
+                else:
+                    logger.debug(f"Low-Res preview: AR corrected target {W_target}x{H_target}. (Original W: {W_orig}, H: {H_orig})")
+                
+                # Resize Left Eye to aspect-ratio-correct low-res target for consistency
+                left_eye_tensor_resized = F.interpolate(
+                    left_eye_tensor.cuda(), 
+                    size=(H_target, W_target), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            except Exception as e:
+                logger.error(f"Low-Res preview failed during AR calculation/resize: {e}. Falling back to original res.", exc_info=True)
+                W_target, H_target = W_orig, H_orig
+                left_eye_tensor_resized = left_eye_tensor.cuda()
+        else:
+            left_eye_tensor_resized = left_eye_tensor.cuda() # Use original res
+
+        
         logger.debug(f"Preview Params: {params}")
+        logger.debug(f"Target Resolution: {W_target}x{H_target} (Low-Res: {is_low_res_preview})")
+
 
         # --- Process Depth Frame ---
         depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
         logger.debug(f"Raw depth numpy shape: {depth_numpy_raw.shape}, range: [{depth_numpy_raw.min():.2f}, {depth_numpy_raw.max():.2f}]")
         
-        # 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME
-        # Get the maximum *raw* value of the depth frame content (across all channels if >1)
+        # 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME (for AutoGain scaling)
+        # We need the max *raw* value of the depth frame content
         max_raw_content_value = depth_numpy_raw.max()
-        if max_raw_content_value < 1.0: # Fallback for already 0-1 normalized content
-            max_raw_content_value = 1.0
+        if max_raw_content_value < 1.0: 
+            max_raw_content_value = 1.0 # Fallback for already 0-1 normalized content
 
-        # Determine the scaling factor (similar logic to _run_batch_process, but simplified)
+        # Determine the scaling factor
         final_scaling_factor = 1.0
         if params['enable_autogain']:
-            # If Raw Input (Disable Normalization) is active, determine the best scaling factor
             if max_raw_content_value <= 256.0 and max_raw_content_value > 1.0:
-                final_scaling_factor = 255.0 # Assume 8-bit content saved in a higher container
-                logger.debug(f"Preview: AutoGain scaling by 255.0 (Max Content: {max_raw_content_value:.2f})")
+                final_scaling_factor = 255.0
             elif max_raw_content_value > 256.0 and max_raw_content_value <= 1024.0:
-                final_scaling_factor = max_raw_content_value # Scale by its actual max
-                logger.debug(f"Preview: AutoGain scaling by Content Max: {final_scaling_factor:.2f}")
+                final_scaling_factor = max_raw_content_value
             elif max_raw_content_value > 1024.0:
-                final_scaling_factor = 65535.0 # For 16-bit
-                logger.debug(f"Preview: AutoGain scaling by 65535.0 (Max Content: {max_raw_content_value:.2f})")
+                final_scaling_factor = 65535.0
             else:
-                final_scaling_factor = 1.0 # For 0-1 float
-                logger.debug(f"Preview: AutoGain scaling by 1.0 (Max Content: {max_raw_content_value:.2f})")
+                final_scaling_factor = 1.0 
         else:
-            # If Normalization is active, the helper will use max_raw_value=1.0, 
-            # and the final normalization will handle the full range (0-1), so 1.0 is safe here.
-            final_scaling_factor = 1.0 
+            final_scaling_factor = 1.0 # Normalization enabled path doesn't need scaling here
 
         depth_numpy_processed = self._process_depth_batch(
             batch_depth_numpy_raw=np.expand_dims(depth_numpy_raw, axis=0),
-            depth_stream_info=None, # Not available for single frame
+            depth_stream_info=None,
             depth_gamma=params['depth_gamma'],
             depth_dilate_size_x=params['depth_dilate_size_x'],
             depth_dilate_size_y=params['depth_dilate_size_y'],
             depth_blur_size_x=params['depth_blur_size_x'],
             depth_blur_size_y=params['depth_blur_size_y'],
-            is_low_res_task=False, # Preview is always "hi-res" logic
-            max_raw_value=final_scaling_factor, # <-- USE THE DETERMINED SCALING FACTOR HERE
+            is_low_res_task=is_low_res_preview, # <-- USE LOW-RES FLAG HERE
+            max_raw_value=final_scaling_factor,
             global_depth_min=0.0,
-            global_depth_max=1.0 # Pass neutral values; we will normalize manually.
+            global_depth_max=1.0 
         )
         logger.debug(f"Processed depth numpy shape: {depth_numpy_processed.shape}, range: [{depth_numpy_processed.min():.2f}, {depth_numpy_processed.max():.2f}]")
 
@@ -2088,8 +2254,6 @@ class SplatterGUI(ThemedTk):
         if params['enable_autogain']:
             # RAW INPUT MODE: Normalize by the determined scaling factor
             depth_normalized = depth_normalized / final_scaling_factor
-            
-            # Gamma was already applied inside _process_depth_batch in this mode.
             logger.debug(f"Preview: Applied raw scaling by {final_scaling_factor:.2f}")
         else:
             # NORMALIZATION ENABLED: Perform min/max normalization on the processed result
@@ -2109,79 +2273,93 @@ class SplatterGUI(ThemedTk):
 
         # --- Perform Splatting ---
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+        # Ensure depth map is resized to the target resolution (low-res or original)
         disp_map_tensor = torch.from_numpy(depth_normalized).unsqueeze(0).unsqueeze(0).float().cuda()
+        
+        # Resize Disparity Map to match the (potentially resized) Left Eye
+        if H_target != disp_map_tensor.shape[2] or W_target != disp_map_tensor.shape[3]:
+             logger.debug(f"Resizing depth map to match target {W_target}x{H_target}.")
+             disp_map_tensor = F.interpolate(disp_map_tensor, size=(H_target, W_target), mode='bilinear', align_corners=False)
+
         disp_map_tensor = (disp_map_tensor - params['convergence_point']) * 2.0
-        actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * left_eye_tensor.shape[3]
+        
+        # Calculate disparity in pixels based on the TARGET width (W_target)
+        actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * W_target
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
-         # --- FIX V2: Ensure Disparity Map matches Left Eye dimensions (Left Eye is the reference) ---
-        _, _, H_img, W_img = left_eye_tensor.shape
-        _, _, H_disp, W_disp = disp_map_tensor.shape
 
-        if H_img != H_disp or W_img != W_disp:
-            logger.warning(f"Resizing depth map from {W_disp}x{H_disp} to match left eye {W_img}x{H_img} before splatting.")
-            # We use bilinear interpolation for the disparity map as it preserves the flow direction and magnitude best.
-            disp_map_tensor = F.interpolate(disp_map_tensor, size=(H_img, W_img), mode='bilinear', align_corners=False)
+        with torch.no_grad():
+            # Use the potentially resized Left Eye
+            right_eye_tensor_raw, occlusion_mask = stereo_projector(left_eye_tensor_resized, disp_map_tensor)
             
-        # --- END FIX V2 ---
-        
-        # --- NEW: Update Info Frame for Preview ---
-        preview_metadata = getattr(self.previewer, 'metadata', {})
-        
-        # 1. Filename: Get from the path stored in metadata if available, otherwise fallback
-        current_video_path = preview_metadata.get('source_video_path')
-        if not current_video_path:
-            # Fallback to the dictionary object from the source list (safest bet)
-            current_source_dict = getattr(self.previewer, 'current_source', {})
-            current_video_path = current_source_dict.get('source_video')
+            # Apply low-res specific post-processing
+            if is_low_res_preview:
+                right_eye_tensor = self._fill_left_edge_occlusions(right_eye_tensor_raw, occlusion_mask, boundary_width_pixels=3)
+            else:
+                right_eye_tensor = right_eye_tensor_raw
+
+
+        # --- NEW: Update Info Frame for Preview (using Target resolution) ---
+        current_source_dict = getattr(self.previewer, 'current_source', {})
+        current_video_path = current_source_dict.get('source_video')
             
         video_filename = os.path.basename(current_video_path) if current_video_path else "N/A"
         
         # 2. Frames: Get total frames from metadata (assuming key 'total_frames' or similar)
+        preview_metadata = getattr(self.previewer, 'metadata', {})
         total_frames = preview_metadata.get('total_frames')
         frames_display = f"1/{total_frames}" if total_frames else "1 (Preview)"
 
         self.processing_filename_var.set(video_filename)
-        self.processing_task_name_var.set("Preview")
-        self.processing_resolution_var.set(f"{W_img}x{H_img}")
-        self.processing_frames_var.set(frames_display) # <--- MODIFIED TO SHOW TOTAL
-        self.processing_disparity_var.set(f"{actual_max_disp_pixels:.2f} pixels ({params['max_disp']:.1f}%)")
-        self.processing_convergence_var.set(f"{params['convergence_point']:.2f} (GUI)")
-        self.processing_gamma_var.set(f"{params['depth_gamma']:.2f} (GUI)")
+        self.processing_task_name_var.set("Preview" + (" (Low-Res)" if is_low_res_preview else ""))
+        self.processing_resolution_var.set(f"{W_target}x{H_target}")
+        self.processing_frames_var.set(frames_display) 
+        self.processing_disparity_var.set(f"{actual_max_disp_pixels:.2f} pixels ({params['max_disp']:.1f}%) ({max_disp_source})")
+        self.processing_convergence_var.set(f"{params['convergence_point']:.2f} ({conv_source})")
+        self.processing_gamma_var.set(f"{params['depth_gamma']:.2f} ({gamma_source})")
+        # --- END NEW: Update Info Frame for Preview ---
 
-        with torch.no_grad():
-            right_eye_tensor, occlusion_mask = stereo_projector(left_eye_tensor.cuda(), disp_map_tensor)
 
         # --- Select Output for Display ---
-        preview_source = self.preview_source_var.get()
-        self.previewer.set_preview_source_options(["Splat Result", "Original (Left Eye)", "Occlusion Mask", "Depth Map", "Anaglyph 3D", "Wigglegram"])
+        self.previewer.set_preview_source_options([
+            "Splat Result",
+            "Splat Result(Low)",
+            "Occlusion Mask",
+            "Occlusion Mask(Low)",
+            "Original (Left Eye)",
+            "Depth Map", 
+            "Anaglyph 3D", 
+            "Wigglegram",
+        ])
 
-        if preview_source == "Splat Result":
+        if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor.cpu()
-        elif preview_source == "Occlusion Mask":
+        elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
             final_tensor = occlusion_mask.repeat(1, 3, 1, 1).cpu()
         elif preview_source == "Depth Map":
             depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
             depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
             final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
         elif preview_source == "Original (Left Eye)":
-            final_tensor = left_eye_tensor.cpu()
+            # Use the resized or original left eye depending on the low-res flag
+            final_tensor = left_eye_tensor_resized.cpu()
         elif preview_source == "Anaglyph 3D":
-            left_np_anaglyph = (left_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             left_gray_np = cv2.cvtColor(left_np_anaglyph, cv2.COLOR_RGB2GRAY)
             anaglyph_np = right_np_anaglyph.copy()
             anaglyph_np[:, :, 0] = left_gray_np
             final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
         elif preview_source == "Wigglegram":
-            self.previewer._start_wigglegram_animation(left_eye_tensor, right_eye_tensor)
+            # Pass the resized left eye and the splatted right eye
+            self.previewer._start_wigglegram_animation(left_eye_tensor_resized.cpu(), right_eye_tensor.cpu())
             return None
         else:
             final_tensor = right_eye_tensor.cpu()
 
         pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
 
-        del stereo_projector, disp_map_tensor, right_eye_tensor, occlusion_mask
+        del stereo_projector, disp_map_tensor, right_eye_tensor_raw, occlusion_mask
         release_cuda_memory()
         logger.debug("--- Finished Preview Processing Callback ---")
         return pil_img
@@ -2736,6 +2914,96 @@ class SplatterGUI(ThemedTk):
             self.clear_processing_info()
             self.status_label.config(text="No files found to restore.")
             messagebox.showinfo("Restore Complete", "No files found in 'finished' folders to restore.")
+
+    def update_sidecar_file(self):
+        """
+        Updates the current video's sidecar file (.fssidecar) with the current 
+        GUI values for Convergence, Max Disparity, and Gamma, while preserving 
+        'frame_overlap' and 'input_bias'. Includes a user confirmation step.
+        """
+        # Ensure a video is loaded in the previewer
+        if not hasattr(self, 'previewer') or not self.previewer.video_list or self.previewer.current_video_index == -1:
+            messagebox.showwarning("Update Sidecar", "Please load a video in the Previewer first.")
+            return
+
+        # 1. Get current sidecar path
+        current_source_dict = self.previewer.video_list[self.previewer.current_video_index]
+        depth_map_path = current_source_dict.get('depth_map')
+
+        if not depth_map_path:
+            messagebox.showerror("Update Sidecar Error", "Could not determine the depth map path for the current video.")
+            return
+
+        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        
+        # --- NEW: Confirmation Dialog ---
+        if os.path.exists(json_sidecar_path):
+            title = "Overwrite Sidecar File?"
+            message = (f"This will overwrite parameters (Convergence, Disparity, Gamma) "
+                       f"in the existing sidecar file:\n\n{os.path.basename(json_sidecar_path)}\n\n"
+                       f"Do you want to continue?")
+        else:
+            title = "Create Sidecar File?"
+            message = (f"This will create a NEW sidecar file:\n\n{os.path.basename(json_sidecar_path)}\n\n"
+                       f"Do you want to continue?")
+
+        if not messagebox.askyesno(title, message):
+            self.status_label.config(text="Sidecar update cancelled.")
+            return
+        # --- END NEW: Confirmation Dialog ---
+
+        logger.info(f"Attempting to update sidecar: {json_sidecar_path}")
+
+        # 2. Get current GUI values (use float for consistency)
+        try:
+            gui_conv_point = float(self.zero_disparity_anchor_var.get())
+            gui_max_disp = float(self.max_disp_var.get())
+            gui_gamma = float(self.depth_gamma_var.get())
+            
+        except ValueError as e:
+            messagebox.showerror("Update Sidecar Error", f"Invalid input value in GUI: {e}")
+            return
+            
+        # 3. Read existing sidecar content (or initialize a new dict)
+        current_data = {}
+        # Only attempt to read if the file exists (it may not if we are creating it)
+        if os.path.exists(json_sidecar_path):
+            try:
+                with open(json_sidecar_path, 'r') as f:
+                    current_data = json.load(f)
+                logger.debug("Existing sidecar loaded for update.")
+            except Exception as e:
+                logger.warning(f"Found sidecar but failed to read its content. Starting with empty data. Error: {e}")
+                current_data = {}
+
+        # 4. Update the specific keys (Disparity, Convergence, Gamma)
+        current_data["convergence_plane"] = gui_conv_point
+        current_data["max_disparity"] = gui_max_disp
+        current_data["gamma"] = gui_gamma
+        
+        # 5. REMOVE keys that should NOT be in this sidecar (if they accidentally got in)
+        for key in ["depth_dilate_size_x", "depth_dilate_size_y", "depth_blur_size_x", "depth_blur_size_y"]:
+            if key in current_data:
+                del current_data[key]
+
+        # 6. Write the updated data back to the file
+        try:
+            with open(json_sidecar_path, 'w') as f:
+                json.dump(current_data, f, indent=4)
+            
+            # 7. Inform the user and refresh the preview
+            action = "updated" if os.path.exists(json_sidecar_path) else "created"
+            messagebox.showinfo("Update Sidecar Success", f"Sidecar '{os.path.basename(json_sidecar_path)}' successfully {action}.")
+            self.status_label.config(text="Sidecar updated.")
+            
+            # Immediately refresh the preview to show the *effect* of the newly saved sidecar 
+            self.on_slider_release(None) 
+
+        except Exception as e:
+            messagebox.showerror("Update Sidecar Error", f"Failed to write sidecar file '{os.path.basename(json_sidecar_path)}':\n{e}")
+            logger.error("Sidecar write failed", exc_info=True)
 
 def compute_global_depth_stats(
         depth_map_reader: VideoReader,
