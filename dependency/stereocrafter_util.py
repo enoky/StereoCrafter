@@ -48,6 +48,12 @@ def create_single_slider_with_label_updater(
     slider.grid(row=row, column=1, sticky="ew", padx=2)
     value_label = ttk.Label(parent, text="") # Start with empty text
     value_label.grid(row=row, column=2, sticky="w", padx=0)
+    
+    # Column 0 (Label) has no weight (fixed width via 'width' option)
+    # Column 1 (Slider) must have weight=1 to expand
+    parent.grid_columnconfigure(0, weight=0)
+    parent.grid_columnconfigure(1, weight=1)
+    parent.grid_columnconfigure(2, weight=0)
 
     # --- Tooltip and State Management ---
     if tooltip_key and hasattr(GUI_self, '_create_hover_tooltip'):

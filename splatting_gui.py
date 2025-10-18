@@ -437,29 +437,53 @@ class SplatterGUI(ThemedTk):
         self.preprocessing_frame.grid_columnconfigure(1, weight=1) # Allow Entry to expand
 
         current_row = 0
-        # Enable Full Resolution Section
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Full Res Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_full_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
-        current_row += 1
 
-        # Full Resolution Batch Size
-        self.lbl_full_res_batch_size = ttk.Label(self.preprocessing_frame, text="Full Res Batch Size:")
-        self.lbl_full_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_full_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.batch_size_var, width=15)
-        self.entry_full_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+         # --- Enable Full Resolution Section (ROW 0) ---
+        
+        # Container for Checkbox and Label/Entry
+        self.full_res_control_frame = ttk.Frame(self.preprocessing_frame)
+        self.full_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+        self.full_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
+        
+        # Checkbox (Left side of the container)
+        self.enable_full_res_checkbox = ttk.Checkbutton(self.full_res_control_frame, text="Enable Full Res Output", variable=self.enable_full_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_full_res_checkbox.grid(row=0, column=0, sticky="w")
+        self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
+        
+        # Label/Entry (Right side of the container)
+        self.lbl_full_res_batch_size = ttk.Label(self.full_res_control_frame, text="Batch Size:")
+        self.lbl_full_res_batch_size.grid(row=0, column=1, sticky="e", padx=(10, 2))
+        self.entry_full_res_batch_size = ttk.Entry(self.full_res_control_frame, textvariable=self.batch_size_var, width=5)
+        self.entry_full_res_batch_size.grid(row=0, column=2, sticky="e", padx=(0, 0))
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
         current_row += 1
 
 
-        # Enable Low Resolution Section
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Enable Low Res Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
-        self.enable_low_res_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
-        self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
-        current_row += 1
+        # --- Enable Low Resolution Section (ROW 1) ---
+        
+        # Container for Checkbox and Label/Entry
+        self.low_res_control_frame = ttk.Frame(self.preprocessing_frame)
+        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="ew", padx=5, pady=(10, 2))
+        self.low_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
 
-        # Low Res Width/Height (Squeezed onto one row)
+        # Checkbox (Left side of the container)
+        self.enable_low_res_checkbox = ttk.Checkbutton(self.low_res_control_frame, text="Enable Low Res Output", variable=self.enable_low_res_var, command=self.toggle_processing_settings_fields)
+        self.enable_low_res_checkbox.grid(row=0, column=0, sticky="w")
+        self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
+        
+        # Label/Entry (Right side of the container)
+        self.lbl_low_res_batch_size = ttk.Label(self.low_res_control_frame, text="Batch Size:")
+        self.lbl_low_res_batch_size.grid(row=0, column=1, sticky="e", padx=(10, 2))
+        self.entry_low_res_batch_size = ttk.Entry(self.low_res_control_frame, textvariable=self.low_res_batch_size_var, width=5)
+        self.entry_low_res_batch_size.grid(row=0, column=2, sticky="e", padx=(0, 0))
+        self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
+        self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
+        current_row += 1
+        
+        # --- Low Res Width/Height (Squeezed onto one row) (ROW 2) ---
+        
+        # Frame for Width/Height fields (Grid under the Low Res checkbox/batch size row)
         self.low_res_wh_frame = ttk.Frame(self.preprocessing_frame)
         self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         
@@ -477,15 +501,6 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.pre_res_width_entry, "low_res_width")
         self._create_hover_tooltip(self.pre_res_height_label, "low_res_height")
         self._create_hover_tooltip(self.pre_res_height_entry, "low_res_height")
-        current_row += 1
-
-        # Low Res Batch Size
-        self.lbl_low_res_batch_size = ttk.Label(self.preprocessing_frame, text="Low Res Batch Size:")
-        self.lbl_low_res_batch_size.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        self.entry_low_res_batch_size = ttk.Entry(self.preprocessing_frame, textvariable=self.low_res_batch_size_var, width=15)
-        self.entry_low_res_batch_size.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
-        self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")        
         current_row += 1
         
         # Dual Output Checkbox (Row 3, Column 0/1)
@@ -564,8 +579,8 @@ class SplatterGUI(ThemedTk):
         current_depth_row += 1
         self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Settings (All)")
         self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
-        self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
-        self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
+        # self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
+        # self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
 
         all_settings_row = 0
         
@@ -2013,10 +2028,36 @@ class SplatterGUI(ThemedTk):
         logger.debug(f"Preview Params: {params}")
 
         # --- Process Depth Frame ---
-        # --- FIX: Transpose from (C, H, W) to (H, W, C) for the helper function ---
         depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        # --- END FIX ---
         logger.debug(f"Raw depth numpy shape: {depth_numpy_raw.shape}, range: [{depth_numpy_raw.min():.2f}, {depth_numpy_raw.max():.2f}]")
+        
+        # 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME
+        # Get the maximum *raw* value of the depth frame content (across all channels if >1)
+        max_raw_content_value = depth_numpy_raw.max()
+        if max_raw_content_value < 1.0: # Fallback for already 0-1 normalized content
+            max_raw_content_value = 1.0
+
+        # Determine the scaling factor (similar logic to _run_batch_process, but simplified)
+        final_scaling_factor = 1.0
+        if params['enable_autogain']:
+            # If Raw Input (Disable Normalization) is active, determine the best scaling factor
+            if max_raw_content_value <= 256.0 and max_raw_content_value > 1.0:
+                final_scaling_factor = 255.0 # Assume 8-bit content saved in a higher container
+                logger.debug(f"Preview: AutoGain scaling by 255.0 (Max Content: {max_raw_content_value:.2f})")
+            elif max_raw_content_value > 256.0 and max_raw_content_value <= 1024.0:
+                final_scaling_factor = max_raw_content_value # Scale by its actual max
+                logger.debug(f"Preview: AutoGain scaling by Content Max: {final_scaling_factor:.2f}")
+            elif max_raw_content_value > 1024.0:
+                final_scaling_factor = 65535.0 # For 16-bit
+                logger.debug(f"Preview: AutoGain scaling by 65535.0 (Max Content: {max_raw_content_value:.2f})")
+            else:
+                final_scaling_factor = 1.0 # For 0-1 float
+                logger.debug(f"Preview: AutoGain scaling by 1.0 (Max Content: {max_raw_content_value:.2f})")
+        else:
+            # If Normalization is active, the helper will use max_raw_value=1.0, 
+            # and the final normalization will handle the full range (0-1), so 1.0 is safe here.
+            final_scaling_factor = 1.0 
+
         depth_numpy_processed = self._process_depth_batch(
             batch_depth_numpy_raw=np.expand_dims(depth_numpy_raw, axis=0),
             depth_stream_info=None, # Not available for single frame
@@ -2026,32 +2067,33 @@ class SplatterGUI(ThemedTk):
             depth_blur_size_x=params['depth_blur_size_x'],
             depth_blur_size_y=params['depth_blur_size_y'],
             is_low_res_task=False, # Preview is always "hi-res" logic
-            max_raw_value=255.0, # Assume 8-bit for preview simplicity
+            max_raw_value=final_scaling_factor, # <-- USE THE DETERMINED SCALING FACTOR HERE
             global_depth_min=0.0,
             global_depth_max=1.0 # Pass neutral values; we will normalize manually.
         )
         logger.debug(f"Processed depth numpy shape: {depth_numpy_processed.shape}, range: [{depth_numpy_processed.min():.2f}, {depth_numpy_processed.max():.2f}]")
 
-        # Normalize
+        # 2. Normalize based on the 'enable_autogain' (Disable Normalization) setting
+        depth_normalized = depth_numpy_processed.squeeze(0)
+
         if params['enable_autogain']:
-            # Raw input mode: The helper function applied gamma to the 0-255 range.
-            # We now normalize this result to 0-1 for the splatting operation.
-            depth_normalized = depth_numpy_processed.squeeze(0) / 255.0
+            # RAW INPUT MODE: Normalize by the determined scaling factor
+            depth_normalized = depth_normalized / final_scaling_factor
+            
+            # Gamma was already applied inside _process_depth_batch in this mode.
+            logger.debug(f"Preview: Applied raw scaling by {final_scaling_factor:.2f}")
         else:
-            # Normalization enabled: The helper function did dilate/blur on the 0-255 range.
-            # Now, we perform the min/max normalization on the processed result, just like the main batch logic.
+            # NORMALIZATION ENABLED: Perform min/max normalization on the processed result
             min_val, max_val = depth_numpy_processed.min(), depth_numpy_processed.max()
             if max_val > min_val:
                 depth_normalized = (depth_numpy_processed.squeeze(0) - min_val) / (max_val - min_val)
             else:
                 depth_normalized = np.zeros_like(depth_numpy_processed.squeeze(0))
             
-            # --- FIX: Apply gamma AFTER normalization for this path ---
-            # The helper function skips gamma in this mode, so we apply it here.
+            # Apply gamma AFTER normalization for the Global Norm path (as skipped in helper)
             if params['depth_gamma'] != 1.0:
                 depth_normalized = np.power(depth_normalized, params['depth_gamma'])
                 logger.debug(f"Applied gamma ({params['depth_gamma']}) post-normalization.")
-            # --- END FIX ---
 
         depth_normalized = np.clip(depth_normalized, 0, 1)
         logger.debug(f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]")
