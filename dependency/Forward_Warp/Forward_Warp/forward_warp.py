@@ -50,7 +50,7 @@ class forward_warp(Module):
         '''
         super(forward_warp, self).__init__()
         assert(interpolation_mode in ("Bilinear", "Nearest"))
-        if(interpolation_mode is "Bilinear"):
+        if(interpolation_mode == "Bilinear"):
             self.interpolation_mode = 0
         else:
             self.interpolation_mode = 1
