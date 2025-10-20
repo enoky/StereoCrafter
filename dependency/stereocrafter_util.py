@@ -4,17 +4,20 @@ import json
 import shutil
 import threading
 import tkinter as tk # Required for Tooltip class
-from tkinter import Toplevel, Label # Required for Tooltip class
+from tkinter import Toplevel, Label, ttk
 from typing import Optional, Tuple
 import logging
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from decord import VideoReader, cpu
 import subprocess
 import cv2
 import gc
 import time
+
+VERSION = "25-10-20.2"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -23,6 +26,157 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+# --- Global Flags ---
+CUDA_AVAILABLE = False
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self.show_delay = 600  # milliseconds
+        self.hide_delay = 100  # milliseconds
+        self.enter_id = None
+        self.leave_id = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
+
+    def show_tooltip(self, event=None):
+        if self.leave_id: self.widget.after_cancel(self.leave_id)
+        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
+
+    def _display_tooltip(self):
+        if self.tooltip_window or not self.text: return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() +20
+        self.tooltip_window = Toplevel(self.widget)
+        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
+        self.tooltip_window.wm_geometry(f"+{x}+{y}")
+
+        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
+                      justify="left", wraplength=250)
+        label.pack(ipadx=1)
+
+    def hide_tooltip(self, event=None):
+        if self.enter_id: self.widget.after_cancel(self.enter_id)
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
+
+class SidecarConfigManager:
+    """Handles reading, writing, and merging of stereocrafter sidecar files."""
+
+    # 1. CENTRAL KEY MAP: {JSON_KEY: (Python_Type, Default_Value)}
+    # NOTE: Decimal places removed, as rounding is now handled by the GUI slider
+    SIDECAR_KEY_MAP = {
+        "convergence_plane": (float, 0.5), 
+        "max_disparity": (float, 20.0),
+        "gamma": (float, 1.0), 
+        "frame_overlap": (float, 0.0),
+        "input_bias": (float, 0.0),
+        # Add future keys here
+    }
+
+    def _get_defaults(self) -> dict:
+        """Returns a dictionary populated with all default values."""
+        defaults = {}
+        # Iterate over the new map structure: key, (expected_type, default_val)
+        for key, (_, default_val) in self.SIDECAR_KEY_MAP.items(): 
+            defaults[key] = default_val
+        return defaults
+
+    def get_merged_config(self, sidecar_path: str, gui_config: dict, override_keys: list) -> dict:
+        """
+        Merges sidecar data with GUI configuration, allowing specific keys to 
+        be overridden by GUI values.
+        
+        gui_config must use the same JSON keys as the sidecar file.
+        """
+        # 1. Load the sidecar data (base config, merged with defaults)
+        merged_config = self.load_sidecar_data(sidecar_path)
+
+        # 2. Apply GUI overrides
+        for key in override_keys:
+            if key in gui_config and key in self.SIDECAR_KEY_MAP:
+                # Get the expected type from the map
+                expected_type = self.SIDECAR_KEY_MAP[key][0]
+                
+                # Attempt to cast the GUI value to the expected type
+                try:
+                    val = gui_config[key]
+                    if expected_type == float:
+                        merged_config[key] = float(val)
+                    elif expected_type == int:
+                        merged_config[key] = int(val)
+                    else:
+                        merged_config[key] = val
+                except (ValueError, TypeError):
+                    logger.warning(f"GUI value for '{key}' is invalid ({gui_config[key]}). Skipping override.")
+        
+        return merged_config
+     
+    def load_sidecar_data(self, file_path: str) -> dict:
+        """
+        Loads and validates sidecar data, returning a dictionary merged with defaults.
+        Returns defaults if file is not found or invalid.
+        """
+        data = self._get_defaults()
+        if not os.path.exists(file_path):
+            logger.debug(f"Sidecar not found at {file_path}. Returning defaults.")
+            return data
+
+        try:
+            with open(file_path, 'r') as f:
+                sidecar_json = json.load(f)
+
+            # Iterate over the new map structure: key, (expected_type, default_val)
+            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
+                if key in sidecar_json:
+                    val = sidecar_json[key]
+                    try:
+                        # Attempt to cast the value to the expected type
+                        if expected_type == int:
+                            data[key] = int(val)
+                        elif expected_type == float:
+                            data[key] = float(val)
+                        # Future: Add other types here
+                    except (ValueError, TypeError):
+                        logger.warning(f"Sidecar key '{key}' has invalid value/type. Using default.")
+
+        except Exception as e:
+            logger.error(f"Failed to read/parse sidecar at {file_path}: {e}")
+            # Still return defaults + whatever valid data was read before the failure
+        
+        return data
+
+    def save_sidecar_data(self, file_path: str, data: dict) -> bool:
+        """
+        Saves a dictionary to the sidecar file, ensuring the directory and file are created.
+        No rounding is applied here, assuming input data is pre-rounded.
+        """
+        try:
+            # 1. Ensure directory exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            # 2. Filter data (No rounding step needed)
+            output_data = {}
+            # Iterate over the new map structure: key, (expected_type, default_val)
+            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
+                if key in data:
+                    output_data[key] = data[key]
+
+            # 3. Write to file (mode 'w' creates the file if it doesn't exist)
+            with open(file_path, 'w') as f:
+                json.dump(output_data, f, indent=4)
+            
+            logger.debug(f"Sidecar saved successfully to {file_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save sidecar to {file_path}: {e}")
+            return False
 
 def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
     """
@@ -71,6 +225,253 @@ def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor)
         logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
         return target_frame
 
+def create_single_slider_with_label_updater(
+    GUI_self,
+    parent: ttk.Frame, 
+    text: str, 
+    var: tk.Variable, 
+    from_: float, 
+    to: float, 
+    row: int, 
+    decimals: int = 0,
+    tooltip_key: Optional[str] = None,
+) -> None:
+    """Creates a single slider, its value label, and all necessary event bindings."""
+    
+    LABEL_FIXED_WIDTH = 8
+    # 1. Widgets
+    label = ttk.Label(parent, text=text, anchor="e")
+    label.grid(row=row, column=0, sticky="ew", padx=0, pady=2)
+    slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
+    slider.grid(row=row, column=1, sticky="ew", padx=2)
+    value_label = ttk.Label(parent, text="") # Start with empty text
+    value_label.grid(row=row, column=2, sticky="w", padx=0)
+    
+    # Column 0 (Label) has no weight (fixed width via 'width' option)
+    # Column 1 (Slider) must have weight=1 to expand
+    parent.grid_columnconfigure(0, weight=0)
+    parent.grid_columnconfigure(1, weight=1)
+    parent.grid_columnconfigure(2, weight=0)
+
+    # --- Tooltip and State Management ---
+    if tooltip_key and hasattr(GUI_self, '_create_hover_tooltip'):
+        # Apply tooltip to both the label and the slider for better UX
+        GUI_self._create_hover_tooltip(label, tooltip_key)
+        GUI_self._create_hover_tooltip(slider, tooltip_key) # <--- Apply to slider
+
+    # 2. Command/Update Logic
+    def update_label_and_preview(value_str: str) -> None:
+        """Updates the text label. Called by user interaction."""
+        try:
+            # Only update the label with the formatted display value
+            value_label.config(text=f"{float(value_str):.{decimals}f}")
+        except ValueError:
+            pass
+
+    def set_value_and_update_label(new_value: float) -> None:
+        """Programmatically sets the slider's value and updates its label."""
+        rounded_value = round(new_value, decimals)
+        var.set(rounded_value)
+        value_label.config(text=f"{rounded_value:.{decimals}f}")
+
+    def on_trough_click(event):
+        """Handles clicks on the slider's trough for precise positioning."""
+        if 'trough' in slider.identify(event.x, event.y):
+            slider.update_idletasks()
+            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+            
+            # Use the decimals to round the new_value
+            rounded_value = round(new_value, decimals)
+            
+            # Set the rounded value immediately
+            var.set(rounded_value) 
+            
+            # Manually update the label's text (this is the missing piece for trough click!)
+            update_label_and_preview(str(rounded_value)) # <--- Ensures label update
+            
+            # Manually trigger preview update
+            GUI_self.on_slider_release(event) 
+            return "break"
+
+    # 3. Bindings & Configuration
+    slider.configure(command=update_label_and_preview)
+    slider.bind("<ButtonRelease-1>", GUI_self.on_slider_release)
+    slider.bind("<Button-1>", on_trough_click) # Trough click handler    
+    update_label_and_preview(str(var.get()))
+
+    # --- Tooltip and State Management ---
+    # Assuming GUI_self has _create_hover_tooltip and widgets_to_disable
+    help_key = text.lower().replace(":", "").replace(" ", "_").replace(".", "")
+    if hasattr(GUI_self, '_create_hover_tooltip'):
+        GUI_self._create_hover_tooltip(label, help_key)
+        
+    if hasattr(GUI_self, 'slider_label_updaters'):
+        GUI_self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get()))
+        
+    if hasattr(GUI_self, 'widgets_to_disable'):
+        GUI_self.widgets_to_disable.append(slider)
+
+def create_dual_slider_layout(
+    GUI_self,
+    parent: ttk.Frame, 
+    text_x: str, 
+    text_y: str, 
+    var_x: tk.Variable, 
+    var_y: tk.Variable, 
+    from_: float, 
+    to: float, 
+    row: int, 
+    decimals: int = 0,
+    is_integer: bool = True,
+    tooltip_key_x: Optional[str] = None,
+    tooltip_key_y: Optional[str] = None,
+) -> None:
+    """
+    Creates a dual (X/Y) slider layout by composing two single sliders.
+    The layout uses one grid row in the parent, with two packed sub-frames.
+    
+    NOTE: The single slider helper must be adapted to use PACK for its internal widgets
+          or this function must manually place the output of the single slider.
+          Since the single slider currently uses GRID (row=row, col=0, 1, 2) this composition
+          needs to ensure the inner frames only use row 0.
+    """
+    
+    # 1. Create a container frame that will sit in the parent's grid
+    xy_frame = ttk.Frame(parent)
+    xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=0)
+    
+    # Configure the container to hold two expanding columns
+    xy_frame.grid_columnconfigure(0, weight=1)
+    xy_frame.grid_columnconfigure(1, weight=1)
+    
+    # --- X SLIDER ---
+    x_inner_frame = ttk.Frame(xy_frame)
+    x_inner_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+    x_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
+    
+    # Call the single slider creator for the X components.
+    # We pass the inner frame, and it will use its grid (row=0, col=0, 1, 2)
+    create_single_slider_with_label_updater(
+        GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals, 
+        tooltip_key=tooltip_key_x)
+    
+    # --- Y SLIDER ---
+    y_inner_frame = ttk.Frame(xy_frame)
+    y_inner_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+    y_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
+
+    # Call the single slider creator for the Y components.
+    create_single_slider_with_label_updater(
+        GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals, 
+        tooltip_key=tooltip_key_y)
+
+def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+    """
+    Applies dilation with separate X and Y kernel sizes to a tensor.
+    Expects a 4D tensor (B, C, H, W).
+    """
+    k_x = int(kernel_size_x)
+    k_y = int(kernel_size_y)
+    if k_x <= 0 or k_y <= 0:
+        return tensor
+
+    # GaussianBlur requires odd kernel sizes (Adjusted k_x/k_y logic removed for Dilate, but kept for Blur)
+    # The fix for unstable 1x1 GPU convolution is no longer needed as we permanently force CPU below.
+    
+    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
+    tensor = tensor.to(device)
+
+    if False: # <--- BYPASSING GPU PATH FOR STABILITY
+        padding_x = k_x // 2
+        padding_y = k_y // 2
+        # Ensure padding is not greater than half the kernel size
+        padding_x = min(padding_x, (k_x - 1) // 2)
+        padding_y = min(padding_y, (k_y - 1) // 2)
+        return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=(padding_y, padding_x))
+    else:
+        # FIXED CPU path
+        processed_frames = []
+        for t in range(tensor.shape[0]):
+            # Get frame (C, H, W) and scale to uint8
+            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
+            
+            # Convert to OpenCV format: (H, W) or (H, W, C)
+            if frame_np.shape[0] == 1:
+                # Single channel: remove channel dim for OpenCV
+                frame_np = frame_np[0]  # shape: (H, W)
+            else:
+                # Multi-channel: transpose to (H, W, C) for OpenCV
+                frame_np = np.transpose(frame_np, (1, 2, 0))
+            
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
+            dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
+            
+            # Convert back to PyTorch format: (C, H, W)
+            if len(dilated_np.shape) == 2:
+                # Single channel: add channel dimension back
+                dilated_np = dilated_np[np.newaxis, :, :]  # shape: (1, H, W)
+            else:
+                # Multi-channel: transpose back to (C, H, W)
+                dilated_np = np.transpose(dilated_np, (2, 0, 1))
+            
+            dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
+            processed_frames.append(dilated_tensor)
+        
+        return torch.stack(processed_frames).to(tensor.device)
+
+def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+    """
+    Applies Gaussian blur with separate X and Y kernel sizes to a tensor.
+    Expects a 4D tensor (B, C, H, W).
+    """
+    k_x = int(kernel_size_x)
+    k_y = int(kernel_size_y)
+    if k_x <= 0 or k_y <= 0:
+        return tensor
+
+    # GaussianBlur requires odd kernel sizes
+    k_x_orig, k_y_orig = k_x, k_y 
+    k_x = k_x if k_x % 2 == 1 else k_x + 1
+    k_y = k_y if k_y % 2 == 1 else k_y + 1
+
+    if k_x != k_x_orig or k_y != k_y_orig:
+        logger.debug(f"custom_blur: Adjusted kernel from {k_x_orig}x{k_y_orig} to odd size {k_x}x{k_y}.")
+    
+    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
+    tensor = tensor.to(device)
+
+    if False: # <--- BYPASSING GPU PATH FOR STABILITY
+        # ... (GPU logic removed) ...
+        pass
+    else:
+        # FIXED CPU path
+        processed_frames = []
+        for t in range(tensor.shape[0]):
+            # Get frame (C, H, W) and scale to uint8
+            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
+            
+            # Convert to OpenCV format: (H, W) or (H, W, C)
+            if frame_np.shape[0] == 1:
+                # Single channel: remove channel dim for OpenCV
+                frame_np = frame_np[0]  # shape: (H, W)
+            else:
+                # Multi-channel: transpose to (H, W, C) for OpenCV
+                frame_np = np.transpose(frame_np, (1, 2, 0))
+
+            blurred_np = cv2.GaussianBlur(frame_np, (k_x, k_y), 0)
+            
+            # Convert back to PyTorch format: (C, H, W)
+            if len(blurred_np.shape) == 2:
+                # Single channel: add channel dimension back
+                blurred_np = blurred_np[np.newaxis, :, :]  # shape: (1, H, W)
+            else:
+                # Multi-channel: transpose back to (C, H, W)
+                blurred_np = np.transpose(blurred_np, (2, 0, 1))
+
+            blurred_tensor = torch.from_numpy(blurred_np).float() / 255.0
+            processed_frames.append(blurred_tensor)
+            
+        return torch.stack(processed_frames).to(tensor.device)
 
 def set_util_logger_level(level):
     """Sets the logging level for the 'stereocrafter_util' logger."""
@@ -79,46 +480,6 @@ def set_util_logger_level(level):
     # Ensure handlers also reflect the new level.
     for handler in logger.handlers:
         handler.setLevel(level)
-        
-# --- Global Flags ---
-CUDA_AVAILABLE = False
-
-# --- Tooltip Class ---
-class Tooltip:
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tooltip_window = None
-        self.show_delay = 500  # milliseconds
-        self.hide_delay = 100  # milliseconds
-        self.enter_id = None
-        self.leave_id = None
-        self.widget.bind("<Enter>", self.show_tooltip)
-        self.widget.bind("<Leave>", self.hide_tooltip)
-        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
-
-    def show_tooltip(self, event=None):
-        if self.leave_id: self.widget.after_cancel(self.leave_id)
-        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
-
-    def _display_tooltip(self):
-        if self.tooltip_window or not self.text: return
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5 # Position below the widget
-        self.tooltip_window = Toplevel(self.widget)
-        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
-        self.tooltip_window.wm_geometry(f"+{x}+{y}")
-
-        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
-                      justify="left", wraplength=250)
-        label.pack(ipadx=1)
-
-    def hide_tooltip(self, event=None):
-        if self.enter_id: self.widget.after_cancel(self.enter_id)
-        if self.tooltip_window:
-            self.tooltip_window.destroy()
-        self.tooltip_window = None
-# --- END Tooltip Class ---
 
 def check_cuda_availability():
     """
@@ -131,7 +492,7 @@ def check_cuda_availability():
         try:
             # Further check with nvidia-smi for robustness
             subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding='utf-8')
-            logger.info("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
+            logger.debug("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
             CUDA_AVAILABLE = True
         except FileNotFoundError:
             logger.warning("nvidia-smi not found. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report.")
@@ -148,6 +509,7 @@ def check_cuda_availability():
     else:
         logger.info("PyTorch reports CUDA is NOT available. NVENC will not be used.")
         CUDA_AVAILABLE = False
+    return CUDA_AVAILABLE
 
 def release_cuda_memory():
     """Releases GPU memory and performs garbage collection."""
@@ -165,7 +527,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     Extracts comprehensive video stream metadata using ffprobe.
     Returns a dict with relevant color properties, codec, pixel format, and HDR mastering metadata
     or None if ffprobe fails/info not found.
-    Requires ffprobe to be installed and in PATH.
+    Requires ffprobe to be installed and in your system PATH.
     This function *does not* show messageboxes; the caller should handle errors.
     """
     cmd = [
@@ -444,7 +806,7 @@ def encode_frames_to_mp4(
             default_cpu_crf = "18" # For CPU x264 (SDR 8-bit, higher quality)
         output_profile = "main"
 
-    logger.debug("default_cpu_crf = {default_cpu_crf}")
+    logger.debug(f"default_cpu_crf = {default_cpu_crf}")
     # Add codec, profile, pix_fmt
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
@@ -552,9 +914,6 @@ def encode_frames_to_mp4(
     logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
     return True
 
-# ======================================================================================
-# NEW FUNCTION FOR DIRECT PIPING TO FFmpeg
-# ======================================================================================
 def start_ffmpeg_pipe_process(
     content_width: int,
     content_height: int,

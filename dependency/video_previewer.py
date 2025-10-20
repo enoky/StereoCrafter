@@ -2,7 +2,7 @@ import os
 import gc
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Union
 import torch
 import numpy as np
 from PIL import Image, ImageTk
@@ -11,6 +11,8 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
+VERSION = "25-10-20.1"
+
 class VideoPreviewer(ttk.Frame):
     """
     A self-contained Tkinter widget for previewing video processing results.
@@ -18,11 +20,22 @@ class VideoPreviewer(ttk.Frame):
     This module handles:
     - Displaying a preview image on a scrollable canvas.
     - Navigating through a list of videos.
-    - Scrubbing through the timeline of the current video.
+    - Scrubbing through the timeline of the current video. 
     - Loading single frames from multiple source videos.
     - Calling a user-provided processing function to generate the preview.
     """
-    def __init__(self, parent, processing_callback: Callable, find_sources_callback: Optional[Callable] = None, get_params_callback: Optional[Callable] = None, help_data: Dict[str, str] = None, **kwargs):
+    def __init__(
+            self,
+            parent,
+            processing_callback: Callable,
+            find_sources_callback: Optional[Callable] = None,
+            get_params_callback: Optional[Callable] = None,
+            help_data: Dict[str, str] = None,
+            preview_size_var: Optional[tk.StringVar] = None,
+            resize_callback: Optional[Callable] = None,
+            update_clip_callback: Optional[Callable] = None,
+            **kwargs,
+        ):
         """
         Initializes the VideoPreviewer frame.
 
@@ -37,6 +50,8 @@ class VideoPreviewer(ttk.Frame):
             get_params_callback (Callable, optional): A function that returns the current
                 dictionary of parameters from the main GUI.
             help_data (Dict[str, str], optional): A dictionary of help texts for tooltips.
+            preview_size_var (tk.StringVar, optional): The variable from the parent GUI to control preview size.
+            resize_callback (Callable, optional): A function to call to ask the parent window to resize itself.
         """
         super().__init__(parent, **kwargs)
         self.parent = parent
@@ -44,28 +59,36 @@ class VideoPreviewer(ttk.Frame):
         self.help_data = help_data if help_data else {}
         self.find_sources_callback = find_sources_callback
         self.get_params_callback = get_params_callback
+        self.preview_size_var = preview_size_var # Store the passed-in variable
+        self.resize_callback = resize_callback # Store the resize callback
+        self.update_clip_callback = update_clip_callback
 
         # --- State ---
-        self.source_readers: Dict[str, VideoReader] = {}
+        self.source_readers: Dict[str, Optional[VideoReader]] = {}
         self.video_list: list[Dict[str, str]] = []
         self.current_video_index: int = -1
         self.current_params: Dict[str, Any] = {}
         self.pil_image_for_preview: Optional[Image.Image] = None
         self.preview_image_tk: Optional[ImageTk.PhotoImage] = None
         self.wiggle_after_id: Optional[str] = None
+        self.last_loaded_video_path: Optional[str] = None
+        self.last_loaded_frame_index: int = 0 
 
         # --- GUI Variables ---
         self.frame_scrubber_var = tk.DoubleVar(value=0)
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
+        self._is_dragging = False
 
         self._create_widgets()
 
-    def _create_hover_tooltip(self, widget, help_key):
+    def _create_hover_tooltip(self, widget, help_key, tooltip_info: Optional[str] = None):
         """Creates a mouse-over tooltip for the given widget."""
         if help_key in self.help_data:
             Tooltip(widget, self.help_data[help_key])
+        elif tooltip_info:
+            Tooltip(widget, tooltip_info)
 
     def _create_widgets(self):
         """Creates and lays out all the widgets for the previewer."""
@@ -90,6 +113,18 @@ class VideoPreviewer(ttk.Frame):
         self.preview_canvas_window_id = self.preview_canvas.create_window((0, 0), window=self.preview_inner_frame, anchor="nw")
         self.preview_label = ttk.Label(self.preview_inner_frame, text="Load a video list to see preview", anchor="center")
         self.preview_label.pack(fill="both", expand=True)
+        
+        # self.preview_canvas.itemconfig(self.preview_canvas_window_id, tags=("content_drag_tag",))
+        # # Start: Call scan_mark and return break
+        # self.preview_label.bind("<ButtonPress-1>", 
+        #                         lambda e: (self.preview_canvas.scan_mark(e.x, e.y), "break")[1])
+        
+        # # Drag: Call scan_dragto and return break
+        # self.preview_label.bind("<B1-Motion>", 
+        #                         lambda e: (self.preview_canvas.scan_dragto(e.x, e.y, gain=1), "break")[1])
+        
+        # # End: Call the method to clear the cursor
+        # self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
 
         # Scrubber Frame
         scrubber_frame = ttk.Frame(self)
@@ -109,30 +144,72 @@ class VideoPreviewer(ttk.Frame):
         preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
 
         # Add Preview Source dropdown
-        ttk.Label(preview_button_frame, text="Preview Source:").pack(side="left", padx=(0, 5))
+        lbl_preview_source = ttk.Label(preview_button_frame, text="Preview Source:")
+        lbl_preview_source.pack(side="left", padx=(0, 5))
         self.preview_source_combo = ttk.Combobox(preview_button_frame, state="readonly", width=18)
         self.preview_source_combo.pack(side="left", padx=5)
         self.preview_source_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
-        self._create_hover_tooltip(self.preview_source_combo, "preview_source")
+        tip_preview_source = "Select which image layer to display in the preview window for diagnostic purposes."
+        self._create_hover_tooltip(lbl_preview_source, "preview_source", tip_preview_source)
+        self._create_hover_tooltip(self.preview_source_combo, "preview_source", tip_preview_source)
 
         self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._handle_load_refresh, width=20)
         self.load_preview_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.load_preview_button, "load_refresh_list")
+        tip_load_refresh_list = "Scans the 'Inpainted Video Folder' for valid files and loads the first one for preview."
+        self._create_hover_tooltip(self.load_preview_button, "load_refresh_list", tip_load_refresh_list)
 
         self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1))
         self.prev_video_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.prev_video_button, "prev_video")
+        self._create_hover_tooltip(self.prev_video_button, "prev_video", "Load the previous video in the list for preview.")
 
         self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1))
         self.next_video_button.pack(side="left", padx=5)
-        self._create_hover_tooltip(self.next_video_button, "next_video")
+        self._create_hover_tooltip(self.next_video_button, "next_video", "Load the next video in the list for preview.")
 
-        ttk.Label(preview_button_frame, text="Jump to:").pack(side="left", padx=(15, 2))
+        lbl_video_jump_entry = ttk.Label(preview_button_frame, text="Jump to:")
+        lbl_video_jump_entry.pack(side="left", padx=(15, 2))
         self.video_jump_entry = ttk.Entry(preview_button_frame, textvariable=self.video_jump_to_var, width=5)
         self.video_jump_entry.pack(side="left")
         self.video_jump_entry.bind("<Return>", self._jump_to_video)
-        self._create_hover_tooltip(self.video_jump_entry, "jump_to_video")
-        ttk.Label(preview_button_frame, textvariable=self.video_status_label_var).pack(side="left", padx=5)
+        lbl_video_jump_info = ttk.Label(preview_button_frame, textvariable=self.video_status_label_var)
+        lbl_video_jump_info.pack(side="left", padx=5)
+        tip_jump_to_video = "Enter a video number and press Enter to jump directly to it in the list."
+        tip_jump_info ="Displys which frame number from total number of frames. (Current_frame/Total_frames)"
+        self._create_hover_tooltip(lbl_video_jump_entry, "jump_to_video", tip_jump_to_video)
+        self._create_hover_tooltip(self.video_jump_entry, "jump_to_video", tip_jump_to_video)
+        self._create_hover_tooltip(lbl_video_jump_info, "jump_to_info", tip_jump_info)
+
+        
+        # --- MODIFIED: Add Preview Size Combobox (Percentage Scale) ---
+        PERCENTAGE_VALUES = ["200%", "150%", "100%", "75%", "50%", "25%"]
+        
+        lbl_preview_scale = ttk.Label(preview_button_frame, text="Preview Scale:")
+        lbl_preview_scale.pack(side="left", padx=(20, 5))
+        tip_preview_scale = "Select the size of the video preview. Larger images may impact performance."
+        self._create_hover_tooltip(lbl_preview_scale, "preview_scale", tip_preview_scale)
+        
+        self.preview_size_combo = ttk.Combobox(
+            preview_button_frame, 
+            textvariable=self.preview_size_var, 
+            values=PERCENTAGE_VALUES, 
+            state="readonly", # Make it selection-only
+            width=7
+        )
+        self.preview_size_combo.pack(side="left")
+        self._create_hover_tooltip(self.preview_size_combo, "preview_scale", tip_preview_scale)
+        
+        # We need to explicitly bind the ComboboxSelected event to update the preview
+        self.preview_size_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
+        
+        self._create_hover_tooltip(self.preview_size_combo, "preview_size", tip_preview_scale)
+        
+        # Re-assign to a variable name used later for disabling/enabling
+        self.preview_size_entry = self.preview_size_combo 
+        # --- END MODIFIED ---
+
+        # --- NEW: Store widgets to be disabled ---
+        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button,
+                                   self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_combo]
 
     def set_parameters(self, params: Dict[str, Any]):
         """
@@ -152,6 +229,20 @@ class VideoPreviewer(ttk.Frame):
         elif options:
             self.preview_source_combo.set(options[0])
 
+    def set_ui_processing_state(self, is_processing: bool):
+        """
+        Disables or enables all interactive widgets in the previewer during batch processing.
+        """
+        state = "disabled" if is_processing else "normal"
+        for widget in self.widgets_to_disable:
+            try:
+                # Special handling for combobox which uses 'readonly' instead of 'normal'
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="disabled" if is_processing else "readonly")
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                pass # Ignore if widgets don't exist yet
 
     def _handle_load_refresh(self):
         """Internal handler for the 'Load/Refresh List' button."""
@@ -168,8 +259,6 @@ class VideoPreviewer(ttk.Frame):
         Args:
             find_sources_callback (Callable): A function that returns a list of dictionaries.
         """
-        self._clear_preview_resources()
-
         self.video_list = find_sources_callback()
 
         if not self.video_list:
@@ -178,7 +267,22 @@ class VideoPreviewer(ttk.Frame):
             self._update_nav_controls()
             return
 
-        self.current_video_index = 0
+        target_index = 0
+        
+        if self.last_loaded_video_path:
+            # Search for the index matching the last loaded path
+            for i, source_dict in enumerate(self.video_list):
+                if source_dict.get('source_video') == self.last_loaded_video_path:
+                    target_index = i
+                    logger.debug(f"Last loaded video path found at new index: {target_index}")
+                    break
+            else:
+                # Path not found (e.g., file was removed/renamed)
+                self.last_loaded_frame_index = 0 # Reset frame scrubber
+                logger.debug("Last loaded video path NOT found in new list. Resetting to index 0.")
+
+
+        self.current_video_index = target_index # Use the recalled or default index
         self._load_preview_by_index(self.current_video_index)
 
     def update_preview(self):
@@ -220,17 +324,37 @@ class VideoPreviewer(ttk.Frame):
                 return # The wigglegram animation loop will handle the display.
             # --- END FIX ---
 
-            # Resize for display if too large, maintaining aspect ratio
-            max_size = int(self.current_params.get("preview_size", 1000))
+            # --- MODIFIED: Calculate scale factor from percentage string and apply resizing ---
+            scale_percent_str = self.current_params.get("preview_size", "100%")
             display_image = self.pil_image_for_preview.copy()
-            if display_image.height > max_size or display_image.width > max_size:
-                display_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+            try:
+                scale_factor = float(scale_percent_str.strip('%')) / 100.0
+            except ValueError:
+                scale_factor = 1.0
+                logger.warning(f"Invalid preview scale '{scale_percent_str}', defaulting to 100%.")
+
+            if scale_factor != 1.0 and scale_factor > 0:
+                new_width = int(display_image.width * scale_factor)
+                new_height = int(display_image.height * scale_factor)
+                
+                # Use Image.resize to handle both scaling up and scaling down
+                display_image = display_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.debug(f"Preview scaled by {scale_percent_str} to {new_width}x{new_height}.")
+            # --- END MODIFIED ---
 
             self.preview_image_tk = ImageTk.PhotoImage(display_image)
             # --- FIX: Attach the image reference to the widget to prevent garbage collection ---
             self.preview_label.config(image=self.preview_image_tk, text="")
             self.preview_label.image = self.preview_image_tk
             # --- END FIX ---
+
+            # --- NEW: Trigger parent window resize ---
+            # if self.resize_callback:
+            #     # Force the parent to update its layout to see the new image size
+            #     self.parent.update_idletasks()
+            #     self.resize_callback()
+            # --- END NEW ---
             self._update_preview_layout()
 
         except Exception as e:
@@ -251,6 +375,7 @@ class VideoPreviewer(ttk.Frame):
         frame_idx = int(float(value))
         total_frames = int(self.frame_scrubber.cget("to")) + 1
         self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
+        self.last_loaded_frame_index = frame_idx
 
     def _on_scrubber_trough_click(self, event):
         """Handles clicks on the frame scrubber's trough for precise positioning."""
@@ -293,13 +418,26 @@ class VideoPreviewer(ttk.Frame):
         self._clear_preview_resources()
 
         if not (0 <= index < len(self.video_list)):
+            self.last_loaded_video_path = None
             return
 
         self.current_video_index = index
         self._update_nav_controls()
 
         source_paths = self.video_list[index]
-        base_name = os.path.basename(next(iter(source_paths.values()))) # Get name from first path
+        base_name = os.path.basename(next(iter(source_paths.values())))
+        
+        main_source_path = source_paths.get('source_video', None)
+
+        initial_frame = 0
+        if main_source_path == self.last_loaded_video_path:
+            # If the path is the SAME, retain the last frame index.
+            initial_frame = self.last_loaded_frame_index
+        else:
+            # If the path is DIFFERENT (new video), reset frame index to 0.
+            self.last_loaded_frame_index = 0
+            
+        self.last_loaded_video_path = main_source_path
 
         self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
         self.parent.update_idletasks()
@@ -324,8 +462,11 @@ class VideoPreviewer(ttk.Frame):
 
             # Configure the scrubber
             self.frame_scrubber.config(to=num_frames - 1)
-            self.frame_scrubber_var.set(0)
-            self.on_scrubber_move(0) # Update label
+            initial_frame = min(initial_frame, num_frames - 1) 
+            self.frame_scrubber_var.set(initial_frame)
+            self.on_scrubber_move(initial_frame)
+            if self.update_clip_callback:
+                self.update_clip_callback()
 
             self.update_preview()
 
@@ -403,24 +544,81 @@ class VideoPreviewer(ttk.Frame):
             self.wiggle_after_id = None
         if hasattr(self, 'wiggle_left_tk'): del self.wiggle_left_tk
         if hasattr(self, 'wiggle_right_tk'): del self.wiggle_right_tk
+    
+    def _start_drag_scroll(self, event):
+        """Records the starting position for a drag-to-scroll operation using scan_mark."""
+        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
+            self._is_dragging = True
+            self.preview_canvas.config(cursor="fleur")
+            
+            # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+            content_x = int(self.preview_canvas.canvasx(event.x))
+            content_y = int(self.preview_canvas.canvasy(event.y))
+            
+            self.preview_canvas.scan_mark(content_x, content_y)
+            logger.debug(f"_start_drag_scroll: Scan Mark at X={content_x}, Y={content_y}")
+        else:
+            logger.debug("_start_drag_scroll: Drag ignored.")
+            
+        # Reset the jump counter/filter (if you still have it, for safety)
+        if hasattr(self, '_consecutive_jumps'):
+            self._consecutive_jumps = 0
+            
+    def _drag_scroll(self, event):
+        """Scrolls the canvas using scan_dragto."""
+        if not self._is_dragging:
+            return
 
+        # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+        content_x = int(self.preview_canvas.canvasx(event.x))
+        content_y = int(self.preview_canvas.canvasy(event.y))
+
+        # Drag the canvas view based on the current cursor position
+        self.preview_canvas.scan_dragto(content_x, content_y, gain=5) 
+        
+        logger.debug(f"_drag_scroll: Scan DragTo at X={content_x}, Y={content_y}")
+
+    def _end_drag_scroll(self, event):
+        """Ends the drag-to-scroll operation."""
+        if self._is_dragging:
+            self._is_dragging = False
+            self.preview_canvas.config(cursor="")
+            logger.debug("_end_drag_scroll: Dragging ended.")
+        
+    # AND BINDINGS (in _create_widgets):
+        self.preview_label.bind("<ButtonPress-1>", 
+                                lambda e: (self._start_drag_scroll(e), "break")[1])
+        self.preview_label.bind("<B1-Motion>", 
+                                lambda e: (self._drag_scroll(e), "break")[1])
+        self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
+                
     def _start_wigglegram_animation(self, left_frame: torch.Tensor, right_frame: torch.Tensor):
         """Starts the wigglegram animation loop."""
         self._stop_wigglegram_animation()
 
-        max_size = int(self.preview_size_var.get())
-        
-        left_np = (left_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        left_pil = Image.fromarray(left_np)
-        if left_pil.height > max_size or left_pil.width > max_size:
-            left_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        self.wiggle_left_tk = ImageTk.PhotoImage(left_pil)
+        # --- MODIFIED: Use percentage scaling for wigglegram frames ---
+        scale_percent_str = self.preview_size_var.get()
+        try:
+            scale_factor = float(scale_percent_str.strip('%')) / 100.0
+        except ValueError:
+            scale_factor = 1.0
 
-        right_np = (right_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        right_pil = Image.fromarray(right_np)
-        if right_pil.height > max_size or right_pil.width > max_size:
-            right_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        self.wiggle_right_tk = ImageTk.PhotoImage(right_pil)
+        def scale_image_for_wiggle(frame_tensor: torch.Tensor) -> ImageTk.PhotoImage:
+            """Scales a single frame tensor to a PhotoImage using the calculated factor."""
+            frame_np = (frame_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(frame_np)
+            
+            if scale_factor != 1.0 and scale_factor > 0:
+                new_width = int(pil_img.width * scale_factor)
+                new_height = int(pil_img.height * scale_factor)
+                if new_width > 0 and new_height > 0:
+                    pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            return ImageTk.PhotoImage(pil_img)
+
+        self.wiggle_left_tk = scale_image_for_wiggle(left_frame)
+        self.wiggle_right_tk = scale_image_for_wiggle(right_frame)
+        # --- END MODIFIED ---
 
         self._wiggle_step(True)
 
@@ -454,6 +652,7 @@ class VideoPreviewer(ttk.Frame):
 
         if filepath:
             try:
+                # self.pil_image_for_preview already holds the correctly scaled image from update_preview
                 self.pil_image_for_preview.save(filepath)
                 logger.info(f"Preview frame saved to: {filepath}")
             except Exception as e:

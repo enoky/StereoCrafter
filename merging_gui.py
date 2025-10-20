@@ -20,11 +20,12 @@ import queue
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     release_cuda_memory, set_util_logger_level, encode_frames_to_mp4,
-    read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer
+    read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer,
+    create_single_slider_with_label_updater
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-14.1"
+GUI_VERSION = "25-10-17.2"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -121,7 +122,7 @@ class MergingGUI(ThemedTk):
         "pad_to_16_9": False,
         "enable_color_transfer": True,
         "batch_chunk_size": "20",
-        "preview_size": "1000",
+        "preview_size": "100%",
     }
 
     def __init__(self):
@@ -141,6 +142,7 @@ class MergingGUI(ThemedTk):
         self.is_processing = False
         self.cleanup_queue = queue.Queue()
 
+        self._is_startup = True # Flag to prevent resizing during initialization
         self.preview_original_left_tensor = None
         self.preview_blended_right_tensor = None
         # --- GUI Variables ---
@@ -168,7 +170,7 @@ class MergingGUI(ThemedTk):
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.batch_chunk_size_var = tk.StringVar(value=str(self.app_config.get("batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"])))        
         self.preview_source_var = tk.StringVar(value="Blended Image")
-        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", self.APP_DEFAULTS["preview_size"])))
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -184,6 +186,7 @@ class MergingGUI(ThemedTk):
 
         self._apply_theme()
         self._configure_logging() # Set initial logging level
+        self.after(0, lambda: setattr(self, '_is_startup', False)) # Set startup flag to false after GUI is built
         self.after(0, self._set_saved_geometry) # Restore window position
         self.protocol("WM_DELETE_WINDOW", self.exit_application)
 
@@ -296,6 +299,10 @@ class MergingGUI(ThemedTk):
         # This ensures the red text color is not overridden by the theme's default button style.
         self.style.configure('Loading.TButton', foreground='red')
 
+        # Adjust window height for new theme if not starting up
+        if not self._is_startup:
+            self._adjust_window_height_for_content()
+
     def show_about_dialog(self):
         """Displays an 'About' dialog for the application."""
         about_text = (
@@ -397,6 +404,53 @@ class MergingGUI(ThemedTk):
         logging.getLogger().setLevel(level)
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
 
+    def _adjust_window_height_for_content(self):
+        """Adjusts the window height to fit the current content, preserving user-set width."""
+        if self._is_startup: # Don't adjust during initial setup
+            return
+
+        current_actual_width = self.winfo_width()
+        if current_actual_width <= 1: # Fallback for very first call
+            current_actual_width = self.window_width
+
+        # --- NEW: More accurate height calculation ---
+        # --- FIX: Calculate base_height by summing widgets *other* than the previewer ---
+        # This is more stable than subtracting a potentially out-of-sync canvas height.
+        base_height = 0
+        for widget in self.winfo_children():
+            if widget is not self.previewer:
+                # --- FIX: Correctly handle tuple and int for pady ---
+                try:
+                    pady_value = widget.pack_info().get('pady', 0)
+                    total_pady = 0
+                    if isinstance(pady_value, int):
+                        total_pady = pady_value * 2
+                    elif isinstance(pady_value, (tuple, list)):
+                        total_pady = sum(pady_value)
+                    base_height += widget.winfo_reqheight() + total_pady
+                except tk.TclError:
+                    # This widget (e.g., the menubar) is not packed, so it has no pady.
+                    base_height += widget.winfo_reqheight()
+        # --- END FIX ---
+
+        # Get the actual height of the displayed preview image, if it exists
+        preview_image_height = 0
+        if hasattr(self.previewer, 'preview_image_tk') and self.previewer.preview_image_tk:
+            preview_image_height = self.previewer.preview_image_tk.height()
+
+        # Add a small buffer for padding/borders
+        padding = 10
+
+        # The new total height is the base UI height + the actual image height + padding
+        new_height = base_height + preview_image_height + padding
+        # --- END NEW ---
+
+        self.geometry(f"{current_actual_width}x{new_height}")
+        logger.debug(f"Content resize applied geometry: {current_actual_width}x{new_height}")
+        
+        # Update stored width and height for the next time save_config is called.
+        self.window_width = current_actual_width
+
     def _toggle_debug_logging(self):
         """Callback for the debug logging checkbox."""
         self._configure_logging()
@@ -467,6 +521,8 @@ class MergingGUI(ThemedTk):
             processing_callback=self._preview_processing_callback,
             find_sources_callback=self._find_preview_sources_callback,
             get_params_callback=self.get_current_settings, # Pass the settings getter
+            preview_size_var=self.preview_size_var, # Pass the preview size variable
+            resize_callback=self._adjust_window_height_for_content, # Pass the resize callback
             help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
@@ -484,55 +540,55 @@ class MergingGUI(ThemedTk):
         param_frame.pack(fill="x", padx=10, pady=5)
         param_frame.grid_columnconfigure(1, weight=1)
 
-        def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
-            """Creates a slider, its value label, and all necessary event bindings."""
-            label = ttk.Label(parent, text=text)
-            label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
-            slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
-            slider.grid(row=row, column=1, sticky="ew", padx=5)
-            value_label = ttk.Label(parent, text="", width=5) # Start with empty text
-            value_label.grid(row=row, column=2, sticky="w", padx=5)
+        # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
+        #     """Creates a slider, its value label, and all necessary event bindings."""
+        #     label = ttk.Label(parent, text=text)
+        #     label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        #     slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
+        #     slider.grid(row=row, column=1, sticky="ew", padx=5)
+        #     value_label = ttk.Label(parent, text="", width=5) # Start with empty text
+        #     value_label.grid(row=row, column=2, sticky="w", padx=5)
 
-            def update_label_and_preview(value_str: str) -> None:
-                """Updates the text label. Called by user interaction."""
-                value_label.config(text=f"{float(value_str):.{decimals}f}")
+        #     def update_label_and_preview(value_str: str) -> None:
+        #         """Updates the text label. Called by user interaction."""
+        #         value_label.config(text=f"{float(value_str):.{decimals}f}")
 
-            def set_value_and_update_label(new_value: float) -> None:
-                """Programmatically sets the slider's value and updates its label."""
-                var.set(new_value)
-                value_label.config(text=f"{new_value:.{decimals}f}")
-                logger.debug(f"new_value {new_value:.{decimals}f}")
+        #     def set_value_and_update_label(new_value: float) -> None:
+        #         """Programmatically sets the slider's value and updates its label."""
+        #         var.set(new_value)
+        #         value_label.config(text=f"{new_value:.{decimals}f}")
+        #         logger.debug(f"new_value {new_value:.{decimals}f}")
 
-            slider.configure(command=update_label_and_preview)
-            slider.bind("<ButtonRelease-1>", self.on_slider_release)
-            self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
-            self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
-            self.widgets_to_disable.append(slider)
+        #     slider.configure(command=update_label_and_preview)
+        #     slider.bind("<ButtonRelease-1>", self.on_slider_release)
+        #     self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
+        #     self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
+        #     self.widgets_to_disable.append(slider)
 
-            def on_trough_click(event):
-                """Handles clicks on the slider's trough for precise positioning."""
-                # Check if the click is on the trough to avoid interfering with handle drags
-                if 'trough' in slider.identify(event.x, event.y):
-                    # --- FIX: Force the widget to update its size info before calculating ---
-                    # This ensures winfo_width() is accurate, which is critical for fractional sliders.
-                    slider.update_idletasks()
-                    new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
-                    var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
-                    # --- FIX: Manually update the label's text after setting the variable ---
-                    value_label.config(text=f"{new_value:.{decimals}f}")
-                    self.on_slider_release(event) # Manually trigger preview update
-                    return "break" # IMPORTANT: Prevents the default slider click behavior
+        #     def on_trough_click(event):
+        #         """Handles clicks on the slider's trough for precise positioning."""
+        #         # Check if the click is on the trough to avoid interfering with handle drags
+        #         if 'trough' in slider.identify(event.x, event.y):
+        #             # --- FIX: Force the widget to update its size info before calculating ---
+        #             # This ensures winfo_width() is accurate, which is critical for fractional sliders.
+        #             slider.update_idletasks()
+        #             new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+        #             var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
+        #             # --- FIX: Manually update the label's text after setting the variable ---
+        #             value_label.config(text=f"{new_value:.{decimals}f}")
+        #             self.on_slider_release(event) # Manually trigger preview update
+        #             return "break" # IMPORTANT: Prevents the default slider click behavior
 
-            slider.bind("<Button-1>", on_trough_click)
+        #     slider.bind("<Button-1>", on_trough_click)
 
-        create_slider_with_label_updater(param_frame, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
-        create_slider_with_label_updater(param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
-        create_slider_with_label_updater(param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
-        create_slider_with_label_updater(param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
-        create_slider_with_label_updater(param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
-        create_slider_with_label_updater(param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
+        create_single_slider_with_label_updater(self, param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
@@ -562,13 +618,7 @@ class MergingGUI(ThemedTk):
         pad_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
         self.widgets_to_disable.append(pad_check)
-        
-        # Add Preview Size option
-        ttk.Label(options_frame, text="Preview Size:").pack(side="left", padx=(20, 5))
-        entry_preview = ttk.Entry(options_frame, textvariable=self.preview_size_var, width=7)
-        entry_preview.pack(side="left")
-        self._create_hover_tooltip(entry_preview, "preview_size")
-        self.widgets_to_disable.append(entry_preview)
+
         # Add Batch Chunk Size option
         ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
         entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7)
@@ -785,7 +835,7 @@ class MergingGUI(ThemedTk):
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
-                "preview_size": int(self.preview_size_var.get()),
+                "preview_size": self.preview_size_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
