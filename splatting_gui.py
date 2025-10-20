@@ -40,7 +40,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.20.3"
+GUI_VERSION = "25.10.20.4"
 MOVE_TO_FINISHED_ENABLED = True
 
 class ForwardWarpStereo(nn.Module):
@@ -1339,13 +1339,33 @@ class SplatterGUI(ThemedTk):
     def _find_preview_sources_callback(self) -> list:
         """
         Callback for VideoPreviewer. Scans for matching source video and depth map pairs.
+        Handles both folder (batch) and file (single) input modes.
         """
-        source_folder = self.input_source_clips_var.get()
-        depth_folder = self.input_depth_maps_var.get()
+        source_path = self.input_source_clips_var.get()
+        depth_path = self.input_depth_maps_var.get()
+        
+        # --- NEW SINGLE-FILE MODE CHECK ---
+        is_source_file = os.path.isfile(source_path)
+        is_depth_file = os.path.isfile(depth_path)
+        
+        if is_source_file and is_depth_file:
+            # Single file mode activated
+            logger.debug(f"Preview Scan: Single file mode detected. Source: {source_path}, Depth: {depth_path}")
+            # The previewer expects a list of dictionaries, even for a single file
+            return [{
+                'source_video': source_path,
+                'depth_map': depth_path
+            }]
+        # --- END NEW SINGLE-FILE MODE CHECK ---
 
-        if not os.path.isdir(source_folder) or not os.path.isdir(depth_folder):
-            logger.error("Preview Scan Failed: Input Source Clips and Input Depth Maps must both be valid directories for preview.")
+        # Fallback to Batch (Folder) mode check
+        if not os.path.isdir(source_path) or not os.path.isdir(depth_path):
+            logger.error("Preview Scan Failed: Inputs must either be two files or two valid directories.")
             return []
+
+        # The rest of the original batch/folder logic (using source_path/depth_path as folder variables)
+        source_folder = source_path
+        depth_folder = depth_path
 
         video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
         source_videos = []
