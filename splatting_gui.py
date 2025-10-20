@@ -40,7 +40,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.20.4"
+GUI_VERSION = "25.10.20.5"
 MOVE_TO_FINISHED_ENABLED = True
 
 class ForwardWarpStereo(nn.Module):
@@ -445,6 +445,7 @@ class SplatterGUI(ThemedTk):
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.debug_logging_var = tk.BooleanVar(value=self._debug_logging_enabled)
         self.help_menu.add_checkbutton(label="Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging)
+        self.help_menu.add_command(label="User Guide", command=self.show_user_guide)
         self.help_menu.add_separator()
 
         # Add "About" submenu (after "Debug Logging")
@@ -2870,6 +2871,56 @@ class SplatterGUI(ThemedTk):
             "\n(C) 2024 Some Rights Reserved"
         )
         tk.messagebox.showinfo("About Stereocrafter Splatting", message)
+
+    def show_user_guide(self):
+        """Reads and displays the user guide from a markdown file in a new window."""
+        # Use a path relative to the script's directory for better reliability
+        guide_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "merger_gui_guide.md")
+        try:
+            with open(guide_path, "r", encoding="utf-8") as f:
+                guide_content = f.read()
+        except FileNotFoundError:
+            messagebox.showerror("File Not Found", f"The user guide file could not be found at:\n{guide_path}")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred while reading the user guide:\n{e}")
+            return
+
+        # Determine colors based on current theme
+        if self.dark_mode_var.get():
+            bg_color, fg_color = "#2b2b2b", "white"
+        else:
+            # Use a standard light bg for text that's slightly different from the main window
+            bg_color, fg_color = "#fdfdfd", "black"
+
+        # Create a new Toplevel window
+        guide_window = tk.Toplevel(self)
+        guide_window.title("SplatterGUI - User Guide") # Corrected title
+        guide_window.geometry("600x700")
+        guide_window.transient(self) # Keep it on top of the main window
+        guide_window.grab_set()      # Modal behavior
+        guide_window.configure(bg=bg_color)
+
+        text_frame = ttk.Frame(guide_window, padding="10")
+        text_frame.configure(style="TFrame") # Ensure it follows the theme
+        text_frame.pack(expand=True, fill="both")
+
+        # Apply theme colors to the Text widget
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, relief="flat", borderwidth=0, padx=5, pady=5, font=("Segoe UI", 9),
+                              bg=bg_color, fg=fg_color, insertbackground=fg_color)
+        text_widget.insert(tk.END, guide_content)
+        text_widget.config(state=tk.DISABLED) # Make it read-only
+
+        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget['yscrollcommand'] = scrollbar.set
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.pack(side=tk.LEFT, expand=True, fill="both")
+
+        button_frame = ttk.Frame(guide_window, padding=(0, 0, 0, 10))
+        button_frame.pack()
+        ok_button = ttk.Button(button_frame, text="Close", command=guide_window.destroy)
+        ok_button.pack(pady=10)
 
     def start_processing(self):
         """Starts the video processing in a separate thread."""
