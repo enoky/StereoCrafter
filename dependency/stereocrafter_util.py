@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-20.1"
+VERSION = "25-10-20.2"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -26,6 +26,44 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+# --- Global Flags ---
+CUDA_AVAILABLE = False
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self.show_delay = 600  # milliseconds
+        self.hide_delay = 100  # milliseconds
+        self.enter_id = None
+        self.leave_id = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
+
+    def show_tooltip(self, event=None):
+        if self.leave_id: self.widget.after_cancel(self.leave_id)
+        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
+
+    def _display_tooltip(self):
+        if self.tooltip_window or not self.text: return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() +20
+        self.tooltip_window = Toplevel(self.widget)
+        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
+        self.tooltip_window.wm_geometry(f"+{x}+{y}")
+
+        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
+                      justify="left", wraplength=250)
+        label.pack(ipadx=1)
+
+    def hide_tooltip(self, event=None):
+        if self.enter_id: self.widget.after_cancel(self.enter_id)
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
 
 class SidecarConfigManager:
     """Handles reading, writing, and merging of stereocrafter sidecar files."""
@@ -49,6 +87,36 @@ class SidecarConfigManager:
             defaults[key] = default_val
         return defaults
 
+    def get_merged_config(self, sidecar_path: str, gui_config: dict, override_keys: list) -> dict:
+        """
+        Merges sidecar data with GUI configuration, allowing specific keys to 
+        be overridden by GUI values.
+        
+        gui_config must use the same JSON keys as the sidecar file.
+        """
+        # 1. Load the sidecar data (base config, merged with defaults)
+        merged_config = self.load_sidecar_data(sidecar_path)
+
+        # 2. Apply GUI overrides
+        for key in override_keys:
+            if key in gui_config and key in self.SIDECAR_KEY_MAP:
+                # Get the expected type from the map
+                expected_type = self.SIDECAR_KEY_MAP[key][0]
+                
+                # Attempt to cast the GUI value to the expected type
+                try:
+                    val = gui_config[key]
+                    if expected_type == float:
+                        merged_config[key] = float(val)
+                    elif expected_type == int:
+                        merged_config[key] = int(val)
+                    else:
+                        merged_config[key] = val
+                except (ValueError, TypeError):
+                    logger.warning(f"GUI value for '{key}' is invalid ({gui_config[key]}). Skipping override.")
+        
+        return merged_config
+     
     def load_sidecar_data(self, file_path: str) -> dict:
         """
         Loads and validates sidecar data, returning a dictionary merged with defaults.
@@ -110,36 +178,53 @@ class SidecarConfigManager:
             logger.error(f"Failed to save sidecar to {file_path}: {e}")
             return False
 
-    def get_merged_config(self, sidecar_path: str, gui_config: dict, override_keys: list) -> dict:
-        """
-        Merges sidecar data with GUI configuration, allowing specific keys to 
-        be overridden by GUI values.
-        
-        gui_config must use the same JSON keys as the sidecar file.
-        """
-        # 1. Load the sidecar data (base config, merged with defaults)
-        merged_config = self.load_sidecar_data(sidecar_path)
+def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
+    """
+    Transfers the color statistics from the source_frame to the target_frame using LAB color space.
+    Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
+    Returns the color-adjusted target_frame in [C, H, W] float [0, 1] format.
+    """
+    try:
+        # Ensure tensors are on CPU and convert to numpy arrays in HWC format
+        # --- FIX: Squeeze the batch dimension if it exists ---
+        source_for_permute = source_frame.squeeze(0) if source_frame.dim() == 4 else source_frame
+        target_for_permute = target_frame.squeeze(0) if target_frame.dim() == 4 else target_frame
 
-        # 2. Apply GUI overrides
-        for key in override_keys:
-            if key in gui_config and key in self.SIDECAR_KEY_MAP:
-                # Get the expected type from the map
-                expected_type = self.SIDECAR_KEY_MAP[key][0]
-                
-                # Attempt to cast the GUI value to the expected type
-                try:
-                    val = gui_config[key]
-                    if expected_type == float:
-                        merged_config[key] = float(val)
-                    elif expected_type == int:
-                        merged_config[key] = int(val)
-                    else:
-                        merged_config[key] = val
-                except (ValueError, TypeError):
-                    logger.warning(f"GUI value for '{key}' is invalid ({gui_config[key]}). Skipping override.")
-        
-        return merged_config
-     
+        source_np = source_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
+        target_np = target_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
+        # --- END FIX ---
+
+        # Scale from [0, 1] to [0, 255] and convert to uint8
+        source_np_uint8 = (np.clip(source_np, 0.0, 1.0) * 255).astype(np.uint8)
+        target_np_uint8 = (np.clip(target_np, 0.0, 1.0) * 255).astype(np.uint8)
+
+        # Convert to LAB color space
+        source_lab = cv2.cvtColor(source_np_uint8, cv2.COLOR_RGB2LAB)
+        target_lab = cv2.cvtColor(target_np_uint8, cv2.COLOR_RGB2LAB)
+
+        src_mean, src_std = cv2.meanStdDev(source_lab)
+        tgt_mean, tgt_std = cv2.meanStdDev(target_lab)
+
+        src_mean = src_mean.flatten()
+        src_std = src_std.flatten()
+        tgt_mean = tgt_mean.flatten()
+        tgt_std = tgt_std.flatten()
+
+        # Ensure no division by zero
+        src_std = np.clip(src_std, 1e-6, None)
+        tgt_std = np.clip(tgt_std, 1e-6, None)
+
+        target_lab_float = target_lab.astype(np.float32)
+        for i in range(3): # For L, A, B channels
+            target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[i]
+
+        adjusted_lab_uint8 = np.clip(target_lab_float, 0, 255).astype(np.uint8)
+        adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
+        return torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
+    except Exception as e:
+        logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
+        return target_frame
+
 def create_single_slider_with_label_updater(
     GUI_self,
     parent: ttk.Frame, 
@@ -388,53 +473,6 @@ def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, us
             
         return torch.stack(processed_frames).to(tensor.device)
 
-def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
-    """
-    Transfers the color statistics from the source_frame to the target_frame using LAB color space.
-    Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
-    Returns the color-adjusted target_frame in [C, H, W] float [0, 1] format.
-    """
-    try:
-        # Ensure tensors are on CPU and convert to numpy arrays in HWC format
-        # --- FIX: Squeeze the batch dimension if it exists ---
-        source_for_permute = source_frame.squeeze(0) if source_frame.dim() == 4 else source_frame
-        target_for_permute = target_frame.squeeze(0) if target_frame.dim() == 4 else target_frame
-
-        source_np = source_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
-        target_np = target_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
-        # --- END FIX ---
-
-        # Scale from [0, 1] to [0, 255] and convert to uint8
-        source_np_uint8 = (np.clip(source_np, 0.0, 1.0) * 255).astype(np.uint8)
-        target_np_uint8 = (np.clip(target_np, 0.0, 1.0) * 255).astype(np.uint8)
-
-        # Convert to LAB color space
-        source_lab = cv2.cvtColor(source_np_uint8, cv2.COLOR_RGB2LAB)
-        target_lab = cv2.cvtColor(target_np_uint8, cv2.COLOR_RGB2LAB)
-
-        src_mean, src_std = cv2.meanStdDev(source_lab)
-        tgt_mean, tgt_std = cv2.meanStdDev(target_lab)
-
-        src_mean = src_mean.flatten()
-        src_std = src_std.flatten()
-        tgt_mean = tgt_mean.flatten()
-        tgt_std = tgt_std.flatten()
-
-        # Ensure no division by zero
-        src_std = np.clip(src_std, 1e-6, None)
-        tgt_std = np.clip(tgt_std, 1e-6, None)
-
-        target_lab_float = target_lab.astype(np.float32)
-        for i in range(3): # For L, A, B channels
-            target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[i]
-
-        adjusted_lab_uint8 = np.clip(target_lab_float, 0, 255).astype(np.uint8)
-        adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
-        return torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
-    except Exception as e:
-        logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
-        return target_frame
-
 def set_util_logger_level(level):
     """Sets the logging level for the 'stereocrafter_util' logger."""
     logger.setLevel(level)
@@ -442,46 +480,6 @@ def set_util_logger_level(level):
     # Ensure handlers also reflect the new level.
     for handler in logger.handlers:
         handler.setLevel(level)
-        
-# --- Global Flags ---
-CUDA_AVAILABLE = False
-
-# --- Tooltip Class ---
-class Tooltip:
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tooltip_window = None
-        self.show_delay = 600  # milliseconds
-        self.hide_delay = 100  # milliseconds
-        self.enter_id = None
-        self.leave_id = None
-        self.widget.bind("<Enter>", self.show_tooltip)
-        self.widget.bind("<Leave>", self.hide_tooltip)
-        self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
-
-    def show_tooltip(self, event=None):
-        if self.leave_id: self.widget.after_cancel(self.leave_id)
-        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
-
-    def _display_tooltip(self):
-        if self.tooltip_window or not self.text: return
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() +20
-        self.tooltip_window = Toplevel(self.widget)
-        self.tooltip_window.wm_overrideredirect(True) # Remove window decorations
-        self.tooltip_window.wm_geometry(f"+{x}+{y}")
-
-        label = Label(self.tooltip_window, text=self.text, background="#ffffe0", relief="solid", borderwidth=1,
-                      justify="left", wraplength=250)
-        label.pack(ipadx=1)
-
-    def hide_tooltip(self, event=None):
-        if self.enter_id: self.widget.after_cancel(self.enter_id)
-        if self.tooltip_window:
-            self.tooltip_window.destroy()
-        self.tooltip_window = None
-# --- END Tooltip Class ---
 
 def check_cuda_availability():
     """
