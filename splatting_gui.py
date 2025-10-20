@@ -40,7 +40,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.20.5"
+GUI_VERSION = "25.10.20.6"
 MOVE_TO_FINISHED_ENABLED = True
 
 class ForwardWarpStereo(nn.Module):
@@ -2411,6 +2411,12 @@ class SplatterGUI(ThemedTk):
 
         # --- Auto-Convergence Logic (BEFORE initializing readers) ---
         auto_conv_mode = settings["auto_convergence_mode"]
+
+        # --- NEW LOGIC: Sidecar overrides Auto-Convergence ---
+        if anchor_source == "Sidecar" and auto_conv_mode != "Off":
+            logger.info(f"Sidecar found for {video_name}. Convergence Point locked to Sidecar value ({current_zero_disparity_anchor:.4f}). Auto-Convergence SKIPPED.")
+            auto_conv_mode = "Off"
+
         if auto_conv_mode != "Off":
             logger.info(f"Auto-Convergence is ENABLED (Mode: {auto_conv_mode}). Running pre-pass...")
 
