@@ -22,6 +22,7 @@ from typing import Optional, Tuple, Optional
 from PIL import Image
 
 # Import custom modules
+CUDA_AVAILABLE = False # start state, will check automaticly later
         
 # --- MODIFIED IMPORT ---
 from dependency.stereocrafter_util import (
@@ -40,7 +41,6 @@ except:
 from dependency.video_previewer import VideoPreviewer
 
 GUI_VERSION = "25.10.20.3"
-CUDA_AVAILABLE = False # start state, will check automaticly later
 MOVE_TO_FINISHED_ENABLED = True
 
 class ForwardWarpStereo(nn.Module):
