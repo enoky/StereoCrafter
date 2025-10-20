@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-20.2"
+VERSION = "25-10-20.3"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -310,6 +310,8 @@ def create_single_slider_with_label_updater(
         
     if hasattr(GUI_self, 'widgets_to_disable'):
         GUI_self.widgets_to_disable.append(slider)
+    
+    return set_value_and_update_label
 
 def create_dual_slider_layout(
     GUI_self,

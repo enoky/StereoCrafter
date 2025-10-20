@@ -40,7 +40,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.20.6"
+GUI_VERSION = "25.10.20.7"
 MOVE_TO_FINISHED_ENABLED = True
 
 class ForwardWarpStereo(nn.Module):
@@ -120,6 +120,13 @@ class SplatterGUI(ThemedTk):
         self.help_texts = {}
         self.sidecar_manager = SidecarConfigManager()
 
+        # --- NEW CACHE AND STATE ---
+        self._auto_conv_cache = {"Average": None, "Peak": None}
+        self._auto_conv_cached_path = None
+        self._is_auto_conv_running = False 
+        self.slider_label_updaters = [] 
+        self.set_convergence_value_programmatically = None
+
         self._load_config()
         self._load_help_texts()
         
@@ -180,6 +187,7 @@ class SplatterGUI(ThemedTk):
         self.processing_task_name_var = tk.StringVar(value="N/A")
         self.processing_gamma_var = tk.StringVar(value="N/A")
 
+        self.slider_label_updaters = [] 
 
         # --- Processing control variables ---
         self.stop_event = threading.Event()
@@ -311,6 +319,25 @@ class SplatterGUI(ThemedTk):
         # if not is_startup:
         #     self._adjust_window_height_for_content()
 
+    def _auto_converge_worker(self, depth_map_path, process_length, batch_size, fallback_value, mode):
+        """Worker thread for running the Auto-Convergence calculation."""
+        
+        # Run the existing auto-convergence logic (no mode parameter needed now)
+        new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
+            depth_map_path,
+            process_length,
+            batch_size,
+            fallback_value,
+        )
+        
+        # Use self.after to safely update the GUI from the worker thread
+        self.after(0, lambda: self._complete_auto_converge_update(
+            new_anchor_avg, 
+            new_anchor_peak, 
+            fallback_value, 
+            mode # Still pass the current mode to know which value to select immediately
+        ))
+
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
         current_path = var.get()
@@ -395,6 +422,68 @@ class SplatterGUI(ThemedTk):
         self.processing_convergence_var.set("N/A")
         self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
+
+    def _complete_auto_converge_update(self, new_anchor_avg: float, new_anchor_peak: float, fallback_value: float, mode: str):
+        """
+        Safely updates the GUI and preview after Auto-Convergence worker is done.
+        
+        Now receives both calculated values.
+        """
+        # Re-enable inputs
+        self._is_auto_conv_running = False
+        self.btn_auto_converge_preview.config(state="normal")
+        self.start_button.config(state="normal")
+        self.start_single_button.config(state="normal")
+        self.auto_convergence_combo.config(state="readonly") # Re-enable combo
+
+        if self.stop_event.is_set():
+            self.status_label.config(text="Auto-Converge pre-pass was stopped.")
+            self.stop_event.clear()
+            return
+
+        # Check if EITHER calculation yielded a result different from the fallback
+        if new_anchor_avg != fallback_value or new_anchor_peak != fallback_value:
+            
+            # 1. Cache BOTH results
+            self._auto_conv_cache["Average"] = new_anchor_avg
+            self._auto_conv_cache["Peak"] = new_anchor_peak
+            
+            # CRITICAL: Store the path of the file that was just scanned
+            current_index = self.previewer.current_video_index
+            if 0 <= current_index < len(self.previewer.video_list):
+                 depth_map_path = self.previewer.video_list[current_index].get('depth_map')
+                 self._auto_conv_cached_path = depth_map_path
+            
+            # 2. Determine which value to apply immediately (based on the current 'mode' selection)
+            anchor_to_apply = new_anchor_avg if mode == "Average" else new_anchor_peak
+            
+            # 3. Update the Tkinter variable and refresh the slider/label
+            
+            is_setter_successful = False
+            if self.set_convergence_value_programmatically:
+                 try:
+                     # Pass the numeric value. The setter handles setting var and updating the label.
+                     self.set_convergence_value_programmatically(anchor_to_apply)
+                     is_setter_successful = True 
+                 except Exception as e:
+                     logger.error(f"Error calling convergence setter: {e}")
+            
+            # Fallback if setter failed (should not happen if fixed)
+            if not is_setter_successful:
+                 self.zero_disparity_anchor_var.set(f"{anchor_to_apply:.2f}")
+
+            self.status_label.config(text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f})")
+            
+            # 4. Immediately trigger a preview update to show the change
+            self.on_slider_release(None) 
+            
+        else:
+            # Calculation failed (both returned fallback)
+            self.status_label.config(text=f"Auto-Converge: Failed to find a valid anchor. Value remains {fallback_value:.2f}")
+            messagebox.showwarning("Auto-Converge Preview", f"Failed to find a valid anchor point in any mode. No changes were made.")
+            # If it was triggered by the combo box, reset the combo box to "Off"
+            if self.auto_convergence_mode_var.get() == mode:
+                self.auto_convergence_combo.set("Off")
 
     def _configure_logging(self):
         """Sets the logging level for the stereocrafter_util logger based on debug_mode_var."""
@@ -654,6 +743,7 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
+        self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
 
         current_row = 0 # Reset for next frame
 
@@ -715,11 +805,12 @@ class SplatterGUI(ThemedTk):
         all_settings_row += 1
         
         # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
-        create_single_slider_with_label_updater(
+        setter_func_conv = create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Convergence:",
             self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2,
             tooltip_key="convergence_point",
             )
+        self.set_convergence_value_programmatically = setter_func_conv 
         
         all_settings_row += 1
         
@@ -845,6 +936,11 @@ class SplatterGUI(ThemedTk):
         self.stop_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.stop_button, "stop_button")
         
+        # --- Preview Auto-Converge Button ---
+        self.btn_auto_converge_preview = ttk.Button(button_frame, text="Preview Auto-Converge", command=self.run_preview_auto_converge)
+        self.btn_auto_converge_preview.pack(side="left", padx=5)
+        self._create_hover_tooltip(self.btn_auto_converge_preview, "preview_auto_converge")
+
         # --- Update Sidecar Button ---
         self.update_sidecar_button = ttk.Button(button_frame, text="Update Sidecar", command=self.update_sidecar_file)
         self.update_sidecar_button.pack(side="left", padx=5)
@@ -1110,43 +1206,43 @@ class SplatterGUI(ThemedTk):
         
         return True
 
-    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float, mode: str) -> float:
+    def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float) -> Tuple[float, float]:
         """
-        Calculates the Auto Convergence point for the entire video based on the selected mode.
-        Uses a hard blur and crops to the center 75% to eliminate noise/edge artifacts.
-
+        Calculates the Auto Convergence points for the entire video (Average and Peak)
+        in a single pass.
+        
         Args:
-            mode (str): "Average" or "Peak".
-            float: fallback_value: The current GUI/Sidecar value to return if auto-convergence fails.
-
+            fallback_value (float): The current GUI/Sidecar value to return if auto-convergence fails.
+            
         Returns:
-            float: The new zero_disparity_anchor_val (0.0 to 1.0) or fallback_value.
+            Tuple[float, float]: (new_anchor_avg: 0.0-1.0, new_anchor_peak: 0.0-1.0). 
+                                 Returns (fallback_value, fallback_value) if the process fails.
         """
-        logger.info("==> Starting Auto-Convergence pre-pass to determine global average depth.")
+        logger.info("==> Starting Auto-Convergence pre-pass to determine global average and peak depth.")
         
         # --- Constants for Auto-Convergence Logic ---
-        BLUR_KERNEL_SIZE = 9  # Hard blur to capture bulk depth, must be odd
-        CENTER_CROP_PERCENT = 0.75 # Use the center 75% of the frame (1 - 0.75 = 0.25 margin total)
-        MIN_VALID_PIXELS = 5 # Minimum number of non-zero/non-max pixels to consider a frame valid
-        INTERNAL_ANCHOR_OFFSET = 0.1 # <--- ADJUST THIS VALUE FOR TESTING (e.g., 0.02, 0.05, 0.1)
+        BLUR_KERNEL_SIZE = 9
+        CENTER_CROP_PERCENT = 0.75
+        MIN_VALID_PIXELS = 5
+        # The offset is only applied at the end for the 'Average' mode.
+        INTERNAL_ANCHOR_OFFSET = 0.1 
         # -------------------------------------------
 
         all_valid_frame_values = []
+        fallback_tuple = (fallback_value, fallback_value) # Value to return on failure
 
         try:
             # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
             depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
             if len(depth_reader) == 0:
                  logger.error("Depth map reader has no frames. Cannot calculate Auto-Convergence.")
-                 return fallback_value # Fallback to user/sidecar default
+                 return fallback_tuple
         except Exception as e:
             logger.error(f"Error initializing depth map reader for Auto-Convergence: {e}")
-            return fallback_value # Fallback to user/sidecar default
+            return fallback_tuple
 
-
-        # 2. Iterate and Average
+        # 2. Iterate and Collect Data
         
-        # Determine the number of frames to process
         video_length = len(depth_reader)
         if total_frames_to_process <= 0 or total_frames_to_process > video_length:
              num_frames = video_length
@@ -1155,22 +1251,25 @@ class SplatterGUI(ThemedTk):
             
         logger.debug(f"  AutoConv determined actual frames to process: {num_frames} (from input length {total_frames_to_process}).")
 
-
-        # Original line: num_frames = min(total_frames_to_process, len(depth_reader))
-        
-        # Now use the determined num_frames for the loop:
         for i in range(0, num_frames, batch_size):
             if self.stop_event.is_set():
                 logger.warning("Auto-Convergence pre-pass stopped by user.")
-                return fallback_value # Fallback
+                return fallback_tuple
 
             current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
             if not current_frame_indices:
                 break
             
-            batch_depth_numpy_raw = depth_reader.get_batch(current_frame_indices).asnumpy()
+            # CRITICAL FIX: Ensure seeking/reading works
+            try:
+                depth_reader.seek(current_frame_indices[0]) 
+                batch_depth_numpy_raw = depth_reader.get_batch(current_frame_indices).asnumpy()
+            except Exception as e:
+                logger.error(f"Error seeking/reading depth map batch starting at index {i}: {e}. Skipping batch.")
+                continue
 
-            # Process depth frames (Grayscale, Float conversion, 0-1 Normalization)
+
+            # Process depth frames (Grayscale, Float conversion)
             if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
                 batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
             elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
@@ -1180,20 +1279,18 @@ class SplatterGUI(ThemedTk):
             
             batch_depth_float = batch_depth_numpy.astype(np.float32)
 
-            # Get chunk min/max for normalization (using the chunk's range, since we don't have global stats yet)
+            # Get chunk min/max for normalization (using the chunk's range)
             min_val = batch_depth_float.min()
             max_val = batch_depth_float.max()
             
             if max_val - min_val > 1e-5:
                 batch_depth_normalized = (batch_depth_float - min_val) / (max_val - min_val)
             else:
-                # If chunk is flat, use a neutral value
                 batch_depth_normalized = np.full_like(batch_depth_float, fill_value=0.5, dtype=np.float32)
 
             # Frame-by-Frame Processing (Blur & Crop)
             for j, frame in enumerate(batch_depth_normalized):
                 
-                # --- NEW DEBUG LOGGING START ---
                 current_frame_idx = current_frame_indices[j]
                 H, W = frame.shape
                 
@@ -1207,45 +1304,41 @@ class SplatterGUI(ThemedTk):
                 cropped_frame = frame_blurred[margin_h:H-margin_h, margin_w:W-margin_w]
                 
                 # c) Average (Exclude true black/white pixels (0.0 or 1.0) which may be background/edges)
-                # Use a small epsilon to catch near-zero/near-one
                 valid_pixels = cropped_frame[(cropped_frame > 0.001) & (cropped_frame < 0.999)] 
                 
-                logger.debug(f"  [AutoConv Frame {current_frame_idx:03d}] Res: {W}x{H}, Crop Margins: {margin_w}x{margin_h}. Cropped Size: {cropped_frame.size}. Valid Pixels: {valid_pixels.size}")
-                # --- NEW DEBUG LOGGING END ---
-
                 if valid_pixels.size > MIN_VALID_PIXELS:
-                    if mode == "Average":
-                        all_valid_frame_values.append(valid_pixels.mean())
-                    elif mode == "Peak":
-                        all_valid_frame_values.append(valid_pixels.max())
+                    # Append the mean of the valid pixels for this frame
+                    all_valid_frame_values.append(valid_pixels.mean()) 
                 else:
-                    # FALLBACK FOR THE FRAME: If filter is too strict, just use the mean of the WHOLE cropped, blurred frame
+                    # FALLBACK FOR THE FRAME: Use the mean of the WHOLE cropped, blurred frame
                     all_valid_frame_values.append(cropped_frame.mean())
-                    # Note: We still log the failure using a warning, but we count the frame.
                     logger.warning(f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}). Forcing mean from full cropped frame.")
 
             draw_progress_bar(i + len(current_frame_indices), num_frames, prefix="  Auto-Conv Pre-Pass:")
         
-        # 3. Final Temporal Average
+        # 3. Final Temporal Calculations
         if all_valid_frame_values:
-            # Use the same aggregation (mean) for both modes for temporal stability
-            raw_anchor = np.mean(all_valid_frame_values)
+            valid_values_np = np.array(all_valid_frame_values)
             
-            # --- MODIFIED: Apply Offset only for Average mode ---
-            offset_to_apply = 0.0
-            if mode == "Average":
-                offset_to_apply = INTERNAL_ANCHOR_OFFSET
+            # Calculate final RAW values (Temporal Mean and Temporal Max)
+            raw_anchor_avg = np.mean(valid_values_np)
+            raw_anchor_peak = np.max(valid_values_np)
             
-            final_anchor_offset = raw_anchor + offset_to_apply
+            # Apply Offset only for Average mode
+            final_anchor_avg_offset = raw_anchor_avg + INTERNAL_ANCHOR_OFFSET
             
             # Clamp to the valid range [0.0, 1.0]
-            final_anchor = np.clip(final_anchor_offset, 0.0, 1.0)
+            final_anchor_avg = np.clip(final_anchor_avg_offset, 0.0, 1.0)
+            final_anchor_peak = np.clip(raw_anchor_peak, 0.0, 1.0)
             
-            logger.info(f"\n==> Auto-Convergence ({mode} mode) Calculated: {raw_anchor:.4f} + Offset ({offset_to_apply:.2f}) = Final Anchor {final_anchor:.4f}")
-            return float(final_anchor)
+            logger.info(f"\n==> Auto-Convergence Calculated: Avg={raw_anchor_avg:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Avg {final_anchor_avg:.4f}")
+            logger.info(f"==> Auto-Convergence Calculated: Peak={raw_anchor_peak:.4f} = Final Peak {final_anchor_peak:.4f}")
+            
+            # Return both calculated values
+            return float(final_anchor_avg), float(final_anchor_peak)
         else:
-            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using GUI/Sidecar value as fallback.")
-            return fallback_value # Fallback to user/sidecar default
+            logger.warning("\n==> Auto-Convergence failed: No valid frames found. Using fallback value.")
+            return fallback_tuple
 
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
@@ -1779,6 +1872,46 @@ class SplatterGUI(ThemedTk):
                 logger.debug(f"==> No sidecar file '{json_sidecar_path_to_move}' found to move.")
         elif actual_depth_map_path:
             logger.info(f"==> Cannot move depth map '{os.path.basename(actual_depth_map_path)}': 'finished_depth_folder' is not set (not in batch mode).")
+
+    def on_auto_convergence_mode_select(self, event):
+        """
+        Handles selection in the Auto-Convergence combo box.
+        If a mode is selected, it checks the cache and runs the calculation if needed.
+        """
+        mode = self.auto_convergence_mode_var.get()
+        
+        if mode == "Off":
+            # self._auto_conv_cache = {"Average": None, "Peak": None} # Clear cache on Off
+            return
+        
+        if self._is_auto_conv_running:
+            logger.warning("Auto-Converge calculation is already running. Please wait.")
+            return
+
+        if self._auto_conv_cache[mode] is not None:
+            # Value is cached, apply it immediately
+            cached_value = self._auto_conv_cache[mode]
+                        
+            # 1. Set the Tkinter variable to the cached value (needed for the setter)
+            self.zero_disparity_anchor_var.set(f"{cached_value:.2f}")
+            
+            # 2. Call the programmatic setter to update the slider position and its label
+            if self.set_convergence_value_programmatically:
+                 try:
+                     self.set_convergence_value_programmatically(cached_value)
+                 except Exception as e:
+                     logger.error(f"Error calling convergence setter on cache hit: {e}")
+            
+            # 3. Update status label
+            self.status_label.config(text=f"Auto-Converge ({mode}): Loaded cached value {cached_value:.2f}")
+            
+            # 4. Refresh preview
+            self.on_slider_release(None)
+            
+            return
+        
+        # Cache miss, run the calculation (using the existing run_preview_auto_converge logic)
+        self.run_preview_auto_converge(force_run=True)
 
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
@@ -2350,6 +2483,75 @@ class SplatterGUI(ThemedTk):
             release_cuda_memory()
             self.progress_queue.put("finished")
             self.after(0, self.clear_processing_info)
+
+    def run_preview_auto_converge(self, force_run=False):
+        """
+        Starts the Auto-Convergence pre-pass on the current preview clip in a thread,
+        and updates the convergence slider/preview upon completion.
+        'force_run=True' is used when triggered by the combo box, as validation is needed.
+        """
+        if not hasattr(self, 'previewer') or not self.previewer.source_readers:
+            if force_run:
+                messagebox.showwarning("Auto-Converge Preview", "Please load a video in the Previewer first.")
+                self.auto_convergence_combo.set("Off") # Reset combo on fail
+            return
+
+        current_index = self.previewer.current_video_index
+        if current_index == -1:
+            if force_run:
+                messagebox.showwarning("Auto-Converge Preview", "No video is currently selected for processing.")
+                self.auto_convergence_combo.set("Off") # Reset combo on fail
+            return
+        
+        mode = self.auto_convergence_mode_var.get()
+        if mode == "Off":
+            if force_run: # This should be caught by the cache check, but as a safeguard
+                return
+            messagebox.showwarning("Auto-Converge Preview", "Auto-Convergence Mode must be set to 'Average' or 'Peak'.")
+            return
+            
+        current_source_dict = self.previewer.video_list[current_index]
+        single_video_path = current_source_dict.get('source_video')
+        single_depth_path = current_source_dict.get('depth_map')
+
+        # --- NEW: Check if calculation is already done for a different mode/path ---
+        is_path_mismatch = (single_depth_path != self._auto_conv_cached_path)
+        is_cache_complete = (self._auto_conv_cache["Average"] is not None) or (self._auto_conv_cache["Peak"] is not None)
+        
+        # If running from the combo box (force_run=True) AND the cache is incomplete 
+        # BUT the path has changed, we must clear the cache and run.
+        if force_run and is_path_mismatch and is_cache_complete:
+            logger.info("New video detected. Clearing Auto-Converge cache.")
+            self._auto_conv_cache = {"Average": None, "Peak": None}
+            self._auto_conv_cached_path = None
+
+        if not single_video_path or not single_depth_path:
+            messagebox.showerror("Auto-Converge Preview Error", "Could not get both video and depth map paths from previewer.")
+            if force_run: self.auto_convergence_combo.set("Off")
+            return
+        
+        try:
+            current_anchor = float(self.zero_disparity_anchor_var.get())
+            process_length = int(self.process_length_var.get())
+            batch_size = int(self.batch_size_var.get())
+        except ValueError as e:
+            messagebox.showerror("Auto-Converge Preview Error", f"Invalid input for slider or process length: {e}")
+            if force_run: self.auto_convergence_combo.set("Off")
+            return
+            
+        # Set running flag and disable inputs
+        self._is_auto_conv_running = True
+        self.btn_auto_converge_preview.config(state="disabled")
+        self.start_button.config(state="disabled")
+        self.start_single_button.config(state="disabled")
+        self.auto_convergence_combo.config(state="disabled") # Disable combo during run
+
+        self.status_label.config(text=f"Auto-Convergence pre-pass started ({mode} mode)...")
+        
+        # Start the calculation in a new thread
+        worker_args = (single_depth_path, process_length, batch_size, current_anchor, mode)
+        self.auto_converge_thread = threading.Thread(target=self._auto_converge_worker, args=worker_args)
+        self.auto_converge_thread.start()
 
     def _process_single_video_tasks(self, video_path, settings, initial_overall_task_counter, is_single_file_mode, finished_source_folder=None, finished_depth_folder=None):
         """
