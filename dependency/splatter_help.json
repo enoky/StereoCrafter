@@ -17,7 +17,7 @@
 
     "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
-    "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged or peak throughout the clip.",
+    "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged or peak throughout the clip. Batch process only",
     
     "depth_dilate_size_x": "Horizontal Dilate for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",
     "depth_dilate_size_y": "Vertical Dilate for the Depthhmask. Must be an odd number (3, 5, 7, etc.) or 0 to disable.",

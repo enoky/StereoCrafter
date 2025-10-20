@@ -34,8 +34,8 @@ These parameters configure the core splatting and output encoding process.
 -   **Dual Output Only:** If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.
 -   **Auto-Convergence:**
     - Off: Disable auto-convergence
-    - Average: EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged throughout the clip.
-    - Peak: EXPERIMENTAL: Simple auto convergence derived from 75% center region and peaked throughout the clip.
+    - Average: EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged throughout the clip. (only when batch processing)
+    - Peak: EXPERIMENTAL: Simple auto convergence derived from 75% center region and peaked throughout the clip. (only when batch processing)
 
 
 ### 4. Depth Map Pre-processing (Hi-Res Only)
