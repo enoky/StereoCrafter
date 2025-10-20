@@ -31,6 +31,7 @@
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
     "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged or peak throughout the clip.",
    
+    "start_single_button": "Start performs the depth splatting on current preview clip.",
     "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
     "stop_button": "Stops the currently running processing task cleanly.",
     "exit_button": "Saves the current GUI settings to 'config_splat.json' and closes the application."

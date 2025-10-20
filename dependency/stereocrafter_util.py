@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-18.4"
+VERSION = "25-10-20.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -27,6 +27,119 @@ if not logging.root.handlers:
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
+class SidecarConfigManager:
+    """Handles reading, writing, and merging of stereocrafter sidecar files."""
+
+    # 1. CENTRAL KEY MAP: {JSON_KEY: (Python_Type, Default_Value)}
+    # NOTE: Decimal places removed, as rounding is now handled by the GUI slider
+    SIDECAR_KEY_MAP = {
+        "convergence_plane": (float, 0.5), 
+        "max_disparity": (float, 20.0),
+        "gamma": (float, 1.0), 
+        "frame_overlap": (float, 0.0),
+        "input_bias": (float, 0.0),
+        # Add future keys here
+    }
+
+    def _get_defaults(self) -> dict:
+        """Returns a dictionary populated with all default values."""
+        defaults = {}
+        # Iterate over the new map structure: key, (expected_type, default_val)
+        for key, (_, default_val) in self.SIDECAR_KEY_MAP.items(): 
+            defaults[key] = default_val
+        return defaults
+
+    def load_sidecar_data(self, file_path: str) -> dict:
+        """
+        Loads and validates sidecar data, returning a dictionary merged with defaults.
+        Returns defaults if file is not found or invalid.
+        """
+        data = self._get_defaults()
+        if not os.path.exists(file_path):
+            logger.debug(f"Sidecar not found at {file_path}. Returning defaults.")
+            return data
+
+        try:
+            with open(file_path, 'r') as f:
+                sidecar_json = json.load(f)
+
+            # Iterate over the new map structure: key, (expected_type, default_val)
+            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
+                if key in sidecar_json:
+                    val = sidecar_json[key]
+                    try:
+                        # Attempt to cast the value to the expected type
+                        if expected_type == int:
+                            data[key] = int(val)
+                        elif expected_type == float:
+                            data[key] = float(val)
+                        # Future: Add other types here
+                    except (ValueError, TypeError):
+                        logger.warning(f"Sidecar key '{key}' has invalid value/type. Using default.")
+
+        except Exception as e:
+            logger.error(f"Failed to read/parse sidecar at {file_path}: {e}")
+            # Still return defaults + whatever valid data was read before the failure
+        
+        return data
+
+    def save_sidecar_data(self, file_path: str, data: dict) -> bool:
+        """
+        Saves a dictionary to the sidecar file, ensuring the directory and file are created.
+        No rounding is applied here, assuming input data is pre-rounded.
+        """
+        try:
+            # 1. Ensure directory exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            # 2. Filter data (No rounding step needed)
+            output_data = {}
+            # Iterate over the new map structure: key, (expected_type, default_val)
+            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
+                if key in data:
+                    output_data[key] = data[key]
+
+            # 3. Write to file (mode 'w' creates the file if it doesn't exist)
+            with open(file_path, 'w') as f:
+                json.dump(output_data, f, indent=4)
+            
+            logger.debug(f"Sidecar saved successfully to {file_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save sidecar to {file_path}: {e}")
+            return False
+
+    def get_merged_config(self, sidecar_path: str, gui_config: dict, override_keys: list) -> dict:
+        """
+        Merges sidecar data with GUI configuration, allowing specific keys to 
+        be overridden by GUI values.
+        
+        gui_config must use the same JSON keys as the sidecar file.
+        """
+        # 1. Load the sidecar data (base config, merged with defaults)
+        merged_config = self.load_sidecar_data(sidecar_path)
+
+        # 2. Apply GUI overrides
+        for key in override_keys:
+            if key in gui_config and key in self.SIDECAR_KEY_MAP:
+                # Get the expected type from the map
+                expected_type = self.SIDECAR_KEY_MAP[key][0]
+                
+                # Attempt to cast the GUI value to the expected type
+                try:
+                    val = gui_config[key]
+                    if expected_type == float:
+                        merged_config[key] = float(val)
+                    elif expected_type == int:
+                        merged_config[key] = int(val)
+                    else:
+                        merged_config[key] = val
+                except (ValueError, TypeError):
+                    logger.warning(f"GUI value for '{key}' is invalid ({gui_config[key]}). Skipping override.")
+        
+        return merged_config
+     
 def create_single_slider_with_label_updater(
     GUI_self,
     parent: ttk.Frame, 
@@ -65,15 +178,16 @@ def create_single_slider_with_label_updater(
     def update_label_and_preview(value_str: str) -> None:
         """Updates the text label. Called by user interaction."""
         try:
-            # Handle float/int conversion for display precision
+            # Only update the label with the formatted display value
             value_label.config(text=f"{float(value_str):.{decimals}f}")
         except ValueError:
-            pass # Ignore if value is invalid during a fast drag/update
+            pass
 
     def set_value_and_update_label(new_value: float) -> None:
         """Programmatically sets the slider's value and updates its label."""
-        var.set(new_value)
-        value_label.config(text=f"{new_value:.{decimals}f}")
+        rounded_value = round(new_value, decimals)
+        var.set(rounded_value)
+        value_label.config(text=f"{rounded_value:.{decimals}f}")
 
     def on_trough_click(event):
         """Handles clicks on the slider's trough for precise positioning."""
@@ -81,12 +195,14 @@ def create_single_slider_with_label_updater(
             slider.update_idletasks()
             new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
             
-            # If the source variable is an IntVar/DoubleVar, set the raw float.
-            # If it's a StringVar, it will accept the float.
-            var.set(new_value) 
+            # Use the decimals to round the new_value
+            rounded_value = round(new_value, decimals)
             
-            # Manually update the label's text
-            update_label_and_preview(str(new_value))
+            # Set the rounded value immediately
+            var.set(rounded_value) 
+            
+            # Manually update the label's text (this is the missing piece for trough click!)
+            update_label_and_preview(str(rounded_value)) # <--- Ensures label update
             
             # Manually trigger preview update
             GUI_self.on_slider_release(event) 
@@ -174,10 +290,13 @@ def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, 
     if k_x <= 0 or k_y <= 0:
         return tensor
 
-    device = tensor.device if use_gpu and torch.cuda.is_available() else torch.device('cpu')
+    # GaussianBlur requires odd kernel sizes (Adjusted k_x/k_y logic removed for Dilate, but kept for Blur)
+    # The fix for unstable 1x1 GPU convolution is no longer needed as we permanently force CPU below.
+    
+    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
     tensor = tensor.to(device)
 
-    if use_gpu and torch.cuda.is_available():
+    if False: # <--- BYPASSING GPU PATH FOR STABILITY
         padding_x = k_x // 2
         padding_y = k_y // 2
         # Ensure padding is not greater than half the kernel size
@@ -185,15 +304,34 @@ def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, 
         padding_y = min(padding_y, (k_y - 1) // 2)
         return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=(padding_y, padding_x))
     else:
-        # CPU fallback
+        # FIXED CPU path
         processed_frames = []
         for t in range(tensor.shape[0]):
-            # Assuming single channel for masks/depth maps
-            frame_np = (tensor[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            # Get frame (C, H, W) and scale to uint8
+            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
+            
+            # Convert to OpenCV format: (H, W) or (H, W, C)
+            if frame_np.shape[0] == 1:
+                # Single channel: remove channel dim for OpenCV
+                frame_np = frame_np[0]  # shape: (H, W)
+            else:
+                # Multi-channel: transpose to (H, W, C) for OpenCV
+                frame_np = np.transpose(frame_np, (1, 2, 0))
+            
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
             dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
+            
+            # Convert back to PyTorch format: (C, H, W)
+            if len(dilated_np.shape) == 2:
+                # Single channel: add channel dimension back
+                dilated_np = dilated_np[np.newaxis, :, :]  # shape: (1, H, W)
+            else:
+                # Multi-channel: transpose back to (C, H, W)
+                dilated_np = np.transpose(dilated_np, (2, 0, 1))
+            
             dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
-            processed_frames.append(dilated_tensor.unsqueeze(0))
+            processed_frames.append(dilated_tensor)
+        
         return torch.stack(processed_frames).to(tensor.device)
 
 def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
@@ -207,36 +345,47 @@ def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, us
         return tensor
 
     # GaussianBlur requires odd kernel sizes
+    k_x_orig, k_y_orig = k_x, k_y 
     k_x = k_x if k_x % 2 == 1 else k_x + 1
     k_y = k_y if k_y % 2 == 1 else k_y + 1
+
+    if k_x != k_x_orig or k_y != k_y_orig:
+        logger.debug(f"custom_blur: Adjusted kernel from {k_x_orig}x{k_y_orig} to odd size {k_x}x{k_y}.")
     
-    device = tensor.device if use_gpu and torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
     tensor = tensor.to(device)
 
-    if use_gpu and torch.cuda.is_available():
-        # Separable Gaussian blur on GPU
-        sigma_x = k_x / 6.0
-        sigma_y = k_y / 6.0
-        
-        ax_x = torch.arange(-k_x // 2 + 1., k_x // 2 + 1., device=device)
-        gauss_x = torch.exp(-(ax_x ** 2) / (2 * sigma_x ** 2))
-        kernel_x = (gauss_x / gauss_x.sum()).view(1, 1, 1, k_x).repeat(tensor.shape[1], 1, 1, 1)
-        
-        ax_y = torch.arange(-k_y // 2 + 1., k_y // 2 + 1., device=device)
-        gauss_y = torch.exp(-(ax_y ** 2) / (2 * sigma_y ** 2))
-        kernel_y = (gauss_y / gauss_y.sum()).view(1, 1, k_y, 1).repeat(tensor.shape[1], 1, 1, 1)
-
-        blurred = F.conv2d(tensor, kernel_x, padding=(0, k_x // 2), groups=tensor.shape[1])
-        blurred = F.conv2d(blurred, kernel_y, padding=(k_y // 2, 0), groups=tensor.shape[1])
-        return torch.clamp(blurred, 0.0, 1.0)
+    if False: # <--- BYPASSING GPU PATH FOR STABILITY
+        # ... (GPU logic removed) ...
+        pass
     else:
-        # CPU fallback
+        # FIXED CPU path
         processed_frames = []
         for t in range(tensor.shape[0]):
-            frame_np = (tensor[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            # Get frame (C, H, W) and scale to uint8
+            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
+            
+            # Convert to OpenCV format: (H, W) or (H, W, C)
+            if frame_np.shape[0] == 1:
+                # Single channel: remove channel dim for OpenCV
+                frame_np = frame_np[0]  # shape: (H, W)
+            else:
+                # Multi-channel: transpose to (H, W, C) for OpenCV
+                frame_np = np.transpose(frame_np, (1, 2, 0))
+
             blurred_np = cv2.GaussianBlur(frame_np, (k_x, k_y), 0)
+            
+            # Convert back to PyTorch format: (C, H, W)
+            if len(blurred_np.shape) == 2:
+                # Single channel: add channel dimension back
+                blurred_np = blurred_np[np.newaxis, :, :]  # shape: (1, H, W)
+            else:
+                # Multi-channel: transpose back to (C, H, W)
+                blurred_np = np.transpose(blurred_np, (2, 0, 1))
+
             blurred_tensor = torch.from_numpy(blurred_np).float() / 255.0
-            processed_frames.append(blurred_tensor.unsqueeze(0))
+            processed_frames.append(blurred_tensor)
+            
         return torch.stack(processed_frames).to(tensor.device)
 
 def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
@@ -767,9 +916,6 @@ def encode_frames_to_mp4(
     logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
     return True
 
-# ======================================================================================
-# NEW FUNCTION FOR DIRECT PIPING TO FFmpeg
-# ======================================================================================
 def start_ffmpeg_pipe_process(
     content_width: int,
     content_height: int,

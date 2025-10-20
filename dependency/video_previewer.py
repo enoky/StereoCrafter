@@ -2,7 +2,7 @@ import os
 import gc
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Union
 import torch
 import numpy as np
 from PIL import Image, ImageTk
@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-17.4"
+VERSION = "25-10-20.1"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -33,6 +33,7 @@ class VideoPreviewer(ttk.Frame):
             help_data: Dict[str, str] = None,
             preview_size_var: Optional[tk.StringVar] = None,
             resize_callback: Optional[Callable] = None,
+            update_clip_callback: Optional[Callable] = None,
             **kwargs,
         ):
         """
@@ -60,15 +61,18 @@ class VideoPreviewer(ttk.Frame):
         self.get_params_callback = get_params_callback
         self.preview_size_var = preview_size_var # Store the passed-in variable
         self.resize_callback = resize_callback # Store the resize callback
+        self.update_clip_callback = update_clip_callback
 
         # --- State ---
-        self.source_readers: Dict[str, VideoReader] = {}
+        self.source_readers: Dict[str, Optional[VideoReader]] = {}
         self.video_list: list[Dict[str, str]] = []
         self.current_video_index: int = -1
         self.current_params: Dict[str, Any] = {}
         self.pil_image_for_preview: Optional[Image.Image] = None
         self.preview_image_tk: Optional[ImageTk.PhotoImage] = None
         self.wiggle_after_id: Optional[str] = None
+        self.last_loaded_video_path: Optional[str] = None
+        self.last_loaded_frame_index: int = 0 
 
         # --- GUI Variables ---
         self.frame_scrubber_var = tk.DoubleVar(value=0)
@@ -255,8 +259,6 @@ class VideoPreviewer(ttk.Frame):
         Args:
             find_sources_callback (Callable): A function that returns a list of dictionaries.
         """
-        self._clear_preview_resources()
-
         self.video_list = find_sources_callback()
 
         if not self.video_list:
@@ -265,7 +267,22 @@ class VideoPreviewer(ttk.Frame):
             self._update_nav_controls()
             return
 
-        self.current_video_index = 0
+        target_index = 0
+        
+        if self.last_loaded_video_path:
+            # Search for the index matching the last loaded path
+            for i, source_dict in enumerate(self.video_list):
+                if source_dict.get('source_video') == self.last_loaded_video_path:
+                    target_index = i
+                    logger.debug(f"Last loaded video path found at new index: {target_index}")
+                    break
+            else:
+                # Path not found (e.g., file was removed/renamed)
+                self.last_loaded_frame_index = 0 # Reset frame scrubber
+                logger.debug("Last loaded video path NOT found in new list. Resetting to index 0.")
+
+
+        self.current_video_index = target_index # Use the recalled or default index
         self._load_preview_by_index(self.current_video_index)
 
     def update_preview(self):
@@ -358,6 +375,7 @@ class VideoPreviewer(ttk.Frame):
         frame_idx = int(float(value))
         total_frames = int(self.frame_scrubber.cget("to")) + 1
         self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
+        self.last_loaded_frame_index = frame_idx
 
     def _on_scrubber_trough_click(self, event):
         """Handles clicks on the frame scrubber's trough for precise positioning."""
@@ -400,13 +418,26 @@ class VideoPreviewer(ttk.Frame):
         self._clear_preview_resources()
 
         if not (0 <= index < len(self.video_list)):
+            self.last_loaded_video_path = None
             return
 
         self.current_video_index = index
         self._update_nav_controls()
 
         source_paths = self.video_list[index]
-        base_name = os.path.basename(next(iter(source_paths.values()))) # Get name from first path
+        base_name = os.path.basename(next(iter(source_paths.values())))
+        
+        main_source_path = source_paths.get('source_video', None)
+
+        initial_frame = 0
+        if main_source_path == self.last_loaded_video_path:
+            # If the path is the SAME, retain the last frame index.
+            initial_frame = self.last_loaded_frame_index
+        else:
+            # If the path is DIFFERENT (new video), reset frame index to 0.
+            self.last_loaded_frame_index = 0
+            
+        self.last_loaded_video_path = main_source_path
 
         self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
         self.parent.update_idletasks()
@@ -431,8 +462,11 @@ class VideoPreviewer(ttk.Frame):
 
             # Configure the scrubber
             self.frame_scrubber.config(to=num_frames - 1)
-            self.frame_scrubber_var.set(0)
-            self.on_scrubber_move(0) # Update label
+            initial_frame = min(initial_frame, num_frames - 1) 
+            self.frame_scrubber_var.set(initial_frame)
+            self.on_scrubber_move(initial_frame)
+            if self.update_clip_callback:
+                self.update_clip_callback()
 
             self.update_preview()
 
