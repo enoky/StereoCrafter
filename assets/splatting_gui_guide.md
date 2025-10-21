@@ -34,8 +34,8 @@ These parameters configure the core splatting and output encoding process.
 -   **Dual Output Only:** If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.
 -   **Auto-Convergence:**
     - Off: Disable auto-convergence
-    - Average: EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged throughout the clip. (only when batch processing)
-    - Peak: EXPERIMENTAL: Simple auto convergence derived from 75% center region and peaked throughout the clip. (only when batch processing)
+    - Average: EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged throughout the clip.
+    - Peak: EXPERIMENTAL: Simple auto convergence derived from 75% center region and peaked throughout the clip.
 
 
 ### 4. Depth Map Pre-processing (Hi-Res Only)
@@ -69,6 +69,7 @@ This section displays the progress of batch processing and provides controls to 
 -   **SINGLE:** Start processing for current preview clip.
 -   **START:** Starts the batch processing: loads videos, depth maps, and performs the depth splatting.
 -   **STOP:** Halts the batch processing after the current video chunk is finished.
+-   **Preview Auto-Converge:** Run a scan of the entire clip to search for the average and peak depth.
 -   **Update Sidecar:** Updates the current sidecar file with the sidecar values
 
 ## Basic Workflow
