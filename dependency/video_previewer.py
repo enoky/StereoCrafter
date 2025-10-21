@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-20.1"
+VERSION = "25-10-21.1"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -389,6 +389,7 @@ class VideoPreviewer(ttk.Frame):
             
             new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
             self.frame_scrubber_var.set(new_value) # This triggers on_scrubber_move
+            self.on_scrubber_move(new_value)
             self.on_slider_release(event) # Manually trigger preview update
             
             return "break" # Prevents the default slider click behavior
