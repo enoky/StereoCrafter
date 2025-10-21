@@ -3777,7 +3777,7 @@ class SplatterGUI(ThemedTk):
                 return
         # If the file does NOT exist, we skip the dialog and proceed.
 
-        logger.info(f"Attempting to {'update' if is_sidecar_present else 'create'} sidecar: {json_sidecar_path}")
+        logger.debug(f"Attempting to {'update' if is_sidecar_present else 'create'} sidecar: {json_sidecar_path}")
 
         # 3. Get current GUI values (use raw strings for consistency)
         try:

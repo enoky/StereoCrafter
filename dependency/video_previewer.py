@@ -138,6 +138,17 @@ class VideoPreviewer(ttk.Frame):
         self.frame_scrubber.bind("<ButtonRelease-1>", self.on_slider_release)
         self.frame_scrubber.bind("<Button-1>", self._on_scrubber_trough_click)
         self.frame_scrubber.configure(command=self.on_scrubber_move)
+        
+        # 1. Bind keys to the scrubber_frame
+        scrubber_frame.bind('<Left>', self._key_jump_frames)
+        scrubber_frame.bind('<Right>', self._key_jump_frames)
+        
+        # 2. Add a general binding to set focus on click anywhere inside the frame
+        scrubber_frame.bind('<Button-1>', lambda e: scrubber_frame.focus_set(), add='+')
+        
+        # 3. Add a binding to the slider itself to set focus on its frame
+        self.frame_scrubber.bind('<Button-1>', lambda e: scrubber_frame.focus_set(), add='+')
+        self.frame_scrubber.bind('<ButtonRelease-1>', lambda e: scrubber_frame.focus_set(), add='+')
 
         # Video Navigation Frame
         preview_button_frame = ttk.Frame(self)
@@ -497,6 +508,41 @@ class VideoPreviewer(ttk.Frame):
                 messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.video_list)}.")
         except ValueError:
             messagebox.showerror("Invalid Input", "Please enter a valid number.")
+
+    def _key_jump_frames(self, event):
+        """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
+        if not self.source_readers:
+            return
+
+        # Determine jump size: 10 for normal, 100 for Shift (state mask 0x1)
+        jump_size = 1
+        if event.state & 0x1: # 0x1 is the mask for the Shift key state
+            jump_size = 10
+            
+        direction_multiplier = 0
+        if event.keysym == "Left":
+            direction_multiplier = -1
+        elif event.keysym == "Right":
+            direction_multiplier = 1
+        elif event.keysym == "Shift_L" or event.keysym == "Shift_R":
+            # Ignore just the Shift keypress itself if it somehow triggered the event
+            return
+        else:
+            return # Should not happen
+
+        current_frame = int(self.frame_scrubber_var.get())
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+        
+        direction = direction_multiplier * jump_size
+        new_frame = current_frame + direction
+        
+        # Clamp the new frame index
+        new_frame = max(0, min(new_frame, total_frames - 1))
+
+        if new_frame != current_frame:
+            self.frame_scrubber_var.set(new_frame)
+            self.on_scrubber_move(new_frame) # Update label
+            self.update_preview() # Update display
 
     def _update_nav_controls(self):
         """Updates the state and labels of the video navigation controls."""
