@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.21.3"
+GUI_VERSION = "25.10.21.4"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -1408,23 +1408,38 @@ class SplatterGUI(ThemedTk):
         if not encoding_successful:
             return False
 
-        # --- Write sidecar JSON after successful encoding ---
-        output_sidecar_data = {}
-        if frame_overlap is not None:
-            output_sidecar_data["frame_overlap"] = frame_overlap
-        if input_bias is not None:
-            output_sidecar_data["input_bias"] = input_bias
-        
-        if output_sidecar_data:
-            sidecar_ext = self.APP_CONFIG_DEFAULTS.get('OUTPUT_SIDECAR_EXT', '.spsidecar')
-            output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}{sidecar_ext}"
-            try:
-                with open(output_sidecar_path, 'w', encoding='utf-8') as f:
-                    json.dump(output_sidecar_data, f, indent=4)
-                logger.info(f"Created output sidecar file: {output_sidecar_path}")
-            except Exception as e:
-                logger.error(f"Error creating output sidecar file '{output_sidecar_path}': {e}")
-        
+        # --- Check for Low-Res Task BEFORE writing sidecar ---
+        if is_low_res_task:
+            
+            # --- Write sidecar JSON after successful encoding ---
+            output_sidecar_data = {}
+            
+            # Check and include frame_overlap and input_bias
+            has_non_zero_setting = False
+
+            if frame_overlap is not None and frame_overlap != 0.0:
+                output_sidecar_data["frame_overlap"] = frame_overlap
+                has_non_zero_setting = True
+                
+            if input_bias is not None and input_bias != 0.0:
+                output_sidecar_data["input_bias"] = input_bias
+                has_non_zero_setting = True
+            
+            # Use the combined condition: non-zero setting AND is low-res
+            if has_non_zero_setting:
+                sidecar_ext = self.APP_CONFIG_DEFAULTS.get('OUTPUT_SIDECAR_EXT', '.spsidecar')
+                output_sidecar_path = f"{os.path.splitext(final_output_video_path)[0]}{sidecar_ext}"
+                try:
+                    with open(output_sidecar_path, 'w', encoding='utf-8') as f:
+                        json.dump(output_sidecar_data, f, indent=4)
+                    logger.info(f"Created output sidecar file: {output_sidecar_path}")
+                except Exception as e:
+                    logger.error(f"Error creating output sidecar file '{output_sidecar_path}': {e}")
+            else:
+                logger.debug("Skipping output sidecar creation: frame_overlap and input_bias are zero.")
+        else:
+            logger.debug("Skipping output sidecar creation: High-resolution output does not require spsidecar.")
+                    
         return True
 
     def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float) -> Tuple[float, float]:
