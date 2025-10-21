@@ -20,6 +20,19 @@ import time
 import logging
 from typing import Optional, Tuple, Optional
 from PIL import Image
+import math # <--- ADD THIS
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    # Fallback/stub for systems without moviepy
+    class VideoFileClip:
+        def __init__(self, *args, **kwargs):
+            logging.warning("moviepy.editor not found. Frame counting disabled.")
+        def close(self): pass
+        @property
+        def fps(self): return None
+        @property
+        def duration(self): return None
 
 # Import custom modules
 CUDA_AVAILABLE = False # start state, will check automaticly later
@@ -40,8 +53,210 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.20.7"
+GUI_VERSION = "25.10.21.1"
 MOVE_TO_FINISHED_ENABLED = True
+
+class FusionSidecarGenerator:
+    """Handles parsing Fusion Export files, matching them to depth maps,
+    and generating/saving FSSIDECAR files using carry-forward logic."""
+    
+    FUSION_PARAMETER_CONFIG = {
+        # Key: {Label, Type, Default, FusionKey(fsexport), SidecarKey(fssidecar), Decimals}
+        "convergence": {
+            "label": "Convergence Plane", "type": float, "default": 0.5, 
+            "fusion_key": "Convergence", "sidecar_key": "convergence_plane", "decimals": 3
+        },
+        "max_disparity": {
+            "label": "Max Disparity", "type": float, "default": 35.0, 
+            "fusion_key": "MaxDisparity", "sidecar_key": "max_disparity", "decimals": 1
+        },
+        "gamma": {
+            "label": "Gamma Correction", "type": float, "default": 1.0,
+            "fusion_key": "FrontGamma", "sidecar_key": "gamma", "decimals": 2
+        },
+        # These keys exist in the sidecar manager but are usually set in the source tool
+        # We include them here for completeness if Fusion ever exported them
+        "frame_overlap": {
+            "label": "Frame Overlap", "type": float, "default": 0.0,
+            "fusion_key": "Overlap", "sidecar_key": "frame_overlap", "decimals": 0
+        },
+        "input_bias": {
+            "label": "Input Bias", "type": float, "default": 0.0, 
+            "fusion_key": "Bias", "sidecar_key": "input_bias", "decimals": 2
+        }
+    }
+    
+    def __init__(self, master_gui, sidecar_manager):
+        self.master_gui = master_gui
+        self.sidecar_manager = sidecar_manager
+        self.logger = logging.getLogger(__name__)
+
+    def _get_video_frame_count(self, file_path):
+        """Safely gets the frame count of a video file using moviepy."""
+        try:
+            clip = VideoFileClip(file_path)
+            fps = clip.fps
+            duration = clip.duration
+            if fps is None or duration is None:
+                # If moviepy failed to get reliable info, fall back
+                fps = 24 
+                if duration is None: return 0 
+            
+            frames = math.ceil(duration * fps)
+            clip.close()
+            return frames
+        except Exception as e:
+            self.logger.warning(f"Error getting frame count for {os.path.basename(file_path)}: {e}")
+            return 0
+
+    def _load_and_validate_fsexport(self, file_path):
+        """Loads, parses, and validates marker data from a Fusion Export file."""
+        try:
+            with open(file_path, 'r') as f:
+                export_data = json.load(f)
+        except json.JSONDecodeError as e:
+            messagebox.showerror("File Error", f"Failed to parse JSON in {os.path.basename(file_path)}: {e}")
+            return None
+        except Exception as e:
+            messagebox.showerror("File Error", f"Failed to read {os.path.basename(file_path)}: {e}")
+            return None
+
+        markers = export_data.get("markers", [])
+        if not markers:
+            messagebox.showwarning("Data Warning", "No 'markers' found in the export file.")
+            return None
+        
+        # Sort markers by frame number (critical for carry-forward logic)
+        markers.sort(key=lambda m: m['frame'])
+        self.logger.info(f"Loaded {len(markers)} markers from {os.path.basename(file_path)}.")
+        return markers
+
+    def _scan_target_videos(self, folder):
+        """Scans the target folder for video files and computes their frame counts."""
+        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+        found_files_paths = []
+        for ext in video_extensions:
+            found_files_paths.extend(glob.glob(os.path.join(folder, ext)))
+        sorted_files_paths = sorted(found_files_paths)
+        
+        if not sorted_files_paths:
+            messagebox.showwarning("No Files", f"No video depth map files found in: {folder}")
+            return None
+
+        target_video_data = []
+        cumulative_frames = 0
+        
+        for full_path in sorted_files_paths:
+            total_frames = self._get_video_frame_count(full_path)
+            
+            if total_frames == 0:
+                self.logger.warning(f"Skipping {os.path.basename(full_path)} due to zero frame count.")
+                continue
+
+            target_video_data.append({
+                "full_path": full_path,
+                "basename": os.path.basename(full_path),
+                "total_frames": total_frames,
+                "timeline_start_frame": cumulative_frames,
+                "timeline_end_frame": cumulative_frames + total_frames - 1,
+            })
+            cumulative_frames += total_frames
+            
+        self.logger.info(f"Scanned {len(target_video_data)} video files. Total timeline frames: {cumulative_frames}.")
+        return target_video_data
+
+    def generate_sidecars(self):
+        """Main entry point for the Fusion Export to Sidecar generation workflow."""
+        
+        # 1. Select Fusion Export File
+        export_file_path = filedialog.askopenfilename(
+            defaultextension=".fsexport",
+            filetypes=[("Fusion Export Files", "*.fsexport.txt;*.fsexport"), ("All Files", "*.*")],
+            title="Select Fusion Export (.fsexport) File"
+        )
+        if not export_file_path:
+            self.master_gui.status_label.config(text="Fusion export selection cancelled.")
+            return
+
+        markers = self._load_and_validate_fsexport(export_file_path)
+        if markers is None:
+            self.master_gui.status_label.config(text="Fusion export loading failed.")
+            return
+
+        # 2. Select Target Depth Map Folder
+        target_folder = filedialog.askdirectory(title="Select Target Depth Map Folder")
+        if not target_folder:
+            self.master_gui.status_label.config(text="Depth map folder selection cancelled.")
+            return
+
+        target_videos = self._scan_target_videos(target_folder)
+        if target_videos is None or not target_videos:
+            self.master_gui.status_label.config(text="No valid depth map videos found.")
+            return
+
+        # 3. Apply Parameters (Carry-Forward Logic)
+        applied_count = 0
+        
+        # Initialize last known values with the config defaults
+        last_param_vals = {}
+        for key, config in self.FUSION_PARAMETER_CONFIG.items():
+             last_param_vals[key] = config["default"]
+
+        for file_data in target_videos:
+            file_start_frame = file_data["timeline_start_frame"]
+            
+            # Find the most relevant marker (latest marker frame <= file_start_frame)
+            relevant_marker = None
+            for marker in markers:
+                if marker['frame'] <= file_start_frame:
+                    relevant_marker = marker
+                else:
+                    break
+            
+            current_param_vals = last_param_vals.copy()
+
+            if relevant_marker and relevant_marker.get('values'):
+                marker_values = relevant_marker['values']
+                updated_from_marker = False
+                
+                for key, config in self.FUSION_PARAMETER_CONFIG.items():
+                    fusion_key = config["fusion_key"]
+                    default_val = config["default"]
+                    
+                    if fusion_key in marker_values:
+                        # Attempt to cast the value from the marker to the expected type
+                        val = marker_values.get(fusion_key, default_val)
+                        try:
+                            current_param_vals[key] = config["type"](val)
+                            updated_from_marker = True
+                        except (ValueError, TypeError):
+                            self.logger.warning(f"Marker value for '{fusion_key}' is invalid ({val}). Using previous/default value.")
+                            
+                if updated_from_marker:
+                    applied_count += 1
+            
+            # 4. Save Sidecar JSON
+            sidecar_data = {}
+            for key, config in self.FUSION_PARAMETER_CONFIG.items():
+                value = current_param_vals[key]
+                # Round to configured decimals for clean sidecar output
+                sidecar_data[config["sidecar_key"]] = round(value, config["decimals"])
+                
+            base_name_without_ext = os.path.splitext(file_data["full_path"])[0]
+            json_filename = base_name_without_ext + ".fssidecar" # Target sidecar extension
+            
+            if not self.sidecar_manager.save_sidecar_data(json_filename, sidecar_data):
+                self.logger.error(f"Failed to save sidecar for {file_data['basename']}.")
+
+            # Update last values for carry-forward to the next file
+            last_param_vals = current_param_vals.copy()
+
+        # 5. Final Status
+        if applied_count == 0:
+            self.master_gui.status_label.config(text="Finished: No parameters were applied from the export file.")
+        else:
+            self.master_gui.status_label.config(text=f"Finished: Applied markers to {applied_count} files, generated {len(target_videos)} FSSIDECARs.")
+        messagebox.showinfo("Sidecar Generation Complete", f"Successfully processed {os.path.basename(export_file_path)} and generated {len(target_videos)} FSSIDECAR files.")
 
 class ForwardWarpStereo(nn.Module):
     """
@@ -525,6 +740,9 @@ class SplatterGUI(ThemedTk):
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
         self.file_menu.add_separator() # Separator for organization
+
+        self.file_menu.add_command(label="Load Fusion Export (.fsexport)...", command=self.run_fusion_sidecar_generator)
+        self.file_menu.add_separator()
 
         self.file_menu .add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu .add_separator()
@@ -1132,7 +1350,11 @@ class SplatterGUI(ThemedTk):
                 with torch.no_grad():
                     right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
                     if is_low_res_task:
-                        right_video_tensor = self._fill_left_edge_occlusions(right_video_tensor_raw, occlusion_mask_tensor, boundary_width_pixels=3)
+                        # 1. Fill Left Edge Occlusions
+                        right_video_tensor_left_filled = self._fill_left_edge_occlusions(right_video_tensor_raw, occlusion_mask_tensor, boundary_width_pixels=3)
+                        
+                        # 2. Fill Right Edge Occlusions (New Call)
+                        right_video_tensor = self._fill_right_edge_occlusions(right_video_tensor_left_filled, occlusion_mask_tensor, boundary_width_pixels=3)
                     else:
                         right_video_tensor = right_video_tensor_raw
 
@@ -1428,6 +1650,66 @@ class SplatterGUI(ThemedTk):
                         modified_right_video_tensor[b_idx, :, h_idx, x] = source_pixel_values
 
         logger.debug(f"Created {boundary_width_pixels}-pixel left-edge content boundary.")
+        return modified_right_video_tensor
+
+    def _fill_right_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
+        """
+        Creates a thin, content-filled boundary at the absolute right edge of the screen
+        by replicating the last visible pixels (from the left) into the rightmost columns.
+        
+        Args:
+            right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W],
+                                               values in [0, 1].
+            occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W],
+                                                  where 1 indicates occlusion.
+            boundary_width_pixels (int): How many columns at the absolute right edge to fill.
+
+        Returns:
+            torch.Tensor: The modified right-eye video tensor with the right-edge boundary filled.
+        """
+        B, C, H, W = right_video_tensor.shape
+
+        boundary_width_pixels = min(W, boundary_width_pixels)
+        if boundary_width_pixels <= 0:
+            logger.debug("Boundary width for right-edge occlusions is 0 or less, skipping fill.")
+            return right_video_tensor
+
+        modified_right_video_tensor = right_video_tensor.clone()
+
+        # Iterate through each batch item and each row independently
+        for b_idx in range(B):
+            for h_idx in range(H):
+                # 1. Find the first non-occluded column 'X' for this specific row, moving from RIGHT to LEFT.
+                # Invert the occlusion mask (0=occluded, 1=visible) to find the last '1' (visible)
+                is_visible_col_mask = (occlusion_mask_tensor[b_idx, 0, h_idx, :] < 0.5)
+                
+                # Find all column indices that are visible
+                visible_column_indices = torch.nonzero(is_visible_col_mask, as_tuple=True)[0]
+
+                # Determine the 'source column' for filling
+                source_col_for_boundary_fill: int
+                
+                if visible_column_indices.numel() > 0:
+                    # If there's any visible content, take the *last* visible column.
+                    source_col_for_boundary_fill = int(visible_column_indices[-1].item())
+                    # Ensure it's not accessing beyond the tensor boundary
+                    source_col_for_boundary_fill = max(source_col_for_boundary_fill, 0)
+                else:
+                    # Fallback: Use the first valid column (0)
+                    source_col_for_boundary_fill = 0
+                
+                # Get the pixel values from this 'source column' to use for the boundary.
+                source_pixel_values = right_video_tensor[b_idx, :, h_idx, source_col_for_boundary_fill] # Shape [C]
+
+                # 2. Fill the rightmost 'boundary_width_pixels' columns for this row
+                for x_offset in range(boundary_width_pixels):
+                    x = W - 1 - x_offset # Column index (W-1 is the far right)
+                    
+                    # Only fill if the current pixel is currently occluded
+                    if occlusion_mask_tensor[b_idx, 0, h_idx, x] > 0.5: # If currently occluded
+                        modified_right_video_tensor[b_idx, :, h_idx, x] = source_pixel_values
+
+        logger.debug(f"Created {boundary_width_pixels}-pixel right-edge content boundary.")
         return modified_right_video_tensor
 
     def _find_preview_sources_callback(self) -> list:
@@ -2244,7 +2526,11 @@ class SplatterGUI(ThemedTk):
             
             # Apply low-res specific post-processing
             if is_low_res_preview:
-                right_eye_tensor = self._fill_left_edge_occlusions(right_eye_tensor_raw, occlusion_mask, boundary_width_pixels=3)
+                # 1. Fill Left Edge Occlusions
+                right_eye_tensor_left_filled = self._fill_left_edge_occlusions(right_eye_tensor_raw, occlusion_mask, boundary_width_pixels=3)
+                
+                # 2. Fill Right Edge Occlusions (New Call)
+                right_eye_tensor = self._fill_right_edge_occlusions(right_eye_tensor_left_filled, occlusion_mask, boundary_width_pixels=3)
             else:
                 right_eye_tensor = right_eye_tensor_raw
 
@@ -2484,6 +2770,16 @@ class SplatterGUI(ThemedTk):
             self.progress_queue.put("finished")
             self.after(0, self.clear_processing_info)
 
+    def run_fusion_sidecar_generator(self):
+        """Initializes and runs the FusionSidecarGenerator tool."""
+        # Use an external thread to prevent the GUI from freezing during the file scan
+        def worker():
+            self.status_label.config(text="Starting Fusion Export Sidecar Generation...")
+            generator = FusionSidecarGenerator(self, self.sidecar_manager)
+            generator.generate_sidecars()
+            
+        threading.Thread(target=worker, daemon=True).start()
+
     def run_preview_auto_converge(self, force_run=False):
         """
         Starts the Auto-Convergence pre-pass on the current preview clip in a thread,
@@ -2622,14 +2918,21 @@ class SplatterGUI(ThemedTk):
         if auto_conv_mode != "Off":
             logger.info(f"Auto-Convergence is ENABLED (Mode: {auto_conv_mode}). Running pre-pass...")
 
-            new_anchor_val = self._determine_auto_convergence(
+            try:
+                anchor_float = float(current_zero_disparity_anchor)
+            except (ValueError, TypeError):
+                logger.error(f"Invalid convergence anchor value found: {current_zero_disparity_anchor}. Defaulting to 0.5.")
+                anchor_float = 0.5
+
+            new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
                 actual_depth_map_path,
                 settings["process_length"],
                 settings["full_res_batch_size"],
-                current_zero_disparity_anchor,
-                mode=auto_conv_mode
+                anchor_float,
             )
             
+            new_anchor_val = new_anchor_avg if auto_conv_mode == "Average" else new_anchor_peak
+
             # Update variables for current task
             if new_anchor_val != current_zero_disparity_anchor:
                 current_zero_disparity_anchor = new_anchor_val
