@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.21.2"
+GUI_VERSION = "25.10.21.3"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -76,7 +76,7 @@ class FusionSidecarGenerator:
         # These keys exist in the sidecar manager but are usually set in the source tool
         # We include them here for completeness if Fusion ever exported them
         "frame_overlap": {
-            "label": "Frame Overlap", "type": float, "default": 0.0,
+            "label": "Frame Overlap", "type": float, "default": 3,
             "fusion_key": "Overlap", "sidecar_key": "frame_overlap", "decimals": 0
         },
         "input_bias": {
@@ -1287,7 +1287,7 @@ class SplatterGUI(ThemedTk):
                 # Use the FIRST frame index for the file name (e.g., 00000.png)
                 file_frame_idx = current_frame_indices[0] 
                 
-                self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, file_frame_idx, task_name) 
+                # self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, file_frame_idx, task_name) 
                 
                 batch_depth_numpy = self._process_depth_batch(
                     batch_depth_numpy_raw=batch_depth_numpy_raw,
@@ -1307,7 +1307,7 @@ class SplatterGUI(ThemedTk):
                     debug_task_name=task_name,
                     # --- END NEW DEBUG ARGS ---
                 )
-                self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, file_frame_idx, task_name)
+                # self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, file_frame_idx, task_name)
 
                 batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
                 batch_depth_normalized = batch_depth_numpy.copy()
@@ -1329,7 +1329,7 @@ class SplatterGUI(ThemedTk):
                 if not assume_raw_input and depth_gamma != 1.0:
                      batch_depth_normalized = np.power(batch_depth_normalized, depth_gamma)
                 
-                self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, file_frame_idx, task_name) 
+                # self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, file_frame_idx, task_name) 
                 
                 batch_depth_vis_list = []
                 for d_frame in batch_depth_normalized:

@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-20.3"
+VERSION = "25-10-20.4"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -74,7 +74,7 @@ class SidecarConfigManager:
         "convergence_plane": (float, 0.5), 
         "max_disparity": (float, 20.0),
         "gamma": (float, 1.0), 
-        "frame_overlap": (float, 0.0),
+        "frame_overlap": (float, 3.0),
         "input_bias": (float, 0.0),
         # Add future keys here
     }
