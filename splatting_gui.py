@@ -2129,8 +2129,10 @@ class SplatterGUI(ThemedTk):
             # --- Retry for Sidecar file (if it exists) ---
             depth_map_dirname = os.path.dirname(actual_depth_map_path)
             depth_map_basename_without_ext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}.fssidecar")
-            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}.fssidecar")
+            input_sidecar_ext = self.APP_CONFIG_DEFAULTS.get('SIDECAR_EXT', '.fssidecar') # Fallback to .fssidecar
+            
+            json_sidecar_path_to_move = os.path.join(depth_map_dirname, f"{depth_map_basename_without_ext}{input_sidecar_ext}")
+            dest_path_json = os.path.join(finished_depth_folder, f"{depth_map_basename_without_ext}{input_sidecar_ext}")
 
             if os.path.exists(json_sidecar_path_to_move):
                 for attempt in range(max_retries):
