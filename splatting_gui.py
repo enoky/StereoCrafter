@@ -2224,7 +2224,7 @@ class SplatterGUI(ThemedTk):
         
         # Convert to float32 for processing
         batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
-        self._save_debug_image(batch_depth_numpy_float, "01_GRAYSCALE", debug_batch_index, debug_frame_index, debug_task_name)
+        # self._save_debug_image(batch_depth_numpy_float, "01_GRAYSCALE", debug_batch_index, debug_frame_index, debug_task_name)
 
 
         # 2. Gamma Adjustment (Only in RAW mode, otherwise skipped)
@@ -2242,7 +2242,7 @@ class SplatterGUI(ThemedTk):
                 else:
                     batch_depth_numpy_float = np.power(batch_depth_numpy_float, depth_gamma)
 
-        self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
+        # self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
 
 
         # --- 3. Dilate and Blur (Hi-Res Only, using stable OpenCV CPU calls) ---
@@ -2287,7 +2287,7 @@ class SplatterGUI(ThemedTk):
                 batch_depth_numpy_float = batch_depth_numpy_uint8.astype(np.float32) * (scale_factor / 255.0)
 
         # --- DEBUG SAVE 4: Final Processed Image ---
-        self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
+        # self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
 
 
         return batch_depth_numpy_float
