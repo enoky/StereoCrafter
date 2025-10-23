@@ -61,6 +61,7 @@ try:
 except ImportError:
     THEMEDTK_AVAILABLE = False
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
+# --- Imports End ---
 
 GUI_VERSION = "25.10.08"
 _HELP_TEXTS = {}
@@ -300,11 +301,10 @@ class DepthCrafterGUI:
         # --- Core Theme Application (Must happen before detailed styling) ---
         if self.dark_mode_var.get():
             colors = DARK_MODE_COLORS
-            theme_name = colors["theme_name"]
         else:
             colors = LIGHT_MODE_COLORS
-            theme_name = colors["theme_name"]
-
+        
+        theme_name = colors["theme_name"]
         self.current_theme_colors = colors
         
         if THEMEDTK_AVAILABLE:
@@ -409,10 +409,9 @@ class DepthCrafterGUI:
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
-        self.help_menu.add_command(label="GUI Overview", command=lambda: self._show_help_for("general_gui_overview"))
-        # --- ADD THIS CHECKBUTTON TO HELP MENU ---
-        self.help_menu.add_separator() # Optional separator for clarity
         self.help_menu.add_checkbutton(label="Enable Debug Logging", variable=self.debug_logging_enabled, command=self._toggle_debug_logging)
+        self.help_menu.add_separator() # Optional separator for clarity
+        self.help_menu.add_command(label="GUI Overview", command=lambda: self._show_help_for("general_gui_overview"))
         # -----------------------------------------
 
     def _determine_input_mode_from_path(self, path_str: str) -> Tuple[str, bool]:
@@ -1296,7 +1295,7 @@ class DepthCrafterGUI:
         
         button_frame = ttk.Frame(help_window, padding=(0, 5, 0, 10))
         button_frame.pack(fill=tk.X)
-        ok_button = tttk.Button(button_frame, text="OK", command=help_window.destroy, width=10)
+        ok_button = ttk.Button(button_frame, text="OK", command=help_window.destroy, width=10)
         ok_button.pack()
         
         self.root.update_idletasks()
