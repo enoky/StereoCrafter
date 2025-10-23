@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-21.1"
+VERSION = "25-10-23.1"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -71,6 +71,7 @@ class VideoPreviewer(ttk.Frame):
         self.pil_image_for_preview: Optional[Image.Image] = None
         self.preview_image_tk: Optional[ImageTk.PhotoImage] = None
         self.wiggle_after_id: Optional[str] = None
+        self.root_window = self.parent.winfo_toplevel() 
         self.last_loaded_video_path: Optional[str] = None
         self.last_loaded_frame_index: int = 0 
 
@@ -139,20 +140,18 @@ class VideoPreviewer(ttk.Frame):
         self.frame_scrubber.bind("<Button-1>", self._on_scrubber_trough_click)
         self.frame_scrubber.configure(command=self.on_scrubber_move)
         
-        # 1. Bind keys to the scrubber_frame
-        scrubber_frame.bind('<Left>', self._key_jump_frames)
-        scrubber_frame.bind('<Right>', self._key_jump_frames)
-        
-        # 2. Add a general binding to set focus on click anywhere inside the frame
-        scrubber_frame.bind('<Button-1>', lambda e: scrubber_frame.focus_set(), add='+')
-        
-        # 3. Add a binding to the slider itself to set focus on its frame
-        self.frame_scrubber.bind('<Button-1>', lambda e: scrubber_frame.focus_set(), add='+')
-        self.frame_scrubber.bind('<ButtonRelease-1>', lambda e: scrubber_frame.focus_set(), add='+')
-
         # Video Navigation Frame
         preview_button_frame = ttk.Frame(self)
         preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
+        
+        # Bindings are placed on the top-level window for global detection
+        self.root_window.bind('<Left>', self._key_jump_frames, add='+')
+        self.root_window.bind('<Right>', self._key_jump_frames, add='+')
+        self.root_window.bind('<Shift-Left>', self._key_jump_frames, add='+')
+        self.root_window.bind('<Shift-Right>', self._key_jump_frames, add='+')
+        self.root_window.bind('<Control-Left>', self._key_jump_clips, add='+')
+        self.root_window.bind('<Control-Right>', self._key_jump_clips, add='+')
+        logger.debug("Global key bindings for frame jumping installed on root window.")
 
         # Add Preview Source dropdown
         lbl_preview_source = ttk.Label(preview_button_frame, text="Preview Source:")
@@ -479,6 +478,9 @@ class VideoPreviewer(ttk.Frame):
             self.on_scrubber_move(initial_frame)
             if self.update_clip_callback:
                 self.update_clip_callback()
+            
+            if self.parent and hasattr(self.parent, 'update_gui_from_sidecar'):
+                self.parent.update_gui_from_sidecar(source_paths.get('depth_map'))
 
             self.update_preview()
 
@@ -492,6 +494,11 @@ class VideoPreviewer(ttk.Frame):
         """Navigate to the previous or next video in the preview list."""
         if not self.video_list:
             return
+        
+        # --- Auto-Save Current Sidecar before navigating ---
+        if self.parent and hasattr(self.parent, '_auto_save_current_sidecar'):
+            self.parent._auto_save_current_sidecar()
+
         new_index = self.current_video_index + direction
         if 0 <= new_index < len(self.video_list):
             self._load_preview_by_index(new_index)
@@ -508,6 +515,22 @@ class VideoPreviewer(ttk.Frame):
                 messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.video_list)}.")
         except ValueError:
             messagebox.showerror("Invalid Input", "Please enter a valid number.")
+
+    def _key_jump_clips(self, event):
+        """Handler for Ctrl+Left/Right arrow keys to jump between clips."""
+        if not self.video_list:
+            return
+
+        direction = 0
+        if event.keysym == "Left":
+            direction = -1
+        elif event.keysym == "Right":
+            direction = 1
+        else:
+            return # Should not happen
+
+        # Call the existing navigation function
+        self._nav_preview_video(direction)
 
     def _key_jump_frames(self, event):
         """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
