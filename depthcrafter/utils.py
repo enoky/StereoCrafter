@@ -158,6 +158,67 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             stream_info["height"] = s.get("height")
             stream_info["nb_frames"] = s.get("nb_frames")
             stream_info["duration"] = s.get("duration") # Duration might be here too with this syntax
+            stream_info["nb_read_frames"] = s.get("nb_read_frames")
+
+        # If nb_frames is missing or zero, re-run ffprobe with -count_frames
+        if not stream_info.get("nb_frames") or int(stream_info.get("nb_frames", "0")) == 0:
+            _logger.info(f"Rerunning ffprobe with -count_frames for {video_path} as nb_frames is zero or missing.")
+            cmd_count_frames = [
+                "ffprobe",
+                "-count_frames",  # Force full decode to count frames
+                "-v", "error",
+                "-select_streams", "v:0",  # Select the first video stream
+                "-show_entries", "stream=nb_read_frames",  # Only need frame count this time
+                "-of", "json",
+                video_path
+            ]
+            try:
+                result_count_frames = subprocess.run(cmd_count_frames, capture_output=True, text=True, check=True,
+                                                      encoding='utf-8', timeout=60)
+                raw_stdout_count_frames = result_count_frames.stdout
+                data_count_frames = json.loads(raw_stdout_count_frames)
+
+                if "streams" in data_count_frames and len(data_count_frames["streams"]) > 0:
+                    s = data_count_frames["streams"][0]
+                    # Update nb_frames with the counted value, if available
+                    if "nb_read_frames" in s:
+                        stream_info["nb_frames"] = s["nb_read_frames"]
+                        stream_info["nb_read_frames"] = s["nb_read_frames"]
+                        _logger.info(
+                            f"Successfully updated nb_frames to {stream_info['nb_frames']} using -count_frames for {video_path}."
+                        )
+                else:
+                    _logger.warning(
+                        f"No stream info found in -count_frames output for {video_path}."
+                    )
+
+            except subprocess.CalledProcessError as e:
+                _logger.error(
+                    f"ffprobe -count_frames failed for {video_path} (return code {e.returncode}):\n{e.stderr}"
+                )
+            except json.JSONDecodeError as e:
+                _logger.error(
+                    f"Failed to parse ffprobe -count_frames output for {video_path}: {e}. Raw output might be malformed JSON."
+                )
+                _logger.debug(
+                    f"Raw ffprobe -count_frames stdout (if available): {result_count_frames.stdout if 'result_count_frames' in locals() else 'N/A'}"
+                )
+            except Exception as e:
+                _logger.error(
+                    f"An unexpected error occurred with ffprobe -count_frames for {video_path}: {e}",
+                    exc_info=True
+                )
+
+        # --- After potentially using count_frames, prioritize nb_read_frames if available ---
+        if stream_info.get("nb_read_frames"):
+            # if stream_info.get("nb_read_frames")
+            stream_info["nb_frames"] = stream_info["nb_read_frames"]
+
+        # stream_info["nb_frames"] = s.get("nb_frames")
+
+
+
+            stream_info["nb_read_frames"] = s.get("nb_read_frames") # <--- ADD THIS. Get the frame count with -count_frames
             
             # HDR mastering display and CLL metadata (from side_data_list within the stream)
             if s.get("side_data_list"):
@@ -170,7 +231,21 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         # --- Guess nb_frames from duration * r_frame_rate if nb_frames is still missing/zero ---
         if not stream_info.get("nb_frames") or int(stream_info.get("nb_frames", "0")) == 0:
             if stream_info.get("duration") and stream_info.get("r_frame_rate"):
+                _logger.debug(f"DEBUG: Attempting to guess frame count from duration and r_frame_rate for {video_path}")
+                _logger.debug(f"DEBUG:   Duration = {stream_info.get('duration')}")
+                _logger.debug(f"DEBUG:   r_frame_rate = {stream_info.get('r_frame_rate')}")
+
+                if not stream_info.get("duration") or not stream_info.get("r_frame_rate"):
+                    _logger.warning(f"ffprobe is missing duration OR frame rate; cannot reliably determine frame count for {video_path}")
+                    return None, raw_stdout
+
+                # [Validation] if duration is 0 and there is no nb_frames detected return None
+                if stream_info.get("duration") == '0.0':
+                    _logger.error(f"ffprobe reports zero duration and zero frames for {video_path}")
+                    return None, raw_stdout
                 try:
+                    # [Validation] Validate that stream_info values are not null to allow the division calculation
+
                     duration_f = float(stream_info["duration"])
                     r_frame_rate_str = stream_info["r_frame_rate"].split('/')
                     if len(r_frame_rate_str) == 2 and float(r_frame_rate_str[1]) != 0:
@@ -187,7 +262,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         # Filter out empty strings/None values and values '0' or '0.0'
         filtered_info = {k: v for k, v in stream_info.items() if v is not None and str(v).strip() not in ["N/A", "und", "unknown", "0", "0.0"]}
         
-        return (filtered_info, raw_stdout) if filtered_info else (None, raw_stdout)
+        return filtered_info, raw_stdout if filtered_info else (None, raw_stdout)
 
     except subprocess.CalledProcessError as e:
         _logger.error(f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}")
@@ -197,7 +272,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         _logger.error(f"Failed to parse ffprobe output for {video_path}: {e}. Raw output might be malformed JSON.")
-        _logger.debug(f"Raw ffprobe stdout (if available): {result.stdout if 'result' in locals() else 'N/A'}")
+        _logger.debug(f"Raw ffprobe stdout (if available): {result.stdout if 'result' in locals() else 'N/A'}") # [Bug] There might be the possibility of result does not get defined and a NameError occurs
         return None
     except Exception as e:
         _logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
@@ -572,6 +647,7 @@ def read_video_frames(
     try:
         vid_reader = VideoReader(video_path, ctx=cpu(0), width=final_width_for_decord, height=final_height_for_decord)
     except Exception as e:
+        _logger.error(f"Decord init EXCEPTION: {e}")
         _logger.error(f"Failed to initialize Decord VideoReader for {os.path.basename(video_path)} with target resolution {final_width_for_decord}x{final_height_for_decord}: {e}", exc_info=True)
         return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, 0, 0, video_stream_info, None
 
@@ -611,6 +687,8 @@ def read_video_frames(
     _logger.debug(f"Loading {len(frames_idx)} frames using Decord for {os.path.basename(video_path)}.")
     frames_batch = vid_reader.get_batch(frames_idx)
     frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0 # Normalize to 0-1 float32
+    _logger.debug(f"Successfully Loaded batch, frames_numpy {frames_numpy.shape}")
+
     del vid_reader
     gc.collect()
 

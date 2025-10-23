@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.21.4"
+GUI_VERSION = "25.10.23.1"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -386,7 +386,8 @@ class SplatterGUI(ThemedTk):
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
-        self.override_sidecar_var = tk.BooleanVar(value=self.app_config.get("override_sidecar_preview", False))
+        self.update_slider_from_sidecar_var = tk.BooleanVar(value=self.app_config.get("update_slider_from_sidecar", True))
+        self.auto_save_sidecar_var = tk.BooleanVar(value=self.app_config.get("auto_save_sidecar", False))
 
         # --- NEW: Previewer Variables ---
         self.preview_source_var = tk.StringVar(value="Splat Result")
@@ -552,6 +553,57 @@ class SplatterGUI(ThemedTk):
             mode # Still pass the current mode to know which value to select immediately
         ))
 
+    def _auto_save_current_sidecar(self):
+        """
+        Saves the current GUI values to the sidecar file without user interaction.
+        Only runs if self.auto_save_sidecar_var is True.
+        """
+        if not self.auto_save_sidecar_var.get():
+            return
+            
+        # 1. Ensure a video is loaded
+        if not hasattr(self, 'previewer') or not self.previewer.video_list or self.previewer.current_video_index == -1:
+            return
+
+        # 2. Get current sidecar path
+        current_index = self.previewer.current_video_index
+        current_source_dict = self.previewer.video_list[current_index]
+        depth_map_path = current_source_dict.get('depth_map')
+        
+        if not depth_map_path:
+            logger.error("Auto-Save: Could not determine depth map path for current clip.")
+            return
+
+        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        
+        # 3. Get current GUI values (use raw strings for consistency)
+        try:
+            save_data = {
+                "convergence_plane": float(self.zero_disparity_anchor_var.get()),
+                "max_disparity": float(self.max_disp_var.get()),
+                "gamma": float(self.depth_gamma_var.get()),
+            }
+        except ValueError:
+            logger.error("Auto-Save: Invalid input value in GUI. Skipping save.")
+            return
+            
+        # 4. Read existing sidecar content to preserve frame_overlap and input_bias
+        current_data = {}
+        # Load the existing data if the sidecar exists, otherwise start with defaults
+        current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
+        
+        # 5. Merge GUI values into current data
+        current_data.update(save_data)
+        
+        # 6. Write the updated data back to the file using the manager
+        if self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data):
+            logger.debug(f"Auto-Saved sidecar to {os.path.basename(json_sidecar_path)}")
+            self.status_label.config(text=f"Auto-Saved sidecar.")
+        else:
+            logger.error(f"Auto-Save: Failed to write sidecar file '{os.path.basename(json_sidecar_path)}'.")
+    
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
         current_path = var.get()
@@ -745,6 +797,14 @@ class SplatterGUI(ThemedTk):
 
         self.file_menu .add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu .add_separator()
+
+        # Update Slider from Sidecar Toggle (Existing)
+        self.file_menu.add_checkbutton(label="Update Slider from Sidecar", variable=self.update_slider_from_sidecar_var)
+
+        # --- Auto Save Sidecar Toggle ---
+        self.file_menu.add_checkbutton(label="Auto Save Sidecar on Next", variable=self.auto_save_sidecar_var)
+        self.file_menu.add_separator()
+
         self.file_menu .add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu .add_command(label="Restore Finished", command=self.restore_finished_files)
 
@@ -1042,17 +1102,6 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")   
 
         all_settings_row += 1
-        
-        # --- NEW: Override Sidecar Checkbox ---
-        self.override_sidecar_checkbox = ttk.Checkbutton(
-            self.depth_all_settings_frame, text="Override Sidecar (Preview Only)",
-            variable=self.override_sidecar_var,
-            command=lambda: [self.on_slider_release(None), self._toggle_sidecar_update_button_state()],
-            width=28
-            )
-        self.override_sidecar_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(self.override_sidecar_checkbox, "override_sidecar_preview")
-
         current_row = 0 # Reset for next frame
         # ===================================================================
         # --- RIGHT COLUMN: Current Processing Information frame ---
@@ -1853,7 +1902,6 @@ class SplatterGUI(ThemedTk):
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
             "enable_autogain": self.enable_autogain_var.get(),
-            "override_sidecar_preview": self.override_sidecar_var.get(),
         }
         return config
 
@@ -2630,12 +2678,10 @@ class SplatterGUI(ThemedTk):
         # ----------------------------------------------------------------------
         # NEW SIDECAR LOGIC FOR PREVIEW
         # ----------------------------------------------------------------------
-        # --- FIX: Use reliable indexing to get the correct path ---
         depth_map_path = None
         if 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
             current_source_dict = self.previewer.video_list[self.previewer.current_video_index]
             depth_map_path = current_source_dict.get('depth_map')
-        # --- END FIX ---
         
         gui_config = {
             "convergence_plane": float(self.zero_disparity_anchor_var.get()),
@@ -2643,60 +2689,13 @@ class SplatterGUI(ThemedTk):
             "gamma": float(self.depth_gamma_var.get()),
         }
         
-        # Determine the override keys
-        override_keys = []
-        if self.override_sidecar_var.get():
-            # If override is checked, GUI values override all three
-            override_keys = ["convergence_plane", "max_disparity", "gamma"]
-        elif not self.enable_sidecar_gamma_var.get():
-            # If gamma toggle is off, GUI gamma overrides Sidecar gamma
-            override_keys = ["gamma"]
-
-        conv_source = "GUI"
-        gamma_source = "GUI"
-        max_disp_source = "GUI"
-        
-        sidecar_path_found = False
-        
-        # --- MODIFIED BLOCK ---
-        if depth_map_path:
-            depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
-            sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-            json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
-            
-            # Check if sidecar exists
-            sidecar_path_found = os.path.exists(json_sidecar_path)
-
-            if sidecar_path_found:
-                # Merge: Sidecar is the base, GUI overrides where specified
-                merged_config = self.sidecar_manager.get_merged_config(json_sidecar_path, gui_config, override_keys)
-                logger.debug("Preview: Sidecar found. Merged config applied.")
-            else:
-                # Sidecar not found: GUI is the base (uses the initial gui_config)
-                merged_config = self.sidecar_manager._get_defaults()
-                merged_config.update(gui_config) # Override defaults with current GUI settings
-                logger.debug("Preview: Sidecar NOT found. Using GUI values.")
-        else:
-            merged_config = self.sidecar_manager._get_defaults()
-            merged_config.update(gui_config)
-            logger.debug("Preview: No depth map path available from previewer's list. Using GUI values.") # <--- MODIFIED LOG
-        # --- END MODIFIED BLOCK ---
-
+        merged_config = gui_config.copy()
 
         # Set final parameters from the merged config
         params['convergence_point'] = merged_config["convergence_plane"]
         params['max_disp'] = merged_config["max_disparity"]
         params['depth_gamma'] = merged_config["gamma"]
 
-        # Determine the final source for display info
-        if sidecar_path_found:
-            conv_source = "GUI" if "convergence_plane" in override_keys else "Sidecar"
-            max_disp_source = "GUI" if "max_disparity" in override_keys else "Sidecar"
-            gamma_source = "GUI" if "gamma" in override_keys else "Sidecar"
-        else:
-            conv_source = "GUI"
-            max_disp_source = "GUI"
-            gamma_source = "GUI"
         # ----------------------------------------------------------------------
         # END NEW SIDECAR LOGIC FOR PREVIEW
         # ----------------------------------------------------------------------
@@ -2853,9 +2852,6 @@ class SplatterGUI(ThemedTk):
         self.processing_task_name_var.set("Preview" + (" (Low-Res)" if is_low_res_preview else ""))
         self.processing_resolution_var.set(f"{W_target}x{H_target}")
         self.processing_frames_var.set(frames_display) 
-        self.processing_disparity_var.set(f"{params['max_disp']:.1f}% ({actual_max_disp_pixels:.2f} pixels) ({max_disp_source})")
-        self.processing_convergence_var.set(f"{params['convergence_point']:.2f} ({conv_source})")
-        self.processing_gamma_var.set(f"{params['depth_gamma']:.2f} ({gamma_source})")
         # --- END NEW: Update Info Frame for Preview ---
 
 
@@ -3716,17 +3712,18 @@ class SplatterGUI(ThemedTk):
         # Check if batch processing is currently active (easiest way is to check the stop button's state)
         is_batch_processing_active = (self.stop_button.cget("state") == "normal")
         
+        # Check if a video is currently loaded in the previewer
+        is_video_loaded = (hasattr(self, 'previewer') and self.previewer.current_video_index != -1)
+        
         # If batch is active, the button MUST be disabled, regardless of override state.
         if is_batch_processing_active:
             self.update_sidecar_button.config(state="disabled")
             return
             
-        # If batch is NOT active, base the state entirely on the Override checkbox.
-        if self.override_sidecar_var.get():
-            # Override is checked: GUI values are active, so ENABLE saving them.
+        # If a video is loaded and batch is NOT active, ENABLE the button.
+        if is_video_loaded:
             self.update_sidecar_button.config(state="normal")
         else:
-            # Override is unchecked: Sidecar values are active, so DISABLE saving GUI values.
             self.update_sidecar_button.config(state="disabled")
 
     def _update_clip_state_and_text(self):
@@ -3740,6 +3737,75 @@ class SplatterGUI(ThemedTk):
         if hasattr(self, '_toggle_sidecar_update_button_state'):
             self._toggle_sidecar_update_button_state()
 
+    def update_gui_from_sidecar(self, depth_map_path: str):
+        """
+        Reads the sidecar config for the given depth map path and updates the
+        Convergence, Max Disparity, and Gamma sliders.
+        """
+        if not self.update_slider_from_sidecar_var.get():
+            logger.debug("update_gui_from_sidecar: Feature is toggled OFF. Skipping update.")
+            return
+
+        if not depth_map_path:
+            return
+
+        # 1. Determine sidecar path
+        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        
+        if not os.path.exists(json_sidecar_path):
+            logger.debug(f"update_gui_from_sidecar: No sidecar found at {json_sidecar_path}. Skipping update.")
+            return
+
+        # 2. Load merged config (Sidecar values merged with defaults)
+        # We use merge to ensure we get a complete dictionary even if keys are missing
+        sidecar_config = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
+        
+        logger.info(f"Updating sliders from sidecar: {os.path.basename(json_sidecar_path)}")
+
+        # 3. Update Sliders Programmatically (Requires programmatic setter/updater)
+        
+        # Convergence
+        conv_val = sidecar_config.get("convergence_plane", self.zero_disparity_anchor_var.get())
+        self.zero_disparity_anchor_var.set(conv_val)
+        if self.set_convergence_value_programmatically:
+            self.set_convergence_value_programmatically(conv_val)
+
+        # Max Disparity
+        disp_val = sidecar_config.get("max_disparity", self.max_disp_var.get())
+        self.max_disp_var.set(disp_val)
+        # We need to manually update the max_disp label/slider if a setter was created for it.
+        # Since we only explicitly stored the convergence setter, we rely on the internal `slider_label_updaters` list for the others.
+        # Find the max_disp updater (crude but works if no dedicated setter is stored)
+        for key in self.SIDECAR_KEY_MAP:
+             if key == "max_disparity":
+                self.max_disp_var.set(disp_val)
+                # Find the correct updater by variable name, and call it (if available)
+                if hasattr(self, 'slider_label_updaters'):
+                     for updater in self.slider_label_updaters:
+                         # This check is fragile, but is a fallback if no dedicated setter was stored
+                         if str(self.max_disp_var.get()) in str(updater):
+                              updater()
+                              break
+                break
+        
+        # Gamma
+        gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
+        self.depth_gamma_var.set(gamma_val)
+        for key in self.SIDECAR_KEY_MAP:
+             if key == "gamma":
+                self.depth_gamma_var.set(gamma_val)
+                if hasattr(self, 'slider_label_updaters'):
+                     for updater in self.slider_label_updaters:
+                         if str(self.depth_gamma_var.get()) in str(updater):
+                              updater()
+                              break
+                break
+
+        # 4. Refresh preview to show the new values
+        self.on_slider_release(None)
+    
     def _update_sidecar_button_text(self):
         """Checks if a sidecar exists for the current preview video and updates the button text."""
         is_sidecar_present = False
