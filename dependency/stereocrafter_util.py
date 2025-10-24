@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-20.4"
+VERSION = "25-10-24.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -235,16 +235,26 @@ def create_single_slider_with_label_updater(
     row: int, 
     decimals: int = 0,
     tooltip_key: Optional[str] = None,
+    trough_increment: float = -1.0,
 ) -> None:
     """Creates a single slider, its value label, and all necessary event bindings."""
     
-    LABEL_FIXED_WIDTH = 8
+
+    # --- NEW: Calculate Incremental Step Size ---
+    # Step size should be 10 * the precision. 
+    # For decimals=0 (int), precision is 1. Step is 10.
+    # For decimals=2 (0.01), precision is 0.01. Step is 0.1.
+    precision = 1 ** (-decimals)
+    INCREMENTAL_STEP = precision * 1
+    VALUE_LABEL_FIXED_WIDTH = 4
+
     # 1. Widgets
     label = ttk.Label(parent, text=text, anchor="e")
     label.grid(row=row, column=0, sticky="ew", padx=0, pady=2)
     slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
     slider.grid(row=row, column=1, sticky="ew", padx=2)
-    value_label = ttk.Label(parent, text="") # Start with empty text
+
+    value_label = ttk.Label(parent, text="", width=VALUE_LABEL_FIXED_WIDTH) # Start with empty text
     value_label.grid(row=row, column=2, sticky="w", padx=0)
     
     # Column 0 (Label) has no weight (fixed width via 'width' option)
@@ -275,23 +285,73 @@ def create_single_slider_with_label_updater(
         value_label.config(text=f"{rounded_value:.{decimals}f}")
 
     def on_trough_click(event):
-        """Handles clicks on the slider's trough for precise positioning."""
-        if 'trough' in slider.identify(event.x, event.y):
-            slider.update_idletasks()
-            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+        """Handles clicks on the slider's trough for precise positioning or incremental change."""
+        
+        element = slider.identify(event.x, event.y)
+        
+        # If the click is on the slider thumb, do NOTHING and let the default behavior (dragging) execute.
+        if element == 'slider':
+             return 
+        
+        # Now we know it is a trough or other element, proceed with custom logic
+        if 'trough' not in element:
+             return "break"
+        
+        slider.update_idletasks()
+        
+        # Calculate the X position as a percentage of the slider width
+        click_ratio = event.x / slider.winfo_width()
+        
+        # Calculate the value at the click position
+        from_val, to_val = float(slider.cget("from")), float(slider.cget("to"))
+        value_at_click = from_val + (to_val - from_val) * click_ratio
+        
+        current_value = var.get()
+        if isinstance(current_value, str):
+             try:
+                 current_value = float(current_value)
+             except ValueError:
+                 current_value = from_val # Safety fallback
+
+        # --- MODIFIED LOGIC: Check for increment value > 0 ---
+        if trough_increment > 0:
+            # --- INCREMENTAL MODE ---
+            if value_at_click > current_value:
+                # Click is to the right of the thumb, so increment
+                new_value = current_value + trough_increment
+            else:
+                # Click is to the left of the thumb, so decrement
+                new_value = current_value - trough_increment
             
-            # Use the decimals to round the new_value
-            rounded_value = round(new_value, decimals)
+            # Clamp the new value to the slider's bounds
+            new_value = max(from_val, min(to_val, new_value))
             
-            # Set the rounded value immediately
-            var.set(rounded_value) 
+            # Use the dedicated setter to round and update all components
+            set_value_and_update_label(new_value)
             
-            # Manually update the label's text (this is the missing piece for trough click!)
-            update_label_and_preview(str(rounded_value)) # <--- Ensures label update
+        else: # -1.0 or 0, implies jump mode
+            # --- JUMP MODE ---
+            new_value = value_at_click
+            # Use the dedicated setter to round and update all components
+            set_value_and_update_label(new_value)
             
-            # Manually trigger preview update
+        # --- END MODIFIED LOGIC ---
+
+        # Manually trigger preview update only if the value actually changed (or on jump mode)
+        # Check if we were in jump mode OR if the value actually changed after clamping/rounding
+        is_jump_mode = trough_increment <= 0
+        if is_jump_mode or round(new_value, decimals) != round(current_value, decimals):
             GUI_self.on_slider_release(event) 
-            return "break"
+            
+        return "break"
+    
+    # ----------------------------------------------------
+    # Ensure a minimum step of 1 for integer-like fields, but let float logic handle smaller
+    if decimals == 0 and INCREMENTAL_STEP == 10:
+         pass # Keep 10
+    elif INCREMENTAL_STEP == 0:
+         INCREMENTAL_STEP = 1.0 # Safety fallback
+    # --- END NEW ---
 
     # 3. Bindings & Configuration
     slider.configure(command=update_label_and_preview)
@@ -327,6 +387,7 @@ def create_dual_slider_layout(
     is_integer: bool = True,
     tooltip_key_x: Optional[str] = None,
     tooltip_key_y: Optional[str] = None,
+    trough_increment: float = -1.0,
 ) -> None:
     """
     Creates a dual (X/Y) slider layout by composing two single sliders.
@@ -355,7 +416,9 @@ def create_dual_slider_layout(
     # We pass the inner frame, and it will use its grid (row=0, col=0, 1, 2)
     create_single_slider_with_label_updater(
         GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals, 
-        tooltip_key=tooltip_key_x)
+        tooltip_key=tooltip_key_x,
+        trough_increment=trough_increment
+    )
     
     # --- Y SLIDER ---
     y_inner_frame = ttk.Frame(xy_frame)
@@ -365,7 +428,9 @@ def create_dual_slider_layout(
     # Call the single slider creator for the Y components.
     create_single_slider_with_label_updater(
         GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals, 
-        tooltip_key=tooltip_key_y)
+        tooltip_key=tooltip_key_y,
+        trough_increment=trough_increment
+    )
 
 def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
     """
