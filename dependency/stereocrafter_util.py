@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-24.1"
+VERSION = "25-10-24.2"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -43,10 +43,6 @@ class Tooltip:
         self.widget.bind("<Leave>", self.hide_tooltip)
         self.widget.bind("<ButtonPress>", self.hide_tooltip) # Hide on click
 
-    def show_tooltip(self, event=None):
-        if self.leave_id: self.widget.after_cancel(self.leave_id)
-        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
-
     def _display_tooltip(self):
         if self.tooltip_window or not self.text: return
         x = self.widget.winfo_rootx() + 20
@@ -65,6 +61,10 @@ class Tooltip:
             self.tooltip_window.destroy()
         self.tooltip_window = None
 
+    def show_tooltip(self, event=None):
+        if self.leave_id: self.widget.after_cancel(self.leave_id)
+        self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
+
 class SidecarConfigManager:
     """Handles reading, writing, and merging of stereocrafter sidecar files."""
 
@@ -74,8 +74,12 @@ class SidecarConfigManager:
         "convergence_plane": (float, 0.5), 
         "max_disparity": (float, 20.0),
         "gamma": (float, 1.0), 
-        "frame_overlap": (float, 3.0),
         "input_bias": (float, 0.0),
+        "depth_dilate_size_x": (int, 3),
+        "depth_dilate_size_y": (int, 3),
+        "depth_blur_size_x": (int, 5),
+        "depth_blur_size_y": (int, 5),
+        "disable_depth_normalization": (bool, False),
         # Add future keys here
     }
 
@@ -280,6 +284,13 @@ def create_single_slider_with_label_updater(
 
     def set_value_and_update_label(new_value: float) -> None:
         """Programmatically sets the slider's value and updates its label."""
+        
+        try:
+             new_value = float(new_value)
+        except (ValueError, TypeError):
+             logger.error(f"Value '{new_value}' could not be converted to float in slider setter.", exc_info=True)
+             return # Abort if conversion fails
+        
         rounded_value = round(new_value, decimals)
         var.set(rounded_value)
         value_label.config(text=f"{rounded_value:.{decimals}f}")
@@ -540,14 +551,6 @@ def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, us
             
         return torch.stack(processed_frames).to(tensor.device)
 
-def set_util_logger_level(level):
-    """Sets the logging level for the 'stereocrafter_util' logger."""
-    logger.setLevel(level)
-    # If basicConfig was already called, its handlers might not update automatically.
-    # Ensure handlers also reflect the new level.
-    for handler in logger.handlers:
-        handler.setLevel(level)
-
 def check_cuda_availability():
     """
     Checks if CUDA is available via PyTorch and if nvidia-smi can run.
@@ -578,93 +581,6 @@ def check_cuda_availability():
         CUDA_AVAILABLE = False
     return CUDA_AVAILABLE
 
-def release_cuda_memory():
-    """Releases GPU memory and performs garbage collection."""
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.debug("CUDA cache cleared.")
-        gc.collect()
-        logger.debug("Python garbage collector invoked.")
-    except Exception as e:
-        logger.error(f"Error releasing VRAM or during garbage collection: {e}", exc_info=True)
-
-def get_video_stream_info(video_path: str) -> Optional[dict]:
-    """
-    Extracts comprehensive video stream metadata using ffprobe.
-    Returns a dict with relevant color properties, codec, pixel format, and HDR mastering metadata
-    or None if ffprobe fails/info not found.
-    Requires ffprobe to be installed and in your system PATH.
-    This function *does not* show messageboxes; the caller should handle errors.
-    """
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0", # Select the first video stream
-        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,r_frame_rate",
-        "-show_entries", "side_data=mastering_display_metadata,max_content_light_level", # ADDED entries
-        "-of", "json",
-        video_path
-    ]
-    
-    try:
-        # Check if ffprobe is available without showing a messagebox
-        subprocess.run(["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
-    except FileNotFoundError:
-        logger.error("ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error running ffprobe check: {e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("ffprobe check timed out.")
-        return None
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
-        data = json.loads(result.stdout)
-        
-        stream_info = {}
-        if "streams" in data and len(data["streams"]) > 0:
-            s = data["streams"][0]
-            # Common video stream properties
-            for key in ["codec_name", "profile", "pix_fmt", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
-                if key in s:
-                    stream_info[key] = s[key]
-            
-            # HDR mastering display and CLL metadata (often in side_data_list, but sometimes also directly in stream)
-            # Prioritize stream-level if available, otherwise check side_data_list
-            if "mastering_display_metadata" in s:
-                stream_info["mastering_display_metadata"] = s["mastering_display_metadata"]
-            if "max_content_light_level" in s:
-                stream_info["max_content_light_level"] = s["max_content_light_level"]
-
-        # Check side_data_list if stream-level properties weren't found or for additional data
-        if "side_data_list" in data:
-            for sd in data["side_data_list"]:
-                if "mastering_display_metadata" in sd and "mastering_display_metadata" not in stream_info:
-                    stream_info["mastering_display_metadata"] = sd["mastering_display_metadata"]
-                if "max_content_light_level" in sd and "max_content_light_level" not in stream_info:
-                    stream_info["max_content_light_level"] = sd["max_content_light_level"]
-
-        # Filter out empty strings/None/N/A values
-        filtered_info = {k: v for k, v in stream_info.items() if v and v not in ["N/A", "und", "unknown"]}
-        return filtered_info if filtered_info else None
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error(f"ffprobe timed out for {video_path}.")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.debug(f"Raw ffprobe stdout: {result.stdout}")
-        return None
-    except Exception as e:
-        logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
-        return None
-
 def draw_progress_bar(current, total, bar_length=50, prefix='Progress:', suffix=''):
     """
     Draws an ASCII progress bar in the console, overwriting the same line.
@@ -687,89 +603,6 @@ def draw_progress_bar(current, total, bar_length=50, prefix='Progress:', suffix=
 
     if current == total:
         print() # Add a final newline when done
-
-def read_video_frames_decord(
-    video_path: str,
-    process_length: int = -1,
-    target_fps: float = -1.0,
-    set_res_width: Optional[int] = None,
-    set_res_height: Optional[int] = None,
-    decord_ctx=cpu(0)
-) -> Tuple[np.ndarray, float, int, int, int, int, Optional[dict]]:
-    """
-    Reads video frames using decord, optionally resizing and downsampling frame rate.
-    Returns frames as a 4D float32 numpy array [T, H, W, C] normalized to 0-1,
-    the actual output FPS, original video height/width, actual processed height/width,
-    and video stream metadata.
-    """
-    logger.info(f"Reading video: {os.path.basename(video_path)}")
-
-    # Get video stream info first for FPS detection
-    video_stream_info = get_video_stream_info(video_path)
-
-    # Use a dummy VideoReader to get original dimensions without loading all frames
-    temp_reader = VideoReader(video_path, ctx=cpu(0))
-    original_height, original_width = temp_reader.get_batch([0]).shape[1:3]
-    del temp_reader # Release immediately
-
-    height_for_decord = original_height
-    width_for_decord = original_width
-
-    if set_res_width is not None and set_res_width > 0 and \
-       set_res_height is not None and set_res_height > 0:
-        height_for_decord = set_res_height
-        width_for_decord = set_res_width
-        logger.info(f"Targeting specific resolution for decord: {width_for_decord}x{height_for_decord}")
-    else:
-        logger.info(f"Using original video resolution for decord: {original_width}x{original_height}")
-
-    # Initialize VideoReader with potential target resolution
-    vid_reader = VideoReader(video_path, ctx=decord_ctx, width=width_for_decord, height=height_for_decord)
-    num_total_frames = len(vid_reader)
-
-    if num_total_frames == 0:
-        logger.warning(f"No frames found in {video_path}.")
-        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info
-
-    # Determine FPS: Use ffprobe's r_frame_rate if reliable, otherwise decord's avg_fps, or target_fps
-    actual_output_fps = 0.0
-    if target_fps != -1.0 and target_fps > 0:
-        actual_output_fps = target_fps
-        logger.info(f"Using user-specified target FPS: {actual_output_fps:.2f}")
-    elif video_stream_info and "r_frame_rate" in video_stream_info:
-        try:
-            r_frame_rate_str = video_stream_info["r_frame_rate"].split('/')
-            if len(r_frame_rate_str) == 2:
-                actual_output_fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
-            else:
-                actual_output_fps = float(r_frame_rate_str[0])
-            logger.info(f"Using ffprobe FPS: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
-        except (ValueError, ZeroDivisionError):
-            actual_output_fps = vid_reader.get_avg_fps()
-            logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord avg_fps: {actual_output_fps:.2f}")
-    else:
-        actual_output_fps = vid_reader.get_avg_fps()
-        logger.info(f"Using Decord avg_fps: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
-
-    stride = max(round(vid_reader.get_avg_fps() / actual_output_fps), 1)
-    frames_idx = list(range(0, num_total_frames, stride))
-
-    if process_length != -1 and process_length < len(frames_idx):
-        frames_idx = frames_idx[:process_length]
-        logger.info(f"Limiting to {len(frames_idx)} frames based on process_length parameter.")
-    
-    if not frames_idx:
-        logger.warning(f"No frames selected for processing after stride and process_length filters.")
-        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info
-
-    frames_batch = vid_reader.get_batch(frames_idx)
-    frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0 # Normalize to 0-1 float32
-
-    # Get actual processed height/width after Decord (might differ from target if source is smaller)
-    actual_processed_height, actual_processed_width = frames_numpy.shape[1:3]
-    logger.info(f"Read {len(frames_idx)} frames. Original: {original_width}x{original_height}, Processed: {actual_processed_width}x{actual_processed_height}")
-
-    return frames_numpy, actual_output_fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info
 
 def encode_frames_to_mp4(
     temp_png_dir: str,
@@ -980,6 +813,184 @@ def encode_frames_to_mp4(
 
     logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
     return True
+
+def get_video_stream_info(video_path: str) -> Optional[dict]:
+    """
+    Extracts comprehensive video stream metadata using ffprobe.
+    Returns a dict with relevant color properties, codec, pixel format, and HDR mastering metadata
+    or None if ffprobe fails/info not found.
+    Requires ffprobe to be installed and in your system PATH.
+    This function *does not* show messageboxes; the caller should handle errors.
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0", # Select the first video stream
+        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+        "-show_entries", "side_data=mastering_display_metadata,max_content_light_level", # ADDED entries
+        "-of", "json",
+        video_path
+    ]
+    
+    try:
+        # Check if ffprobe is available without showing a messagebox
+        subprocess.run(["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding='utf-8', timeout=10)
+    except FileNotFoundError:
+        logger.error("ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running ffprobe check: {e.stderr}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("ffprobe check timed out.")
+        return None
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
+        data = json.loads(result.stdout)
+        
+        stream_info = {}
+        if "streams" in data and len(data["streams"]) > 0:
+            s = data["streams"][0]
+            # Common video stream properties
+            for key in ["codec_name", "profile", "pix_fmt", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
+                if key in s:
+                    stream_info[key] = s[key]
+            
+            # HDR mastering display and CLL metadata (often in side_data_list, but sometimes also directly in stream)
+            # Prioritize stream-level if available, otherwise check side_data_list
+            if "mastering_display_metadata" in s:
+                stream_info["mastering_display_metadata"] = s["mastering_display_metadata"]
+            if "max_content_light_level" in s:
+                stream_info["max_content_light_level"] = s["max_content_light_level"]
+
+        # Check side_data_list if stream-level properties weren't found or for additional data
+        if "side_data_list" in data:
+            for sd in data["side_data_list"]:
+                if "mastering_display_metadata" in sd and "mastering_display_metadata" not in stream_info:
+                    stream_info["mastering_display_metadata"] = sd["mastering_display_metadata"]
+                if "max_content_light_level" in sd and "max_content_light_level" not in stream_info:
+                    stream_info["max_content_light_level"] = sd["max_content_light_level"]
+
+        # Filter out empty strings/None/N/A values
+        filtered_info = {k: v for k, v in stream_info.items() if v and v not in ["N/A", "und", "unknown"]}
+        return filtered_info if filtered_info else None
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error(f"ffprobe timed out for {video_path}.")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
+        logger.debug(f"Raw ffprobe stdout: {result.stdout}")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
+        return None
+
+def release_cuda_memory():
+    """Releases GPU memory and performs garbage collection."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.debug("CUDA cache cleared.")
+        gc.collect()
+        logger.debug("Python garbage collector invoked.")
+    except Exception as e:
+        logger.error(f"Error releasing VRAM or during garbage collection: {e}", exc_info=True)
+
+def read_video_frames_decord(
+    video_path: str,
+    process_length: int = -1,
+    target_fps: float = -1.0,
+    set_res_width: Optional[int] = None,
+    set_res_height: Optional[int] = None,
+    decord_ctx=cpu(0)
+) -> Tuple[np.ndarray, float, int, int, int, int, Optional[dict]]:
+    """
+    Reads video frames using decord, optionally resizing and downsampling frame rate.
+    Returns frames as a 4D float32 numpy array [T, H, W, C] normalized to 0-1,
+    the actual output FPS, original video height/width, actual processed height/width,
+    and video stream metadata.
+    """
+    logger.info(f"Reading video: {os.path.basename(video_path)}")
+
+    # Get video stream info first for FPS detection
+    video_stream_info = get_video_stream_info(video_path)
+
+    # Use a dummy VideoReader to get original dimensions without loading all frames
+    temp_reader = VideoReader(video_path, ctx=cpu(0))
+    original_height, original_width = temp_reader.get_batch([0]).shape[1:3]
+    del temp_reader # Release immediately
+
+    height_for_decord = original_height
+    width_for_decord = original_width
+
+    if set_res_width is not None and set_res_width > 0 and \
+       set_res_height is not None and set_res_height > 0:
+        height_for_decord = set_res_height
+        width_for_decord = set_res_width
+        logger.info(f"Targeting specific resolution for decord: {width_for_decord}x{height_for_decord}")
+    else:
+        logger.info(f"Using original video resolution for decord: {original_width}x{original_height}")
+
+    # Initialize VideoReader with potential target resolution
+    vid_reader = VideoReader(video_path, ctx=decord_ctx, width=width_for_decord, height=height_for_decord)
+    num_total_frames = len(vid_reader)
+
+    if num_total_frames == 0:
+        logger.warning(f"No frames found in {video_path}.")
+        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info
+
+    # Determine FPS: Use ffprobe's r_frame_rate if reliable, otherwise decord's avg_fps, or target_fps
+    actual_output_fps = 0.0
+    if target_fps != -1.0 and target_fps > 0:
+        actual_output_fps = target_fps
+        logger.info(f"Using user-specified target FPS: {actual_output_fps:.2f}")
+    elif video_stream_info and "r_frame_rate" in video_stream_info:
+        try:
+            r_frame_rate_str = video_stream_info["r_frame_rate"].split('/')
+            if len(r_frame_rate_str) == 2:
+                actual_output_fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
+            else:
+                actual_output_fps = float(r_frame_rate_str[0])
+            logger.info(f"Using ffprobe FPS: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
+        except (ValueError, ZeroDivisionError):
+            actual_output_fps = vid_reader.get_avg_fps()
+            logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord avg_fps: {actual_output_fps:.2f}")
+    else:
+        actual_output_fps = vid_reader.get_avg_fps()
+        logger.info(f"Using Decord avg_fps: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
+
+    stride = max(round(vid_reader.get_avg_fps() / actual_output_fps), 1)
+    frames_idx = list(range(0, num_total_frames, stride))
+
+    if process_length != -1 and process_length < len(frames_idx):
+        frames_idx = frames_idx[:process_length]
+        logger.info(f"Limiting to {len(frames_idx)} frames based on process_length parameter.")
+    
+    if not frames_idx:
+        logger.warning(f"No frames selected for processing after stride and process_length filters.")
+        return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info
+
+    frames_batch = vid_reader.get_batch(frames_idx)
+    frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0 # Normalize to 0-1 float32
+
+    # Get actual processed height/width after Decord (might differ from target if source is smaller)
+    actual_processed_height, actual_processed_width = frames_numpy.shape[1:3]
+    logger.info(f"Read {len(frames_idx)} frames. Original: {original_width}x{original_height}, Processed: {actual_processed_width}x{actual_processed_height}")
+
+    return frames_numpy, actual_output_fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info
+
+def set_util_logger_level(level):
+    """Sets the logging level for the 'stereocrafter_util' logger."""
+    logger.setLevel(level)
+    # If basicConfig was already called, its handlers might not update automatically.
+    # Ensure handlers also reflect the new level.
+    for handler in logger.handlers:
+        handler.setLevel(level)
 
 def start_ffmpeg_pipe_process(
     content_width: int,
