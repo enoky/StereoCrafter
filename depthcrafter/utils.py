@@ -706,25 +706,38 @@ def save_video(video_frames: Union[List[np.ndarray], List[PIL.Image.Image], np.n
     elif output_format == "main10_mp4" and not output_video_path.lower().endswith(".mp4"):
         _logger.warning(f"Saving HEVC to an .mp4 container, but the output path '{output_video_path}' does not end with .mp4. This might lead to issues if an explicit format isn't forced.")
 
-    # Frame conversion logic (remains the same)
+    # Determine scaling factor and dtype based on output format
+    target_max_val = 255.0  # Default for 8-bit (H.264)
+    target_dtype = np.uint8
+    
+    # Use 16-bit scale for 10-bit encoding
+    if output_format == "main10_mp4":
+        target_max_val = 65535.0 
+        target_dtype = np.uint16
+    # elif output_format in ["exr", "exr_sequence", "png_sequence"]:
+    #    # These formats are often handled later/separately in a post-processing step
+    #    # and should be left as 0-1 float or converted specifically.
+    #    # Since save_video is for mp4 by default, we'll focus on that.
+    #    pass
+
+    # Frame conversion logic (Modified to use target_max_val and target_dtype)
     if isinstance(video_frames, np.ndarray):
-        if video_frames.ndim == 3:
-            if video_frames.dtype == np.float32 or video_frames.dtype == np.float64:
-                 video_frames = (video_frames * 255).astype(np.uint8)
-        elif video_frames.ndim == 4:
-            if video_frames.dtype == np.float32 or video_frames.dtype == np.float64:
-                video_frames = (video_frames * 255).astype(np.uint8)
+        # We assume video_frames is already clipped to 0-1 float if it came from the pipe/merge
+        if video_frames.dtype == np.float32 or video_frames.dtype == np.float64:
+             video_frames = (video_frames * target_max_val).astype(target_dtype)
+
     elif isinstance(video_frames, list) and len(video_frames) > 0 and isinstance(video_frames[0], np.ndarray):
         processed_frames = []
         for frame in video_frames:
             if frame.dtype == np.float32 or frame.dtype == np.float64:
-                processed_frames.append((frame * 255).astype(np.uint8))
-            elif frame.dtype == np.uint8:
+                processed_frames.append((frame * target_max_val).astype(target_dtype))
+            elif frame.dtype == np.uint8 or frame.dtype == np.uint16:
                 processed_frames.append(frame)
             else:
                 _logger.error(f"Unsupported numpy array dtype in list for video saving: {frame.dtype}")
                 raise ValueError(f"Unsupported numpy array dtype in list: {frame.dtype}")
         video_frames = processed_frames
+        
     elif isinstance(video_frames, list) and len(video_frames) > 0 and isinstance(video_frames[0], PIL.Image.Image):
         video_frames = [np.array(frame) for frame in video_frames]
     elif isinstance(video_frames, list) and len(video_frames) == 0:
