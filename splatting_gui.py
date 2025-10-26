@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-24.2"
+GUI_VERSION = "25-10-27.0"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
