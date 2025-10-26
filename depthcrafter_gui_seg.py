@@ -63,7 +63,7 @@ except ImportError:
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
 # --- Imports End ---
 
-GUI_VERSION = "25-10-23.1"
+GUI_VERSION = "25-10-27.0"
 _HELP_TEXTS = {}
 
 DARK_MODE_COLORS = {
