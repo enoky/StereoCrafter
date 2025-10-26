@@ -402,7 +402,9 @@ class SplatterGUI(ThemedTk):
         self.processing_task_name_var = tk.StringVar(value="N/A")
         self.processing_gamma_var = tk.StringVar(value="N/A")
 
-        self.slider_label_updaters = [] 
+        self.slider_label_updaters = []
+        
+        self.widgets_to_disable = [] 
 
         # --- Processing control variables ---
         self.stop_event = threading.Event()
@@ -3310,6 +3312,12 @@ class SplatterGUI(ThemedTk):
         # Depth Map Pre-processing Container (Right Side)
         set_frame_children_state(self.depth_settings_container, state)
 
+        # --- CRITICAL FIX: Explicitly re-enable slider widgets if state is 'normal' ---
+        if state == 'normal' and hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                # ttk.Scale can use 'normal' or 'disabled'
+                widget.config(state='normal')
+
         if hasattr(self, 'update_sidecar_button'):
             if state == 'disabled':
                 self.update_sidecar_button.config(state="disabled")
@@ -3488,6 +3496,12 @@ class SplatterGUI(ThemedTk):
         self.status_label.config(text="Starting processing...")
         # --- NEW: Disable all inputs at start ---
         self._set_input_state('disabled')
+        
+        # --- CRITICAL FIX: Explicitly disable slider widgets ---
+        if hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                widget.config(state="disabled")
+
         # --- NEW: Disable previewer widgets ---
         if hasattr(self, 'previewer'):
             self.previewer.set_ui_processing_state(True)
@@ -3580,6 +3594,13 @@ class SplatterGUI(ThemedTk):
         Starts processing for the single video currently loaded in the previewer.
         It runs the batch logic in single-file mode.
         """
+        
+        # --- CRITICAL FIX: Explicitly disable slider widgets ---
+        if hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                widget.config(state="disabled")
+        # --- END CRITICAL FIX ---
+
         if not hasattr(self, 'previewer') or not self.previewer.source_readers:
             messagebox.showwarning("Process Single Clip", "Please load a video in the Previewer first.")
             return
