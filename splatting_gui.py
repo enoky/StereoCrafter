@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-29.1"
+GUI_VERSION = "25-10-29.2"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -2890,9 +2890,22 @@ class SplatterGUI(ThemedTk):
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
             final_tensor = occlusion_mask.repeat(1, 3, 1, 1).cpu()
         elif preview_source == "Depth Map":
-            depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-            depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
-            final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            # --- MODIFIED FOR GRAYSCALE OUTPUT ---
+            # 1. Take the single-channel normalized array (0-1 float)
+            depth_vis_normalized = depth_normalized
+            
+            # 2. Convert to 3-channel grayscale (by repeating the channel)
+            # This is necessary because the previewer expects a 3-channel RGB image.
+            depth_vis_uint8 = (depth_vis_normalized * 255).astype(np.uint8)
+            
+            # Create a 3-channel image by stacking the grayscale channel
+            depth_vis_rgb_grayscale = np.stack([depth_vis_uint8] * 3, axis=-1)
+            
+            # 3. Convert back to PyTorch tensor
+            final_tensor = torch.from_numpy(depth_vis_rgb_grayscale).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            # depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+            # depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
+            # final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0            
         elif preview_source == "Original (Left Eye)":
             # Use the resized or original left eye depending on the low-res flag
             final_tensor = left_eye_tensor_resized.cpu()
