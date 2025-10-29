@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-24.2"
+VERSION = "25-10-29.0"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -75,10 +75,10 @@ class SidecarConfigManager:
         "max_disparity": (float, 20.0),
         "gamma": (float, 1.0), 
         "input_bias": (float, 0.0),
-        "depth_dilate_size_x": (int, 3),
-        "depth_dilate_size_y": (int, 3),
-        "depth_blur_size_x": (int, 5),
-        "depth_blur_size_y": (int, 5),
+        "depth_dilate_size_x": (float, 0.0),
+        "depth_dilate_size_y": (float, 0.0),
+        "depth_blur_size_x": (float, 0.0),
+        "depth_blur_size_y": (float, 0.0),
         "disable_depth_normalization": (bool, False),
         # Add future keys here
     }
@@ -443,59 +443,78 @@ def create_dual_slider_layout(
         trough_increment=trough_increment
     )
 
-def custom_dilate(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+def custom_dilate(
+    tensor: torch.Tensor,
+    kernel_size_x: float, 
+    kernel_size_y: float, 
+    use_gpu: bool = False
+) -> torch.Tensor:
     """
-    Applies dilation with separate X and Y kernel sizes to a tensor.
-    Expects a 4D tensor (B, C, H, W).
+    Applies dilation using an integer kernel and incorporates the fractional part
+    via blurring (most stable simulation of fractional dilation).
+    
+    Interprets kernel_size_x/y as the final desired integer kernel size.
+    Expects a 4D tensor (B, C, H, W) in [0,1].
     """
-    k_x = int(kernel_size_x)
-    k_y = int(kernel_size_y)
-    if k_x <= 0 or k_y <= 0:
+    k_x_int = int(kernel_size_x)
+    k_y_int = int(kernel_size_y)
+    
+    if k_x_int <= 0 and k_y_int <= 0:
         return tensor
 
-    # GaussianBlur requires odd kernel sizes (Adjusted k_x/k_y logic removed for Dilate, but kept for Blur)
-    # The fix for unstable 1x1 GPU convolution is no longer needed as we permanently force CPU below.
-    
-    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
+    device = torch.device('cpu')
     tensor = tensor.to(device)
+    processed_frames = []
+    
+    # 1. Determine Kernel and Fractional Sigma
+    # Kernel must be odd
+    k_x = k_x_int if k_x_int % 2 == 1 else k_x_int + 1
+    k_y = k_y_int if k_y_int % 2 == 1 else k_y_int + 1
+    
+    # Calculate fractional part for blurring
+    frac_x = kernel_size_x - k_x_int
+    frac_y = kernel_size_y - k_y_int
 
-    if False: # <--- BYPASSING GPU PATH FOR STABILITY
-        padding_x = k_x // 2
-        padding_y = k_y // 2
-        # Ensure padding is not greater than half the kernel size
-        padding_x = min(padding_x, (k_x - 1) // 2)
-        padding_y = min(padding_y, (k_y - 1) // 2)
-        return F.max_pool2d(tensor, kernel_size=(k_y, k_x), stride=1, padding=(padding_y, padding_x))
-    else:
-        # FIXED CPU path
-        processed_frames = []
-        for t in range(tensor.shape[0]):
-            # Get frame (C, H, W) and scale to uint8
-            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
-            
-            # Convert to OpenCV format: (H, W) or (H, W, C)
-            if frame_np.shape[0] == 1:
-                # Single channel: remove channel dim for OpenCV
-                frame_np = frame_np[0]  # shape: (H, W)
-            else:
-                # Multi-channel: transpose to (H, W, C) for OpenCV
-                frame_np = np.transpose(frame_np, (1, 2, 0))
-            
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
-            dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
-            
-            # Convert back to PyTorch format: (C, H, W)
-            if len(dilated_np.shape) == 2:
-                # Single channel: add channel dimension back
-                dilated_np = dilated_np[np.newaxis, :, :]  # shape: (1, H, W)
-            else:
-                # Multi-channel: transpose back to (C, H, W)
-                dilated_np = np.transpose(dilated_np, (2, 0, 1))
-            
-            dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
-            processed_frames.append(dilated_tensor)
+    for t in range(tensor.shape[0]):
+        # Get frame (C, H, W) and scale to uint8
+        frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
         
-        return torch.stack(processed_frames).to(tensor.device)
+        # Convert to OpenCV format: (H, W) or (H, W, C)
+        if frame_np.shape[0] == 1:
+            frame_cv = frame_np[0]
+        else:
+            frame_cv = np.transpose(frame_np, (1, 2, 0))
+
+        # --- DILATION (Integer Part) ---
+        if k_x_int > 0 or k_y_int > 0:
+            # Use the odd kernel size for dilation
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
+            dilated_cv = cv2.dilate(frame_cv, kernel, iterations=1)
+        else:
+             dilated_cv = frame_cv
+             
+        # --- FRACTIONAL BLUR (Fractional Part) ---
+        # If there is a fractional component, apply a slight blur to simulate subpixel expansion
+        if frac_x > 0.0 or frac_y > 0.0:
+            # Use the fractional part to scale the blur sigma (e.g., 0.5 blur for 0.5 fractional part)
+            sigma_x = frac_x * 0.5 
+            sigma_y = frac_y * 0.5 
+            
+            # Apply Gaussian Blur (kernel size 0 means it's auto-derived from sigma)
+            # Use a tiny kernel to force the subpixel effect
+            kernel_frac = (max(3, int(sigma_x*6) | 1), max(3, int(sigma_y*6) | 1)) # Smallest odd kernel > 1
+            dilated_cv = cv2.GaussianBlur(dilated_cv, kernel_frac, sigmaX=sigma_x, sigmaY=sigma_y)
+
+        # Convert back to PyTorch format: (C, H, W)
+        if len(dilated_cv.shape) == 2:
+            dilated_np = dilated_cv[np.newaxis, :, :]
+        else:
+            dilated_np = np.transpose(dilated_cv, (2, 0, 1))
+        
+        dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
+        processed_frames.append(dilated_tensor)
+    
+    return torch.stack(processed_frames).to(tensor.device)
 
 def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
     """

@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-27.0"
+GUI_VERSION = "25-10-29.0"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -1003,8 +1003,8 @@ class SplatterGUI(ThemedTk):
         row_inner = 0
         create_dual_slider_layout(
             self, self.depth_prep_frame, "Dilate X:", "Y:",
-            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15,
-            row_inner, decimals=0, is_integer=True,
+            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 35,
+            row_inner, decimals=0, is_integer=False,
             tooltip_key_x="depth_dilate_size_x",
             tooltip_key_y="depth_dilate_size_y",
             trough_increment=1.0
@@ -1204,10 +1204,10 @@ class SplatterGUI(ThemedTk):
             user_output_crf: Optional[int] = None,
             is_low_res_task: bool = False,
             depth_gamma: float = 1.0,
-            depth_dilate_size_x: int = 0,
-            depth_dilate_size_y: int = 0,
-            depth_blur_size_x: int = 0,
-            depth_blur_size_y: int = 0,
+            depth_dilate_size_x: float = 0.0,
+            depth_dilate_size_y: float = 0.0,
+            depth_blur_size_x: float = 0.0,
+            depth_blur_size_y: float = 0.0,
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1841,24 +1841,22 @@ class SplatterGUI(ThemedTk):
     def get_current_preview_settings(self) -> dict:
         """Gathers settings from the GUI needed for the preview callback."""
         try:
-            # Helper function to safely convert StringVar content to int
-            def safe_int_conversion(var: tk.StringVar) -> int:
-                try:
-                    # Convert to float first to handle fractional strings like '35.227...'
-                    return int(float(var.get()))
-                except ValueError:
-                    # If it fails (e.g., empty string), default to 0
-                    return 0
+            # Helper function to safely convert StringVar content to float
+            def safe_float_conversion(var: tk.StringVar, default: float = 0.0) -> float:
+                 try:
+                     return float(var.get())
+                 except ValueError:
+                     return default
 
             return {
                 "max_disp": float(self.max_disp_var.get()),
                 "convergence_point": float(self.zero_disparity_anchor_var.get()),
                 "depth_gamma": float(self.depth_gamma_var.get()),
-                # --- MODIFIED: Use safe conversion for integer kernel sizes (float -> int) ---
-                "depth_dilate_size_x": safe_int_conversion(self.depth_dilate_size_x_var),
-                "depth_dilate_size_y": safe_int_conversion(self.depth_dilate_size_y_var),
-                "depth_blur_size_x": safe_int_conversion(self.depth_blur_size_x_var),
-                "depth_blur_size_y": safe_int_conversion(self.depth_blur_size_y_var),
+                # --- CRITICAL FIX: Use safe_float_conversion for fractional settings ---
+                "depth_dilate_size_x": safe_float_conversion(self.depth_dilate_size_x_var),
+                "depth_dilate_size_y": safe_float_conversion(self.depth_dilate_size_y_var),
+                "depth_blur_size_x": safe_float_conversion(self.depth_blur_size_x_var),
+                "depth_blur_size_y": safe_float_conversion(self.depth_blur_size_y_var),
                 "preview_size": self.preview_size_var.get(),
                 "enable_autogain": self.enable_autogain_var.get(),
             }
@@ -2250,7 +2248,7 @@ class SplatterGUI(ThemedTk):
                  self._update_clip_state_and_text()
 
     def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
-                              depth_dilate_size_x: int, depth_dilate_size_y: int, depth_blur_size_x: int, depth_blur_size_y: int, 
+                              depth_dilate_size_x: float, depth_dilate_size_y: float, depth_blur_size_x: float, depth_blur_size_y: float, 
                               is_low_res_task: bool, max_raw_value: float,
                               global_depth_min: float, global_depth_max: float,
                               debug_batch_index: int = 0, debug_frame_index: int = 0, debug_task_name: str = "PreProcess",
@@ -2258,6 +2256,8 @@ class SplatterGUI(ThemedTk):
         """
         Loads, converts, and pre-processes the raw depth map batch using stable NumPy/OpenCV CPU calls.
         """
+        device = torch.device('cpu')
+
         # 1. Grayscale Conversion (Standard NumPy)
         if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3: # RGB
             batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
@@ -2293,41 +2293,40 @@ class SplatterGUI(ThemedTk):
         needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
         
         if needs_processing:
-            processed_frames = []
+            # --- PREPARE TENSOR FOR UTILITY FUNCTIONS ---
+            # batch_depth_numpy_float is (B, H, W) (needs to be B, C, H, W)
+            # Unsqueeze to add a channel dimension C=1
+            depth_tensor_4d = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).to(device) 
             
-            # --- CRITICAL FIX: Determine Scale Factor for uint8 Conversion ---
-            # This ensures the float data is correctly scaled to 0-255 based on its true max value.
-            scale_factor = global_depth_max if global_depth_max > 1.0 else 1.0
+            processed_tensor = depth_tensor_4d
             
-            for frame_np_float in batch_depth_numpy_float:
-                
-                # Convert float[0, MaxRaw] to uint8[0, 255] for OpenCV operations
-                # This is the stable scaling (frame * (255 / scale_factor))
-                frame_np_uint8 = (frame_np_float * (255.0 / scale_factor)).astype(np.uint8)
-                
-                # --- Dilate ---
-                k_x_dilate, k_y_dilate = depth_dilate_size_x, depth_dilate_size_y
-                if k_x_dilate > 0 or k_y_dilate > 0:
-                    # Ensure non-zero kernels for OpenCV
-                    k_x_dilate = max(1, k_x_dilate)
-                    k_y_dilate = max(1, k_y_dilate)
-                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x_dilate, k_y_dilate))
-                    frame_np_uint8 = cv2.dilate(frame_np_uint8, kernel, iterations=1)
-                
-                # --- Blur ---
-                k_x_blur, k_y_blur = depth_blur_size_x, depth_blur_size_y
-                if k_x_blur > 0 or k_y_blur > 0:
-                    # Ensure kernel size is odd for OpenCV
-                    k_x_blur = k_x_blur if k_x_blur % 2 == 1 else k_x_blur + 1
-                    k_y_blur = k_y_blur if k_y_blur % 2 == 1 else k_y_blur + 1
-                    
-                    frame_np_uint8 = cv2.GaussianBlur(frame_np_uint8, (k_x_blur, k_y_blur), 0)
+            # 1. DILATE (using fractional)
+            if depth_dilate_size_x > 0 or depth_dilate_size_y > 0:
+                logger.debug(f"dilate x = {depth_dilate_size_x}, y = {depth_dilate_size_y}")
+                # Cast the integer sizes to float for fractional dilation
+                processed_tensor = custom_dilate(
+                    processed_tensor, 
+                    float(depth_dilate_size_x), 
+                    float(depth_dilate_size_y), 
+                    use_gpu=False
+                )
+            
+            # 2. BLUR (using standard integer blur)
+            if depth_blur_size_x > 0 or depth_blur_size_y > 0:
+                # Cast to int for the blur function (which handles odd size logic)
+                processed_tensor = custom_blur(
+                    processed_tensor, 
+                    int(depth_blur_size_x), 
+                    int(depth_blur_size_y), 
+                    use_gpu=False
+                )
 
-                processed_frames.append(frame_np_uint8)
-                
-            # Convert back to float32 using the scale factor inverse
-            batch_depth_numpy_uint8 = np.stack(processed_frames, axis=0)
-            batch_depth_numpy_float = batch_depth_numpy_uint8.astype(np.float32) * (scale_factor / 255.0)
+            # Convert back to (B, H, W) numpy float (squeeze channel dim)
+            batch_depth_numpy_float = processed_tensor.squeeze(1).cpu().numpy()
+            
+            # Clean up VRAM just in case
+            del depth_tensor_4d, processed_tensor
+            release_cuda_memory()
 
         # --- DEBUG SAVE 4: Final Processed Image ---
         # self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
@@ -3155,10 +3154,10 @@ class SplatterGUI(ThemedTk):
                 "convergence_plane": float(self.zero_disparity_anchor_var.get()),
                 "max_disparity": float(self.max_disp_var.get()),
                 "gamma": float(self.depth_gamma_var.get()),
-                "depth_dilate_size_x": int(float(self.depth_dilate_size_x_var.get())),
-                "depth_dilate_size_y": int(float(self.depth_dilate_size_y_var.get())),
-                "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
-                "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
+                "depth_dilate_size_x": float(self.depth_dilate_size_x_var.get()),
+                "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
+                "depth_blur_size_x": float(self.depth_blur_size_x_var.get()),
+                "depth_blur_size_y": float(self.depth_blur_size_y_var.get()),
                 "disable_depth_normalization": self.enable_autogain_var.get(),
             }
         except ValueError:
