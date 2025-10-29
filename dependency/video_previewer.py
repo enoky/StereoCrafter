@@ -11,7 +11,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory
 
-VERSION = "25-10-23.1"
+VERSION = "25-10-24.2"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -34,6 +34,7 @@ class VideoPreviewer(ttk.Frame):
             preview_size_var: Optional[tk.StringVar] = None,
             resize_callback: Optional[Callable] = None,
             update_clip_callback: Optional[Callable] = None,
+            on_clip_navigate_callback: Optional[Callable] = None,
             **kwargs,
         ):
         """
@@ -62,6 +63,7 @@ class VideoPreviewer(ttk.Frame):
         self.preview_size_var = preview_size_var # Store the passed-in variable
         self.resize_callback = resize_callback # Store the resize callback
         self.update_clip_callback = update_clip_callback
+        self.on_clip_navigate_callback = on_clip_navigate_callback
 
         # --- State ---
         self.source_readers: Dict[str, Optional[VideoReader]] = {}
@@ -83,6 +85,30 @@ class VideoPreviewer(ttk.Frame):
         self._is_dragging = False
 
         self._create_widgets()
+
+    def cleanup(self):
+        """Public method to be called when the parent GUI is closing."""
+        self._clear_preview_resources()
+
+    def _clear_preview_resources(self):
+        """Closes all preview-related video readers and clears the preview display."""
+        self._stop_wigglegram_animation()
+
+        for key in list(self.source_readers.keys()):
+            if self.source_readers[key]:
+                del self.source_readers[key]
+        self.source_readers.clear()
+
+        # --- FIX: Create a dummy image to hold the place, preventing TclError ---
+        # This is the most robust way to clear the image in Tkinter without race conditions.
+        self._dummy_image = ImageTk.PhotoImage(Image.new('RGBA', (1, 1), (0,0,0,0)))
+        self.preview_label.config(image=self._dummy_image, text="Load a video list to see preview")
+        self.preview_label.image = self._dummy_image
+        self.preview_image_tk = None
+        # --- END FIX ---
+        self.pil_image_for_preview = None
+        gc.collect()
+        logger.debug("Preview resources and file handles have been released.")
 
     def _create_hover_tooltip(self, widget, help_key, tooltip_info: Optional[str] = None):
         """Creates a mouse-over tooltip for the given widget."""
@@ -221,39 +247,34 @@ class VideoPreviewer(ttk.Frame):
         self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button,
                                    self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_combo]
 
-    def set_parameters(self, params: Dict[str, Any]):
-        """
-        Receives a dictionary of parameters from the main GUI.
-        Triggers a preview update if the parameters have changed.
-        """
-        # This method is now primarily for external triggers.
-        # The main way of getting params is now the get_params_callback.
-        self.update_preview()
+    def _drag_scroll(self, event):
+        """Scrolls the canvas using scan_dragto."""
+        if not self._is_dragging:
+            return
 
-    def set_preview_source_options(self, options: list):
-        """Sets the available options for the preview source dropdown."""
-        current_val = self.preview_source_combo.get()
-        self.preview_source_combo['values'] = options
-        if current_val in options:
-            self.preview_source_combo.set(current_val)
-        elif options:
-            self.preview_source_combo.set(options[0])
+        # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+        content_x = int(self.preview_canvas.canvasx(event.x))
+        content_y = int(self.preview_canvas.canvasy(event.y))
 
-    def set_ui_processing_state(self, is_processing: bool):
-        """
-        Disables or enables all interactive widgets in the previewer during batch processing.
-        """
-        state = "disabled" if is_processing else "normal"
-        for widget in self.widgets_to_disable:
-            try:
-                # Special handling for combobox which uses 'readonly' instead of 'normal'
-                if isinstance(widget, ttk.Combobox):
-                    widget.config(state="disabled" if is_processing else "readonly")
-                else:
-                    widget.config(state=state)
-            except tk.TclError:
-                pass # Ignore if widgets don't exist yet
+        # Drag the canvas view based on the current cursor position
+        self.preview_canvas.scan_dragto(content_x, content_y, gain=5) 
+        
+        logger.debug(f"_drag_scroll: Scan DragTo at X={content_x}, Y={content_y}")
 
+    def _end_drag_scroll(self, event):
+        """Ends the drag-to-scroll operation."""
+        if self._is_dragging:
+            self._is_dragging = False
+            self.preview_canvas.config(cursor="")
+            logger.debug("_end_drag_scroll: Dragging ended.")
+        
+    # AND BINDINGS (in _create_widgets):
+        self.preview_label.bind("<ButtonPress-1>", 
+                                lambda e: (self._start_drag_scroll(e), "break")[1])
+        self.preview_label.bind("<B1-Motion>", 
+                                lambda e: (self._drag_scroll(e), "break")[1])
+        self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
+                
     def _handle_load_refresh(self):
         """Internal handler for the 'Load/Refresh List' button."""
         if self.find_sources_callback:
@@ -261,6 +282,74 @@ class VideoPreviewer(ttk.Frame):
         else:
             logger.error("VideoPreviewer: 'find_sources_callback' was not provided during initialization. Cannot load video list.")
             messagebox.showerror("Initialization Error", "The 'find_sources_callback' was not provided to the previewer.")
+
+    def _jump_to_video(self, event=None):
+        """Jump to a specific video number in the preview list."""
+        if not self.video_list:
+            return
+        
+        if self.on_clip_navigate_callback:
+            self.on_clip_navigate_callback()
+
+        try:
+            target_index = int(self.video_jump_to_var.get()) - 1
+            if 0 <= target_index < len(self.video_list):
+                self._load_preview_by_index(target_index)
+            else:
+                messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.video_list)}.")
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid number.")
+
+    def _key_jump_clips(self, event):
+        """Handler for Ctrl+Left/Right arrow keys to jump between clips."""
+        if not self.video_list:
+            return
+
+        direction = 0
+        if event.keysym == "Left":
+            direction = -1
+        elif event.keysym == "Right":
+            direction = 1
+        else:
+            return # Should not happen
+
+        # Call the existing navigation function
+        self._nav_preview_video(direction)
+
+    def _key_jump_frames(self, event):
+        """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
+        if not self.source_readers:
+            return
+
+        # Determine jump size: 10 for normal, 100 for Shift (state mask 0x1)
+        jump_size = 1
+        if event.state & 0x1: # 0x1 is the mask for the Shift key state
+            jump_size = 10
+            
+        direction_multiplier = 0
+        if event.keysym == "Left":
+            direction_multiplier = -1
+        elif event.keysym == "Right":
+            direction_multiplier = 1
+        elif event.keysym == "Shift_L" or event.keysym == "Shift_R":
+            # Ignore just the Shift keypress itself if it somehow triggered the event
+            return
+        else:
+            return # Should not happen
+
+        current_frame = int(self.frame_scrubber_var.get())
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+        
+        direction = direction_multiplier * jump_size
+        new_frame = current_frame + direction
+        
+        # Clamp the new frame index
+        new_frame = max(0, min(new_frame, total_frames - 1))
+
+        if new_frame != current_frame:
+            self.frame_scrubber_var.set(new_frame)
+            self.on_scrubber_move(new_frame) # Update label
+            self.update_preview() # Update display
 
     def load_video_list(self, find_sources_callback: Callable):
         """
@@ -294,6 +383,245 @@ class VideoPreviewer(ttk.Frame):
 
         self.current_video_index = target_index # Use the recalled or default index
         self._load_preview_by_index(self.current_video_index)
+
+    def _load_preview_by_index(self, index: int):
+        """Loads a specific video from the preview list by its index."""
+        self._clear_preview_resources()
+
+        if not (0 <= index < len(self.video_list)):
+            self.last_loaded_video_path = None
+            return
+
+        self.current_video_index = index
+        self._update_nav_controls()
+
+        source_paths = self.video_list[index]
+        base_name = os.path.basename(next(iter(source_paths.values())))
+        
+        main_source_path = source_paths.get('source_video', None)
+
+        initial_frame = 0
+        if main_source_path == self.last_loaded_video_path:
+            # If the path is the SAME, retain the last frame index.
+            initial_frame = self.last_loaded_frame_index
+        else:
+            # If the path is DIFFERENT (new video), reset frame index to 0.
+            self.last_loaded_frame_index = 0
+            
+        self.last_loaded_video_path = main_source_path
+
+        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        self.parent.update_idletasks()
+
+        try:
+            # Initialize VideoReader for each source path
+            num_frames = -1
+            for key, path in source_paths.items():
+                if path and os.path.exists(path):
+                    reader = VideoReader(path, ctx=cpu(0))
+                    if num_frames == -1:
+                        num_frames = len(reader)
+                    elif num_frames != len(reader):
+                        raise ValueError(f"Frame count mismatch between sources for {base_name}")
+                    self.source_readers[key] = reader
+                else:
+                    self.source_readers[key] = None
+                    logger.debug(f"Source '{key}' not found for {base_name} at path: {path}")
+
+            if num_frames <= 0:
+                raise ValueError("Video has no frames or could not be loaded.")
+
+            # Configure the scrubber
+            self.frame_scrubber.config(to=num_frames - 1)
+            initial_frame = min(initial_frame, num_frames - 1) 
+            self.frame_scrubber_var.set(initial_frame)
+            self.on_scrubber_move(initial_frame)
+            if self.update_clip_callback:
+                self.update_clip_callback()
+            
+            if self.parent and hasattr(self.parent, 'update_gui_from_sidecar'):
+                self.parent.update_gui_from_sidecar(source_paths.get('depth_map'))
+
+            self.update_preview()
+
+        except Exception as e:
+            messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
+            logger.error("Preview load failed", exc_info=True)
+        finally:
+            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _nav_preview_video(self, direction: int):
+        """Navigate to the previous or next video in the preview list."""
+        if not self.video_list:
+            return
+        
+        # --- Auto-Save Current Sidecar before navigating ---
+        if self.on_clip_navigate_callback:
+            self.on_clip_navigate_callback()
+
+        new_index = self.current_video_index + direction
+        if 0 <= new_index < len(self.video_list):
+            self._load_preview_by_index(new_index)
+
+    def on_slider_release(self, event):
+        """Called when a slider is released. Updates the preview."""
+        self._stop_wigglegram_animation()
+        if self.source_readers:
+            self.update_preview()
+
+    def on_scrubber_move(self, value):
+        """Called continuously as the frame scrubber moves to update the label."""
+        frame_idx = int(float(value))
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+        self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
+        self.last_loaded_frame_index = frame_idx
+
+    def _on_scrubber_trough_click(self, event):
+        """Handles clicks on the frame scrubber's trough for precise positioning."""
+        slider = self.frame_scrubber
+        # Check if the click is on the trough to avoid interfering with handle drags
+        if 'trough' in slider.identify(event.x, event.y):
+            # Force the widget to update its size info to get an accurate width
+            slider.update_idletasks()
+            from_ = slider.cget("from")
+            to = slider.cget("to")
+            
+            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+            self.frame_scrubber_var.set(new_value) # This triggers on_scrubber_move
+            self.on_scrubber_move(new_value)
+            self.on_slider_release(event) # Manually trigger preview update
+            
+            return "break" # Prevents the default slider click behavior
+
+    def save_preview_frame(self):
+        """Saves the current preview image to a file."""
+        if self.pil_image_for_preview is None:
+            messagebox.showwarning("No Preview", "There is no preview image to save.")
+            return
+
+        default_filename = "preview_frame.png"
+        if self.current_video_index != -1:
+            source_paths = self.video_list[self.current_video_index]
+            base_name = os.path.splitext(os.path.basename(next(iter(source_paths.values()))))[0]
+            frame_num = int(self.frame_scrubber_var.get())
+            default_filename = f"{base_name}_frame_{frame_num:05d}.png"
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Preview Frame As...",
+            initialfile=default_filename,
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")]
+        )
+
+        if filepath:
+            try:
+                # self.pil_image_for_preview already holds the correctly scaled image from update_preview
+                self.pil_image_for_preview.save(filepath)
+                logger.info(f"Preview frame saved to: {filepath}")
+            except Exception as e:
+                logger.error(f"Failed to save preview frame: {e}", exc_info=True)
+                messagebox.showerror("Save Error", f"An error occurred while saving the image:\n{e}")
+
+    def set_parameters(self, params: Dict[str, Any]):
+        """
+        Receives a dictionary of parameters from the main GUI.
+        Triggers a preview update if the parameters have changed.
+        """
+        # This method is now primarily for external triggers.
+        # The main way of getting params is now the get_params_callback.
+        self.update_preview()
+
+    def set_preview_source_options(self, options: list):
+        """Sets the available options for the preview source dropdown."""
+        current_val = self.preview_source_combo.get()
+        self.preview_source_combo['values'] = options
+        if current_val in options:
+            self.preview_source_combo.set(current_val)
+        elif options:
+            self.preview_source_combo.set(options[0])
+
+    def set_ui_processing_state(self, is_processing: bool):
+        """
+        Disables or enables all interactive widgets in the previewer during batch processing.
+        """
+        state = "disabled" if is_processing else "normal"
+        for widget in self.widgets_to_disable:
+            try:
+                # Special handling for combobox which uses 'readonly' instead of 'normal'
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="disabled" if is_processing else "readonly")
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                pass # Ignore if widgets don't exist yet
+
+    def _start_drag_scroll(self, event):
+        """Records the starting position for a drag-to-scroll operation using scan_mark."""
+        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
+            self._is_dragging = True
+            self.preview_canvas.config(cursor="fleur")
+            
+            # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
+            content_x = int(self.preview_canvas.canvasx(event.x))
+            content_y = int(self.preview_canvas.canvasy(event.y))
+            
+            self.preview_canvas.scan_mark(content_x, content_y)
+            logger.debug(f"_start_drag_scroll: Scan Mark at X={content_x}, Y={content_y}")
+        else:
+            logger.debug("_start_drag_scroll: Drag ignored.")
+            
+        # Reset the jump counter/filter (if you still have it, for safety)
+        if hasattr(self, '_consecutive_jumps'):
+            self._consecutive_jumps = 0
+            
+    def _start_wigglegram_animation(self, left_frame: torch.Tensor, right_frame: torch.Tensor):
+        """Starts the wigglegram animation loop."""
+        self._stop_wigglegram_animation()
+
+        # --- MODIFIED: Use percentage scaling for wigglegram frames ---
+        scale_percent_str = self.preview_size_var.get()
+        try:
+            scale_factor = float(scale_percent_str.strip('%')) / 100.0
+        except ValueError:
+            scale_factor = 1.0
+
+        def scale_image_for_wiggle(frame_tensor: torch.Tensor) -> ImageTk.PhotoImage:
+            """Scales a single frame tensor to a PhotoImage using the calculated factor."""
+            frame_np = (frame_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(frame_np)
+            
+            if scale_factor != 1.0 and scale_factor > 0:
+                new_width = int(pil_img.width * scale_factor)
+                new_height = int(pil_img.height * scale_factor)
+                if new_width > 0 and new_height > 0:
+                    pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            return ImageTk.PhotoImage(pil_img)
+
+        self.wiggle_left_tk = scale_image_for_wiggle(left_frame)
+        self.wiggle_right_tk = scale_image_for_wiggle(right_frame)
+        # --- END MODIFIED ---
+
+        self._wiggle_step(True)
+
+    def _stop_wigglegram_animation(self):
+        if self.wiggle_after_id:
+            self.parent.after_cancel(self.wiggle_after_id)
+            self.wiggle_after_id = None
+        if hasattr(self, 'wiggle_left_tk'): del self.wiggle_left_tk
+        if hasattr(self, 'wiggle_right_tk'): del self.wiggle_right_tk
+    
+    def _update_nav_controls(self):
+        """Updates the state and labels of the video navigation controls."""
+        total_videos = len(self.video_list)
+        current_index = self.current_video_index
+
+        self.video_status_label_var.set(f"Video: {current_index + 1} / {total_videos}" if total_videos > 0 else "Video: 0 / 0")
+        self.video_jump_to_var.set(str(current_index + 1) if total_videos > 0 else "1")
+
+        self.prev_video_button.config(state="normal" if current_index > 0 else "disabled")
+        self.next_video_button.config(state="normal" if 0 <= current_index < total_videos - 1 else "disabled")
+        self.video_jump_entry.config(state="normal" if total_videos > 0 else "disabled")
 
     def update_preview(self):
         """The main preview generation function."""
@@ -374,211 +702,6 @@ class VideoPreviewer(ttk.Frame):
             release_cuda_memory()
             self.load_preview_button.config(text="Load/Refresh List", style="TButton")
 
-    def on_slider_release(self, event):
-        """Called when a slider is released. Updates the preview."""
-        self._stop_wigglegram_animation()
-        if self.source_readers:
-            self.update_preview()
-
-    def on_scrubber_move(self, value):
-        """Called continuously as the frame scrubber moves to update the label."""
-        frame_idx = int(float(value))
-        total_frames = int(self.frame_scrubber.cget("to")) + 1
-        self.frame_label_var.set(f"Frame: {frame_idx + 1} / {total_frames}")
-        self.last_loaded_frame_index = frame_idx
-
-    def _on_scrubber_trough_click(self, event):
-        """Handles clicks on the frame scrubber's trough for precise positioning."""
-        slider = self.frame_scrubber
-        # Check if the click is on the trough to avoid interfering with handle drags
-        if 'trough' in slider.identify(event.x, event.y):
-            # Force the widget to update its size info to get an accurate width
-            slider.update_idletasks()
-            from_ = slider.cget("from")
-            to = slider.cget("to")
-            
-            new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
-            self.frame_scrubber_var.set(new_value) # This triggers on_scrubber_move
-            self.on_scrubber_move(new_value)
-            self.on_slider_release(event) # Manually trigger preview update
-            
-            return "break" # Prevents the default slider click behavior
-
-    def _clear_preview_resources(self):
-        """Closes all preview-related video readers and clears the preview display."""
-        self._stop_wigglegram_animation()
-
-        for key in list(self.source_readers.keys()):
-            if self.source_readers[key]:
-                del self.source_readers[key]
-        self.source_readers.clear()
-
-        # --- FIX: Create a dummy image to hold the place, preventing TclError ---
-        # This is the most robust way to clear the image in Tkinter without race conditions.
-        self._dummy_image = ImageTk.PhotoImage(Image.new('RGBA', (1, 1), (0,0,0,0)))
-        self.preview_label.config(image=self._dummy_image, text="Load a video list to see preview")
-        self.preview_label.image = self._dummy_image
-        self.preview_image_tk = None
-        # --- END FIX ---
-        self.pil_image_for_preview = None
-        gc.collect()
-        logger.debug("Preview resources and file handles have been released.")
-
-    def _load_preview_by_index(self, index: int):
-        """Loads a specific video from the preview list by its index."""
-        self._clear_preview_resources()
-
-        if not (0 <= index < len(self.video_list)):
-            self.last_loaded_video_path = None
-            return
-
-        self.current_video_index = index
-        self._update_nav_controls()
-
-        source_paths = self.video_list[index]
-        base_name = os.path.basename(next(iter(source_paths.values())))
-        
-        main_source_path = source_paths.get('source_video', None)
-
-        initial_frame = 0
-        if main_source_path == self.last_loaded_video_path:
-            # If the path is the SAME, retain the last frame index.
-            initial_frame = self.last_loaded_frame_index
-        else:
-            # If the path is DIFFERENT (new video), reset frame index to 0.
-            self.last_loaded_frame_index = 0
-            
-        self.last_loaded_video_path = main_source_path
-
-        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
-        self.parent.update_idletasks()
-
-        try:
-            # Initialize VideoReader for each source path
-            num_frames = -1
-            for key, path in source_paths.items():
-                if path and os.path.exists(path):
-                    reader = VideoReader(path, ctx=cpu(0))
-                    if num_frames == -1:
-                        num_frames = len(reader)
-                    elif num_frames != len(reader):
-                        raise ValueError(f"Frame count mismatch between sources for {base_name}")
-                    self.source_readers[key] = reader
-                else:
-                    self.source_readers[key] = None
-                    logger.debug(f"Source '{key}' not found for {base_name} at path: {path}")
-
-            if num_frames <= 0:
-                raise ValueError("Video has no frames or could not be loaded.")
-
-            # Configure the scrubber
-            self.frame_scrubber.config(to=num_frames - 1)
-            initial_frame = min(initial_frame, num_frames - 1) 
-            self.frame_scrubber_var.set(initial_frame)
-            self.on_scrubber_move(initial_frame)
-            if self.update_clip_callback:
-                self.update_clip_callback()
-            
-            if self.parent and hasattr(self.parent, 'update_gui_from_sidecar'):
-                self.parent.update_gui_from_sidecar(source_paths.get('depth_map'))
-
-            self.update_preview()
-
-        except Exception as e:
-            messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
-            logger.error("Preview load failed", exc_info=True)
-        finally:
-            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
-
-    def _nav_preview_video(self, direction: int):
-        """Navigate to the previous or next video in the preview list."""
-        if not self.video_list:
-            return
-        
-        # --- Auto-Save Current Sidecar before navigating ---
-        if self.parent and hasattr(self.parent, '_auto_save_current_sidecar'):
-            self.parent._auto_save_current_sidecar()
-
-        new_index = self.current_video_index + direction
-        if 0 <= new_index < len(self.video_list):
-            self._load_preview_by_index(new_index)
-
-    def _jump_to_video(self, event=None):
-        """Jump to a specific video number in the preview list."""
-        if not self.video_list:
-            return
-        try:
-            target_index = int(self.video_jump_to_var.get()) - 1
-            if 0 <= target_index < len(self.video_list):
-                self._load_preview_by_index(target_index)
-            else:
-                messagebox.showwarning("Out of Range", f"Please enter a number between 1 and {len(self.video_list)}.")
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter a valid number.")
-
-    def _key_jump_clips(self, event):
-        """Handler for Ctrl+Left/Right arrow keys to jump between clips."""
-        if not self.video_list:
-            return
-
-        direction = 0
-        if event.keysym == "Left":
-            direction = -1
-        elif event.keysym == "Right":
-            direction = 1
-        else:
-            return # Should not happen
-
-        # Call the existing navigation function
-        self._nav_preview_video(direction)
-
-    def _key_jump_frames(self, event):
-        """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
-        if not self.source_readers:
-            return
-
-        # Determine jump size: 10 for normal, 100 for Shift (state mask 0x1)
-        jump_size = 1
-        if event.state & 0x1: # 0x1 is the mask for the Shift key state
-            jump_size = 10
-            
-        direction_multiplier = 0
-        if event.keysym == "Left":
-            direction_multiplier = -1
-        elif event.keysym == "Right":
-            direction_multiplier = 1
-        elif event.keysym == "Shift_L" or event.keysym == "Shift_R":
-            # Ignore just the Shift keypress itself if it somehow triggered the event
-            return
-        else:
-            return # Should not happen
-
-        current_frame = int(self.frame_scrubber_var.get())
-        total_frames = int(self.frame_scrubber.cget("to")) + 1
-        
-        direction = direction_multiplier * jump_size
-        new_frame = current_frame + direction
-        
-        # Clamp the new frame index
-        new_frame = max(0, min(new_frame, total_frames - 1))
-
-        if new_frame != current_frame:
-            self.frame_scrubber_var.set(new_frame)
-            self.on_scrubber_move(new_frame) # Update label
-            self.update_preview() # Update display
-
-    def _update_nav_controls(self):
-        """Updates the state and labels of the video navigation controls."""
-        total_videos = len(self.video_list)
-        current_index = self.current_video_index
-
-        self.video_status_label_var.set(f"Video: {current_index + 1} / {total_videos}" if total_videos > 0 else "Video: 0 / 0")
-        self.video_jump_to_var.set(str(current_index + 1) if total_videos > 0 else "1")
-
-        self.prev_video_button.config(state="normal" if current_index > 0 else "disabled")
-        self.next_video_button.config(state="normal" if 0 <= current_index < total_videos - 1 else "disabled")
-        self.video_jump_entry.config(state="normal" if total_videos > 0 else "disabled")
-
     def _update_preview_layout(self):
         """Centers the image if it's smaller than the canvas, and hides/shows scrollbars."""
         if not hasattr(self, 'preview_canvas') or self.pil_image_for_preview is None:
@@ -608,90 +731,6 @@ class VideoPreviewer(ttk.Frame):
         self.preview_inner_frame.update_idletasks()
         self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
 
-    def _stop_wigglegram_animation(self):
-        if self.wiggle_after_id:
-            self.parent.after_cancel(self.wiggle_after_id)
-            self.wiggle_after_id = None
-        if hasattr(self, 'wiggle_left_tk'): del self.wiggle_left_tk
-        if hasattr(self, 'wiggle_right_tk'): del self.wiggle_right_tk
-    
-    def _start_drag_scroll(self, event):
-        """Records the starting position for a drag-to-scroll operation using scan_mark."""
-        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
-            self._is_dragging = True
-            self.preview_canvas.config(cursor="fleur")
-            
-            # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
-            content_x = int(self.preview_canvas.canvasx(event.x))
-            content_y = int(self.preview_canvas.canvasy(event.y))
-            
-            self.preview_canvas.scan_mark(content_x, content_y)
-            logger.debug(f"_start_drag_scroll: Scan Mark at X={content_x}, Y={content_y}")
-        else:
-            logger.debug("_start_drag_scroll: Drag ignored.")
-            
-        # Reset the jump counter/filter (if you still have it, for safety)
-        if hasattr(self, '_consecutive_jumps'):
-            self._consecutive_jumps = 0
-            
-    def _drag_scroll(self, event):
-        """Scrolls the canvas using scan_dragto."""
-        if not self._is_dragging:
-            return
-
-        # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
-        content_x = int(self.preview_canvas.canvasx(event.x))
-        content_y = int(self.preview_canvas.canvasy(event.y))
-
-        # Drag the canvas view based on the current cursor position
-        self.preview_canvas.scan_dragto(content_x, content_y, gain=5) 
-        
-        logger.debug(f"_drag_scroll: Scan DragTo at X={content_x}, Y={content_y}")
-
-    def _end_drag_scroll(self, event):
-        """Ends the drag-to-scroll operation."""
-        if self._is_dragging:
-            self._is_dragging = False
-            self.preview_canvas.config(cursor="")
-            logger.debug("_end_drag_scroll: Dragging ended.")
-        
-    # AND BINDINGS (in _create_widgets):
-        self.preview_label.bind("<ButtonPress-1>", 
-                                lambda e: (self._start_drag_scroll(e), "break")[1])
-        self.preview_label.bind("<B1-Motion>", 
-                                lambda e: (self._drag_scroll(e), "break")[1])
-        self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
-                
-    def _start_wigglegram_animation(self, left_frame: torch.Tensor, right_frame: torch.Tensor):
-        """Starts the wigglegram animation loop."""
-        self._stop_wigglegram_animation()
-
-        # --- MODIFIED: Use percentage scaling for wigglegram frames ---
-        scale_percent_str = self.preview_size_var.get()
-        try:
-            scale_factor = float(scale_percent_str.strip('%')) / 100.0
-        except ValueError:
-            scale_factor = 1.0
-
-        def scale_image_for_wiggle(frame_tensor: torch.Tensor) -> ImageTk.PhotoImage:
-            """Scales a single frame tensor to a PhotoImage using the calculated factor."""
-            frame_np = (frame_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            pil_img = Image.fromarray(frame_np)
-            
-            if scale_factor != 1.0 and scale_factor > 0:
-                new_width = int(pil_img.width * scale_factor)
-                new_height = int(pil_img.height * scale_factor)
-                if new_width > 0 and new_height > 0:
-                    pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            return ImageTk.PhotoImage(pil_img)
-
-        self.wiggle_left_tk = scale_image_for_wiggle(left_frame)
-        self.wiggle_right_tk = scale_image_for_wiggle(right_frame)
-        # --- END MODIFIED ---
-
-        self._wiggle_step(True)
-
     def _wiggle_step(self, show_left: bool):
         """A single step in the wigglegram animation."""
         if not hasattr(self, 'wiggle_left_tk'): return # Stop if resources were cleared
@@ -699,36 +738,3 @@ class VideoPreviewer(ttk.Frame):
         self.preview_label.config(image=current_image)
         self.preview_label.image = current_image # Prevent garbage collection
         self.wiggle_after_id = self.parent.after(60, self._wiggle_step, not show_left)
-
-    def save_preview_frame(self):
-        """Saves the current preview image to a file."""
-        if self.pil_image_for_preview is None:
-            messagebox.showwarning("No Preview", "There is no preview image to save.")
-            return
-
-        default_filename = "preview_frame.png"
-        if self.current_video_index != -1:
-            source_paths = self.video_list[self.current_video_index]
-            base_name = os.path.splitext(os.path.basename(next(iter(source_paths.values()))))[0]
-            frame_num = int(self.frame_scrubber_var.get())
-            default_filename = f"{base_name}_frame_{frame_num:05d}.png"
-
-        filepath = filedialog.asksaveasfilename(
-            title="Save Preview Frame As...",
-            initialfile=default_filename,
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")]
-        )
-
-        if filepath:
-            try:
-                # self.pil_image_for_preview already holds the correctly scaled image from update_preview
-                self.pil_image_for_preview.save(filepath)
-                logger.info(f"Preview frame saved to: {filepath}")
-            except Exception as e:
-                logger.error(f"Failed to save preview frame: {e}", exc_info=True)
-                messagebox.showerror("Save Error", f"An error occurred while saving the image:\n{e}")
-
-    def cleanup(self):
-        """Public method to be called when the parent GUI is closing."""
-        self._clear_preview_resources()

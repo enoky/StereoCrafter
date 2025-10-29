@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25.10.23.1"
+GUI_VERSION = "25-10-29.1"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -402,7 +402,9 @@ class SplatterGUI(ThemedTk):
         self.processing_task_name_var = tk.StringVar(value="N/A")
         self.processing_gamma_var = tk.StringVar(value="N/A")
 
-        self.slider_label_updaters = [] 
+        self.slider_label_updaters = []
+        
+        self.widgets_to_disable = [] 
 
         # --- Processing control variables ---
         self.stop_event = threading.Event()
@@ -561,49 +563,8 @@ class SplatterGUI(ThemedTk):
         if not self.auto_save_sidecar_var.get():
             return
             
-        # 1. Ensure a video is loaded
-        if not hasattr(self, 'previewer') or not self.previewer.video_list or self.previewer.current_video_index == -1:
-            return
+        self._save_current_sidecar_data(is_auto_save=True)
 
-        # 2. Get current sidecar path
-        current_index = self.previewer.current_video_index
-        current_source_dict = self.previewer.video_list[current_index]
-        depth_map_path = current_source_dict.get('depth_map')
-        
-        if not depth_map_path:
-            logger.error("Auto-Save: Could not determine depth map path for current clip.")
-            return
-
-        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
-        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
-        
-        # 3. Get current GUI values (use raw strings for consistency)
-        try:
-            save_data = {
-                "convergence_plane": float(self.zero_disparity_anchor_var.get()),
-                "max_disparity": float(self.max_disp_var.get()),
-                "gamma": float(self.depth_gamma_var.get()),
-            }
-        except ValueError:
-            logger.error("Auto-Save: Invalid input value in GUI. Skipping save.")
-            return
-            
-        # 4. Read existing sidecar content to preserve frame_overlap and input_bias
-        current_data = {}
-        # Load the existing data if the sidecar exists, otherwise start with defaults
-        current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
-        
-        # 5. Merge GUI values into current data
-        current_data.update(save_data)
-        
-        # 6. Write the updated data back to the file using the manager
-        if self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data):
-            logger.debug(f"Auto-Saved sidecar to {os.path.basename(json_sidecar_path)}")
-            self.status_label.config(text=f"Auto-Saved sidecar.")
-        else:
-            logger.error(f"Auto-Save: Failed to write sidecar file '{os.path.basename(json_sidecar_path)}'.")
-    
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
         current_path = var.get()
@@ -879,6 +840,7 @@ class SplatterGUI(ThemedTk):
             preview_size_var=self.preview_size_var, # Pass the preview size variable
             resize_callback=self._adjust_window_height_for_content, # Pass the resize callback
             update_clip_callback=self._update_clip_state_and_text,
+            on_clip_navigate_callback=self._auto_save_current_sidecar,
             help_data=self.help_texts,
         )
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
@@ -1033,7 +995,7 @@ class SplatterGUI(ThemedTk):
         
         # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
         current_depth_row = 0 # Use a new counter for this container
-        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing (Hi-Res Only)")
+        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing")
         self.depth_prep_frame.grid(row=current_depth_row, column=0, sticky="ew") # Use grid here for placement inside container
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
@@ -1041,12 +1003,13 @@ class SplatterGUI(ThemedTk):
         row_inner = 0
         create_dual_slider_layout(
             self, self.depth_prep_frame, "Dilate X:", "Y:",
-            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 15,
-            row_inner, decimals=0, is_integer=True,
+            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 35,
+            row_inner, decimals=0, is_integer=False,
             tooltip_key_x="depth_dilate_size_x",
             tooltip_key_y="depth_dilate_size_y",
+            trough_increment=2.0,
+            display_next_odd_integer=True,
             )
-
         row_inner += 1
         create_dual_slider_layout(
             self, self.depth_prep_frame, "   Blur X:", "Y:",
@@ -1054,25 +1017,27 @@ class SplatterGUI(ThemedTk):
             row_inner, decimals=0, is_integer=True,
             tooltip_key_x="depth_blur_size_x",
             tooltip_key_y="depth_blur_size_y",
+            trough_increment=1.0,
             )
-
+        
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
-        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Settings (All)")
+        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Stereo Projection")
         self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
         # self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
         # self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
 
         all_settings_row = 0
-        
-        # Gamma Slider (MOVED FROM OUTPUT FRAME)
+
+        # Gamma Slider
         create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Gamma:",
             self.depth_gamma_var, 0.1, 3.0, all_settings_row, decimals=1,
             tooltip_key="depth_gamma",
+            trough_increment=0.1
             )
         all_settings_row += 1
-
+        
         # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
         create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Disparity:",
@@ -1232,7 +1197,6 @@ class SplatterGUI(ThemedTk):
             dual_output: bool,
             zero_disparity_anchor_val: float,
             video_stream_info: Optional[dict],
-            frame_overlap: Optional[int],
             input_bias: Optional[float],
             assume_raw_input: bool, 
             global_depth_min: float, 
@@ -1241,10 +1205,10 @@ class SplatterGUI(ThemedTk):
             user_output_crf: Optional[int] = None,
             is_low_res_task: bool = False,
             depth_gamma: float = 1.0,
-            depth_dilate_size_x: int = 0,
-            depth_dilate_size_y: int = 0,
-            depth_blur_size_x: int = 0,
-            depth_blur_size_y: int = 0,
+            depth_dilate_size_x: float = 0.0,
+            depth_dilate_size_y: float = 0.0,
+            depth_blur_size_x: float = 0.0,
+            depth_blur_size_y: float = 0.0,
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1380,6 +1344,18 @@ class SplatterGUI(ThemedTk):
                 
                 # self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, file_frame_idx, task_name) 
                 
+                # --- NEW LOGIC: Invert Gamma Effect (Gamma > 1.0 makes near-field brighter) ---
+                if not assume_raw_input and round(depth_gamma, 2) != 1.0:
+                    logger.debug(f"Applying gamma reversal for intuitive control (Gamma={depth_gamma:.2f}).")
+                    # Step 1: Invert normalized depth
+                    inverted_depth = 1.0 - batch_depth_normalized
+                    # Step 2: Apply gamma to the inverted depth
+                    gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
+                    # Step 3: Invert back
+                    batch_depth_normalized = 1.0 - gamma_applied_inverted
+                    # Clamp to ensure no float inaccuracies push values outside [0, 1]
+                    batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
+
                 batch_depth_vis_list = []
                 for d_frame in batch_depth_normalized:
                     d_frame_vis = d_frame.copy()
@@ -1465,10 +1441,6 @@ class SplatterGUI(ThemedTk):
             
             # Check and include frame_overlap and input_bias
             has_non_zero_setting = False
-
-            if frame_overlap is not None and frame_overlap != 0.0:
-                output_sidecar_data["frame_overlap"] = frame_overlap
-                has_non_zero_setting = True
                 
             if input_bias is not None and input_bias != 0.0:
                 output_sidecar_data["input_bias"] = input_bias
@@ -1839,34 +1811,6 @@ class SplatterGUI(ThemedTk):
 
         return video_source_list
 
-    def get_current_preview_settings(self) -> dict:
-        """Gathers settings from the GUI needed for the preview callback."""
-        try:
-            # Helper function to safely convert StringVar content to int
-            def safe_int_conversion(var: tk.StringVar) -> int:
-                try:
-                    # Convert to float first to handle fractional strings like '35.227...'
-                    return int(float(var.get()))
-                except ValueError:
-                    # If it fails (e.g., empty string), default to 0
-                    return 0
-
-            return {
-                "max_disp": float(self.max_disp_var.get()),
-                "convergence_point": float(self.zero_disparity_anchor_var.get()),
-                "depth_gamma": float(self.depth_gamma_var.get()),
-                # --- MODIFIED: Use safe conversion for integer kernel sizes (float -> int) ---
-                "depth_dilate_size_x": safe_int_conversion(self.depth_dilate_size_x_var),
-                "depth_dilate_size_y": safe_int_conversion(self.depth_dilate_size_y_var),
-                "depth_blur_size_x": safe_int_conversion(self.depth_blur_size_x_var),
-                "depth_blur_size_y": safe_int_conversion(self.depth_blur_size_y_var),
-                "preview_size": self.preview_size_var.get(),
-                "enable_autogain": self.enable_autogain_var.get(),
-            }
-        except (ValueError, tk.TclError) as e:
-            logger.error(f"Invalid preview setting value: {e}")
-            return None
-
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
         config = {
@@ -1880,6 +1824,8 @@ class SplatterGUI(ThemedTk):
             "window_height": self.winfo_height(),
             "window_x": self.winfo_x(),
             "window_y": self.winfo_y(),
+            "update_slider_from_sidecar": self.update_slider_from_sidecar_var.get(),
+            "auto_save_sidecar": self.auto_save_sidecar_var.get(),
 
             "enable_full_resolution": self.enable_full_res_var.get(),
             "batch_size": self.batch_size_var.get(),
@@ -1904,6 +1850,52 @@ class SplatterGUI(ThemedTk):
             "enable_autogain": self.enable_autogain_var.get(),
         }
         return config
+
+    def get_current_preview_settings(self) -> dict:
+        """Gathers settings from the GUI needed for the preview callback."""
+        try:
+            # Helper function to safely convert StringVar content to float
+            def safe_float_conversion(var: tk.StringVar, default: float = 0.0) -> float:
+                 try:
+                     return float(var.get())
+                 except ValueError:
+                     return default
+
+            return {
+                "max_disp": float(self.max_disp_var.get()),
+                "convergence_point": float(self.zero_disparity_anchor_var.get()),
+                "depth_gamma": float(self.depth_gamma_var.get()),
+                # --- CRITICAL FIX: Use safe_float_conversion for fractional settings ---
+                "depth_dilate_size_x": safe_float_conversion(self.depth_dilate_size_x_var),
+                "depth_dilate_size_y": safe_float_conversion(self.depth_dilate_size_y_var),
+                "depth_blur_size_x": safe_float_conversion(self.depth_blur_size_x_var),
+                "depth_blur_size_y": safe_float_conversion(self.depth_blur_size_y_var),
+                "preview_size": self.preview_size_var.get(),
+                "enable_autogain": self.enable_autogain_var.get(),
+            }
+        except (ValueError, tk.TclError) as e:
+            logger.error(f"Invalid preview setting value: {e}")
+            return None
+
+    def _get_current_sidecar_paths_and_data(self) -> Optional[Tuple[str, str, dict]]:
+        """Helper to get current file path, sidecar path, and existing data (merged with defaults)."""
+        if not hasattr(self, 'previewer') or not self.previewer.video_list or self.previewer.current_video_index == -1:
+            return None
+
+        current_index = self.previewer.current_video_index
+        depth_map_path = self.previewer.video_list[current_index].get('depth_map')
+        
+        if not depth_map_path:
+            return None
+
+        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        
+        # Load existing data (merged with defaults) to preserve non-GUI parameters like overlap/bias
+        current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
+        
+        return json_sidecar_path, depth_map_path, current_data
 
     def _get_defined_tasks(self, settings):
         """Helper to return a list of processing tasks based on GUI settings."""
@@ -1986,7 +1978,6 @@ class SplatterGUI(ThemedTk):
             "actual_depth_map_path": actual_depth_map_path,
             "convergence_plane": merged_config["convergence_plane"],
             "max_disparity_percentage": merged_config["max_disparity"],
-            "frame_overlap": merged_config.get("frame_overlap"),
             "input_bias": merged_config.get("input_bias"),
             "depth_gamma": merged_config["gamma"],
             
@@ -2270,7 +2261,7 @@ class SplatterGUI(ThemedTk):
                  self._update_clip_state_and_text()
 
     def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
-                              depth_dilate_size_x: int, depth_dilate_size_y: int, depth_blur_size_x: int, depth_blur_size_y: int, 
+                              depth_dilate_size_x: float, depth_dilate_size_y: float, depth_blur_size_x: float, depth_blur_size_y: float, 
                               is_low_res_task: bool, max_raw_value: float,
                               global_depth_min: float, global_depth_max: float,
                               debug_batch_index: int = 0, debug_frame_index: int = 0, debug_task_name: str = "PreProcess",
@@ -2278,6 +2269,8 @@ class SplatterGUI(ThemedTk):
         """
         Loads, converts, and pre-processes the raw depth map batch using stable NumPy/OpenCV CPU calls.
         """
+        device = torch.device('cpu')
+
         # 1. Grayscale Conversion (Standard NumPy)
         if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3: # RGB
             batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
@@ -2294,61 +2287,65 @@ class SplatterGUI(ThemedTk):
         # 2. Gamma Adjustment (Only in RAW mode, otherwise skipped)
         is_global_norm_active = (global_depth_min != 0.0 or global_depth_max != 1.0) and not (global_depth_min == 0.0 and global_depth_max == 0.0)
         
-        if depth_gamma != 1.0:
+        if round(float(depth_gamma), 2) != 1.0:
             if is_global_norm_active:
                 logger.debug("Gamma adjustment SKIPPED in helper: Applied post-normalization (Global Norm Mode).")
             else:
-                logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
-                if max_raw_value > 1.0:
-                    normalized_chunk = batch_depth_numpy_float / max_raw_value
-                    normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
-                    batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
-                else:
-                    batch_depth_numpy_float = np.power(batch_depth_numpy_float, depth_gamma)
+                # --- MODIFIED LOGIC: Apply Inverted Gamma Correction to Raw Input ---
+                logger.debug(f"Applying INVERTED depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
+                
+                # Step 1: Normalize down to 0-1 range based on the expected raw max
+                normalized_chunk = batch_depth_numpy_float / max_raw_value
+                
+                # Step 2: Invert, Apply Gamma, and Invert Back
+                inverted_depth = 1.0 - normalized_chunk
+                gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
+                final_normalized_gamma = 1.0 - gamma_applied_inverted
+                
+                # Step 3: Scale back up to the raw value range
+                batch_depth_numpy_float = final_normalized_gamma * max_raw_value
 
         # self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
 
 
-        # --- 3. Dilate and Blur (Hi-Res Only, using stable OpenCV CPU calls) ---
-        if not is_low_res_task:
-            needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
+        # --- 3. Dilate and Blur (Now applies to ALL) ---
+        needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
+        
+        if needs_processing:
+            # --- PREPARE TENSOR FOR UTILITY FUNCTIONS ---
+            # batch_depth_numpy_float is (B, H, W) (needs to be B, C, H, W)
+            # Unsqueeze to add a channel dimension C=1
+            depth_tensor_4d = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).to(device) 
             
-            if needs_processing:
-                processed_frames = []
-                
-                # --- CRITICAL FIX: Determine Scale Factor for uint8 Conversion ---
-                # This ensures the float data is correctly scaled to 0-255 based on its true max value.
-                scale_factor = global_depth_max if global_depth_max > 1.0 else 1.0
-                
-                for frame_np_float in batch_depth_numpy_float:
-                    
-                    # Convert float[0, MaxRaw] to uint8[0, 255] for OpenCV operations
-                    # This is the stable scaling (frame * (255 / scale_factor))
-                    frame_np_uint8 = (frame_np_float * (255.0 / scale_factor)).astype(np.uint8)
-                    
-                    # --- Dilate ---
-                    k_x_dilate, k_y_dilate = depth_dilate_size_x, depth_dilate_size_y
-                    if k_x_dilate > 0 or k_y_dilate > 0:
-                        # Ensure non-zero kernels for OpenCV
-                        k_x_dilate = max(1, k_x_dilate)
-                        k_y_dilate = max(1, k_y_dilate)
-                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x_dilate, k_y_dilate))
-                        frame_np_uint8 = cv2.dilate(frame_np_uint8, kernel, iterations=1)
-                    
-                    # --- Blur ---
-                    k_x_blur, k_y_blur = depth_blur_size_x, depth_blur_size_y
-                    if k_x_blur > 0 or k_y_blur > 0:
-                        # Ensure kernel size is odd for OpenCV
-                        k_x_blur = k_x_blur if k_x_blur % 2 == 1 else k_x_blur + 1
-                        k_y_blur = k_y_blur if k_y_blur % 2 == 1 else k_y_blur + 1
-                        
-                        frame_np_uint8 = cv2.GaussianBlur(frame_np_uint8, (k_x_blur, k_y_blur), 0)
+            processed_tensor = depth_tensor_4d
+            
+            # 1. DILATE (using fractional)
+            if depth_dilate_size_x > 0 or depth_dilate_size_y > 0:
+                logger.debug(f"dilate x = {depth_dilate_size_x}, y = {depth_dilate_size_y}")
+                # Cast the integer sizes to float for fractional dilation
+                processed_tensor = custom_dilate(
+                    processed_tensor, 
+                    float(depth_dilate_size_x), 
+                    float(depth_dilate_size_y), 
+                    use_gpu=False
+                )
+            
+            # 2. BLUR (using standard integer blur)
+            if depth_blur_size_x > 0 or depth_blur_size_y > 0:
+                # Cast to int for the blur function (which handles odd size logic)
+                processed_tensor = custom_blur(
+                    processed_tensor, 
+                    int(depth_blur_size_x), 
+                    int(depth_blur_size_y), 
+                    use_gpu=False
+                )
 
-                    processed_frames.append(frame_np_uint8)
-                    
-                # Convert back to float32 using the scale factor inverse
-                batch_depth_numpy_uint8 = np.stack(processed_frames, axis=0)
-                batch_depth_numpy_float = batch_depth_numpy_uint8.astype(np.float32) * (scale_factor / 255.0)
+            # Convert back to (B, H, W) numpy float (squeeze channel dim)
+            batch_depth_numpy_float = processed_tensor.squeeze(1).cpu().numpy()
+            
+            # Clean up VRAM just in case
+            del depth_tensor_4d, processed_tensor
+            release_cuda_memory()
 
         # --- DEBUG SAVE 4: Final Processed Image ---
         # self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
@@ -2399,7 +2396,6 @@ class SplatterGUI(ThemedTk):
         actual_depth_map_path = video_specific_settings["actual_depth_map_path"]
         current_zero_disparity_anchor = video_specific_settings["convergence_plane"]
         current_max_disparity_percentage = video_specific_settings["max_disparity_percentage"]
-        current_frame_overlap = video_specific_settings["frame_overlap"]
         current_input_bias = video_specific_settings["input_bias"]
         anchor_source = video_specific_settings["anchor_source"]
         max_disp_source = video_specific_settings["max_disp_source"]
@@ -2582,7 +2578,6 @@ class SplatterGUI(ThemedTk):
                 dual_output=settings["dual_output"],
                 zero_disparity_anchor_val=current_zero_disparity_anchor,
                 video_stream_info=video_stream_info,
-                frame_overlap=current_frame_overlap,
                 input_bias=current_input_bias,
                 assume_raw_input=assume_raw_input_mode,
                 global_depth_min=global_depth_min,
@@ -2798,8 +2793,17 @@ class SplatterGUI(ThemedTk):
                 depth_normalized = np.zeros_like(depth_numpy_processed.squeeze(0))
             
             # Apply gamma AFTER normalization for the Global Norm path (as skipped in helper)
-            if params['depth_gamma'] != 1.0:
-                depth_normalized = np.power(depth_normalized, params['depth_gamma'])
+            if round(params['depth_gamma'], 2) != 1.0:
+                
+                gamma_val = params['depth_gamma']
+                logger.debug(f"Applied gamma reversal for intuitive control (Gamma={gamma_val:.2f}).")
+                
+                # Step 1: Invert normalized depth
+                inverted_depth = 1.0 - depth_normalized
+                # Step 2: Apply gamma to the inverted depth
+                gamma_applied_inverted = np.power(inverted_depth, gamma_val)
+                # Step 3: Invert back
+                depth_normalized = 1.0 - gamma_applied_inverted
                 logger.debug(f"Applied gamma ({params['depth_gamma']}) post-normalization.")
 
         depth_normalized = np.clip(depth_normalized, 0, 1)
@@ -3154,6 +3158,62 @@ class SplatterGUI(ThemedTk):
         with open("config_splat.json", "w") as f:
             json.dump(config, f, indent=4)
    
+    def _save_current_sidecar_data(self, is_auto_save: bool = False) -> bool:
+        """
+        Core method to prepare data and save the sidecar file.
+
+        Args:
+            is_auto_save (bool): If True, logs are DEBUG/INFO, otherwise ERROR.
+        
+        Returns:
+            bool: True on success, False on failure.
+        """
+        result = self._get_current_sidecar_paths_and_data()
+        if result is None:
+            if not is_auto_save:
+                messagebox.showwarning("Sidecar Save", "Please load a video in the Previewer first.")
+            return False
+
+        json_sidecar_path, depth_map_path, current_data = result
+        
+        # 1. Get current GUI values (the data to override/save)
+        try:
+            gui_save_data = {
+                "convergence_plane": float(self.zero_disparity_anchor_var.get()),
+                "max_disparity": float(self.max_disp_var.get()),
+                "gamma": float(self.depth_gamma_var.get()),
+                "depth_dilate_size_x": float(self.depth_dilate_size_x_var.get()),
+                "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
+                "depth_blur_size_x": float(self.depth_blur_size_x_var.get()),
+                "depth_blur_size_y": float(self.depth_blur_size_y_var.get()),
+                "disable_depth_normalization": self.enable_autogain_var.get(),
+            }
+        except ValueError:
+            logger.error("Sidecar Save: Invalid input value in GUI. Skipping save.")
+            if not is_auto_save:
+                messagebox.showerror("Sidecar Error", "Invalid input value in GUI. Skipping save.")
+            return False
+        
+        # 2. Merge GUI values into current data (preserving overlap/bias)
+        current_data.update(gui_save_data)
+        
+        # 3. Write the updated data back to the file using the manager
+        if self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data):
+            action = "Auto-Saved" if is_auto_save else ("Updated" if os.path.exists(json_sidecar_path) else "Created")
+            
+            logger.info(f"{action} sidecar: {os.path.basename(json_sidecar_path)}")
+            self.status_label.config(text=f"{action} sidecar.")
+
+            # Update button text in case a file was just created
+            self._update_sidecar_button_text()
+            
+            return True
+        else:
+            logger.error(f"Sidecar Save: Failed to write sidecar file '{os.path.basename(json_sidecar_path)}'.")
+            if not is_auto_save:
+                messagebox.showerror("Sidecar Error", f"Failed to write sidecar file '{os.path.basename(json_sidecar_path)}'. Check logs.")
+            return False
+
     def _save_debug_image(self, data: np.ndarray, filename_tag: str, batch_index: int, frame_index: int, task_name: str):
         """Saves a normalized (0-1) NumPy array as a grayscale PNG to a debug folder."""
         if not self._debug_logging_enabled:
@@ -3278,6 +3338,12 @@ class SplatterGUI(ThemedTk):
         
         # Depth Map Pre-processing Container (Right Side)
         set_frame_children_state(self.depth_settings_container, state)
+
+        # --- CRITICAL FIX: Explicitly re-enable slider widgets if state is 'normal' ---
+        if state == 'normal' and hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                # ttk.Scale can use 'normal' or 'disabled'
+                widget.config(state='normal')
 
         if hasattr(self, 'update_sidecar_button'):
             if state == 'disabled':
@@ -3457,6 +3523,12 @@ class SplatterGUI(ThemedTk):
         self.status_label.config(text="Starting processing...")
         # --- NEW: Disable all inputs at start ---
         self._set_input_state('disabled')
+        
+        # --- CRITICAL FIX: Explicitly disable slider widgets ---
+        if hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                widget.config(state="disabled")
+
         # --- NEW: Disable previewer widgets ---
         if hasattr(self, 'previewer'):
             self.previewer.set_ui_processing_state(True)
@@ -3549,6 +3621,13 @@ class SplatterGUI(ThemedTk):
         Starts processing for the single video currently loaded in the previewer.
         It runs the batch logic in single-file mode.
         """
+        
+        # --- CRITICAL FIX: Explicitly disable slider widgets ---
+        if hasattr(self, 'widgets_to_disable'):
+            for widget in self.widgets_to_disable:
+                widget.config(state="disabled")
+        # --- END CRITICAL FIX ---
+
         if not hasattr(self, 'previewer') or not self.previewer.source_readers:
             messagebox.showwarning("Process Single Clip", "Please load a video in the Previewer first.")
             return
@@ -3762,7 +3841,7 @@ class SplatterGUI(ThemedTk):
         # We use merge to ensure we get a complete dictionary even if keys are missing
         sidecar_config = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
         
-        logger.info(f"Updating sliders from sidecar: {os.path.basename(json_sidecar_path)}")
+        logger.debug(f"Updating sliders from sidecar: {os.path.basename(json_sidecar_path)}")
 
         # 3. Update Sliders Programmatically (Requires programmatic setter/updater)
         
@@ -3772,36 +3851,37 @@ class SplatterGUI(ThemedTk):
         if self.set_convergence_value_programmatically:
             self.set_convergence_value_programmatically(conv_val)
 
-        # Max Disparity
+        # Max Disparity (Simple set)
         disp_val = sidecar_config.get("max_disparity", self.max_disp_var.get())
         self.max_disp_var.set(disp_val)
-        # We need to manually update the max_disp label/slider if a setter was created for it.
-        # Since we only explicitly stored the convergence setter, we rely on the internal `slider_label_updaters` list for the others.
-        # Find the max_disp updater (crude but works if no dedicated setter is stored)
-        for key in self.SIDECAR_KEY_MAP:
-             if key == "max_disparity":
-                self.max_disp_var.set(disp_val)
-                # Find the correct updater by variable name, and call it (if available)
-                if hasattr(self, 'slider_label_updaters'):
-                     for updater in self.slider_label_updaters:
-                         # This check is fragile, but is a fallback if no dedicated setter was stored
-                         if str(self.max_disp_var.get()) in str(updater):
-                              updater()
-                              break
-                break
         
-        # Gamma
+        # Gamma (Simple set)
         gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
         self.depth_gamma_var.set(gamma_val)
-        for key in self.SIDECAR_KEY_MAP:
-             if key == "gamma":
-                self.depth_gamma_var.set(gamma_val)
-                if hasattr(self, 'slider_label_updaters'):
-                     for updater in self.slider_label_updaters:
-                         if str(self.depth_gamma_var.get()) in str(updater):
-                              updater()
-                              break
-                break
+
+        # Dilate X
+        dilate_x_val = sidecar_config.get("depth_dilate_size_x", self.depth_dilate_size_x_var.get())
+        self.depth_dilate_size_x_var.set(dilate_x_val)
+
+        # Dilate Y
+        dilate_y_val = sidecar_config.get("depth_dilate_size_y", self.depth_dilate_size_y_var.get())
+        self.depth_dilate_size_y_var.set(dilate_y_val)
+        
+        # Blur X
+        blur_x_val = sidecar_config.get("depth_blur_size_x", self.depth_blur_size_x_var.get())
+        self.depth_blur_size_x_var.set(blur_x_val)
+        # Blur Y
+        blur_y_val = sidecar_config.get("depth_blur_size_y", self.depth_blur_size_y_var.get())
+        self.depth_blur_size_y_var.set(blur_y_val)
+        
+        # Disable Normalization Checkbox (Boolean)
+        disable_norm_state = sidecar_config.get("disable_depth_normalization", self.enable_autogain_var.get())
+        self.enable_autogain_var.set(bool(disable_norm_state))
+
+        # --- Re-run all updaters to ensure all labels/sliders reflect the new values ---
+        if hasattr(self, 'slider_label_updaters'):
+             for updater in self.slider_label_updaters:
+                 updater()
 
         # 4. Refresh preview to show the new values
         self.on_slider_release(None)
@@ -3826,25 +3906,15 @@ class SplatterGUI(ThemedTk):
         
     def update_sidecar_file(self):
         """
-        Updates/Creates the current video's sidecar file. 
-        Prompts for confirmation only when overwriting an existing file.
+        Saves the current GUI values to the sidecar file after checking for user confirmation.
         """
-        # Ensure a video is loaded in the previewer
-        if not hasattr(self, 'previewer') or not self.previewer.video_list or self.previewer.current_video_index == -1:
+        # 1. Get current sidecar path and data (needed for overwrite check)
+        result = self._get_current_sidecar_paths_and_data()
+        if result is None:
             messagebox.showwarning("Sidecar Action", "Please load a video in the Previewer first.")
             return
-
-        # 1. Get current sidecar path
-        current_source_dict = self.previewer.video_list[self.previewer.current_video_index]
-        depth_map_path = current_source_dict.get('depth_map')
-        if not depth_map_path:
-            messagebox.showerror("Sidecar Error", "Could not determine the depth map path for the current video.")
-            return
-
-        depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
-        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
         
+        json_sidecar_path, _, _ = result
         is_sidecar_present = os.path.exists(json_sidecar_path)
 
         # 2. Conditional Confirmation Dialog
@@ -3856,48 +3926,11 @@ class SplatterGUI(ThemedTk):
             if not messagebox.askyesno(title, message):
                 self.status_label.config(text="Sidecar update cancelled.")
                 return
-        # If the file does NOT exist, we skip the dialog and proceed.
 
-        logger.debug(f"Attempting to {'update' if is_sidecar_present else 'create'} sidecar: {json_sidecar_path}")
-
-        # 3. Get current GUI values (use raw strings for consistency)
-        try:
-            save_data = {
-                "convergence_plane": float(self.zero_disparity_anchor_var.get()),
-                "max_disparity": float(self.max_disp_var.get()),
-                "gamma": float(self.depth_gamma_var.get()),
-            }
-        except ValueError as e:
-            messagebox.showerror("Sidecar Error", f"Invalid input value in GUI: {e}")
-            return
-            
-        # 4. Read existing sidecar content to preserve frame_overlap and input_bias
-        current_data = {}
-        if is_sidecar_present:
-            try:
-                # Use the manager to load current data (which includes overlap/bias)
-                current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
-            except Exception:
-                current_data = {}
-        
-        # 5. Merge GUI values into current data
-        current_data.update(save_data)
-        
-        # 6. Write the updated data back to the file using the manager
-        if self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data):
-            # 7. Success: Log to console and status bar (silent success)
-            action = "updated" if is_sidecar_present else "created"
-            logger.info(f"Sidecar '{os.path.basename(json_sidecar_path)}' successfully {action}.")
-            self.status_label.config(text=f"Sidecar {action}.")
-            
-            # Update button text in case a file was just created
-            self._update_sidecar_button_text()
-            
+        # 3. Call the core saving function
+        if self._save_current_sidecar_data(is_auto_save=False):
             # Immediately refresh the preview to show the *effect* of the newly saved sidecar 
             self.on_slider_release(None) 
-        else:
-            # Failure
-            messagebox.showerror("Sidecar Error", f"Failed to write sidecar file '{os.path.basename(json_sidecar_path)}'. Check logs.")
 
 def compute_global_depth_stats(
         depth_map_reader: VideoReader,
