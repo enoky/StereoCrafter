@@ -1344,6 +1344,18 @@ class SplatterGUI(ThemedTk):
                 
                 # self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, file_frame_idx, task_name) 
                 
+                # --- NEW LOGIC: Invert Gamma Effect (Gamma > 1.0 makes near-field brighter) ---
+                if not assume_raw_input and round(depth_gamma, 2) != 1.0:
+                    logger.debug(f"Applying gamma reversal for intuitive control (Gamma={depth_gamma:.2f}).")
+                    # Step 1: Invert normalized depth
+                    inverted_depth = 1.0 - batch_depth_normalized
+                    # Step 2: Apply gamma to the inverted depth
+                    gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
+                    # Step 3: Invert back
+                    batch_depth_normalized = 1.0 - gamma_applied_inverted
+                    # Clamp to ensure no float inaccuracies push values outside [0, 1]
+                    batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
+
                 batch_depth_vis_list = []
                 for d_frame in batch_depth_normalized:
                     d_frame_vis = d_frame.copy()
@@ -2776,7 +2788,17 @@ class SplatterGUI(ThemedTk):
             
             # Apply gamma AFTER normalization for the Global Norm path (as skipped in helper)
             if round(params['depth_gamma'], 2) != 1.0:
-                depth_normalized = np.power(depth_normalized, params['depth_gamma'])
+                
+                # --- NEW LOGIC: Invert Gamma Effect for Preview ---
+                gamma_val = params['depth_gamma']
+                logger.debug(f"Applied gamma reversal for intuitive control (Gamma={gamma_val:.2f}).")
+                
+                # Step 1: Invert normalized depth
+                inverted_depth = 1.0 - depth_normalized
+                # Step 2: Apply gamma to the inverted depth
+                gamma_applied_inverted = np.power(inverted_depth, gamma_val)
+                # Step 3: Invert back
+                depth_normalized = 1.0 - gamma_applied_inverted
                 logger.debug(f"Applied gamma ({params['depth_gamma']}) post-normalization.")
 
         depth_normalized = np.clip(depth_normalized, 0, 1)
