@@ -2291,13 +2291,19 @@ class SplatterGUI(ThemedTk):
             if is_global_norm_active:
                 logger.debug("Gamma adjustment SKIPPED in helper: Applied post-normalization (Global Norm Mode).")
             else:
-                logger.debug(f"Applying depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
-                if max_raw_value > 1.0:
-                    normalized_chunk = batch_depth_numpy_float / max_raw_value
-                    normalized_chunk_gamma = np.power(normalized_chunk, depth_gamma)
-                    batch_depth_numpy_float = normalized_chunk_gamma * max_raw_value
-                else:
-                    batch_depth_numpy_float = np.power(batch_depth_numpy_float, depth_gamma)
+                # --- MODIFIED LOGIC: Apply Inverted Gamma Correction to Raw Input ---
+                logger.debug(f"Applying INVERTED depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
+                
+                # Step 1: Normalize down to 0-1 range based on the expected raw max
+                normalized_chunk = batch_depth_numpy_float / max_raw_value
+                
+                # Step 2: Invert, Apply Gamma, and Invert Back
+                inverted_depth = 1.0 - normalized_chunk
+                gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
+                final_normalized_gamma = 1.0 - gamma_applied_inverted
+                
+                # Step 3: Scale back up to the raw value range
+                batch_depth_numpy_float = final_normalized_gamma * max_raw_value
 
         # self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
 
@@ -2789,7 +2795,6 @@ class SplatterGUI(ThemedTk):
             # Apply gamma AFTER normalization for the Global Norm path (as skipped in helper)
             if round(params['depth_gamma'], 2) != 1.0:
                 
-                # --- NEW LOGIC: Invert Gamma Effect for Preview ---
                 gamma_val = params['depth_gamma']
                 logger.debug(f"Applied gamma reversal for intuitive control (Gamma={gamma_val:.2f}).")
                 
