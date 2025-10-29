@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-29.0"
+GUI_VERSION = "25-10-29.1"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -1007,7 +1007,8 @@ class SplatterGUI(ThemedTk):
             row_inner, decimals=0, is_integer=False,
             tooltip_key_x="depth_dilate_size_x",
             tooltip_key_y="depth_dilate_size_y",
-            trough_increment=1.0
+            trough_increment=2.0,
+            display_next_odd_integer=True,
             )
         row_inner += 1
         create_dual_slider_layout(
@@ -1016,7 +1017,7 @@ class SplatterGUI(ThemedTk):
             row_inner, decimals=0, is_integer=True,
             tooltip_key_x="depth_blur_size_x",
             tooltip_key_y="depth_blur_size_y",
-            trough_increment=2.0
+            trough_increment=1.0,
             )
         
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---

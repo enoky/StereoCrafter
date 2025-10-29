@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-29.0"
+VERSION = "25-10-29.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -240,6 +240,7 @@ def create_single_slider_with_label_updater(
     decimals: int = 0,
     tooltip_key: Optional[str] = None,
     trough_increment: float = -1.0,
+    display_next_odd_integer: bool = False,
 ) -> None:
     """Creates a single slider, its value label, and all necessary event bindings."""
     
@@ -277,8 +278,31 @@ def create_single_slider_with_label_updater(
     def update_label_and_preview(value_str: str) -> None:
         """Updates the text label. Called by user interaction."""
         try:
-            # Only update the label with the formatted display value
-            value_label.config(text=f"{float(value_str):.{decimals}f}")
+            value = float(value_str)
+            display_value = value
+            
+            # --- NEW LOGIC: Display Next Odd Integer ---
+            if display_next_odd_integer:
+                # The actual kernel size that will be used is the next odd number.
+                # Cast to int for kernel calculation
+                k_int = int(round(value))
+                if k_int < 0:
+                    k_int = 0
+                
+                # Logic: If 0, display 0. If positive and even, display next odd. If odd, display itself.
+                if k_int > 0 and k_int % 2 == 0:
+                    display_value = k_int + 1
+                elif k_int > 0 and k_int % 2 != 0:
+                    display_value = k_int
+                elif k_int == 0:
+                    display_value = 0
+                
+                value_label.config(text=f"{display_value:.{decimals}f}")
+            # --- END NEW LOGIC ---
+            else:
+                # Only update the label with the formatted display value
+                value_label.config(text=f"{display_value:.{decimals}f}")
+
         except ValueError:
             pass
 
@@ -293,7 +317,7 @@ def create_single_slider_with_label_updater(
         
         rounded_value = round(new_value, decimals)
         var.set(rounded_value)
-        value_label.config(text=f"{rounded_value:.{decimals}f}")
+        update_label_and_preview(str(rounded_value))
 
     def on_trough_click(event):
         """Handles clicks on the slider's trough for precise positioning or incremental change."""
@@ -399,6 +423,7 @@ def create_dual_slider_layout(
     tooltip_key_x: Optional[str] = None,
     tooltip_key_y: Optional[str] = None,
     trough_increment: float = -1.0,
+    display_next_odd_integer: bool = False,
 ) -> None:
     """
     Creates a dual (X/Y) slider layout by composing two single sliders.
@@ -428,7 +453,8 @@ def create_dual_slider_layout(
     create_single_slider_with_label_updater(
         GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals, 
         tooltip_key=tooltip_key_x,
-        trough_increment=trough_increment
+        trough_increment=trough_increment,
+        display_next_odd_integer=display_next_odd_integer 
     )
     
     # --- Y SLIDER ---
@@ -440,7 +466,8 @@ def create_dual_slider_layout(
     create_single_slider_with_label_updater(
         GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals, 
         tooltip_key=tooltip_key_y,
-        trough_increment=trough_increment
+        trough_increment=trough_increment,
+        display_next_odd_integer=display_next_odd_integer 
     )
 
 def custom_dilate(
