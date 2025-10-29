@@ -1018,15 +1018,6 @@ class SplatterGUI(ThemedTk):
             tooltip_key_y="depth_blur_size_y",
             trough_increment=2.0
             )
-        row_inner += 1
-        
-        # Gamma Slider
-        create_single_slider_with_label_updater(
-            self, self.depth_prep_frame, "Gamma:",
-            self.depth_gamma_var, 0.1, 3.0, row_inner, decimals=1,
-            tooltip_key="depth_gamma",
-            trough_increment=0.1
-            )
         
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
@@ -1037,6 +1028,15 @@ class SplatterGUI(ThemedTk):
 
         all_settings_row = 0
 
+        # Gamma Slider
+        create_single_slider_with_label_updater(
+            self, self.depth_all_settings_frame, "Gamma:",
+            self.depth_gamma_var, 0.1, 3.0, all_settings_row, decimals=1,
+            tooltip_key="depth_gamma",
+            trough_increment=0.1
+            )
+        all_settings_row += 1
+        
         # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
         create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Disparity:",
