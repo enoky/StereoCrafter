@@ -374,6 +374,7 @@ class SplatterGUI(ThemedTk):
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
         self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
+        self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
 
         self.auto_convergence_mode_var = tk.StringVar(value=self.app_config.get("auto_convergence_mode", "Off"))
 
@@ -1067,6 +1068,17 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")   
 
         all_settings_row += 1
+        
+        # --- NEW: Move to Finished Folder Checkbox ---
+        self.move_to_finished_checkbox = ttk.Checkbutton(
+            self.depth_all_settings_frame, text="Resume",
+            variable=self.move_to_finished_var,
+            width=28
+            )
+        self.move_to_finished_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(self.move_to_finished_checkbox, "move_to_finished_folder")
+        all_settings_row += 1
+
         current_row = 0 # Reset for next frame
         # ===================================================================
         # --- RIGHT COLUMN: Current Processing Information frame ---
@@ -1848,6 +1860,7 @@ class SplatterGUI(ThemedTk):
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
             "enable_autogain": self.enable_autogain_var.get(),
+            "move_to_finished": self.move_to_finished_var.get(),
         }
         return config
 
@@ -2432,17 +2445,14 @@ class SplatterGUI(ThemedTk):
                 settings["process_length"],
                 settings["full_res_batch_size"],
                 anchor_float,
-            )
-            
+            )            
             new_anchor_val = new_anchor_avg if auto_conv_mode == "Average" else new_anchor_peak
 
-            # Update variables for current task
             if new_anchor_val != current_zero_disparity_anchor:
                 current_zero_disparity_anchor = new_anchor_val
                 anchor_source = "Auto"
             
             logger.info(f"Using Convergence Point: {current_zero_disparity_anchor:.4f} (Source: {anchor_source})")
-        # --- END Auto-Convergence Logic ---
 
         for task in processing_tasks:
             if self.stop_event.is_set():
@@ -2622,16 +2632,20 @@ class SplatterGUI(ThemedTk):
             return expected_task_count, any_task_completed_successfully_for_this_video
 
         # Move to finished logic 
+        move_enabled = settings["move_to_finished"] # Use the setting from the dictionary
+
         if is_single_file_mode:
             # CRITICAL FIX: Get the finished folders directly from settings (set in start_single_processing)
             single_finished_src = settings.get("single_finished_source_folder")
             single_finished_depth = settings.get("single_finished_depth_folder")
-            
-            if single_finished_src and single_finished_depth and self.MOVE_TO_FINISHED_ENABLED and any_task_completed_successfully_for_this_video:
+
+            # --- Check move_enabled setting ---
+            if single_finished_src and single_finished_depth and move_enabled and any_task_completed_successfully_for_this_video:
                 self._move_processed_files(video_path, actual_depth_map_path, single_finished_src, single_finished_depth)
             else:
-                logger.debug(f"Single file move skipped. Enabled={self.MOVE_TO_FINISHED_ENABLED}, Success={any_task_completed_successfully_for_this_video}, PathsValid={bool(single_finished_src)}")
-        elif any_task_completed_successfully_for_this_video and finished_source_folder and finished_depth_folder:
+                logger.debug(f"Single file move skipped. Enabled={move_enabled}, Success={any_task_completed_successfully_for_this_video}, PathsValid={bool(single_finished_src)}")
+                
+        elif any_task_completed_successfully_for_this_video and finished_source_folder and finished_depth_folder and move_enabled:
             # Batch mode move (uses the arguments passed from _run_batch_process)
             self._move_processed_files(video_path, actual_depth_map_path, finished_source_folder, finished_depth_folder)
 
@@ -2923,7 +2937,7 @@ class SplatterGUI(ThemedTk):
         self.enable_autogain_var.set(False) # Default: Global Depth Normalization
         self.zero_disparity_anchor_var.set("0.5")
         self.output_crf_var.set("23")        
-        self.auto_convergence_mode_var.set("Off")
+        self.move_to_finished_var.set(True)
         
         self.toggle_processing_settings_fields()
         self._save_config()
@@ -3429,14 +3443,15 @@ class SplatterGUI(ThemedTk):
         elif is_source_dir and is_depth_dir:
             logger.debug("==> Running in batch (folder) mode.")
 
-            if self.MOVE_TO_FINISHED_ENABLED:
+            # --- Check GUI Setting for Finished Folders ---
+            if settings["move_to_finished"]:
                 finished_source_folder = os.path.join(input_source_clips_path, "finished")
                 finished_depth_folder = os.path.join(input_depth_maps_path, "finished")
                 os.makedirs(finished_source_folder, exist_ok=True)
                 os.makedirs(finished_depth_folder, exist_ok=True)
                 logger.debug("Finished folders enabled for batch mode.")
             else:
-                logger.debug("Finished folders DISABLED globally. Files will remain in input folders.")
+                logger.debug("Finished folders DISABLED by user setting. Files will remain in input folders.")
 
             os.makedirs(output_splatted, exist_ok=True)
 
@@ -3671,7 +3686,8 @@ class SplatterGUI(ThemedTk):
         single_finished_source_folder = None
         single_finished_depth_folder = None
         
-        if self.MOVE_TO_FINISHED_ENABLED:
+        # --- Check the new GUI variable ---
+        if self.move_to_finished_var.get():
             # We assume the finished folder is in the same directory as the original input file/depth map
             single_finished_source_folder = os.path.join(os.path.dirname(single_video_path), "finished")
             single_finished_depth_folder = os.path.join(os.path.dirname(single_depth_path), "finished")
@@ -3711,6 +3727,7 @@ class SplatterGUI(ThemedTk):
             "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
             "single_finished_source_folder": single_finished_source_folder,
             "single_finished_depth_folder": single_finished_depth_folder,
+            "move_to_finished": self.move_to_finished_var.get(), 
         }
 
         # 4. Start the processing thread

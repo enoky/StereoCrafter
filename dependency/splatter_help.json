@@ -28,6 +28,7 @@
     "max_disp": "Maximum disparity value as a percentage of the video's width x 20. Higher values result in more extreme parallax effects (depth shift). Example: '30.0' means a maximum of 1.5% shift horizontally at the forground.",
     "convergence_point": "Set to 1.0 will place depth inside the screen. 0.0 will give 100% pop out. StereoCrafter Default = 0.5, Recommend 0.8.",    
     "no_normalization": "Use this only if your scene is too long and you have split your video/depthmap into shorter lengths to be rejoined after processing. Otherwise your cut scenes depth will not align",
+    "move_to_finished_folder": "When enabled, will move source input files to finished folder after processing.",    
     "override_sidecar_preview": "If sidecar file exist, it will be displayed with those settings, This checkbox will allow you to override and save/edit your current settings",
    
     "start_single_button": "Start performs the depth splatting on current preview clip.",
