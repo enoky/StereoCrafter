@@ -25,7 +25,7 @@ from dependency.stereocrafter_util import (
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-17.2"
+GUI_VERSION = "25-10-30.1"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
