@@ -574,7 +574,7 @@ def merge_depth_segments(
             file_extension_for_path = "exr"
         
         # --- FIRST OUTPUT: Standard Normalization & Save ---
-        _logger.info("Generating standard output...")
+        _logger.debug("Generating standard output...")
         standard_normalized_video = normalize_video_data(
             final_video_unclipped, # Use original unclipped data
             use_percentile_norm,
@@ -648,7 +648,7 @@ def merge_depth_segments(
         # Re-raise to ensure GUI gets the error for its message queue and UI state
         raise
     
-    _logger.info("Depth segment merging process finished successfully.")
+    _logger.debug("Depth segment merging process finished successfully.")
     return actual_saved_output_path
 
 

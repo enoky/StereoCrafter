@@ -63,7 +63,7 @@ except ImportError:
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
 # --- Imports End ---
 
-GUI_VERSION = "25-10-27.0"
+GUI_VERSION = "25-10-30.1"
 _HELP_TEXTS = {}
 
 DARK_MODE_COLORS = {
@@ -270,7 +270,7 @@ class DepthCrafterGUI:
         self.toggle_merge_related_options_active_state()
         self.toggle_secondary_output_options_active_state()
                 
-        _logger.info("DepthCrafter GUI initialized successfully.")
+        _logger.debug("DepthCrafter GUI initialized successfully.")
 
     def _apply_all_settings(self, settings_data: dict):
         for key, value_from_json in settings_data.items():
@@ -362,7 +362,7 @@ class DepthCrafterGUI:
                 else:
                     _logger.info(f"  Video frames ({orig_frames}) >= threshold ({min_frames}). Segment folder for {original_basename} will be kept.")
             else:
-                _logger.info(f"Keeping intermediate NPZ files for {original_basename} (Keep NPZ checked, no positive frame threshold).")
+                _logger.debug(f"Keeping intermediate NPZ files for {original_basename} (Keep NPZ checked, no positive frame threshold).")
         if del_folder:
             if os.path.exists(segment_subfolder_path):
                 try: 
@@ -373,7 +373,7 @@ class DepthCrafterGUI:
             else:
                 _logger.warning(f"  Segment subfolder not found for deletion: {segment_subfolder_path}")
         else:
-            _logger.info(f"Keeping intermediate NPZ files and _master_meta.json in {segment_subfolder_path}")
+            _logger.debug(f"Keeping intermediate NPZ files and _master_meta.json in {segment_subfolder_path}")
 
     def _collect_all_settings(self) -> dict:
         settings_data = {}
@@ -599,7 +599,7 @@ class DepthCrafterGUI:
         else:
             master_meta_for_this_vid["overall_status"] = "all_failed"
 
-        _logger.info(f"Finished processing for {original_basename}. Overall Status: {master_meta_for_this_vid['overall_status']}.")
+        _logger.debug(f"Finished processing for {original_basename}. Overall Status: {master_meta_for_this_vid['overall_status']}.")
         
         main_output_dir, segment_subfolder_path, was_segments = self._determine_video_paths_and_processing_mode(original_basename, master_meta_for_this_vid)
         master_meta_filepath, meta_saved = None, False
@@ -722,7 +722,7 @@ class DepthCrafterGUI:
             choice_incomplete = messagebox.askyesnocancel("Resume Incomplete Segments?", msg_dialog_incomplete, parent=self.root)
 
             if choice_incomplete is True:
-                _logger.info(f"Attempting to resume incomplete segments for {original_basename}.")
+                _logger.debug(f"Attempting to resume incomplete segments for {original_basename}.")
                 segments_to_run = []
                 num_already_complete = 0
                 completed_segment_metadata_from_json = []
@@ -831,7 +831,7 @@ class DepthCrafterGUI:
                 _logger.error(f"merge_depth_segments returned None for {original_basename}. Merge considered failed.")
                 return False, f"N/A (Merge module returned no path)"
             else:
-                _logger.info(f"Primary merge for {original_basename} successful. Output: {primary_output_path}")
+                _logger.debug(f"Primary merge for {original_basename} successful. Output: {primary_output_path}")
                 return True, primary_output_path # Successful merge
                 
         except Exception as e: 
@@ -863,8 +863,8 @@ class DepthCrafterGUI:
             "completed_successful_jobs": 0, "completed_failed_jobs": 0,
         }
         if self.process_as_segments_var.get():
-            entry["global_processing_settings"]["segment_definition_output_window_frames"] = job_info_for_original_details.get("gui_desired_output_window_frames")
-            entry["global_processing_settings"]["segment_definition_output_overlap_frames"] = job_info_for_original_details.get("gui_desired_output_overlap_frames")
+            entry["global_processing_settings"]["segment_definition_output_window_frames"] = job_info_for_original_details.get("gui_desired_output_window_frames", self.window_size.get())
+            entry["global_processing_settings"]["segment_definition_output_overlap_frames"] = job_info_for_original_details.get("gui_desired_output_overlap_frames", self.overlap.get())
         return entry
 
     def _is_image_sequence_folder(self, folder_path: str) -> bool:
@@ -914,12 +914,12 @@ class DepthCrafterGUI:
         settings_data = load_json_file(filepath)
         if settings_data:
             self._apply_all_settings(settings_data)
-            _logger.info(f"Successfully loaded settings from: {filepath}")
+            _logger.debug(f"Successfully loaded settings from: {filepath}")
         else:
             messagebox.showerror("Load Error", f"Could not load settings from:\n{filepath}\nSee console log for details.")
 
     def _move_original_source(self, current_video_path: str, original_basename: str, target_subfolder: str):
-        _logger.info(f"Moving original source '{original_basename}' to '{target_subfolder}' folder.")
+        _logger.debug(f"Moving original source '{original_basename}' to '{target_subfolder}' folder.")
         try:
             path_from_gui_input_field = self.input_dir_or_file_var.get()
 
@@ -1307,9 +1307,9 @@ class DepthCrafterGUI:
         help_window.wait_window()
         _logger.debug(f"Displayed help overview for '{help_key}'.")
         
-    def _start_processing_wrapper(self, video_processing_jobs, base_job_info_map, effective_seed_for_run):
+    def _start_processing_wrapper(self, source_specs_to_process, effective_seed_for_run):
         try: 
-            self.start_processing(video_processing_jobs, base_job_info_map, effective_seed_for_run)
+            self.start_processing(source_specs_to_process, effective_seed_for_run)
         finally: 
             self._set_ui_processing_state(False)
 
@@ -1321,6 +1321,86 @@ class DepthCrafterGUI:
             logging.getLogger().setLevel(logging.INFO)  # Set root logger back to INFO
             _logger.info("Debug logging DISABLED (set to INFO level).")
 
+    def _update_gui_info_on_job_start(self, job_info_to_run, original_basename, log_msg_prefix):
+        """Updates GUI processing info labels with target/expected values before a job starts."""
+        _logger.debug(f"DEBUG GUI UPDATE (Initial): Starting update for {original_basename}")
+        
+        self.current_filename_var.set(f"{original_basename} ({log_msg_prefix})") 
+        
+        # Initial Resolution (using target_height/width setting and original dimensions as a hint)
+        target_h_setting = self.target_height.get()
+        target_w_setting = self.target_width.get()
+        is_segment_job = job_info_to_run.get("is_segment", False)
+
+        initial_display_res = "N/A"
+        if target_h_setting > 0 and target_w_setting > 0:
+            initial_display_res = f"{target_w_setting}x{target_h_setting}"
+        else:
+            # Fallback to detected original dimensions if target H/W are not set
+            original_h = job_info_to_run.get("original_height", "N/A")
+            original_w = job_info_to_run.get("original_width", "N/A")
+            if original_h != "N/A" and original_w != "N/A":
+                initial_display_res = f"{original_w}x{original_h} (Original/Fallback)"
+        self.current_resolution_var.set(initial_display_res)
+
+        # Initial Frames (using gui settings for segment/process_length)
+        total_frames_orig_vid = job_info_to_run.get('original_video_raw_frame_count', 'N/A')
+        
+        initial_display_frames_str = "N/A"
+        if is_segment_job:
+            num_frames_to_load_raw = job_info_to_run.get("num_frames_to_load_raw", "N/A")
+            if num_frames_to_load_raw != "N/A":
+                initial_display_frames_str = f"{num_frames_to_load_raw}"
+            
+            if total_frames_orig_vid != "N/A" and str(num_frames_to_load_raw) != str(total_frames_orig_vid):
+                initial_display_frames_str += f" of {total_frames_orig_vid}"
+        else: # Full video
+            process_length_setting = self.process_length.get()
+            if process_length_setting != -1:
+                initial_display_frames_str = f"{process_length_setting}"
+            else:
+                initial_display_frames_str = f"{total_frames_orig_vid}"
+        self.current_frames_var.set(initial_display_frames_str)
+
+        self.root.update_idletasks() # Force GUI update for initial display
+        
+    def _update_gui_info_on_job_finish(self, job_info_to_run, current_job_specific_metadata):
+        """Updates GUI processing info labels with actual/processed values after a job finishes."""
+        # _logger.debug(f"DEBUG GUI UPDATE (Final): Starting update for {job_info_to_run['original_basename']}")
+
+        # RESOLUTION UPDATE (from actual processed values)
+        processed_h = current_job_specific_metadata.get("processed_height", "N/A")
+        processed_w = current_job_specific_metadata.get("processed_width", "N/A")
+        
+        final_display_res = "N/A"
+        if processed_h != "N/A" and processed_w != "N/A":
+            final_display_res = f"{processed_w}x{processed_h}" # This is the actual processed resolution
+        else:
+            final_display_res = self.current_resolution_var.get() + " (Failed to confirm)" # Append if couldn't get actual
+        self.current_resolution_var.set(final_display_res)
+        
+        # FRAMES UPDATE (from actual processed values)
+        processed_frames_for_job = current_job_specific_metadata.get("frames_in_output_video", "N/A")
+        total_frames_orig_vid = job_info_to_run.get('original_video_raw_frame_count', 'N/A')
+        is_segment_job = job_info_to_run.get("is_segment", False)
+        
+        final_display_frames_str = "N/A"
+
+        if processed_frames_for_job != "N/A":
+            if is_segment_job:
+                final_display_frames_str = f"{processed_frames_for_job}"
+                if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
+                    final_display_frames_str += f" of {total_frames_orig_vid} total"
+            else: # Full video processing
+                final_display_frames_str = f"{processed_frames_for_job}"
+                if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
+                    final_display_frames_str += f" (of {total_frames_orig_vid} total)"
+        else:
+            final_display_frames_str = self.current_frames_var.get() + " (Failed to confirm)" # Append if couldn't get actual
+        
+        self.current_frames_var.set(final_display_frames_str)
+        self.root.update_idletasks() # Force GUI update for final display
+    
     def add_param(self, parent, label, var, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
         entry = ttk.Entry(parent, textvariable=var, width=20)
@@ -1837,6 +1917,8 @@ class DepthCrafterGUI:
                 msg_type, content = self.message_queue.get_nowait()
                 if msg_type == "progress":
                     self.progress["value"] = content
+                elif msg_type == "status":
+                    self.status_message_var.set(content)
                 elif msg_type == "set_ui_state":
                     self._set_ui_processing_state(content)
             except queue.Empty:
@@ -1844,7 +1926,7 @@ class DepthCrafterGUI:
             except Exception as e:
                 _logger.exception(f"Error processing GUI queue: {e}")
         
-        self.root.after(100, self.process_queue) # Still schedule, but only for progress/UI state
+        self.root.after(100, self.process_queue)
 
     def re_merge_from_gui(self):
         if not merge_depth_segments: 
@@ -2015,112 +2097,43 @@ class DepthCrafterGUI:
             _logger.debug(f"GUI: Seed was set to {gui_seed_setting} (negative). Generating a new random seed for this run: {effective_seed_for_run}")
         else:
             _logger.debug(f"GUI: Using user-specified seed: {effective_seed_for_run}")
+        
+        # --- PHASE 1: FAST SCAN FOR TOTAL SOURCES (REPLACING HEAVY METADATA/SEGMENT DEFINITION) ---
+        final_jobs_to_process_sources = sources_to_process_specs # The list of file/folder specs
 
-        final_jobs_to_process = []
-        base_job_info_map_for_run = {} 
-
-        gui_fps_setting = self.target_fps.get()
-        gui_len_setting = self.process_length.get()
-        gui_win_setting = self.window_size.get()
-        gui_ov_setting = self.overlap.get()
-
-        for source_spec in sources_to_process_specs:
-            source_path = source_spec["path"]
-            current_gui_mode = source_spec["type"] 
-            base_name = source_spec["basename"]
-
-            source_type_for_define = ""
-            if current_gui_mode == "single_video_file" or current_gui_mode == "video_file":
-                source_type_for_define = "video_file"
-            elif current_gui_mode == "image_sequence_folder":
-                source_type_for_define = "image_sequence_folder"
-            elif current_gui_mode == "single_image_file":
-                source_type_for_define = "single_image_file"
-            else:
-                _logger.error(f"GUI Start Thread: Unknown source_spec type '{current_gui_mode}' for basename '{base_name}'. Cannot map to define_video_segments source type.")
-                continue
-
-            all_potential_segments_for_video, base_job_info_initial = define_video_segments(
-                video_path_or_folder=source_path,
-                original_basename=base_name,
-                gui_target_fps_setting=gui_fps_setting,
-                gui_process_length_overall=gui_len_setting,
-                gui_segment_output_window_frames=gui_win_setting,
-                gui_segment_output_overlap_frames=gui_ov_setting,
-                source_type=source_type_for_define,
-                gui_target_height_setting=self.target_height.get(), # <--- ADD THIS
-                gui_target_width_setting=self.target_width.get(), 
-            )
-
-            if not base_job_info_initial:
-                _logger.info(f"Skipping {base_name}: Issues in segment definition (metadata error).")
-                continue
-            
-            base_job_info_map_for_run[source_path] = base_job_info_initial.copy()
-
-            if self.process_as_segments_var.get():
-                if not all_potential_segments_for_video:
-                    reason_skip = "Too short or invalid overlap/settings" if base_job_info_initial.get("original_video_raw_frame_count", 0) > 0 else "Source issue or zero frames/duration"
-                    _logger.info(f"GUI: No segments defined by settings for {base_name} (Reason: {reason_skip}). Skipping processing for this video.")
-                    continue
-
-                segment_subfolder_name = get_segment_output_folder_name(base_name)
-                segment_subfolder_path = os.path.join(self.output_dir.get(), segment_subfolder_name)
-                current_video_base_info_ref = base_job_info_map_for_run[source_path]
-                
-                segments_for_this_video, action_taken = self._get_segments_to_resume_or_overwrite(
-                    source_path, base_name, segment_subfolder_path, all_potential_segments_for_video,
-                    current_video_base_info_ref
-                )
-                _logger.debug(f"For video '{base_name}': Action '{action_taken}', {len(segments_for_this_video)} segments will be processed.")
-                if segments_for_this_video:
-                    final_jobs_to_process.extend(segments_for_this_video)
-            
-            else:
-                full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(base_name, "mp4"))
-                proceed_full = True
-                if os.path.exists(full_out_check_path):
-                    if not messagebox.askyesno("Overwrite?", f"An output file for '{base_name}' might exist (e.g., MP4):\n{full_out_check_path}\n\nOverwrite if it exists?"):
-                        _logger.info(f"Skipping {base_name} (full video processing, user chose not to overwrite).")
-                        proceed_full = False
-                
-                if proceed_full:
-                    full_source_job = {
-                        **base_job_info_initial,
-                        "is_segment": False,
-                        "gui_desired_output_window_frames": gui_win_setting, 
-                        "gui_desired_output_overlap_frames": gui_ov_setting 
-                    }
-                    final_jobs_to_process.append(full_source_job)
-
-        if final_jobs_to_process:
+        if final_jobs_to_process_sources:
             # --- ADDED THESE LINES TO RESET PREVIOUS JOB INFO ---
             self.current_filename_var.set("N/A")
             self.current_resolution_var.set("N/A")
             self.current_frames_var.set("N/A")
             # --------------------------------------------------
-            self.status_message_var.set("Starting processing...")
+            self.status_message_var.set(f"Starting processing {len(final_jobs_to_process_sources)} files/sequences...")
+            self.progress["value"] = 0 # Initialize progress bar value
+            self.progress["maximum"] = len(final_jobs_to_process_sources) # Set progress bar max to total files/sources
             self._set_ui_processing_state(True)
+            
+            # Pass the list of source specs. The ffprobe/segment definition will happen inside start_processing.
             self.processing_thread = threading.Thread(target=self._start_processing_wrapper, 
-                                                      args=(final_jobs_to_process, base_job_info_map_for_run,
-                                                      effective_seed_for_run), 
+                                                      args=(final_jobs_to_process_sources, effective_seed_for_run), 
                                                       daemon=True)
             self.processing_thread.start()
             self.root.after(100, self.process_queue) # Start queue processing for progress updates
         else:
             _logger.info("No videos/segments to process after considering existing data and user choices (or all skipped).")
 
-    def start_processing(self, video_processing_jobs, base_job_info_map, effective_seed_for_run):
+    def start_processing(self, source_specs_to_process, effective_seed_for_run):
         self.stop_event.clear()
-        self.progress["value"] = 0
-        self.progress["maximum"] = len(video_processing_jobs)
-        _logger.info(f"Starting batch processing for {len(video_processing_jobs)} items...")
+        
+        # Progress max is already set to len(source_specs_to_process) in start_thread
+        _logger.debug(f"Starting lazy batch processing for {len(source_specs_to_process)} sources...")
         self.status_message_var.set("Starting processing...")
 
-        returned_job_specific_metadata_last_job = {} 
-        
+        # Initialize a dict to store master metadata for each video/sequence path
+        all_videos_master_metadata = {}
+        base_job_info_map = {} # Map to store base_job_info for each video path
+
         try:
-            # Log model loading strategy
+            # 1. Initialize DepthCrafterDemo (Model Loading)
             if not self.use_local_models_only_var.get():
                 _logger.info("Attempting to check model at Hugging Face Hub against local.")
             else:
@@ -2143,170 +2156,195 @@ class DepthCrafterGUI:
             self.current_resolution_var.set("N/A")
             self.current_frames_var.set("N/A")
             return 
-
-        all_videos_master_metadata = {} 
         
-        for i, job_info_to_run in enumerate(video_processing_jobs):
+        total_sources_processed = 0
+        
+        # 2. Main Loop: Process one source (file/folder) at a time
+        for source_idx, source_spec in enumerate(source_specs_to_process):
             if self.stop_event.is_set():
-                _logger.info("Processing cancelled by user after current item.")
-                self.status_message_var.set("Stopping...")
-                self.current_filename_var.set("N/A") # Reset immediately on stop
-                self.current_resolution_var.set("N/A") # Reset immediately on stop
-                self.current_frames_var.set("N/A") # Reset immediately on stop
-                self.root.update_idletasks() # Ensure this reset is visible
+                _logger.info("Processing cancelled by user.")
+                self.status_message_var.set("Cancelled.")
                 break
-            
-            current_video_path = job_info_to_run["video_path"] 
-            original_basename = job_info_to_run["original_basename"]
-            is_segment_job = job_info_to_run.get("is_segment", False)
 
-            log_msg_prefix = f"Segment {job_info_to_run.get('segment_id', -1)+1}/{job_info_to_run.get('total_segments', 0)}" if is_segment_job else "Full video"
+            current_video_path = source_spec["path"] 
+            original_basename = source_spec["basename"]
+            current_gui_mode = source_spec["type"] 
             
-            # --- START PART A: INITIAL GUI UPDATE (TARGET/EXPECTED VALUES) ---
-            _logger.debug(f"DEBUG GUI UPDATE (Initial): Starting update for {original_basename}")
-            self.current_filename_var.set(f"{original_basename} ({log_msg_prefix})") 
-            
-            # Initial Resolution (using target_height/width setting and original dimensions as a hint)
-            target_h_setting = self.target_height.get()
-            target_w_setting = self.target_width.get()
+            gui_fps_setting = self.target_fps.get()
+            gui_len_setting = self.process_length.get()
+            gui_win_setting = self.window_size.get()
+            gui_ov_setting = self.overlap.get()
 
-            initial_display_res = "N/A"
-            if target_h_setting > 0 and target_w_setting > 0:
-                 initial_display_res = f"{target_w_setting}x{target_h_setting}"
+            log_msg_base = f"Source {source_idx+1}/{len(source_specs_to_process)}: {original_basename}"
+            _logger.debug(f"--- Defining Jobs for {log_msg_base}...")
+            self.status_message_var.set(f"Defining jobs for {source_idx+1} of {len(source_specs_to_process)}")
+            self.root.update_idletasks()
+            
+            # Determine source type for define_video_segments
+            source_type_for_define = ""
+            if current_gui_mode == "single_video_file" or current_gui_mode == "video_file":
+                source_type_for_define = "video_file"
+            elif current_gui_mode == "image_sequence_folder":
+                source_type_for_define = "image_sequence_folder"
+            elif current_gui_mode == "single_image_file":
+                source_type_for_define = "single_image_file"
             else:
-                 original_h = job_info_to_run.get("original_height", "N/A")
-                 original_w = job_info_to_run.get("original_width", "N/A")
-                 if original_h != "N/A" and original_w != "N/A":
-                     initial_display_res = f"{original_w}x{original_h} (Original/Fallback)"
-            self.current_resolution_var.set(initial_display_res)
+                _logger.error(f"Lazy Job Definition: Unknown source_spec type '{current_gui_mode}' for basename '{original_basename}'. Skipping.")
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+                continue
 
-            # Initial Frames (using gui settings for segment/process_length)
-            total_frames_orig_vid = job_info_to_run.get('original_video_raw_frame_count', 'N/A')
-            initial_display_frames_str = "N/A"
-            if is_segment_job:
-                window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
-                overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
-                num_frames_to_load_raw = job_info_to_run.get("num_frames_to_load_raw", "N/A")
-                if num_frames_to_load_raw != "N/A" and window_size_setting != "N/A" and overlap_size_setting != "N/A":
-                    initial_display_frames_str = f"{num_frames_to_load_raw}"
-                elif num_frames_to_load_raw != "N/A":
-                    initial_display_frames_str = f"{num_frames_to_load_raw}"
-                
-                if total_frames_orig_vid != "N/A" and str(num_frames_to_load_raw) != str(total_frames_orig_vid):
-                    initial_display_frames_str += f" of {total_frames_orig_vid}"
-            else: # Full video
-                process_length_setting = self.process_length.get()
-                if process_length_setting != -1:
-                    initial_display_frames_str = f"{process_length_setting}"
-                else:
-                    initial_display_frames_str = f"{total_frames_orig_vid}"
-            self.current_frames_var.set(initial_display_frames_str)
-
-            self.root.update_idletasks() # Force GUI update for initial display
-            # --- END PART A: INITIAL GUI UPDATE ---
-
-            if current_video_path not in all_videos_master_metadata:
-                current_video_comprehensive_base_info = base_job_info_map.get(current_video_path, {})
-                total_segments_for_this_video_overall = job_info_to_run.get("total_segments") if is_segment_job else 1
-                if total_segments_for_this_video_overall is None and is_segment_job:
-                    _logger.warning(f"Warning: 'total_segments' missing for segment job of {original_basename}. Defaulting to 1 for master_meta init.")
-
-                all_videos_master_metadata[current_video_path] = self._initialize_master_metadata_entry(
-                    original_basename, 
-                    job_info_to_run,
-                    total_segments_for_this_video_overall
-                )
-                
-                # --- UPDATE THE SNAPSHOTTED SEED HERE ---
-                all_videos_master_metadata[current_video_path]["global_processing_settings"]["seed_setting"] = effective_seed_for_run
-                
-                pre_existing_successful_segment_metadatas = current_video_comprehensive_base_info.get("pre_existing_successful_jobs", [])
-                if pre_existing_successful_segment_metadatas:
-                    _logger.debug(f"Loading {len(pre_existing_successful_segment_metadatas)} pre-existing successful segment metadata entries for {original_basename} into current run's master data.")
-                    all_videos_master_metadata[current_video_path]["jobs_info"].extend(pre_existing_successful_segment_metadatas)
-                    all_videos_master_metadata[current_video_path]["completed_successful_jobs"] += len(pre_existing_successful_segment_metadatas)
+            # A. FFPROBE/METADATA EXTRACTION (Heavy lifting happens here - Phase 2 start)
+            all_potential_segments_for_video, base_job_info_initial = define_video_segments(
+                video_path_or_folder=current_video_path,
+                original_basename=original_basename,
+                gui_target_fps_setting=gui_fps_setting,
+                gui_process_length_overall=gui_len_setting,
+                gui_segment_output_window_frames=gui_win_setting,
+                gui_segment_output_overlap_frames=gui_ov_setting,
+                source_type=source_type_for_define,
+                gui_target_height_setting=self.target_height.get(),
+                gui_target_width_setting=self.target_width.get(),
+            )
             
+            if not base_job_info_initial:
+                _logger.info(f"Skipping {original_basename}: Issues in metadata extraction/segment definition.")
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+                continue
+            
+            # Store base info (includes raw frame count, fps, etc. gathered by define_video_segments)
+            base_job_info_map[current_video_path] = base_job_info_initial.copy()
+            
+            jobs_to_process_for_this_source = []
+            is_segment_processing = self.process_as_segments_var.get()
+            
+            # B. Decide on the actual job list (segments or full video)
+            if is_segment_processing:
+                if not all_potential_segments_for_video:
+                    reason_skip = "Too short or invalid overlap/settings" if base_job_info_initial.get("original_video_raw_frame_count", 0) > 0 else "Source issue or zero frames/duration"
+                    _logger.info(f"Skipping {original_basename}: No segments defined by settings (Reason: {reason_skip}).")
+                    total_sources_processed += 1
+                    self.message_queue.put(("progress", total_sources_processed))
+                    continue
+                    
+                segment_subfolder_name = get_segment_output_folder_name(original_basename)
+                segment_subfolder_path = os.path.join(self.output_dir.get(), segment_subfolder_name)
+                current_video_base_info_ref = base_job_info_map[current_video_path]
+                
+                # This call handles the resume/overwrite logic
+                jobs_to_process_for_this_source, action_taken = self._get_segments_to_resume_or_overwrite(
+                    current_video_path, original_basename, segment_subfolder_path, 
+                    all_potential_segments_for_video, current_video_base_info_ref
+                )
+                _logger.debug(f"For source '{original_basename}': Action '{action_taken}', {len(jobs_to_process_for_this_source)} segments will be processed.")
+                
+                if not jobs_to_process_for_this_source and not current_video_base_info_ref.get("pre_existing_successful_jobs"):
+                     _logger.info(f"Skipping {original_basename}: Job definition/resume resulted in no segments to process.")
+                     total_sources_processed += 1
+                     self.message_queue.put(("progress", total_sources_processed))
+                     continue
+                     
+            else: # Full video processing mode
+                full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(original_basename, "mp4"))
+                proceed_full = True
+                if os.path.exists(full_out_check_path):
+                    if not messagebox.askyesno("Overwrite?", f"An output file for '{original_basename}' might exist (e.g., MP4):\n{full_out_check_path}\n\nOverwrite if it exists?"):
+                        _logger.info(f"Skipping {original_basename} (full video processing, user chose not to overwrite).")
+                        proceed_full = False
+                
+                if proceed_full:
+                    full_source_job = {
+                        **base_job_info_initial,
+                        "is_segment": False,
+                        "gui_desired_output_window_frames": gui_win_setting, 
+                        "gui_desired_output_overlap_frames": gui_ov_setting 
+                    }
+                    jobs_to_process_for_this_source.append(full_source_job)
+                else:
+                    total_sources_processed += 1
+                    self.message_queue.put(("progress", total_sources_processed))
+                    continue # Skip to next source
+            
+            # C. Initialize Master Metadata for this video/sequence
+            total_expected_jobs_overall = len(all_potential_segments_for_video) if is_segment_processing else 1
+            all_videos_master_metadata[current_video_path] = self._initialize_master_metadata_entry(
+                original_basename, 
+                base_job_info_initial,
+                total_expected_jobs_overall
+            )
             master_meta_for_this_vid = all_videos_master_metadata[current_video_path]
             
-            # _logger.info(f"Processing {original_basename} - {log_msg_prefix} ({i+1}/{len(video_processing_jobs)})")
-            _logger.info(f"Processing {original_basename} - {log_msg_prefix}")
-            self.status_message_var.set(f"Processing {i + 1} of {len(video_processing_jobs)}")
+            # --- UPDATE THE SNAPSHOTTED SEED HERE ---
+            master_meta_for_this_vid["global_processing_settings"]["seed_setting"] = effective_seed_for_run
+            
+            # Add pre-existing successful segments (only relevant for resume in segment mode)
+            pre_existing_successful_segment_metadatas = base_job_info_map[current_video_path].get("pre_existing_successful_jobs", [])
+            if pre_existing_successful_segment_metadatas:
+                 _logger.debug(f"Loading {len(pre_existing_successful_segment_metadatas)} pre-existing successful segment metadata entries for {original_basename} into current run's master data.")
+                 master_meta_for_this_vid["jobs_info"].extend(pre_existing_successful_segment_metadatas)
+                 master_meta_for_this_vid["completed_successful_jobs"] += len(pre_existing_successful_segment_metadatas)
 
-            job_successful, current_job_specific_metadata = self._process_single_job(demo, job_info_to_run, master_meta_for_this_vid)
+            # D. Process the actual jobs (segments or full video)
+            total_jobs_for_source = len(jobs_to_process_for_this_source)
             
-            if current_job_specific_metadata is None:
-                _logger.error(f"Error: _process_single_job for {original_basename} returned None metadata. Initializing to empty dict.")
-                current_job_specific_metadata = {}
-            
-            returned_job_specific_metadata_last_job = current_job_specific_metadata 
-
-            self.message_queue.put(("progress", i + 1)) # Update progress bar
-
-            # --- START PART B: FINAL GUI UPDATE (ACTUAL/PROCESSED VALUES) ---
-            _logger.debug(f"DEBUG GUI UPDATE (Final): Starting update for {original_basename}")
-
-            # RESOLUTION UPDATE (from actual processed values)
-            processed_h = current_job_specific_metadata.get("processed_height", "N/A")
-            processed_w = current_job_specific_metadata.get("processed_width", "N/A")
-            
-            final_display_res = "N/A"
-            if processed_h != "N/A" and processed_w != "N/A":
-                final_display_res = f"{processed_w}x{processed_h}" # This is the actual processed resolution
-            else:
-                final_display_res = self.current_resolution_var.get() + " (Failed to confirm)" # Append if couldn't get actual
-            self.current_resolution_var.set(final_display_res)
-            
-            # FRAMES UPDATE (from actual processed values)
-            processed_frames_for_job = current_job_specific_metadata.get("frames_in_output_video", "N/A")
-            
-            final_display_frames_str = "N/A"
-
-            if processed_frames_for_job != "N/A":
-                if is_segment_job:
-                    window_size_setting = job_info_to_run.get("gui_desired_output_window_frames", "N/A")
-                    overlap_size_setting = job_info_to_run.get("gui_desired_output_overlap_frames", "N/A")
-                    
-                    if window_size_setting != "N/A" and overlap_size_setting != "N/A":
-                         final_display_frames_str = f"{processed_frames_for_job}"
-                    else:
-                         final_display_frames_str = f"{processed_frames_for_job} (Segment)"
-
-                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
-                         final_display_frames_str += f" of {total_frames_orig_vid} total"
-                    
-                else: # Full video processing
-                    final_display_frames_str = f"{processed_frames_for_job}"
-                    if total_frames_orig_vid != "N/A" and str(processed_frames_for_job) != str(total_frames_orig_vid):
-                        final_display_frames_str += f" (of {total_frames_orig_vid} total)"
-            else:
-                final_display_frames_str = self.current_frames_var.get() + " (Failed to confirm)" # Append if couldn't get actual
-            
-            self.current_frames_var.set(final_display_frames_str)
-            self.root.update_idletasks() # Force GUI update for final display
-            # --- END PART B: FINAL GUI UPDATE ---
-
-            if is_segment_job and "segment_id" not in current_job_specific_metadata:
-                current_job_specific_metadata["segment_id"] = job_info_to_run.get("segment_id", -1)
-            
-            if "_individual_metadata_path" in current_job_specific_metadata:
-                del current_job_specific_metadata["_individual_metadata_path"]
-            
-            master_meta_for_this_vid["jobs_info"].append(current_job_specific_metadata)
-            
-            if job_successful:
-                master_meta_for_this_vid["completed_successful_jobs"] += 1
-            else:
-                master_meta_for_this_vid["completed_failed_jobs"] += 1
+            for job_idx, job_info_to_run in enumerate(jobs_to_process_for_this_source):
+                if self.stop_event.is_set(): break
                 
+                is_segment_job = job_info_to_run.get("is_segment", False)
+                log_msg_prefix = f"Segment {job_info_to_run.get('segment_id', -1)+1}/{job_info_to_run.get('total_segments', 0)} ({job_idx+1}/{total_jobs_for_source})" if is_segment_job else "Full video (1/1)"
+                
+                # --- START PART A: INITIAL GUI UPDATE (TARGET/EXPECTED VALUES) ---
+                self._update_gui_info_on_job_start(job_info_to_run, original_basename, log_msg_prefix)
+                # --- END PART A: INITIAL GUI UPDATE ---
+
+                _logger.info(f"Processing {original_basename} - {log_msg_prefix}")
+                self.status_message_var.set(f"Processing {source_idx + 1} of {len(source_specs_to_process)} ({log_msg_prefix})")
+
+                job_successful, current_job_specific_metadata = self._process_single_job(demo, job_info_to_run, master_meta_for_this_vid)
+                
+                if current_job_specific_metadata is None:
+                    _logger.error(f"Error: _process_single_job for {original_basename} returned None metadata. Initializing to empty dict.")
+                    current_job_specific_metadata = {}
+
+                # --- START PART B: FINAL GUI UPDATE (ACTUAL/PROCESSED VALUES) ---
+                self._update_gui_info_on_job_finish(job_info_to_run, current_job_specific_metadata)
+                # --- END PART B: FINAL GUI UPDATE ---
+
+                if is_segment_job and "segment_id" not in current_job_specific_metadata:
+                    current_job_specific_metadata["segment_id"] = job_info_to_run.get("segment_id", -1)
+                
+                if "_individual_metadata_path" in current_job_specific_metadata:
+                    del current_job_specific_metadata["_individual_metadata_path"]
+                
+                master_meta_for_this_vid["jobs_info"].append(current_job_specific_metadata)
+                
+                if job_successful:
+                    master_meta_for_this_vid["completed_successful_jobs"] += 1
+                else:
+                    master_meta_for_this_vid["completed_failed_jobs"] += 1
+            
+            # E. Finalize the source (merge/cleanup/move original) if all its jobs are accounted for
             total_accounted_for_vid = master_meta_for_this_vid["completed_successful_jobs"] + master_meta_for_this_vid["completed_failed_jobs"]
             
             if total_accounted_for_vid >= master_meta_for_this_vid["total_expected_jobs"]:
-                self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
+                # Finalize only if not cancelled *within* the segment loop
+                if not self.stop_event.is_set():
+                    self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
+                else:
+                    _logger.info(f"Skipping finalization of {original_basename} due to user cancellation.")
+
+            # F. Update Main Progress Bar (1 unit per source file/folder)
+            total_sources_processed += 1
+            self.message_queue.put(("progress", total_sources_processed))
 
         if not self.stop_event.is_set():
-            _logger.info("All processing jobs complete!")
+            _logger.info("All processing sources complete!")
             self.status_message_var.set("Processing Finished.")
+        else:
+            self.status_message_var.set("Processing Cancelled.")
         
+        # G. Cleanup
         if 'demo' in locals() and demo is not None:
             try:
                 if hasattr(demo, 'pipe') and demo.pipe is not None:

@@ -105,7 +105,7 @@ class DepthCrafterDemo:
                 else: # This block handles the case where _ENABLE_XFORMERS_ATTENTION was False
                     _logger.info("xFormers memory-efficient attention disabled by global setting.")
 
-            _logger.info("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
+            _logger.debug("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
         except Exception as e:
             _logger.critical(f"CRITICAL: Failed to initialize DepthCrafterPipeline: {e}", exc_info=True)
             raise # Re-raise after logging
@@ -416,7 +416,7 @@ class DepthCrafterDemo:
         if visual_save_path_or_dir:
             job_specific_metadata["intermediate_visual_path"] = os.path.abspath(visual_save_path_or_dir)
             job_specific_metadata["intermediate_visual_format_saved"] = intermediate_visual_format_to_save
-            _logger.info(f"Saved intermediate segment visual in {intermediate_visual_format_to_save}")
+            _logger.debug(f"Saved intermediate segment visual in {intermediate_visual_format_to_save}")
         
         if visual_save_error: 
             job_specific_metadata["intermediate_visual_save_error"] = visual_save_error 
