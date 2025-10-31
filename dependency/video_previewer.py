@@ -417,19 +417,28 @@ class VideoPreviewer(ttk.Frame):
             # Initialize VideoReader for each source path
             num_frames = -1
             for key, path in source_paths.items():
-                if path and os.path.exists(path):
+                # --- MODIFIED: Explicitly check for valid path and skip if None/empty ---
+                if not isinstance(path, str) or not path or not os.path.exists(path):
+                    self.source_readers[key] = None
+                    # Log only if the key is expected to have a path (i.e., not a flag like 'is_sbs_input')
+                    if key not in ['is_sbs_input', 'is_quad_input']:
+                         logger.debug(f"Source '{key}' skipped. Path is not a string or file not found: {path}")
+                    continue
+                # --- END MODIFIED ---
+                
+                try:
                     reader = VideoReader(path, ctx=cpu(0))
                     if num_frames == -1:
                         num_frames = len(reader)
                     elif num_frames != len(reader):
                         raise ValueError(f"Frame count mismatch between sources for {base_name}")
                     self.source_readers[key] = reader
-                else:
+                except Exception as e:
                     self.source_readers[key] = None
-                    logger.debug(f"Source '{key}' not found for {base_name} at path: {path}")
-
-            if num_frames <= 0:
-                raise ValueError("Video has no frames or could not be loaded.")
+                    logger.error(f"Failed to open reader for source '{key}' at path '{path}': {e}", exc_info=True)
+                    # If the main sources fail, we should stop trying to load
+                    if key in ['inpainted', 'splatted']:
+                         raise ValueError(f"Critical source file '{key}' failed to load: {e}")
 
             # Configure the scrubber
             self.frame_scrubber.config(to=num_frames - 1)
