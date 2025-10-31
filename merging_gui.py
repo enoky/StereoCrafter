@@ -1298,23 +1298,26 @@ class MergingGUI(ThemedTk):
                 'inpainted': inpainted_path,
                 'splatted': None,
                 'original': None,
-                'is_sbs_input': is_sbs_input
+                'is_sbs_input': is_sbs_input,
+                'is_quad_input': False
             }
 
             if splatted4_matches:
-                logger.debug(f"  - Found quad-splatted match: {os.path.basename(splatted4_matches[0])}")
-                source_dict['splatted'] = splatted4_matches[0]
-                # 'original' remains None for quad input as the splatted file contains it
+                splatted_path = splatted4_matches[0]
+                logger.debug(f"  - Found quad-splatted match: {os.path.basename(splatted_path)}")
+                source_dict['splatted'] = splatted_path
+                source_dict['is_quad_input'] = True # Set flag for quad-splatted input
+                # 'original' remains None, which is the necessary structural fix for the crash
             elif splatted2_matches:
-                logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted2_matches[0])}")
-                source_dict['splatted'] = splatted2_matches[0]
+                splatted_path = splatted2_matches[0]
+                logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted_path)}")
+                source_dict['splatted'] = splatted_path
                 original_path = os.path.join(self.original_folder_var.get(), f"{core_name}.mp4")
                 if os.path.exists(original_path):
                     logger.debug(f"  - Found matching original video: {os.path.basename(original_path)}")
                     source_dict['original'] = original_path
                 else:
                     logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{os.path.basename(original_path)}' was not found. It will be treated as optional.")
-                    # 'original' remains None
             else:
                 logger.warning(f"Preview Scan: Skipping '{base_name}'. No matching splatted file found in '{mask_folder}'.")
                 continue # Skip to the next video if no splatted file is found
@@ -1341,33 +1344,34 @@ class MergingGUI(ThemedTk):
             if inpainted_tensor_full is None or splatted_tensor is None:
                 raise ValueError("Missing 'inpainted' or 'splatted' source for preview.")
 
-            # --- FIX: Determine input types based on metadata (from _find_preview_sources_callback) ---
-            # The previous logic (inpainted_tensor_full.shape[3] != splatted_tensor.shape[3]) failed 
-            # for single-pane inpaints with dual-pane splatted masks.
+            # --- FIX: Determine input type based on metadata from the video list ---
             current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             is_sbs_input = current_source_metadata.get('is_sbs_input', False)
+            is_quad_input = current_source_metadata.get('is_quad_input', False) # <--- GET NEW FLAG
             # --- END FIX ---
 
             # 2. Determine input types and extract frame parts
-            is_dual_input = original_tensor is not None # Keep existing check for dual input
-
-            # This logic is now correct because is_sbs_input is based on the file name
+            # Use the correct is_sbs_input flag to extract the right eye if the input is SBS
             inpainted = inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3]//2:] if is_sbs_input else inpainted_tensor_full
             
             # Extract parts from the splatted frame
             _, _, H, W = splatted_tensor.shape
-            if is_dual_input:
-                half_w = W // 2
-                mask_raw = splatted_tensor[:, :, :, :half_w]
-                right_eye_original = splatted_tensor[:, :, :, half_w:]
-                original_left = original_tensor
-                depth_map_vis = None
-            else: # Quad
+            
+            # --- FIX: Use is_quad_input for reliable tensor extraction ---
+            if is_quad_input: # Splatted4 (Original Left and Mask/Warped are all inside the splatted file)
                 half_h, half_w = H // 2, W // 2
                 original_left = splatted_tensor[:, :, :half_h, :half_w]
                 depth_map_vis = splatted_tensor[:, :, :half_h, half_w:]
                 mask_raw = splatted_tensor[:, :, half_h:, :half_w]
                 right_eye_original = splatted_tensor[:, :, half_h:, half_w:]
+                is_dual_input = False # For clarity
+            else: # Splatted2 (Original Left is a separate file provided by original_tensor)
+                half_w = W // 2
+                mask_raw = splatted_tensor[:, :, :, :half_w]
+                right_eye_original = splatted_tensor[:, :, :, half_w:]
+                original_left = original_tensor
+                depth_map_vis = None
+                is_dual_input = True # For clarity
 
             # Configure preview source dropdown based on input type
             preview_options = ["Blended Image", "Original (Left Eye)", "Warped (Right BG)", "Processed Mask", "Anaglyph 3D", "Wigglegram"]
