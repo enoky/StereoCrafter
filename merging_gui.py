@@ -25,7 +25,7 @@ from dependency.stereocrafter_util import (
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-17.2"
+GUI_VERSION = "25-10-30.1"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -1270,10 +1270,14 @@ class MergingGUI(ThemedTk):
             inpaint_suffix = "_inpainted_right_eye.mp4"
             logger.debug(f"Preview Scan: Checking '{base_name}'...")
             sbs_suffix = "_inpainted_sbs.mp4"
+            
+            is_sbs_input = False # Assume single-eye unless proven otherwise
+
             if base_name.endswith(inpaint_suffix):
                 core_name_with_width = base_name[:-len(inpaint_suffix)]
             elif base_name.endswith(sbs_suffix):
                 core_name_with_width = base_name[:-len(sbs_suffix)]
+                is_sbs_input = True # Set flag for double-wide inpainted video
             else:
                 continue
 
@@ -1289,12 +1293,18 @@ class MergingGUI(ThemedTk):
             logger.debug(f"  - Searching for splatted file with patterns: '{splatted4_pattern}' and '{splatted2_pattern}'")
             splatted4_matches = glob.glob(splatted4_pattern)
             splatted2_matches = glob.glob(splatted2_pattern)
+            
+            source_dict = {
+                'inpainted': inpainted_path,
+                'splatted': None,
+                'original': None,
+                'is_sbs_input': is_sbs_input
+            }
 
-            source_dict = {'inpainted': inpainted_path}
             if splatted4_matches:
                 logger.debug(f"  - Found quad-splatted match: {os.path.basename(splatted4_matches[0])}")
                 source_dict['splatted'] = splatted4_matches[0]
-                source_dict['original'] = None # Not needed for quad
+                # 'original' remains None for quad input as the splatted file contains it
             elif splatted2_matches:
                 logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted2_matches[0])}")
                 source_dict['splatted'] = splatted2_matches[0]
@@ -1304,10 +1314,11 @@ class MergingGUI(ThemedTk):
                     source_dict['original'] = original_path
                 else:
                     logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{os.path.basename(original_path)}' was not found. It will be treated as optional.")
-                    source_dict['original'] = None
+                    # 'original' remains None
             else:
                 logger.warning(f"Preview Scan: Skipping '{base_name}'. No matching splatted file found in '{mask_folder}'.")
-                continue
+                continue # Skip to the next video if no splatted file is found
+
             video_source_list.append(source_dict)
         return video_source_list
 
@@ -1330,10 +1341,17 @@ class MergingGUI(ThemedTk):
             if inpainted_tensor_full is None or splatted_tensor is None:
                 raise ValueError("Missing 'inpainted' or 'splatted' source for preview.")
 
-            # 2. Determine input types and extract frame parts
-            is_sbs_input = inpainted_tensor_full.shape[3] != splatted_tensor.shape[3]
-            is_dual_input = original_tensor is not None
+            # --- FIX: Determine input types based on metadata (from _find_preview_sources_callback) ---
+            # The previous logic (inpainted_tensor_full.shape[3] != splatted_tensor.shape[3]) failed 
+            # for single-pane inpaints with dual-pane splatted masks.
+            current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
+            is_sbs_input = current_source_metadata.get('is_sbs_input', False)
+            # --- END FIX ---
 
+            # 2. Determine input types and extract frame parts
+            is_dual_input = original_tensor is not None # Keep existing check for dual input
+
+            # This logic is now correct because is_sbs_input is based on the file name
             inpainted = inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3]//2:] if is_sbs_input else inpainted_tensor_full
             
             # Extract parts from the splatted frame
