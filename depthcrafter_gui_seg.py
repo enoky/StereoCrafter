@@ -63,7 +63,7 @@ except ImportError:
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
 # --- Imports End ---
 
-GUI_VERSION = "25-10-30.1"
+GUI_VERSION = "25-10-31.1"
 _HELP_TEXTS = {}
 
 DARK_MODE_COLORS = {
@@ -1542,7 +1542,7 @@ class DepthCrafterGUI:
         
         # CPU Offload Mode
         ttk.Label(main_params_frame, text="CPU Offload Mode:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
-        self.combo_cpu_offload = ttk.Combobox(main_params_frame, textvariable=self.cpu_offload, values=["model", "sequential", ""], width=17, state="readonly")
+        self.combo_cpu_offload = ttk.Combobox(main_params_frame, textvariable=self.cpu_offload, values=["model", "sequential", "none"], width=17, state="readonly")
         self.combo_cpu_offload.grid(row=row_idx, column=1, padx=5, pady=2, sticky="w")
         _create_hover_tooltip(self.combo_cpu_offload, "cpu_offload")
         self.widgets_to_disable_during_processing.append(self.combo_cpu_offload); row_idx += 1
@@ -2140,6 +2140,13 @@ class DepthCrafterGUI:
                 _logger.info("Attempting to load local model.")
 
             disable_xformers_for_run = self.disable_xformers_var.get()
+
+            
+            
+            # cpu_offload_value = self.cpu_offload.get()
+            # if cpu_offload_value == "none":
+            #     cpu_offload_value = None
+            # _logger.info(f"cpu_offload_value = {cpu_offload_value}")
 
             demo = DepthCrafterDemo(
                 unet_path="tencent/DepthCrafter",

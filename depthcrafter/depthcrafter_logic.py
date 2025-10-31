@@ -49,7 +49,15 @@ from typing import Optional, Tuple, List, Dict, Union
 _ENABLE_XFORMERS_ATTENTION = True # Set to True or False to enable/disable xFormers.
 
 class DepthCrafterDemo:
-    def __init__(self, unet_path: str, pre_train_path: str, cpu_offload: str = "model", use_cudnn_benchmark: bool = False, local_files_only: bool = False, disable_xformers=False):
+    def __init__(
+        self, 
+        unet_path: str, 
+        pre_train_path: str, 
+        cpu_offload: Union[str, None] = "model", 
+        use_cudnn_benchmark: bool = False, 
+        local_files_only: bool = False, 
+        disable_xformers=False
+    ):
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
@@ -65,16 +73,23 @@ class DepthCrafterDemo:
                 variant="fp16",
                 local_files_only=local_files_only
             )
-            if cpu_offload == "sequential":
-                self.pipe.enable_sequential_cpu_offload()
-            elif cpu_offload == "model":
-                self.pipe.enable_model_cpu_offload()
-            else:
-                _logger.warning(f"Unknown CPU offload option '{cpu_offload}'. Defaulting to 'model'.")
-                self.pipe.enable_model_cpu_offload() # Defaulting
-            self.pipe.enable_attention_slicing()
-            _logger.debug("DepthCrafterPipeline initialized successfully.")
+            # for saving memory, we can offload the model to CPU, or even run the model sequentially to save more memory
+            
+            cpu_offload_lower = cpu_offload
 
+            if cpu_offload_lower == "sequential":
+                self.pipe.enable_sequential_cpu_offload()
+                _logger.info("CPU Offload set to 'sequential'.")
+            elif cpu_offload_lower == "model":
+                self.pipe.enable_model_cpu_offload()
+                _logger.info("CPU Offload set to 'model'.")
+            else:
+                # If the value is "none", "None", or any other unrecognized string/value
+                # (or the legacy string "None"), we default to full CUDA.
+                self.pipe.to("cuda") 
+                _logger.info(f"CPU Offload set to '{cpu_offload}' (unrecognized/None option). Model loaded entirely on CUDA.")
+
+                
             # Decide if xFormers should be enabled:
             # It's only enabled if the global flag is True AND the GUI flag (disable_xformers) is False.
             should_enable_xformers = _ENABLE_XFORMERS_ATTENTION and not disable_xformers
