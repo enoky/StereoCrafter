@@ -17,7 +17,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-10-29.1"
+VERSION = "25-11-02.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -474,7 +474,8 @@ def custom_dilate(
     tensor: torch.Tensor,
     kernel_size_x: float, 
     kernel_size_y: float, 
-    use_gpu: bool = False
+    use_gpu: bool = False,
+    max_content_value: float = 1.0,
 ) -> torch.Tensor:
     """
     Applies dilation using an integer kernel and incorporates the fractional part
@@ -503,22 +504,27 @@ def custom_dilate(
     frac_y = kernel_size_y - k_y_int
 
     for t in range(tensor.shape[0]):
-        # Get frame (C, H, W) and scale to uint8
-        frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
+        # Get frame (C, H, W) raw float data
+        frame_float = tensor[t].cpu().numpy() # shape: (C, H, W)
         
-        # Convert to OpenCV format: (H, W) or (H, W, C)
-        if frame_np.shape[0] == 1:
-            frame_cv = frame_np[0]
-        else:
-            frame_cv = np.transpose(frame_np, (1, 2, 0))
+        # 1. Get the single-channel depth data (shape: H, W)
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
+
+        # 2. Use the provided max_content_value for normalization/rescaling
+        #    If max_content_value is 0 or near 0, treat it as 1.0 to prevent division by zero.
+        effective_max_value = max(max_content_value, 1e-5)
+        
+        # 3. Normalize to 0-1 and scale to 0-255 for OpenCV's uint8
+        frame_norm_2d = frame_2d_raw / effective_max_value
+        frame_cv_uint8 = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
 
         # --- DILATION (Integer Part) ---
         if k_x_int > 0 or k_y_int > 0:
             # Use the odd kernel size for dilation
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
-            dilated_cv = cv2.dilate(frame_cv, kernel, iterations=1)
+            processed_cv_uint8 = cv2.dilate(frame_cv_uint8, kernel, iterations=1)
         else:
-             dilated_cv = frame_cv
+             processed_cv_uint8 = frame_cv_uint8
              
         # --- FRACTIONAL BLUR (Fractional Part) ---
         # If there is a fractional component, apply a slight blur to simulate subpixel expansion
@@ -530,20 +536,29 @@ def custom_dilate(
             # Apply Gaussian Blur (kernel size 0 means it's auto-derived from sigma)
             # Use a tiny kernel to force the subpixel effect
             kernel_frac = (max(3, int(sigma_x*6) | 1), max(3, int(sigma_y*6) | 1)) # Smallest odd kernel > 1
-            dilated_cv = cv2.GaussianBlur(dilated_cv, kernel_frac, sigmaX=sigma_x, sigmaY=sigma_y)
+            processed_cv_uint8 = cv2.GaussianBlur(processed_cv_uint8, kernel_frac, sigmaX=sigma_x, sigmaY=sigma_y)
+
+        # --- RESCALE BACK TO ORIGINAL RAW FLOAT RANGE ---
+        # 1. Convert back to float 0-1
+        processed_norm_float = processed_cv_uint8.astype(np.float32) / 255.0
+        
+        # 2. Scale back to the provided effective_max_value
+        processed_raw_float = processed_norm_float * effective_max_value
 
         # Convert back to PyTorch format: (C, H, W)
-        if len(dilated_cv.shape) == 2:
-            dilated_np = dilated_cv[np.newaxis, :, :]
-        else:
-            dilated_np = np.transpose(dilated_cv, (2, 0, 1))
-        
-        dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
+        # Use unsqueeze(0) to ensure C=1 dim is present
+        dilated_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float().to(tensor.device)
         processed_frames.append(dilated_tensor)
     
     return torch.stack(processed_frames).to(tensor.device)
 
-def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True) -> torch.Tensor:
+def custom_blur(
+        tensor: torch.Tensor,
+        kernel_size_x: int,
+        kernel_size_y: int,
+        use_gpu: bool = True,
+        max_content_value: float = 1.0,
+    ) -> torch.Tensor:
     """
     Applies Gaussian blur with separate X and Y kernel sizes to a tensor.
     Expects a 4D tensor (B, C, H, W).
@@ -571,28 +586,35 @@ def custom_blur(tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, us
         # FIXED CPU path
         processed_frames = []
         for t in range(tensor.shape[0]):
-            # Get frame (C, H, W) and scale to uint8
-            frame_np = (tensor[t].cpu().numpy() * 255).astype(np.uint8)  # shape: (C, H, W)
             
-            # Convert to OpenCV format: (H, W) or (H, W, C)
-            if frame_np.shape[0] == 1:
-                # Single channel: remove channel dim for OpenCV
-                frame_np = frame_np[0]  # shape: (H, W)
-            else:
-                # Multi-channel: transpose to (H, W, C) for OpenCV
-                frame_np = np.transpose(frame_np, (1, 2, 0))
+            frame_float = tensor[t].cpu().numpy() # shape: (C, H, W)
 
-            blurred_np = cv2.GaussianBlur(frame_np, (k_x, k_y), 0)
+            # 1. Get the single-channel depth data (shape: H, W)
+            frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
+
+            # 2. Use the provided max_content_value for normalization/rescaling
+            effective_max_value = max(max_content_value, 1e-5)
+            
+            # 3. Normalize to 0-1 and scale to 0-255 for OpenCV's uint8
+            frame_norm_2d = frame_2d_raw / effective_max_value
+            frame_cv_uint8 = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
+
+
+            # Apply Gaussian Blur
+            # Use the new safe uint8 frame
+            processed_cv_uint8 = cv2.GaussianBlur(frame_cv_uint8, (k_x, k_y), 0)
+            
+            
+            # --- RESCALE BACK TO ORIGINAL RAW FLOAT RANGE ---
+            # 1. Convert back to float 0-1
+            processed_norm_float = processed_cv_uint8.astype(np.float32) / 255.0
+            
+            # 2. Scale back to the provided effective_max_value
+            processed_raw_float = processed_norm_float * effective_max_value
             
             # Convert back to PyTorch format: (C, H, W)
-            if len(blurred_np.shape) == 2:
-                # Single channel: add channel dimension back
-                blurred_np = blurred_np[np.newaxis, :, :]  # shape: (1, H, W)
-            else:
-                # Multi-channel: transpose back to (C, H, W)
-                blurred_np = np.transpose(blurred_np, (2, 0, 1))
-
-            blurred_tensor = torch.from_numpy(blurred_np).float() / 255.0
+            # Use unsqueeze(0) to ensure C=1 dim is present
+            blurred_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float()
             processed_frames.append(blurred_tensor)
             
         return torch.stack(processed_frames).to(tensor.device)

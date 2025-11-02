@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-29.2"
+GUI_VERSION = "25-11-02.4"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -294,6 +294,7 @@ class SplatterGUI(ThemedTk):
         # File Extensions
         "SIDECAR_EXT": ".fssidecar",
         "OUTPUT_SIDECAR_EXT": ".spsidecar",
+        "DEFAULT_CONFIG_FILENAME": "config_splat.splatcfg",
         
         # GUI/Processing Defaults (Used for reset/fallback)
         "MAX_DISP": "30.0",
@@ -750,8 +751,9 @@ class SplatterGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu )
         
         # Add new commands to the File menu
-        self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
-        self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
+        self.file_menu.add_command(label="Load Settings from File...", command=self.load_settings)
+        self.file_menu.add_command(label="Save Settings", command=self._save_current_settings_and_notify)
+        self.file_menu.add_command(label="Save Settings to File...", command=self.save_settings)
         self.file_menu.add_separator() # Separator for organization
 
         self.file_menu.add_command(label="Load Fusion Export (.fsexport)...", command=self.run_fusion_sidecar_generator)
@@ -2080,8 +2082,10 @@ class SplatterGUI(ThemedTk):
     
     def _load_config(self):
         """Loads configuration from config_splat.json."""
-        if os.path.exists("config_splat.json"):
-            with open("config_splat.json", "r") as f:
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
+        # --- MODIFIED: Use the new dictionary constant ---
+        if os.path.exists(config_filename):
+            with open(config_filename, "r") as f:
                 self.app_config = json.load(f)
 
     def _load_help_texts(self):
@@ -2340,7 +2344,8 @@ class SplatterGUI(ThemedTk):
                     processed_tensor, 
                     float(depth_dilate_size_x), 
                     float(depth_dilate_size_y), 
-                    use_gpu=False
+                    use_gpu=False,
+                    max_content_value=max_raw_value
                 )
             
             # 2. BLUR (using standard integer blur)
@@ -2350,7 +2355,8 @@ class SplatterGUI(ThemedTk):
                     processed_tensor, 
                     int(depth_blur_size_x), 
                     int(depth_blur_size_y), 
-                    use_gpu=False
+                    use_gpu=False,
+                    max_content_value=max_raw_value
                 )
 
             # Convert back to (B, H, W) numpy float (squeeze channel dim)
@@ -2784,7 +2790,7 @@ class SplatterGUI(ThemedTk):
             depth_dilate_size_y=params['depth_dilate_size_y'],
             depth_blur_size_x=params['depth_blur_size_x'],
             depth_blur_size_y=params['depth_blur_size_y'],
-            is_low_res_task=is_low_res_preview, # <-- USE LOW-RES FLAG HERE
+            is_low_res_task=is_low_res_preview,
             max_raw_value=final_scaling_factor,
             global_depth_min=0.0,
             global_depth_max=1.0 
@@ -3094,7 +3100,9 @@ class SplatterGUI(ThemedTk):
         except Exception as e:
             logger.error(f"An unexpected error occurred during batch processing: {e}", exc_info=True)
             self.progress_queue.put(("status", f"Error: {e}"))
-            self.after(0, lambda: messagebox.showerror("Processing Error", f"An unexpected error occurred during batch processing: {e}"))
+            # FIX: Capture the exception message in the lambda's default argument
+            error_message = str(e) # Convert exception object to string once
+            self.after(0, lambda msg=error_message: messagebox.showerror("Processing Error", f"An unexpected error occurred during batch processing: {msg}"))
         finally:
             release_cuda_memory()
             self.progress_queue.put("finished")
@@ -3178,11 +3186,26 @@ class SplatterGUI(ThemedTk):
         worker_args = (single_depth_path, process_length, batch_size, current_anchor, mode)
         self.auto_converge_thread = threading.Thread(target=self._auto_converge_worker, args=worker_args)
         self.auto_converge_thread.start()
+    
+    def _save_current_settings_and_notify(self):
+        """Saves current GUI settings to config_splat.json and notifies the user."""
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
+        try:
+            self._save_config()
+            # --- MODIFIED: Use the new dictionary constant in messages ---
+            self.status_label.config(text=f"Settings saved to {config_filename}.")
+            messagebox.showinfo("Settings Saved", f"Current settings successfully saved to {config_filename}.")
+            # --- END MODIFIED ---
+        except Exception as e:
+            self.status_label.config(text="Settings save failed.")
+            # --- MODIFIED: Use the new dictionary constant in messages ---
+            messagebox.showerror("Save Error", f"Failed to save settings to {config_filename}:\n{e}")
 
     def _save_config(self):
-        """Saves current GUI settings to config_splat.json."""
+        """Saves current GUI settings to the default file."""
         config = self._get_current_config()
-        with open("config_splat.json", "w") as f:
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
+        with open(config_filename, "w") as f:
             json.dump(config, f, indent=4)
    
     def _save_current_sidecar_data(self, is_auto_save: bool = False) -> bool:
@@ -3629,6 +3652,7 @@ class SplatterGUI(ThemedTk):
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
+            "move_to_finished": self.move_to_finished_var.get(),
             "output_crf": int(self.output_crf_var.get()),
             # --- Depth Pre-processing & Auto-Convergence Settings ---
             "depth_gamma": depth_gamma_val,

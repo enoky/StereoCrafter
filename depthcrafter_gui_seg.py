@@ -63,7 +63,7 @@ except ImportError:
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
 # --- Imports End ---
 
-GUI_VERSION = "25-10-31.1"
+GUI_VERSION = "25-11-01.0"
 _HELP_TEXTS = {}
 
 DARK_MODE_COLORS = {
@@ -2141,13 +2141,6 @@ class DepthCrafterGUI:
 
             disable_xformers_for_run = self.disable_xformers_var.get()
 
-            
-            
-            # cpu_offload_value = self.cpu_offload.get()
-            # if cpu_offload_value == "none":
-            #     cpu_offload_value = None
-            # _logger.info(f"cpu_offload_value = {cpu_offload_value}")
-
             demo = DepthCrafterDemo(
                 unet_path="tencent/DepthCrafter",
                 pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
@@ -2202,18 +2195,28 @@ class DepthCrafterGUI:
                 continue
 
             # A. FFPROBE/METADATA EXTRACTION (Heavy lifting happens here - Phase 2 start)
-            all_potential_segments_for_video, base_job_info_initial = define_video_segments(
-                video_path_or_folder=current_video_path,
-                original_basename=original_basename,
-                gui_target_fps_setting=gui_fps_setting,
-                gui_process_length_overall=gui_len_setting,
-                gui_segment_output_window_frames=gui_win_setting,
-                gui_segment_output_overlap_frames=gui_ov_setting,
-                source_type=source_type_for_define,
-                gui_target_height_setting=self.target_height.get(),
-                gui_target_width_setting=self.target_width.get(),
-            )
-            
+            try:
+                all_potential_segments_for_video, base_job_info_initial = define_video_segments(
+                    video_path_or_folder=current_video_path,
+                    original_basename=original_basename,
+                    gui_target_fps_setting=gui_fps_setting,
+                    gui_process_length_overall=gui_len_setting,
+                    gui_segment_output_window_frames=gui_win_setting,
+                    gui_segment_output_overlap_frames=gui_ov_setting,
+                    source_type=source_type_for_define,
+                    gui_target_height_setting=self.target_height.get(),
+                    gui_target_width_setting=self.target_width.get(),
+                )            
+            except Exception as e_metadata:
+                _logger.error(f"Skipping {original_basename}: File not found or metadata extraction failed. Error: {e_metadata.__class__.__name__}: {e_metadata}")
+                
+                # Update status message if this is the only file, but continue the loop otherwise
+                self.status_message_var.set(f"Error: Missing file or metadata fail for {original_basename}. Skipping.")
+                
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+                continue 
+
             if not base_job_info_initial:
                 _logger.info(f"Skipping {original_basename}: Issues in metadata extraction/segment definition.")
                 total_sources_processed += 1
