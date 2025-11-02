@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-02.0"
+GUI_VERSION = "25-11-02.1"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -2340,7 +2340,8 @@ class SplatterGUI(ThemedTk):
                     processed_tensor, 
                     float(depth_dilate_size_x), 
                     float(depth_dilate_size_y), 
-                    use_gpu=False
+                    use_gpu=False,
+                    max_content_value=max_raw_value
                 )
             
             # 2. BLUR (using standard integer blur)
@@ -2350,7 +2351,8 @@ class SplatterGUI(ThemedTk):
                     processed_tensor, 
                     int(depth_blur_size_x), 
                     int(depth_blur_size_y), 
-                    use_gpu=False
+                    use_gpu=False,
+                    max_content_value=max_raw_value
                 )
 
             # Convert back to (B, H, W) numpy float (squeeze channel dim)
@@ -2784,7 +2786,7 @@ class SplatterGUI(ThemedTk):
             depth_dilate_size_y=params['depth_dilate_size_y'],
             depth_blur_size_x=params['depth_blur_size_x'],
             depth_blur_size_y=params['depth_blur_size_y'],
-            is_low_res_task=is_low_res_preview, # <-- USE LOW-RES FLAG HERE
+            is_low_res_task=is_low_res_preview,
             max_raw_value=final_scaling_factor,
             global_depth_min=0.0,
             global_depth_max=1.0 
