@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-02.3"
+GUI_VERSION = "25-11-02.4"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -294,6 +294,7 @@ class SplatterGUI(ThemedTk):
         # File Extensions
         "SIDECAR_EXT": ".fssidecar",
         "OUTPUT_SIDECAR_EXT": ".spsidecar",
+        "DEFAULT_CONFIG_FILENAME": "config_splat.splatcfg",
         
         # GUI/Processing Defaults (Used for reset/fallback)
         "MAX_DISP": "30.0",
@@ -2081,8 +2082,10 @@ class SplatterGUI(ThemedTk):
     
     def _load_config(self):
         """Loads configuration from config_splat.json."""
-        if os.path.exists("config_splat.json"):
-            with open("config_splat.json", "r") as f:
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
+        # --- MODIFIED: Use the new dictionary constant ---
+        if os.path.exists(config_filename):
+            with open(config_filename, "r") as f:
                 self.app_config = json.load(f)
 
     def _load_help_texts(self):
@@ -3186,18 +3189,23 @@ class SplatterGUI(ThemedTk):
     
     def _save_current_settings_and_notify(self):
         """Saves current GUI settings to config_splat.json and notifies the user."""
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
         try:
             self._save_config()
-            self.status_label.config(text="Settings saved to config_splat.json.")
-            messagebox.showinfo("Settings Saved", "Current settings successfully saved to config_splat.json.")
+            # --- MODIFIED: Use the new dictionary constant in messages ---
+            self.status_label.config(text=f"Settings saved to {config_filename}.")
+            messagebox.showinfo("Settings Saved", f"Current settings successfully saved to {config_filename}.")
+            # --- END MODIFIED ---
         except Exception as e:
             self.status_label.config(text="Settings save failed.")
-            messagebox.showerror("Save Error", f"Failed to save settings to config_splat.json:\n{e}")
+            # --- MODIFIED: Use the new dictionary constant in messages ---
+            messagebox.showerror("Save Error", f"Failed to save settings to {config_filename}:\n{e}")
 
     def _save_config(self):
-        """Saves current GUI settings to config_splat.json."""
+        """Saves current GUI settings to the default file."""
         config = self._get_current_config()
-        with open("config_splat.json", "w") as f:
+        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
+        with open(config_filename, "w") as f:
             json.dump(config, f, indent=4)
    
     def _save_current_sidecar_data(self, is_auto_save: bool = False) -> bool:
