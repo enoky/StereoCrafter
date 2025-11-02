@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-02.1"
+GUI_VERSION = "25-11-02.2"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -3096,7 +3096,9 @@ class SplatterGUI(ThemedTk):
         except Exception as e:
             logger.error(f"An unexpected error occurred during batch processing: {e}", exc_info=True)
             self.progress_queue.put(("status", f"Error: {e}"))
-            self.after(0, lambda: messagebox.showerror("Processing Error", f"An unexpected error occurred during batch processing: {e}"))
+            # FIX: Capture the exception message in the lambda's default argument
+            error_message = str(e) # Convert exception object to string once
+            self.after(0, lambda msg=error_message: messagebox.showerror("Processing Error", f"An unexpected error occurred during batch processing: {msg}"))
         finally:
             release_cuda_memory()
             self.progress_queue.put("finished")
@@ -3631,6 +3633,7 @@ class SplatterGUI(ThemedTk):
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
             "enable_autogain": self.enable_autogain_var.get(),
             "match_depth_res": True,
+            "move_to_finished": self.move_to_finished_var.get(),
             "output_crf": int(self.output_crf_var.get()),
             # --- Depth Pre-processing & Auto-Convergence Settings ---
             "depth_gamma": depth_gamma_val,
