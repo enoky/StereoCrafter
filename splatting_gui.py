@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-02.2"
+GUI_VERSION = "25-11-02.3"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -750,8 +750,9 @@ class SplatterGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu )
         
         # Add new commands to the File menu
-        self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
-        self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
+        self.file_menu.add_command(label="Load Settings from File...", command=self.load_settings)
+        self.file_menu.add_command(label="Save Settings", command=self._save_current_settings_and_notify)
+        self.file_menu.add_command(label="Save Settings to File...", command=self.save_settings)
         self.file_menu.add_separator() # Separator for organization
 
         self.file_menu.add_command(label="Load Fusion Export (.fsexport)...", command=self.run_fusion_sidecar_generator)
@@ -3182,6 +3183,16 @@ class SplatterGUI(ThemedTk):
         worker_args = (single_depth_path, process_length, batch_size, current_anchor, mode)
         self.auto_converge_thread = threading.Thread(target=self._auto_converge_worker, args=worker_args)
         self.auto_converge_thread.start()
+    
+    def _save_current_settings_and_notify(self):
+        """Saves current GUI settings to config_splat.json and notifies the user."""
+        try:
+            self._save_config()
+            self.status_label.config(text="Settings saved to config_splat.json.")
+            messagebox.showinfo("Settings Saved", "Current settings successfully saved to config_splat.json.")
+        except Exception as e:
+            self.status_label.config(text="Settings save failed.")
+            messagebox.showerror("Save Error", f"Failed to save settings to config_splat.json:\n{e}")
 
     def _save_config(self):
         """Saves current GUI settings to config_splat.json."""
