@@ -301,7 +301,7 @@ class SplatterGUI(ThemedTk):
         "CONV_POINT": "0.5",
         "PROC_LENGTH": "-1",
         "BATCH_SIZE_FULL": "10",
-        "BATCH_SIZE_LOW": "50",
+        "BATCH_SIZE_LOW": "15",
         "CRF_OUTPUT": "23",
         
         # Depth Processing Defaults
