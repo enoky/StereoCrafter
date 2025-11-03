@@ -8,11 +8,11 @@
     "output_splatted": "Path to the folder where the splatted output videos will be saved.",
     
     "enable_full_res": "When checked, will generate a splatted video at the original resolution of the input video. Use this for blending over the inpaint.",
-    "full_res_batch_size": "The number of frames to process simultaneously when generating the full-resolution output. A higher value uses more VRAM but can be faster. Adjust based on your GPU's memory.",
+    "full_res_batch_size": "The number of frames to process simultaneously when generating the full-resolution output. A higher value uses more VRAM but can be faster. Adjust based on your GPU's memory. Too high a value will bog down ffmpeg encode.",
     "enable_low_res": "When checked, will generate a splatted video of specified resolution. Use this for inpainting.",
     "low_res_width": "The target width for the low-resolution output. The input video and depth maps will be resized to this width for the low-resolution pass.",
     "low_res_height": "The target height for the low-resolution output. The input video and depth maps will be resized to this height for the low-resolution pass.",
-    "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements.",
+    "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements. Too high a value will bog down ffmpeg encode.",
     "dual_output": "If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.",
 
     "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",

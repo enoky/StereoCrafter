@@ -7,6 +7,11 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="diffusers.models.transformers.transformer_2d")
 import logging # Import standard logging
 
+# Use WARNING or ERROR to silence model loading messages.
+logging.getLogger("diffusers").setLevel(logging.WARNING) 
+logging.getLogger("transformers").setLevel(logging.WARNING) 
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="diffusers.mode
 from typing import Optional, Tuple, List, Dict, Union
 
 # --- Global Configuration Flags ---
+
+
 _ENABLE_XFORMERS_ATTENTION = True # Set to True or False to enable/disable xFormers.
 
 class DepthCrafterDemo:
