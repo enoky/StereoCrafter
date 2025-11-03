@@ -4,15 +4,15 @@ from pprint import pprint
 import os
 
 # --- [USER CONFIGURATION] ---
-FRAME_OFFSET = 1 
+FRAME_OFFSET = 0 
 KF_STEP = 2 # The flag value for 'Step' interpolation.
 # Add or remove control IDs here, using the desired mode/values.
 controls_to_keyframe = {
     "MaxDisparity": {"mode": "STATIC_VALUE",},    
     "Convergence": {"mode": "STATIC_VALUE",},
     "FrontGamma": {"mode": "STATIC_VALUE",},
-    "Bias": {"mode": "STATIC_VALUE",},
-    "Overlap": {"mode": "STATIC_VALUE",},
+    # "Bias": {"mode": "STATIC_VALUE",},
+    # "Overlap": {"mode": "STATIC_VALUE",},
 }
 # --- [END USER CONFIGURATION] ---
 

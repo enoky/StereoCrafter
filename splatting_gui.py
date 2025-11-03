@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-02.4"
+GUI_VERSION = "25-11-03.0"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -1272,6 +1272,7 @@ class SplatterGUI(ThemedTk):
 
         try:
             for i in range(0, num_frames, batch_size):
+                t_start_batch = time.perf_counter() # <--- TIMER START: Total Batch
                 if self.stop_event.is_set() or ffmpeg_process.poll() is not None:
                     if ffmpeg_process.poll() is not None:
                         logger.error("FFmpeg process terminated unexpectedly. Stopping frame processing.")
@@ -1280,12 +1281,14 @@ class SplatterGUI(ThemedTk):
                     encoding_successful = False
                     break
 
+                # --- TIMER 1: Video/Depth I/O (Disk/Decode/Resize) ---
+                t_start_io = time.perf_counter()
+
                 current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
                 if not current_frame_indices:
                     break
 
                 batch_frames_numpy = input_video_reader.get_batch(current_frame_indices).asnumpy()
-                # --- CRITICAL FIX: Seek Depth Reader to the first frame of the batch ---
                 # This often resolves issues where Decord/FFmpeg loses the internal stream position
                 try:
                     # Seek to the first frame of the current batch
@@ -1295,26 +1298,23 @@ class SplatterGUI(ThemedTk):
                 except Exception as e:
                     logger.error(f"Error seeking/reading depth map batch starting at index {i}: {e}. Falling back to a potentially blank read.")
                     batch_depth_numpy_raw = depth_map_reader.get_batch(current_frame_indices).asnumpy()
-                # --- END CRITICAL FIX ---
+                t_end_io = time.perf_counter()
                 
-                # --- NEW: Define debug variables early ---
                 file_frame_idx = current_frame_indices[0] 
                 task_name = "LowRes" if is_low_res_task else "HiRes"
-                # --- END NEW ---
                 
-                # --- DEBUG CHECK (Keep this to confirm the fix) ---
                 if batch_depth_numpy_raw.min() == batch_depth_numpy_raw.max() == 0:
                     logger.warning(f"Depth map batch starting at index {i} is entirely blank/zero after read. **Seeking failed to resolve.**")
-                # --- END DEBUG CHECK ---
                     
                 if batch_depth_numpy_raw.min() == batch_depth_numpy_raw.max():
                     logger.warning(f"Depth map batch starting at index {i} is entirely uniform/flat after read. Min/Max: {batch_depth_numpy_raw.min():.2f}")
-                # --- END NEW DEBUG & CHECK ---
 
                 # Use the FIRST frame index for the file name (e.g., 00000.png)
                 file_frame_idx = current_frame_indices[0] 
                 
                 # self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, file_frame_idx, task_name) 
+                # --- TIMER 2: CPU Pre-processing (Dilate, Blur, Grayscale, Gamma, Min/Max Calc) ---
+                t_start_preproc = time.perf_counter()
                 
                 batch_depth_numpy = self._process_depth_batch(
                     batch_depth_numpy_raw=batch_depth_numpy_raw,
@@ -1380,10 +1380,23 @@ class SplatterGUI(ThemedTk):
                     batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
                 batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) 
 
+                t_end_preproc = time.perf_counter()
+                # --- END TIMER 2 ---
+
+                # --- TIMER 3: HtoD Transfer (CPU to GPU) ---
+                t_start_transfer_HtoD = time.perf_counter()
+                
                 left_video_tensor = torch.from_numpy(batch_frames_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
                 disp_map_tensor = torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()        
                 disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
                 disp_map_tensor = disp_map_tensor * max_disp
+
+                torch.cuda.synchronize() # Force synchronization before compute
+                t_end_transfer_HtoD = time.perf_counter()
+                # --- END TIMER 3 ---
+
+                # --- TIMER 4: GPU Compute (Core Splatting) ---
+                t_start_compute = time.perf_counter()
 
                 with torch.no_grad():
                     right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
@@ -1396,8 +1409,21 @@ class SplatterGUI(ThemedTk):
                     else:
                         right_video_tensor = right_video_tensor_raw
 
+                torch.cuda.synchronize() # Force synchronization after compute
+                t_end_compute = time.perf_counter()
+                # --- END TIMER 4 ---
+
+                # --- TIMER 5: DtoH Transfer (GPU to CPU) ---
+                t_start_transfer_DtoH = time.perf_counter()
+                
                 right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
                 occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
+
+                t_end_transfer_DtoH = time.perf_counter()
+                # --- END TIMER 5 ---
+
+                # --- TIMER 6: FFmpeg Write (Blocking I/O) ---
+                t_start_write = time.perf_counter()
 
                 for j in range(len(batch_frames_numpy)):
                     if dual_output:
@@ -1414,10 +1440,35 @@ class SplatterGUI(ThemedTk):
                     ffmpeg_process.stdin.write(video_grid_bgr.tobytes())
                     frame_count += 1
 
+                t_end_write = time.perf_counter()
+                # --- END TIMER 6 ---
+
                 del left_video_tensor, disp_map_tensor, right_video_tensor, occlusion_mask_tensor
                 torch.cuda.empty_cache()
                 draw_progress_bar(frame_count, num_frames, prefix=f"  Encoding:")
         
+                t_end_batch = time.perf_counter() # <--- TIMER END: Total Batch
+                
+                # --- LOG RESULTS: Conditionally log at DEBUG level ---
+                if logger.isEnabledFor(logging.DEBUG):
+                    batch_size_actual = len(current_frame_indices)
+                    task_tag = "LowRes" if is_low_res_task else "HiRes"
+                    
+                    io_time = t_end_io - t_start_io
+                    preproc_time = t_end_preproc - t_start_preproc
+                    htod_time = t_end_transfer_HtoD - t_start_transfer_HtoD
+                    compute_time = t_end_compute - t_start_compute
+                    dtoh_time = t_end_transfer_DtoH - t_start_transfer_DtoH
+                    write_time = t_end_write - t_start_write
+                    total_batch_time = t_end_batch - t_start_batch
+
+                    logger.info(
+                        f"[{task_tag} Batch {i//batch_size_actual + 1}] Frames={batch_size_actual} Total={total_batch_time*1000:.0f}ms | "
+                        f"IO={io_time*1000:.0f}ms | CPU_Proc={preproc_time*1000:.0f}ms | HtoD={htod_time*1000:.0f}ms | "
+                        f"GPU_Comp={compute_time*1000:.0f}ms | DtoH={dtoh_time*1000:.0f}ms | FFmpeg_Write={write_time*1000:.0f}ms"
+                    )
+                # --- END LOG RESULTS ---
+
         except (IOError, BrokenPipeError) as e:
             logger.error(f"FFmpeg pipe error: {e}. Encoding may have failed.")
             encoding_successful = False
@@ -1628,137 +1679,151 @@ class SplatterGUI(ThemedTk):
 
     def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
         """
-        Creates a thin, content-filled boundary at the absolute left edge of the screen
+        [VECTORIZED] Creates a thin, content-filled boundary at the absolute left edge of the screen
         by replicating the first visible pixels (from the right) into the leftmost columns.
-        The region between this new boundary and the actual content is left occluded for inpainting.
-
-        Args:
-            right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W],
-                                               values in [0, 1].
-            occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W],
-                                                  where 1 indicates occlusion.
-            boundary_width_pixels (int): How many columns at the absolute left edge to fill
-                                         with replicated content (e.g., 1, 2, or 3 pixels wide).
-
-        Returns:
-            torch.Tensor: The modified right-eye video tensor with the left-edge boundary filled.
         """
         B, C, H, W = right_video_tensor.shape
-
-        # Ensure boundary_width_pixels is valid and not too large
         boundary_width_pixels = min(W, boundary_width_pixels)
         if boundary_width_pixels <= 0:
             logger.debug("Boundary width for left-edge occlusions is 0 or less, skipping fill.")
-            return right_video_tensor # No filling needed
+            return right_video_tensor
 
         modified_right_video_tensor = right_video_tensor.clone()
+        
+        # 1. Determine the first visible pixel index for every (B, H) slice.
+        #    occlusion_mask_tensor is 1.0 for occluded, 0.0 for visible.
+        #    visible_mask is True for visible (where mask < 0.5)
+        visible_mask = (occlusion_mask_tensor[:, 0, :, :] < 0.5) # Shape [B, H, W]
 
-        # Iterate through each batch item and each row independently
-        for b_idx in range(B):
-            for h_idx in range(H):
-                # Find the first non-occluded column 'X' for this specific row, moving from left to right.
-                # If a row is entirely occluded, or only has content on the far right, it defaults to W-1
-                # to pick up some content, or just won't apply if col 0 is already visible and we don't overwrite.
-                
-                # Invert the occlusion mask (0=occluded, 1=visible) to find the first '1' (visible)
-                visible_mask_row = (occlusion_mask_tensor[b_idx, 0, h_idx, :] <= 0.5) # True where visible
-                
-                # Invert the occlusion mask (0=occluded, 1=visible) to find the first '1' (visible)
-                # `occlusion_mask_tensor` is 1 for occluded, 0 for visible.
-                # We want to find the first column where occlusion is NOT 1 (i.e., visible)
-                # Ensure it's a bool tensor for torch.nonzero
-                is_visible_col_mask = (occlusion_mask_tensor[b_idx, 0, h_idx, :] < 0.5)
-                
-                # Find all column indices that are visible
-                visible_column_indices = torch.nonzero(is_visible_col_mask, as_tuple=True)[0]
+        # Use argmax to find the index of the FIRST True value along the W dimension.
+        # Note: If a row is all False (all occluded), argmax returns index 0.
+        # We handle this by clamping/fallback later.
+        first_visible_index = torch.argmax(visible_mask.int(), dim=2, keepdim=True) # Shape [B, H, 1]
+        
+        # Fallback: If a row is entirely occluded (all False), argmax returns 0.
+        # The correct fallback is W-1 if W>0, or just leave it at 0 and hope the source pixel is black.
+        # Find rows where argmax returned 0, AND the actual first column is occluded (0.0).
+        # A visible_mask where all values are False (all occluded) will result in argmax=0 for that row.
+        # We need to find if there's *any* visible pixel. Sum(W) > 0.
+        fully_occluded = (visible_mask.sum(dim=2, keepdim=True) == 0) # [B, H, 1] True if fully occluded
+        
+        # Set the index to W-1 for fully occluded rows to pull a border pixel (safer than 0)
+        # Note: We must ensure this operation runs on the GPU with the tensors.
+        # Clamp to ensure index is always valid (max index is W-1)
+        source_column_indices = torch.clamp(first_visible_index, 0, W - 1)
+        
+        # Override source index for fully occluded rows to a safe boundary (W-1)
+        source_column_indices[fully_occluded] = W - 1 
 
-                # Determine the 'source column' for filling
-                source_col_for_boundary_fill: int # Explicitly type as int for Pylance
-                
-                if visible_column_indices.numel() > 0:
-                    # If there's any visible content, take the *first* visible column.
-                    source_col_for_boundary_fill = int(visible_column_indices[0].item())
-                    # Ensure it's not trying to access beyond the tensor boundary if some edge cases exist.
-                    source_col_for_boundary_fill = min(source_col_for_boundary_fill, W - 1)
-                else:
-                    # If the entire row is occluded, or only has very far-right content.
-                    # Fallback: Use the last valid column (W-1) to ensure we always get *some* pixels.
-                    # This might replicate a black pixel if the whole row is black, but avoids IndexError.
-                    source_col_for_boundary_fill = W - 1
-                    # logger.debug(f"Row {h_idx} in batch {b_idx} is fully occluded or near-fully. Using last column for boundary fill source.")
-                
-                # Get the pixel values from this 'source column' to use for the boundary.
-                # Pylance should now correctly infer source_col_for_boundary_fill as an int.
-                source_pixel_values = right_video_tensor[b_idx, :, h_idx, source_col_for_boundary_fill] # Shape [C]
+        # 2. Gather the source pixels for filling (Shape [B, C, H])
+        #    We need to reshape the right_video_tensor [B, C, H, W] to gather the source_column_indices [B, H, 1].
+        #    torch.gather() is the vectorized way to do this.
+        #    Gather on dimension W (dim=3), using indices expanded to [B, C, H, 1]
+        source_column_indices_expanded = source_column_indices.unsqueeze(1).repeat(1, C, 1, 1) # Shape [B, C, H, 1]
+        
+        # Gather the color from the source column for all rows
+        source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
+        source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
 
-                # Now, fill the leftmost 'boundary_width_pixels' columns for this row,
-                # but ONLY if those columns are currently occluded.
-                for x in range(boundary_width_pixels):
-                    # Check if the current pixel at (b_idx, :, h_idx, x) is occluded
-                    if occlusion_mask_tensor[b_idx, 0, h_idx, x] > 0.5: # If currently occluded
-                        modified_right_video_tensor[b_idx, :, h_idx, x] = source_pixel_values
 
-        logger.debug(f"Created {boundary_width_pixels}-pixel left-edge content boundary.")
+        # 3. Create a mask of the leftmost columns that are currently occluded
+        #    This mask is True only for pixels (B, C, H, W) that are BOTH in the boundary AND occluded.
+        #    Boundary mask [W]: True for x < boundary_width_pixels
+        boundary_region_mask = torch.zeros(W, dtype=torch.bool, device=right_video_tensor.device)
+        if boundary_width_pixels > 0:
+            boundary_region_mask[:boundary_width_pixels] = True
+            
+        # Occlusion mask (1.0 for occluded)
+        is_occluded_4d = (occlusion_mask_tensor > 0.5) # Shape [B, 1, H, W]
+        
+        # Combine the masks
+        # [B, 1, H, W] AND [W] -> [B, 1, H, W]
+        fill_target_mask = is_occluded_4d & boundary_region_mask.view(1, 1, 1, W)
+        
+        # 4. Apply the gathered pixel values to the masked regions
+        #    Apply fill mask to the source values to match shape for where the fill should occur.
+        #    source_pixel_values_3d is [B, C, H]. Expand it to [B, C, H, W]
+        source_to_apply = source_pixel_values_3d.unsqueeze(3).repeat(1, 1, 1, W)
+
+        # Use torch.where to conditionally update the tensor:
+        modified_right_video_tensor = torch.where(
+            fill_target_mask.repeat(1, C, 1, 1), # Use C-channel mask
+            source_to_apply,                     # Value to use if mask is True
+            modified_right_video_tensor          # Value to use if mask is False (original pixel)
+        )
+        
+        logger.debug(f"[Vectorized] Created {boundary_width_pixels}-pixel left-edge content boundary.")
         return modified_right_video_tensor
 
     def _fill_right_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
         """
-        Creates a thin, content-filled boundary at the absolute right edge of the screen
+        [VECTORIZED] Creates a thin, content-filled boundary at the absolute right edge of the screen
         by replicating the last visible pixels (from the left) into the rightmost columns.
-        
-        Args:
-            right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W],
-                                               values in [0, 1].
-            occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W],
-                                                  where 1 indicates occlusion.
-            boundary_width_pixels (int): How many columns at the absolute right edge to fill.
-
-        Returns:
-            torch.Tensor: The modified right-eye video tensor with the right-edge boundary filled.
         """
         B, C, H, W = right_video_tensor.shape
-
         boundary_width_pixels = min(W, boundary_width_pixels)
         if boundary_width_pixels <= 0:
             logger.debug("Boundary width for right-edge occlusions is 0 or less, skipping fill.")
             return right_video_tensor
 
         modified_right_video_tensor = right_video_tensor.clone()
+        
+        # 1. Determine the LAST visible pixel index for every (B, H) slice.
+        #    occlusion_mask_tensor is 1.0 for occluded, 0.0 for visible.
+        #    visible_mask is True for visible (where mask < 0.5)
+        visible_mask = (occlusion_mask_tensor[:, 0, :, :] < 0.5) # Shape [B, H, W]
 
-        # Iterate through each batch item and each row independently
-        for b_idx in range(B):
-            for h_idx in range(H):
-                # 1. Find the first non-occluded column 'X' for this specific row, moving from RIGHT to LEFT.
-                # Invert the occlusion mask (0=occluded, 1=visible) to find the last '1' (visible)
-                is_visible_col_mask = (occlusion_mask_tensor[b_idx, 0, h_idx, :] < 0.5)
-                
-                # Find all column indices that are visible
-                visible_column_indices = torch.nonzero(is_visible_col_mask, as_tuple=True)[0]
+        # Use argmax on the REVERSED tensor to find the index of the first True from the right.
+        # The true index is W - 1 - (index in the reversed tensor).
+        visible_mask_reversed = torch.flip(visible_mask, dims=[2])
+        first_visible_index_reversed = torch.argmax(visible_mask_reversed.int(), dim=2, keepdim=True) # Shape [B, H, 1]
 
-                # Determine the 'source column' for filling
-                source_col_for_boundary_fill: int
-                
-                if visible_column_indices.numel() > 0:
-                    # If there's any visible content, take the *last* visible column.
-                    source_col_for_boundary_fill = int(visible_column_indices[-1].item())
-                    # Ensure it's not accessing beyond the tensor boundary
-                    source_col_for_boundary_fill = max(source_col_for_boundary_fill, 0)
-                else:
-                    # Fallback: Use the first valid column (0)
-                    source_col_for_boundary_fill = 0
-                
-                # Get the pixel values from this 'source column' to use for the boundary.
-                source_pixel_values = right_video_tensor[b_idx, :, h_idx, source_col_for_boundary_fill] # Shape [C]
+        # Calculate the actual index of the LAST visible pixel (from 0 to W-1)
+        last_visible_index = W - 1 - first_visible_index_reversed # Shape [B, H, 1]
+        
+        # Fallback: Find rows that are fully occluded (no visible pixels)
+        fully_occluded = (visible_mask.sum(dim=2, keepdim=True) == 0) # [B, H, 1] True if fully occluded
 
-                # 2. Fill the rightmost 'boundary_width_pixels' columns for this row
-                for x_offset in range(boundary_width_pixels):
-                    x = W - 1 - x_offset # Column index (W-1 is the far right)
-                    
-                    # Only fill if the current pixel is currently occluded
-                    if occlusion_mask_tensor[b_idx, 0, h_idx, x] > 0.5: # If currently occluded
-                        modified_right_video_tensor[b_idx, :, h_idx, x] = source_pixel_values
+        # Override source index for fully occluded rows to a safe boundary (0)
+        source_column_indices = torch.clamp(last_visible_index, 0, W - 1)
+        source_column_indices[fully_occluded] = 0 # If fully occluded, use index 0 as source (safer than W-1)
 
-        logger.debug(f"Created {boundary_width_pixels}-pixel right-edge content boundary.")
+
+        # 2. Gather the source pixels for filling (Shape [B, C, H])
+        #    Gather on dimension W (dim=3), using indices expanded to [B, C, H, 1]
+        source_column_indices_expanded = source_column_indices.unsqueeze(1).repeat(1, C, 1, 1) # Shape [B, C, H, 1]
+        
+        # Gather the color from the source column for all rows (the last visible pixel's color)
+        source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
+        source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
+
+
+        # 3. Create a mask of the rightmost columns that are currently occluded
+        #    Boundary mask [W]: True for x >= W - boundary_width_pixels
+        boundary_region_mask = torch.zeros(W, dtype=torch.bool, device=right_video_tensor.device)
+        if boundary_width_pixels > 0:
+            boundary_region_mask[W - boundary_width_pixels:] = True
+            
+        # Occlusion mask (1.0 for occluded)
+        is_occluded_4d = (occlusion_mask_tensor > 0.5) # Shape [B, 1, H, W]
+        
+        # Combine the masks
+        # [B, 1, H, W] AND [W] -> [B, 1, H, W]
+        fill_target_mask = is_occluded_4d & boundary_region_mask.view(1, 1, 1, W)
+
+
+        # 4. Apply the gathered pixel values to the masked regions
+        #    Expand source values to [B, C, H, W]
+        source_to_apply = source_pixel_values_3d.unsqueeze(3).repeat(1, 1, 1, W)
+
+        # Use torch.where to conditionally update the tensor:
+        modified_right_video_tensor = torch.where(
+            fill_target_mask.repeat(1, C, 1, 1), # Use C-channel mask
+            source_to_apply,                     # Value to use if mask is True
+            modified_right_video_tensor          # Value to use if mask is False (original pixel)
+        )
+        
+        logger.debug(f"[Vectorized] Created {boundary_width_pixels}-pixel right-edge content boundary.")
         return modified_right_video_tensor
 
     def _find_preview_sources_callback(self) -> list:
