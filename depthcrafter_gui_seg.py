@@ -153,6 +153,8 @@ class DepthCrafterGUI:
         self.seed = tk.IntVar(value=42)
         self.cpu_offload = tk.StringVar(value="model")
         self.use_cudnn_benchmark = tk.BooleanVar(value=False)
+        self.available_gpus = torch.cuda.device_count()
+        self.target_gpu_id = tk.IntVar(value=0) # Default to GPU 0
         self.process_length = tk.IntVar(value=-1)
         self.target_fps = tk.DoubleVar(value=-1.0)
         self.window_size = tk.IntVar(value=110)
@@ -232,6 +234,7 @@ class DepthCrafterGUI:
             "is_depth_far_black": self.is_depth_far_black,
             "dark_mode_var": self.dark_mode_var,
             "disable_xformers_var": self.disable_xformers_var,
+            "target_gpu_id": self.target_gpu_id,
         }
         self.initial_default_settings = self._collect_all_settings()
         self._help_data = None
@@ -1547,6 +1550,26 @@ class DepthCrafterGUI:
         _create_hover_tooltip(self.combo_cpu_offload, "cpu_offload")
         self.widgets_to_disable_during_processing.append(self.combo_cpu_offload); row_idx += 1
 
+        
+        # --- NEW: Target GPU ID Selection ---
+        ttk.Label(main_params_frame, text="Target GPU ID:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        
+        # Generate list of GPU IDs (e.g., [0, 1])
+        gpu_values = list(range(self.available_gpus))
+        if not gpu_values:
+            gpu_values = [0] # Default to 0 if no GPUs found
+
+        self.combo_target_gpu_id = ttk.Combobox(
+            main_params_frame, 
+            textvariable=self.target_gpu_id, 
+            values=gpu_values, 
+            width=17, 
+            state="readonly" if self.available_gpus > 1 else "disabled" # Disable if only 1 GPU
+        )
+        self.combo_target_gpu_id.grid(row=row_idx, column=1, padx=5, pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_target_gpu_id, "target_gpu_id") # (You'll need to add a tooltip entry)
+        self.widgets_to_disable_during_processing.append(self.combo_target_gpu_id); row_idx += 1
+
         # --- Frame & Segment Control Frame ---
         fs_frame = ttk.LabelFrame(settings_container_frame, text="Frame & Segment Control")
         fs_frame.grid(row=0, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
@@ -2140,6 +2163,11 @@ class DepthCrafterGUI:
                 _logger.info("Attempting to load local model.")
 
             disable_xformers_for_run = self.disable_xformers_var.get()
+            target_gpu_for_run = self.target_gpu_id.get() # <--- GET GPU ID
+
+            cpu_offload_value = self.cpu_offload.get()
+            if cpu_offload_value.lower() in ["none", ""]: 
+                cpu_offload_value = None
 
             demo = DepthCrafterDemo(
                 unet_path="tencent/DepthCrafter",
@@ -2148,6 +2176,7 @@ class DepthCrafterGUI:
                 use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
                 local_files_only=self.use_local_models_only_var.get(),
                 disable_xformers=disable_xformers_for_run,
+                target_device_id=target_gpu_for_run,
             )
         except Exception as e:
             _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
