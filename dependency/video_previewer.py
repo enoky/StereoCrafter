@@ -740,8 +740,6 @@ class VideoPreviewer(ttk.Frame):
         self.preview_inner_frame.update_idletasks()
         self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
 
-    
-
     def replace_source_path_for_current_video(self, key: str, path: str):
         """Replace the source path for the currently loaded video for `key` (e.g., 'depth_map').
         This closes the old reader (if any), opens a new VideoReader for the given path (if exists),
@@ -774,7 +772,8 @@ class VideoPreviewer(ttk.Frame):
             self.update_preview()
         except Exception as e:
             logger.exception(f"Error updating preview after replacing source path: {e}")
-def _wiggle_step(self, show_left: bool):
+            
+    def _wiggle_step(self, show_left: bool):
         """A single step in the wigglegram animation."""
         if not hasattr(self, 'wiggle_left_tk'): return # Stop if resources were cleared
         current_image = self.wiggle_left_tk if show_left else self.wiggle_right_tk
