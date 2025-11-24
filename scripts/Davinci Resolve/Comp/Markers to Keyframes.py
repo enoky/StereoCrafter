@@ -4,7 +4,7 @@ from pprint import pprint
 import os
 
 # --- [USER CONFIGURATION] ---
-FRAME_OFFSET = 0 
+FRAME_OFFSET = 0
 KF_STEP = 2 # The flag value for 'Step' interpolation.
 # Add or remove control IDs here, using the desired mode/values.
 controls_to_keyframe = {
