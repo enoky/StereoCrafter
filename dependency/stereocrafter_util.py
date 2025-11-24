@@ -80,6 +80,7 @@ class SidecarConfigManager:
         "depth_blur_size_x": (float, 0.0),
         "depth_blur_size_y": (float, 0.0),
         "disable_depth_normalization": (bool, False),
+        "selected_depth_map": (str, ""),
         # Add future keys here
     }
 
@@ -145,7 +146,8 @@ class SidecarConfigManager:
                             data[key] = int(val)
                         elif expected_type == float:
                             data[key] = float(val)
-                        # Future: Add other types here
+                        else:
+                            data[key] = val
                     except (ValueError, TypeError):
                         logger.warning(f"Sidecar key '{key}' has invalid value/type. Using default.")
 
@@ -565,7 +567,7 @@ def custom_blur(
     """
     k_x = int(kernel_size_x)
     k_y = int(kernel_size_y)
-    if k_x <= 0 or k_y <= 0:
+    if k_x <= 0 and k_y <= 0:
         return tensor
 
     # GaussianBlur requires odd kernel sizes

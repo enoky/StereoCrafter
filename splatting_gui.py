@@ -322,7 +322,8 @@ class SplatterGUI(ThemedTk):
         "depth_blur_size_x": "DEPTH_BLUR_SIZE_X",
         "depth_blur_size_y": "DEPTH_BLUR_SIZE_Y",
         "frame_overlap": "FRAME_OVERLAP",
-        "input_bias": "INPUT_BIAS"
+        "input_bias": "INPUT_BIAS",
+        "selected_depth_map": "SELECTED_DEPTH_MAP"
     }
     MOVE_TO_FINISHED_ENABLED = True
     # ---------------------------------------
@@ -360,10 +361,21 @@ class SplatterGUI(ThemedTk):
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.input_source_clips_var = tk.StringVar(value=self.app_config.get("input_source_clips", "./input_source_clips"))
         self.input_depth_maps_var = tk.StringVar(value=self.app_config.get("input_depth_maps", "./input_depth_maps"))
+        self.multi_map_var = tk.BooleanVar(value=False)
+        self.selected_depth_map_var = tk.StringVar(value="")
+        self.depth_map_subfolders = []  # List of valid subfolders
+        self.depth_map_radio_buttons = []         # keep list for UI management
+        self.depth_map_radio_dict = {}            # NEW: map text->widget
+        self._current_video_sidecar_map = None  # Track sidecar's selected map
+        self._suppress_sidecar_map_update = False  # Prevent overwriting manual selections
+        self._last_loaded_source_video = None  # Track source video for NEW video detection
+        self.input_depth_maps_var.trace_add("write", lambda *args: self._on_depth_map_folder_changed())
         self.output_splatted_var = tk.StringVar(value=self.app_config.get("output_splatted", "./output_splatted"))
 
         self.max_disp_var = tk.StringVar(value=self.app_config.get("max_disp", defaults["MAX_DISP"]))
         self.process_length_var = tk.StringVar(value=self.app_config.get("process_length", defaults["PROC_LENGTH"]))
+        self.process_from_var = tk.StringVar(value="")
+        self.process_to_var = tk.StringVar(value="")
         self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"]))
         
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
@@ -403,6 +415,7 @@ class SplatterGUI(ThemedTk):
         self.processing_convergence_var = tk.StringVar(value="N/A")
         self.processing_task_name_var = tk.StringVar(value="N/A")
         self.processing_gamma_var = tk.StringVar(value="N/A")
+        self.processing_map_var = tk.StringVar(value="N/A")
 
         self.slider_label_updaters = []
         
@@ -414,6 +427,7 @@ class SplatterGUI(ThemedTk):
         self.processing_thread = None
 
         self._create_widgets()
+        self._setup_keyboard_shortcuts()
         self.style = ttk.Style()
         
         self.update_idletasks() # Ensure widgets are rendered for correct reqheight
@@ -593,6 +607,221 @@ class SplatterGUI(ThemedTk):
         if file_path:
             var.set(file_path)
 
+    def _on_multi_map_toggle(self):
+        """Called when Multi-Map checkbox is toggled."""
+        if self.multi_map_var.get():
+            # Multi-Map enabled - scan for subfolders
+            self._scan_depth_map_folders()
+        else:
+            # Multi-Map disabled - clear radio buttons
+            self._clear_depth_map_radio_buttons()
+            self.selected_depth_map_var.set("")
+
+    def _on_depth_map_folder_changed(self):
+        """Called when the Input Depth Maps folder path changes."""
+        if self.multi_map_var.get():
+            # Re-scan if Multi-Map is enabled
+            self._scan_depth_map_folders()
+
+    def _scan_depth_map_folders(self):
+        """Scans the Input Depth Maps folder for subfolders containing *_depth.mp4 files."""
+        base_folder = self.input_depth_maps_var.get()
+
+        # Clear existing radio buttons
+        self._clear_depth_map_radio_buttons()
+        self.depth_map_subfolders = []
+
+        if not os.path.isdir(base_folder):
+            return
+
+        # Find all subfolders that contain depth map files
+        try:
+            for item in sorted(os.listdir(base_folder)):
+                subfolder_path = os.path.join(base_folder, item)
+                if os.path.isdir(subfolder_path):
+                    # Check if this subfolder contains *_depth.mp4 files
+                    depth_files = glob.glob(os.path.join(subfolder_path, "*_depth.mp4"))
+                    if depth_files:
+                        self.depth_map_subfolders.append(item)
+        except Exception as e:
+            logger.error(f"Error scanning depth map subfolders: {e}")
+            return
+
+        if self.depth_map_subfolders:
+            # Select the first one by default (alphabetically first)
+            self.selected_depth_map_var.set(self.depth_map_subfolders[0])
+            # Create radio buttons in the previewer
+            self._create_depth_map_radio_buttons()
+            # Trigger preview update
+            self.on_slider_release(None)
+        else:
+            logger.warning("No valid depth map subfolders found")
+            self.selected_depth_map_var.set("")
+
+    def _clear_depth_map_radio_buttons(self):
+        """Removes all depth map radio buttons from the GUI."""
+        for widget in self.depth_map_radio_buttons:
+            widget.destroy()
+        self.depth_map_radio_buttons = []
+
+    def _create_depth_map_radio_buttons(self):
+        """Creates radio buttons for each valid depth map subfolder."""
+        logger.info(f"Creating radio buttons, current selected_depth_map_var = {self.selected_depth_map_var.get()}")
+        self._clear_depth_map_radio_buttons()
+
+        if not hasattr(self, 'previewer') or self.previewer is None:
+            return
+
+        # Get the preview button frame from the previewer
+        # The radio buttons should be added to the same frame as preview_size_combo
+        preview_button_frame = self.previewer.preview_size_combo.master
+
+        for subfolder_name in self.depth_map_subfolders:
+            rb = ttk.Radiobutton(
+                preview_button_frame,
+                text=subfolder_name,
+                variable=self.selected_depth_map_var,
+                value=subfolder_name,
+                command=self._on_map_selection_changed
+            )
+            rb.pack(side="left", padx=5)
+            self.depth_map_radio_buttons.append(rb)
+            self.depth_map_radio_dict[subfolder_name] = rb   # NEW
+
+    def _on_map_selection_changed(self, from_sidecar=False):
+        """
+        Called when the user changes the depth map selection (radio buttons),
+        or when a sidecar restores a map (from_sidecar=True).
+
+        In Multi-Map mode this now ONLY updates the CURRENT video’s depth map
+        path instead of iterating over every video.
+        """
+        logger.info(f"Depth map selection changed. from_sidecar={from_sidecar}")
+        if not from_sidecar:
+            # User clicked a radio button – suppress sidecar overwrites
+            self._suppress_sidecar_map_update = True
+
+        # Compute the folder for the newly selected map
+        new_depth_folder = self._get_effective_depth_map_folder()
+
+        # If there is no previewer / no videos, nothing to do
+        if not hasattr(self, "previewer") or self.previewer is None:
+            return
+
+        current_index = getattr(self.previewer, "current_video_index", None)
+        if current_index is None:
+            return
+        if current_index < 0 or current_index >= len(self.previewer.video_list):
+            return
+
+        # Work only on the CURRENT video entry
+        video_entry = self.previewer.video_list[current_index]
+        source_video = video_entry.get("source_video", "")
+        if not source_video:
+            return
+
+        video_name = os.path.splitext(os.path.basename(source_video))[0]
+        depth_mp4 = os.path.join(new_depth_folder, f"{video_name}_depth.mp4")
+        depth_npz = os.path.join(new_depth_folder, f"{video_name}_depth.npz")
+
+        depth_path = None
+        if os.path.exists(depth_mp4):
+            depth_path = depth_mp4
+        elif os.path.exists(depth_npz):
+            depth_path = depth_npz
+
+        # Update the current entry only
+        video_entry["depth_map"] = depth_path
+
+        # Only log for the current video, and only if it’s missing
+        if depth_path is None:
+            logger.info(
+                f"Depth map for current video {video_name} not found in "
+                f"{os.path.basename(new_depth_folder)}"
+            )
+
+        # Refresh previewer so the current video immediately reflects the new map
+        try:
+            self.previewer.replace_source_path_for_current_video(
+                "depth_map", depth_path or ""
+            )
+        except Exception as e:
+            logger.exception(f"Error refreshing preview after map switch: {e}")
+
+        # Keep the processing queue entry (if present) in sync for this one video
+        if hasattr(self, "resolution_output_list") and 0 <= current_index < len(self.resolution_output_list):
+            self.resolution_output_list[current_index].depth_map = depth_path
+
+    def _get_effective_depth_map_folder(self, base_folder=None):
+        """Returns the effective depth map folder based on Multi-Map settings.
+    
+        Args:
+            base_folder: Optional override for base folder (used during processing)
+    
+        Returns:
+            str: The folder path to use for depth maps
+        """
+        if base_folder is None:
+            base_folder = self.input_depth_maps_var.get()
+    
+        # If the user has selected a single depth MAP FILE, treat its directory as the folder.
+        if base_folder and os.path.isfile(base_folder):
+            base_folder = os.path.dirname(base_folder)
+    
+        if self.multi_map_var.get() and self.selected_depth_map_var.get().strip():
+            # Multi-Map is enabled and a subfolder is selected
+            return os.path.join(base_folder, self.selected_depth_map_var.get().strip())
+        else:
+            # Normal mode - use the base folder directly
+            return base_folder
+
+    def _get_sidecar_base_folder(self):
+        """Returns the folder where sidecars should be stored.
+
+        When Multi-Map is enabled, sidecars are stored in a 'sidecars' subfolder.
+        When Multi-Map is disabled, sidecars are stored alongside depth maps.
+
+        Returns:
+            str: The folder path for sidecar storage
+        """
+        if self.multi_map_var.get():
+            # Multi-Map mode: store sidecars in 'sidecars' subfolder
+            base_folder = self.input_depth_maps_var.get()
+            sidecar_folder = os.path.join(base_folder, "sidecars")
+            # Create the sidecars folder if it doesn't exist
+            os.makedirs(sidecar_folder, exist_ok=True)
+            return sidecar_folder
+        else:
+            # Normal mode: store sidecars with depth maps
+            return self._get_effective_depth_map_folder()
+
+    def _get_sidecar_selected_map_for_video(self, video_path):
+        """
+        Returns the Multi-Map subfolder name for a given video based on its sidecar,
+        or None if there is no sidecar / no selected_depth_map entry.
+        """
+        try:
+            # Derive expected sidecar name from *video name* (matches your depth sidecars)
+            video_name = os.path.splitext(os.path.basename(video_path))[0]
+            sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+
+            # In Multi-Map mode, sidecars live in <InputDepthMaps>/sidecars
+            sidecar_folder = self._get_sidecar_base_folder()
+            sidecar_path = os.path.join(sidecar_folder, f"{video_name}_depth{sidecar_ext}")
+
+            if not os.path.exists(sidecar_path):
+                return None
+
+            sidecar_config = self.sidecar_manager.load_sidecar_data(sidecar_path) or {}
+            selected_map_val = sidecar_config.get("selected_depth_map", "")
+            if selected_map_val:
+                return selected_map_val
+
+        except Exception as e:
+            logger.error(f"Error reading sidecar map for {video_path}: {e}")
+
+        return None
+
     def check_queue(self):
         """Periodically checks the progress queue for updates to the GUI."""
         try:
@@ -635,6 +864,8 @@ class SplatterGUI(ThemedTk):
                         self.processing_convergence_var.set(info_data["convergence"])
                     if "gamma" in info_data: # <--- ADD THIS CHECK
                         self.processing_gamma_var.set(info_data["gamma"])
+                    if "map" in info_data:
+                        self.processing_map_var.set(info_data["map"])
                     if "task_name" in info_data:
                         self.processing_task_name_var.set(info_data["task_name"])
 
@@ -651,6 +882,7 @@ class SplatterGUI(ThemedTk):
         self.processing_convergence_var.set("N/A")
         self.processing_gamma_var.set("N/A")
         self.processing_task_name_var.set("N/A")
+        self.processing_map_var.set("N/A")
 
     def _complete_auto_converge_update(self, new_anchor_avg: float, new_anchor_peak: float, fallback_value: float, mode: str):
         """
@@ -784,22 +1016,22 @@ class SplatterGUI(ThemedTk):
 
         # --- Folder selection frame ---
         self.folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
-        self.folder_frame.pack(pady=10, padx=10, fill="x")
+        self.folder_frame.pack(pady=2, padx=10, fill="x")
         self.folder_frame.grid_columnconfigure(1, weight=1)
 
         # Settings Container (NEW)
         self.settings_container_frame = ttk.Frame(self) # <-- ADD self. to settings_container_frame
-        self.settings_container_frame.pack(pady=10, padx=10, fill="x")
+        self.settings_container_frame.pack(pady=2, padx=10, fill="x")
 
         # Input Source Clips Row
         self.lbl_source_clips = ttk.Label(self.folder_frame, text="Input Source Clips:")
-        self.lbl_source_clips.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_source_clips.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.entry_source_clips = ttk.Entry(self.folder_frame, textvariable=self.input_source_clips_var)
-        self.entry_source_clips.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.entry_source_clips.grid(row=current_row, column=1, padx=5, pady=0, sticky="ew")
         self.btn_browse_source_clips_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_source_clips_var))
-        self.btn_browse_source_clips_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_browse_source_clips_folder.grid(row=current_row, column=2, padx=2, pady=0)
         self.btn_select_source_clips_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_source_clips_var, [("Video Files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]))
-        self.btn_select_source_clips_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self.btn_select_source_clips_file.grid(row=current_row, column=3, padx=2, pady=0)
         self._create_hover_tooltip(self.lbl_source_clips, "input_source_clips")
         self._create_hover_tooltip(self.entry_source_clips, "input_source_clips")
         self._create_hover_tooltip(self.btn_browse_source_clips_folder, "input_source_clips_folder")
@@ -808,13 +1040,13 @@ class SplatterGUI(ThemedTk):
 
         # Input Depth Maps Row
         self.lbl_input_depth_maps = ttk.Label(self.folder_frame, text="Input Depth Maps:")
-        self.lbl_input_depth_maps.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_input_depth_maps.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.entry_input_depth_maps = ttk.Entry(self.folder_frame, textvariable=self.input_depth_maps_var)
-        self.entry_input_depth_maps.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.entry_input_depth_maps.grid(row=current_row, column=1, padx=5, pady=0, sticky="ew")
         self.btn_browse_input_depth_maps_folder = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.input_depth_maps_var))
-        self.btn_browse_input_depth_maps_folder.grid(row=current_row, column=2, padx=2, pady=2)
+        self.btn_browse_input_depth_maps_folder.grid(row=current_row, column=2, padx=2, pady=0)
         self.btn_select_input_depth_maps_file = ttk.Button(self.folder_frame, text="Select File", command=lambda: self._browse_file(self.input_depth_maps_var, [("Depth Files", "*.mp4 *.npz"), ("All files", "*.*")]))
-        self.btn_select_input_depth_maps_file.grid(row=current_row, column=3, padx=2, pady=2)
+        self.btn_select_input_depth_maps_file.grid(row=current_row, column=3, padx=2, pady=0)
         self._create_hover_tooltip(self.lbl_input_depth_maps, "input_depth_maps")
         self._create_hover_tooltip(self.entry_input_depth_maps, "input_depth_maps")
         self._create_hover_tooltip(self.btn_browse_input_depth_maps_folder, "input_depth_maps_folder")
@@ -823,13 +1055,16 @@ class SplatterGUI(ThemedTk):
 
         # Output Splatted Row
         self.lbl_output_splatted = ttk.Label(self.folder_frame, text="Output Splatted:")
-        self.lbl_output_splatted.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_output_splatted.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.entry_output_splatted = ttk.Entry(self.folder_frame, textvariable=self.output_splatted_var)
-        self.entry_output_splatted.grid(row=current_row, column=1, padx=5, pady=2, sticky="ew")
+        self.entry_output_splatted.grid(row=current_row, column=1, padx=5, pady=0, sticky="ew")
         self.btn_browse_output_splatted = ttk.Button(self.folder_frame, text="Browse Folder", command=lambda: self._browse_folder(self.output_splatted_var))
-        self.btn_browse_output_splatted.grid(row=current_row, column=2, columnspan=2, padx=5, pady=2)
+        self.btn_browse_output_splatted.grid(row=current_row, column=2, padx=5, pady=0)
+        self.chk_multi_map = ttk.Checkbutton(self.folder_frame, text="Multi-Map", variable=self.multi_map_var, command=self._on_multi_map_toggle)
+        self.chk_multi_map.grid(row=current_row, column=3, padx=5, pady=0)
         self._create_hover_tooltip(self.lbl_output_splatted, "output_splatted")
         self._create_hover_tooltip(self.entry_output_splatted, "output_splatted")
+        self._create_hover_tooltip(self.chk_multi_map, "multi_map")
         self._create_hover_tooltip(self.btn_browse_output_splatted, "output_splatted")
         # Reset current_row for next frame
         current_row = 0
@@ -846,12 +1081,12 @@ class SplatterGUI(ThemedTk):
             on_clip_navigate_callback=self._auto_save_current_sidecar,
             help_data=self.help_texts,
         )
-        self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
+        self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
 
         # --- NEW: MAIN LAYOUT CONTAINER (Holds Settings Left and Info Right) ---
         self.main_layout_frame = ttk.Frame(self)
-        self.main_layout_frame.pack(pady=10, padx=10, fill="x")
+        self.main_layout_frame.pack(pady=2, padx=10, fill="x")
         self.main_layout_frame.grid_columnconfigure(0, weight=1) # Left settings column
         self.main_layout_frame.grid_columnconfigure(1, weight=1) # Right info column (fixed width)
 
@@ -861,7 +1096,7 @@ class SplatterGUI(ThemedTk):
 
         # --- Settings Container Frame (to hold two side-by-side frames) ---
         self.settings_container_frame = ttk.Frame(self.settings_stack_frame)
-        self.settings_container_frame.pack(pady=(0, 10), fill="x") # Pack it inside the stack frame
+        self.settings_container_frame.pack(pady=(0, 2), fill="x") # Pack it inside the stack frame
         self.settings_container_frame.grid_columnconfigure(0, weight=1)
         self.settings_container_frame.grid_columnconfigure(1, weight=1)
 
@@ -903,12 +1138,11 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
         current_row += 1
 
-
         # --- Enable Low Resolution Section (ROW 1) ---
         
         # Container for Checkbox and Label/Entry
         self.low_res_control_frame = ttk.Frame(self.preprocessing_frame)
-        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 2))
+        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 2))
         self.low_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
 
         # Checkbox (Left side of the container)
@@ -930,7 +1164,7 @@ class SplatterGUI(ThemedTk):
         
         # Frame for Width/Height fields (Grid under the Low Res checkbox/batch size row)
         self.low_res_wh_frame = ttk.Frame(self.preprocessing_frame)
-        self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
         
         self.pre_res_width_label = ttk.Label(self.low_res_wh_frame, text="Width:")
         self.pre_res_width_label.pack(side="left", padx=(0, 2))
@@ -950,39 +1184,39 @@ class SplatterGUI(ThemedTk):
         
         # Dual Output Checkbox (Row 3, Column 0/1)
         self.dual_output_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Dual Output Only", variable=self.dual_output_var)
-        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
         
         # --- 2. Splatting & Output Settings Frame (Bottom Left) ---
         # *** THIS IS THE MOVED FRAME: now attached to self.process_settings_container at row=1 ***
         current_row = 0 # Reset for internal use of output_settings_frame
         self.output_settings_frame = ttk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings")
-        self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(10, 0)) # <-- Grid 1,0 in process_settings_container
+        self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(2, 0)) # <-- Grid 1,0 in process_settings_container
         self.output_settings_frame.grid_columnconfigure(1, weight=1)
                 
         # Process Length (Remains Entry)
         self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length:")
-        self.lbl_process_length.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_process_length.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
-        self.entry_process_length.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self.entry_process_length.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.lbl_process_length, "process_length")
         self._create_hover_tooltip(self.entry_process_length, "process_length")
         current_row += 1
         
         # Output CRF setting (Remains Entry)
         self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF:")
-        self.lbl_output_crf.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_output_crf.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.entry_output_crf = ttk.Entry(self.output_settings_frame, textvariable=self.output_crf_var, width=15)
-        self.entry_output_crf.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self.entry_output_crf.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.lbl_output_crf, "output_crf")
         self._create_hover_tooltip(self.entry_output_crf, "output_crf")
         current_row += 1
 
         # Auto-Convergence Combo (Row 2, Column 0/1)
         self.lbl_auto_convergence = ttk.Label(self.output_settings_frame, text="Auto-Convergence:")
-        self.lbl_auto_convergence.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        self.lbl_auto_convergence.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
         self.auto_convergence_combo = ttk.Combobox(self.output_settings_frame, textvariable=self.auto_convergence_mode_var, values=["Off", "Average", "Peak"], state="readonly", width=15)
-        self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=2)
+        self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
@@ -1026,7 +1260,7 @@ class SplatterGUI(ThemedTk):
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
         self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Stereo Projection")
-        self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(10, 0)) # Pack it below Hi-Res frame
+        self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(2, 0)) # Pack it below Hi-Res frame
         # self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
         # self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
 
@@ -1042,7 +1276,7 @@ class SplatterGUI(ThemedTk):
         all_settings_row += 1
         
         # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
-        create_single_slider_with_label_updater(
+        self.set_disparity_value_programmatically = create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Disparity:",
             self.max_disp_var, 0.0, 100.0, all_settings_row, decimals=0,
             tooltip_key="max_disp",
@@ -1066,7 +1300,7 @@ class SplatterGUI(ThemedTk):
             command=lambda: self.on_slider_release(None),
             width=28
             )
-        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")   
 
         all_settings_row += 1
@@ -1077,7 +1311,7 @@ class SplatterGUI(ThemedTk):
             variable=self.move_to_finished_var,
             width=28
             )
-        self.move_to_finished_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self.move_to_finished_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.move_to_finished_checkbox, "move_to_finished_folder")
         all_settings_row += 1
 
@@ -1094,7 +1328,6 @@ class SplatterGUI(ThemedTk):
         LABEL_VALUE_WIDTH = 25
         info_row = 0
 
-
         # Row 0: Filename
         lbl_filename_static = tk.Label(self.info_frame, text="Filename:")
         lbl_filename_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
@@ -1102,7 +1335,6 @@ class SplatterGUI(ThemedTk):
         lbl_filename_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_filename_static, lbl_filename_value])
         info_row += 1
-
 
         # Row 1: Task Name
         lbl_task_static = tk.Label(self.info_frame, text="Task:")
@@ -1151,10 +1383,18 @@ class SplatterGUI(ThemedTk):
         lbl_convergence_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_convergence_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
+        info_row += 1
+
+        # Row 6: Depth Map Source (Multi-Map)
+        lbl_map_static = tk.Label(self.info_frame, text="Map:")
+        lbl_map_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
+        lbl_map_value = tk.Label(self.info_frame, textvariable=self.processing_map_var, anchor="w", width=LABEL_VALUE_WIDTH)
+        lbl_map_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
+        self.info_labels.extend([lbl_map_static, lbl_map_value])
 
         # --- Progress frame ---
         progress_frame = ttk.LabelFrame(self, text="Progress")
-        progress_frame.pack(pady=10, padx=10, fill="x")
+        progress_frame.pack(pady=2, padx=10, fill="x")
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill="x", expand=True, padx=5, pady=2)
@@ -1163,9 +1403,8 @@ class SplatterGUI(ThemedTk):
 
         # --- Button frame ---
         button_frame = ttk.Frame(self)
-        button_frame.pack(pady=10)
+        button_frame.pack(pady=2)
 
-        
         # --- Single Process Button ---
         self.start_single_button = ttk.Button(button_frame, text="SINGLE", command=self.start_single_processing)
         self.start_single_button.pack(side="left", padx=5)
@@ -1175,6 +1414,17 @@ class SplatterGUI(ThemedTk):
         self.start_button = ttk.Button(button_frame, text="START", command=self.start_processing)
         self.start_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.start_button, "start_button")
+
+        # --- From/To Process Range ---
+        ttk.Label(button_frame, text="From:").pack(side="left", padx=(15, 2))
+        self.entry_process_from = ttk.Entry(button_frame, textvariable=self.process_from_var, width=6)
+        self.entry_process_from.pack(side="left", padx=2)
+        self._create_hover_tooltip(self.entry_process_from, "process_from")
+
+        ttk.Label(button_frame, text="To:").pack(side="left", padx=(5, 2))
+        self.entry_process_to = ttk.Entry(button_frame, textvariable=self.process_to_var, width=6)
+        self.entry_process_to.pack(side="left", padx=2)
+        self._create_hover_tooltip(self.entry_process_to, "process_to")
 
         # --- Stop Process Button ---
         self.stop_button = ttk.Button(button_frame, text="STOP", command=self.stop_processing, state="disabled")
@@ -1193,9 +1443,111 @@ class SplatterGUI(ThemedTk):
 
         # --- Current Processing Information frame ---
         self.info_frame = ttk.LabelFrame(self, text="Current Processing Information") # Store frame as instance attribute
-        self.info_frame.pack(pady=10, padx=10, fill="x")
+        self.info_frame.pack(pady=2, padx=10, fill="x")
         self.info_frame.grid_columnconfigure(1, weight=1)
-    
+
+    def _setup_keyboard_shortcuts(self):
+        """Sets up keyboard shortcuts for quick adjustments.
+
+        Shortcuts only work when NOT in a text entry field:
+        - 7/9: Previous/Next depth map (Multi-Map)
+        - 4/6: Decrease/Increase Dilate X
+        - 1/3: Decrease/Increase Convergence
+        """
+        self.bind('<KeyPress>', self._handle_keypress)
+
+    def _handle_keypress(self, event):
+        """Handles keyboard shortcuts, but only when not in a text entry."""
+        # Check if focus is in an Entry or Text widget
+        focused_widget = self.focus_get()
+        if isinstance(focused_widget, (tk.Entry, tk.Text, ttk.Entry)):
+            # User is typing in a text field - don't intercept
+            return
+
+        # Map shortcuts
+        if event.char == '7':
+            self._cycle_depth_map(-1)  # Previous map
+        elif event.char == '9':
+            self._cycle_depth_map(1)   # Next map
+        elif event.char == '4':
+            self._adjust_disparity(-1)    # Decrease disparity
+        elif event.char == '6':
+            self._adjust_disparity(1)     # Increase disparity
+        elif event.char == '1':
+            self._adjust_convergence(-0.01)  # Decrease convergence
+        elif event.char == '3':
+            self._adjust_convergence(0.01)   # Increase convergence
+
+    def _cycle_depth_map(self, direction):
+        """Cycles through depth map subfolders.
+
+        Args:
+            direction: -1 for previous, 1 for next
+        """
+        if not self.multi_map_var.get():
+            return  # Multi-Map not enabled
+
+        if not self.depth_map_subfolders:
+            return  # No subfolders
+
+        current_value = self.selected_depth_map_var.get()
+        try:
+            current_index = self.depth_map_subfolders.index(current_value)
+        except ValueError:
+            current_index = 0
+
+        # Calculate new index with wrapping
+        new_index = (current_index + direction) % len(self.depth_map_subfolders)
+        new_value = self.depth_map_subfolders[new_index]
+
+        # Update the selection
+        self.selected_depth_map_var.set(new_value)
+
+        # Trigger the map change
+        self._on_map_selection_changed()
+
+    def _adjust_disparity(self, direction):
+        """Adjusts Max Disparity value.
+
+        Args:
+            direction: -1 to decrease, 1 to increase
+        """
+        try:
+            current = float(self.max_disp_var.get())
+            new_value = max(0, min(100, current + direction))  # Clamp 0-100
+
+            # Use the proper setter function which updates both slider AND label
+            if hasattr(self, 'set_disparity_value_programmatically') and self.set_disparity_value_programmatically:
+                self.set_disparity_value_programmatically(new_value)
+            else:
+                self.max_disp_var.set(f"{new_value:.1f}")
+
+            # Trigger preview update
+            self.on_slider_release(None)
+        except ValueError:
+            pass  # Invalid current value
+
+    def _adjust_convergence(self, delta):
+        """Adjusts Convergence Plane value.
+
+        Args:
+            delta: Amount to change (e.g., 0.01 or -0.01)
+        """
+        try:
+            current = float(self.zero_disparity_anchor_var.get())
+            new_value = max(0.0, min(1.0, current + delta))  # Clamp between 0 and 1
+
+            # Use the proper setter function which updates both slider AND label
+            if self.set_convergence_value_programmatically:
+                self.set_convergence_value_programmatically(new_value)
+            else:
+                self.zero_disparity_anchor_var.set(f"{new_value:.2f}")
+
+            # Trigger preview update
+            self.on_slider_release(None)
+        except ValueError:
+            pass  # Invalid current value
+
     def depthSplatting(
             self: "SplatterGUI",
             input_video_reader: VideoReader,
@@ -1590,7 +1942,6 @@ class SplatterGUI(ThemedTk):
                 logger.error(f"Error seeking/reading depth map batch starting at index {i}: {e}. Skipping batch.")
                 continue
 
-
             # Process depth frames (Grayscale, Float conversion)
             if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
                 batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
@@ -1725,7 +2076,6 @@ class SplatterGUI(ThemedTk):
         source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
         source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
 
-
         # 3. Create a mask of the leftmost columns that are currently occluded
         #    This mask is True only for pixels (B, C, H, W) that are BOTH in the boundary AND occluded.
         #    Boundary mask [W]: True for x < boundary_width_pixels
@@ -1788,7 +2138,6 @@ class SplatterGUI(ThemedTk):
         source_column_indices = torch.clamp(last_visible_index, 0, W - 1)
         source_column_indices[fully_occluded] = 0 # If fully occluded, use index 0 as source (safer than W-1)
 
-
         # 2. Gather the source pixels for filling (Shape [B, C, H])
         #    Gather on dimension W (dim=3), using indices expanded to [B, C, H, 1]
         source_column_indices_expanded = source_column_indices.unsqueeze(1).repeat(1, C, 1, 1) # Shape [B, C, H, 1]
@@ -1796,7 +2145,6 @@ class SplatterGUI(ThemedTk):
         # Gather the color from the source column for all rows (the last visible pixel's color)
         source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
         source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
-
 
         # 3. Create a mask of the rightmost columns that are currently occluded
         #    Boundary mask [W]: True for x >= W - boundary_width_pixels
@@ -1810,7 +2158,6 @@ class SplatterGUI(ThemedTk):
         # Combine the masks
         # [B, 1, H, W] AND [W] -> [B, 1, H, W]
         fill_target_mask = is_occluded_4d & boundary_region_mask.view(1, 1, 1, W)
-
 
         # 4. Apply the gathered pixel values to the masked regions
         #    Expand source values to [B, C, H, W]
@@ -1832,62 +2179,137 @@ class SplatterGUI(ThemedTk):
         Handles both folder (batch) and file (single) input modes.
         """
         source_path = self.input_source_clips_var.get()
-        depth_path = self.input_depth_maps_var.get()
-        
-        # --- NEW SINGLE-FILE MODE CHECK ---
-        is_source_file = os.path.isfile(source_path)
-        is_depth_file = os.path.isfile(depth_path)
-        
-        if is_source_file and is_depth_file:
-            # Single file mode activated
-            logger.debug(f"Preview Scan: Single file mode detected. Source: {source_path}, Depth: {depth_path}")
-            # The previewer expects a list of dictionaries, even for a single file
-            return [{
-                'source_video': source_path,
-                'depth_map': depth_path
-            }]
-        # --- END NEW SINGLE-FILE MODE CHECK ---
-
-        # Fallback to Batch (Folder) mode check
-        if not os.path.isdir(source_path) or not os.path.isdir(depth_path):
-            logger.error("Preview Scan Failed: Inputs must either be two files or two valid directories.")
+        depth_raw_path = self.input_depth_maps_var.get()
+    
+        if not source_path or not depth_raw_path:
+            logger.warning("Preview Scan Failed: Source or depth path is empty.")
             return []
-
-        # The rest of the original batch/folder logic (using source_path/depth_path as folder variables)
+    
+        # ------------------------------------------------------------
+        # 1) SINGLE-FILE MODE (both are actual files)
+        # ------------------------------------------------------------
+        is_source_file = os.path.isfile(source_path)
+        is_depth_file = os.path.isfile(depth_raw_path)
+    
+        if is_source_file and is_depth_file:
+            logger.debug(
+                f"Preview Scan: Single file mode detected. "
+                f"Source: {source_path}, Depth: {depth_raw_path}"
+            )
+            return [{
+                "source_video": source_path,
+                "depth_map": depth_raw_path,
+            }]
+    
+        # ------------------------------------------------------------
+        # 2) FOLDER / BATCH MODE
+        # ------------------------------------------------------------
+        if not os.path.isdir(source_path) or not os.path.isdir(depth_raw_path):
+            logger.error(
+                "Preview Scan Failed: Inputs must either be two files or two valid directories."
+            )
+            return []
+    
         source_folder = source_path
-        depth_folder = depth_path
-
-        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+        base_depth_folder = depth_raw_path
+    
+        # Collect all source videos
+        video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
         source_videos = []
         for ext in video_extensions:
             source_videos.extend(glob.glob(os.path.join(source_folder, ext)))
-
+    
+        if not source_videos:
+            logger.warning(f"No source videos found in folder: {source_folder}")
+            return []
+    
         video_source_list = []
-        for video_path in sorted(source_videos):
-            base_name = os.path.splitext(os.path.basename(video_path))[0]
-            
-            # --- MODIFIED: More robust search for depth map files ---
-            depth_paths_to_check = [
-                os.path.join(depth_folder, f"{base_name}_depth.mp4"),
-                os.path.join(depth_folder, f"{base_name}_depth.npz"),
-                os.path.join(depth_folder, f"{base_name}.mp4"), 
-                os.path.join(depth_folder, f"{base_name}.npz"), 
-            ]
-
-            matching_depth_path = None
-            
-            for dp in depth_paths_to_check:
-                if os.path.exists(dp):
-                    matching_depth_path = dp
-                    break
-            
-            if matching_depth_path:
-                logger.debug(f"Preview Scan: Found pair for '{base_name}'.")
-                video_source_list.append({
-                    'source_video': video_path,
-                    'depth_map': matching_depth_path
-                })
-
+    
+        # ------------------------------------------------------------
+        # 2A) MULTI-MAP PREVIEW: search all map subfolders
+        # ------------------------------------------------------------
+        if self.multi_map_var.get():
+            depth_candidate_folders = []
+    
+            # Treat each subdirectory (except 'sidecars') as a map folder
+            try:
+                for entry in os.listdir(base_depth_folder):
+                    full_sub = os.path.join(base_depth_folder, entry)
+                    if os.path.isdir(full_sub) and entry.lower() != "sidecars":
+                        depth_candidate_folders.append(full_sub)
+            except FileNotFoundError:
+                logger.error(f"Preview Scan Failed: Depth folder not found: {base_depth_folder}")
+                return []
+    
+            if not depth_candidate_folders:
+                logger.warning(
+                    f"Preview Scan: No map subfolders found in Multi-Map base folder: {base_depth_folder}"
+                )
+    
+            for video_path in sorted(source_videos):
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                matched = False
+    
+                for dpath in depth_candidate_folders:
+                    mp4 = os.path.join(dpath, f"{base_name}_depth.mp4")
+                    npz = os.path.join(dpath, f"{base_name}_depth.npz")
+    
+                    if os.path.exists(mp4):
+                        video_source_list.append({
+                            "source_video": video_path,
+                            "depth_map": mp4,
+                        })
+                        matched = True
+                        break
+                    elif os.path.exists(npz):
+                        video_source_list.append({
+                            "source_video": video_path,
+                            "depth_map": npz,
+                        })
+                        matched = True
+                        break
+    
+                if not matched:
+                    logger.debug(
+                        f"Preview Scan: No depth map found in any map folder for '{base_name}'."
+                    )
+    
+        # ------------------------------------------------------------
+        # 2B) NORMAL MODE PREVIEW: single depth folder
+        # ------------------------------------------------------------
+        else:
+            depth_folder = base_depth_folder
+    
+            for video_path in sorted(source_videos):
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+    
+                candidates = [
+                    os.path.join(depth_folder, f"{base_name}_depth.mp4"),
+                    os.path.join(depth_folder, f"{base_name}_depth.npz"),
+                    os.path.join(depth_folder, f"{base_name}.mp4"),
+                    os.path.join(depth_folder, f"{base_name}.npz"),
+                ]
+    
+                matching_depth_path = None
+                for dp in candidates:
+                    if os.path.exists(dp):
+                        matching_depth_path = dp
+                        break
+    
+                if matching_depth_path:
+                    logger.debug(f"Preview Scan: Found pair for '{base_name}'.")
+                    video_source_list.append({
+                        "source_video": video_path,
+                        "depth_map": matching_depth_path,
+                    })
+    
+        if not video_source_list:
+            logger.warning("Preview Scan: No matching source/depth pairs found.")
+        else:
+            logger.info(
+                f"Preview Scan: Found {len(video_source_list)} matching source/depth pairs."
+            )
+    
         return video_source_list
 
     def _get_current_config(self):
@@ -1970,7 +2392,9 @@ class SplatterGUI(ThemedTk):
 
         depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
         sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        # Use base folder for sidecars when Multi-Map is enabled
+        sidecar_folder = self._get_sidecar_base_folder()
+        json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
         
         # Load existing data (merged with defaults) to preserve non-GUI parameters like overlap/bias
         current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
@@ -2001,150 +2425,293 @@ class SplatterGUI(ThemedTk):
                 "is_low_res": True
             })
         return processing_tasks
-    
-    def _get_video_specific_settings(self, video_path, input_depth_maps_path_setting, default_zero_disparity_anchor, gui_max_disp, is_single_file_mode):
+
+    def _get_video_specific_settings(
+        self,
+        video_path,
+        input_depth_maps_path_setting,
+        default_zero_disparity_anchor,
+        gui_max_disp,
+        is_single_file_mode,
+    ):
         """
-        Determines the actual depth map path and reads video-specific settings from a sidecar JSON.
-        Returns a dictionary containing relevant settings or an 'error' key.
+        Determine the actual depth map path and video-specific settings.
+
+        Behavior in Multi-Map mode:
+          * If a sidecar exists for this video and contains 'selected_depth_map',
+            that subfolder is used for the depth map lookup.
+          * Otherwise, we fall back to the map selected in the GUI when Start was pressed.
         """
         video_name = os.path.splitext(os.path.basename(video_path))[0]
+        base_name = video_name
+
+        # ------------------------------------------------------------------
+        # 1) Locate sidecar for this video (if any)
+        # ------------------------------------------------------------------
+        sidecar_ext = self.APP_CONFIG_DEFAULTS["SIDECAR_EXT"]
+        sidecar_folder = self._get_sidecar_base_folder()
+        json_sidecar_path = os.path.join(sidecar_folder, f"{video_name}_depth{sidecar_ext}")
+
+        merged_config = None
+        sidecar_exists = False
+        selected_map_for_video = None
+
+        if os.path.exists(json_sidecar_path):
+            try:
+                merged_config = self.sidecar_manager.load_sidecar_data(json_sidecar_path) or {}
+                sidecar_exists = True
+            except Exception as e:
+                logger.error(f"Failed to load sidecar for {video_name}: {e}")
+                merged_config = None
+
+            if isinstance(merged_config, dict):
+                selected_map_for_video = merged_config.get("selected_depth_map") or None
+
+        # ------------------------------------------------------------------
+        # 2) GUI defaults used when sidecar is missing or incomplete
+        # ------------------------------------------------------------------
+        gui_config = {
+            "convergence_plane": float(default_zero_disparity_anchor),
+            "max_disparity": float(gui_max_disp),
+            "gamma": float(self.depth_gamma_var.get() or self.APP_CONFIG_DEFAULTS["DEPTH_GAMMA"]),
+        }
+
+        # ------------------------------------------------------------------
+        # 3) Resolve per-video depth map path
+        # ------------------------------------------------------------------
+
+        base_folder = input_depth_maps_path_setting
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
         actual_depth_map_path = None
-        
-        # Determine actual depth map file path
+
+        # --- Single-file mode: depth path setting is the actual file ---
         if is_single_file_mode:
-            actual_depth_map_path = input_depth_maps_path_setting
-            if not os.path.exists(actual_depth_map_path):
-                return {"error": f"Single depth map file '{actual_depth_map_path}' not found."}
-        else:
-            depth_map_path_mp4 = os.path.join(input_depth_maps_path_setting, f"{video_name}_depth.mp4")
-            depth_map_path_npz = os.path.join(input_depth_maps_path_setting, f"{video_name}_depth.npz")
-
-            if os.path.exists(depth_map_path_mp4):
-                actual_depth_map_path = depth_map_path_mp4
-            elif os.path.exists(depth_map_path_npz):
-                actual_depth_map_path = depth_map_path_npz
+            # Here input_depth_maps_path_setting is expected to be the
+            # depth map *file* path, not a directory.
+            if os.path.isfile(base_folder):
+                actual_depth_map_path = base_folder
+                logger.info(f"Single-file mode: using depth map file '{actual_depth_map_path}'")
+                # Optional: show map as "Direct file" in the info panel
+                self.progress_queue.put(("update_info", {"map": "Direct file"}))
             else:
-                return {"error": f"No depth map found for {video_name} in {input_depth_maps_path_setting}. Expected '{video_name}_depth.mp4' or '{video_name}_depth.npz'."}
-        
+                return {
+                    "error": (
+                        f"Single-file mode: depth map file '{base_folder}' does not exist."
+                    )
+                }
+
+        # --- Batch / folder mode ---
+        else:
+            #
+            # MULTI-MAP MODE
+            #
+            if self.multi_map_var.get():
+
+                # 1) First try sidecar’s selected map for this video
+                sidecar_map = self._get_sidecar_selected_map_for_video(video_path)
+
+                if sidecar_map:
+                    candidate_dir = os.path.join(base_folder, sidecar_map)
+                    c_mp4 = os.path.join(candidate_dir, f"{video_name}_depth.mp4")
+                    c_npz = os.path.join(candidate_dir, f"{video_name}_depth.npz")
+
+                    if os.path.exists(c_mp4):
+                        actual_depth_map_path = c_mp4
+                    elif os.path.exists(c_npz):
+                        actual_depth_map_path = c_npz
+
+                    if actual_depth_map_path:
+                        logger.info(f"[MM] USING sidecar map '{sidecar_map}' for '{video_name}'")
+                        # Show map name PLUS source (Sidecar)
+                        self.progress_queue.put(("update_info", {"map": f"{sidecar_map} (Sidecar)"}))
+                    else:
+                        logger.warning(
+                            f"[MM] sidecar map '{sidecar_map}' has no depth file for '{video_name}'"
+                        )
+
+                # 2) If sidecar FAILED, fall back to GUI-selected map
+                if not actual_depth_map_path:
+                    gui_map = self.selected_depth_map_var.get().strip()
+                    if gui_map:
+                        candidate_dir = os.path.join(base_folder, gui_map)
+                        c_mp4 = os.path.join(candidate_dir, f"{video_name}_depth.mp4")
+                        c_npz = os.path.join(candidate_dir, f"{video_name}_depth.npz")
+
+                        if os.path.exists(c_mp4):
+                            actual_depth_map_path = c_mp4
+                        elif os.path.exists(c_npz):
+                            actual_depth_map_path = c_npz
+
+                        if actual_depth_map_path:
+                            logger.info(f"[MM] USING GUI map '{gui_map}' for '{video_name}'")
+                            # Show map name PLUS source (GUI/Default)
+                            self.progress_queue.put(("update_info", {"map": f"{gui_map} (GUI/Default)"}))
+
+                # 3) Absolute hard fallback: look in base folder
+                if not actual_depth_map_path:
+                    c_mp4 = os.path.join(base_folder, f"{video_name}_depth.mp4")
+                    c_npz = os.path.join(base_folder, f"{video_name}_depth.npz")
+                    if os.path.exists(c_mp4):
+                        actual_depth_map_path = c_mp4
+                    elif os.path.exists(c_npz):
+                        actual_depth_map_path = c_npz
+
+                if not actual_depth_map_path:
+                    return {
+                        "error": f"No depth map for '{video_name}' in ANY multimap source"
+                    }
+
+            #
+            # NORMAL (non-multi-map) MODE
+            #
+            else:
+                # Here base_folder is expected to be a directory containing all depth maps.
+                c_mp4 = os.path.join(base_folder, f"{video_name}_depth.mp4")
+                c_npz = os.path.join(base_folder, f"{video_name}_depth.npz")
+
+                if os.path.exists(c_mp4):
+                    actual_depth_map_path = c_mp4
+                elif os.path.exists(c_npz):
+                    actual_depth_map_path = c_npz
+                else:
+                    return {
+                        "error": f"No depth for '{video_name}' in '{base_folder}'"
+                    }
+
         actual_depth_map_path = os.path.normpath(actual_depth_map_path)
-        depth_map_basename = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
-        
-        # --- Get Sidecar Path ---
-        sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-        json_sidecar_path = os.path.join(os.path.dirname(actual_depth_map_path), f"{depth_map_basename}{sidecar_ext}")
-        # ------------------------
 
-        # [NEW]: Compile GUI Input Fields for the Merge
-        try:
-            gui_config = {
-                "convergence_plane": float(self.zero_disparity_anchor_var.get()),
-                "max_disparity": float(self.max_disp_var.get()),
-                "gamma": float(self.depth_gamma_var.get()),
-                # Dilate/Blur are *not* included as they are local pre-processing steps, not config for the inpaint
+        # ------------------------------------------------------------
+        # Multi-Map: resolve map folder from sidecar per-video
+        # ------------------------------------------------------------
+        depth_map_path = None
+        
+        if self.multi_map_var.get():
+        
+            # new helper we already added earlier
+            selected_map = self._get_sidecar_selected_map_for_video(video_path)
+        
+            if selected_map:
+                candidate_folder = os.path.join(self.input_depth_maps_var.get(), selected_map)
+                candidate_mp4 = os.path.join(candidate_folder, f"{base_name}_depth.mp4")
+                candidate_npz = os.path.join(candidate_folder, f"{base_name}_depth.npz")
+        
+                if os.path.exists(candidate_mp4):
+                    depth_map_path = candidate_mp4
+                elif os.path.exists(candidate_npz):
+                    depth_map_path = candidate_npz
+
+        # ------------------------------------------------------------------
+        # 4) Build merged settings (sidecar values with GUI defaults)
+        # ------------------------------------------------------------------
+        if not merged_config or not isinstance(merged_config, dict):
+            merged_config = {
+                "convergence_plane": gui_config["convergence_plane"],
+                "max_disparity": gui_config["max_disparity"],
+                "gamma": gui_config["gamma"],
+                "input_bias": 0.0,
             }
-        except ValueError:
-            gui_config = {}
-        
-        # The GUI override keys are defined for the batch process here (i.e., NO override)
-        # The batch process always prefers the sidecar/default unless manually coded otherwise.
-        # This function is used to load the sidecar's values for Auto-Convergence pre-pass calculation.
-        
-        # Use an empty list of override keys to ensure we get pure sidecar values first.
-        # The main loop logic in _run_batch_process handles the final override selection.
-        merged_config = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
 
-        # Initialize tracking sources for the main loop info display
+        # Determine map source label for Multi-Map status display
+        if self.multi_map_var.get():
+            map_source = "Sidecar" if sidecar_exists else "GUI/Default"
+        else:
+            map_source = "N/A"
+
         settings = {
             "actual_depth_map_path": actual_depth_map_path,
-            "convergence_plane": merged_config["convergence_plane"],
-            "max_disparity_percentage": merged_config["max_disparity"],
+            "convergence_plane": merged_config.get("convergence_plane", gui_config["convergence_plane"]),
+            "max_disparity_percentage": merged_config.get("max_disparity", gui_config["max_disparity"]),
             "input_bias": merged_config.get("input_bias"),
-            "depth_gamma": merged_config["gamma"],
-            
-            # --- Placeholders for GUI-derived settings not in sidecar ---
+            "depth_gamma": merged_config.get("gamma", gui_config["gamma"]),
+            # GUI-derived depth pre-processing settings
             "depth_dilate_size_x": int(float(self.depth_dilate_size_x_var.get())),
             "depth_dilate_size_y": int(float(self.depth_dilate_size_y_var.get())),
             "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
             "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
-            
-            # We assume 'Sidecar' as the source for the tracking info if a sidecar was found,
-            # otherwise, the main loop will need to infer the source.
-            "sidecar_found": os.path.exists(json_sidecar_path),
-            
-            "anchor_source": "Sidecar" if os.path.exists(json_sidecar_path) else "GUI/Default",
-            "max_disp_source": "Sidecar" if os.path.exists(json_sidecar_path) else "GUI/Default",
-            "gamma_source": "Sidecar" if os.path.exists(json_sidecar_path) else "GUI/Default",
+            # Tracking / info sources
+            "sidecar_found": sidecar_exists,
+            "anchor_source": "Sidecar" if sidecar_exists else "GUI/Default",
+            "max_disp_source": "Sidecar" if sidecar_exists else "GUI/Default",
+            "gamma_source": "Sidecar" if sidecar_exists else "GUI/Default",
+            "map_source": map_source,
         }
-        
-        # Override with GUI values if sidecar not found (i.e., trust GUI over default 0.5/20.0)
-        if not os.path.exists(json_sidecar_path):
-             settings["convergence_plane"] = gui_config["convergence_plane"]
-             settings["max_disparity_percentage"] = gui_config["max_disparity"]
-             settings["depth_gamma"] = gui_config["gamma"]
+
+        # If no sidecar file exists at all, enforce GUI values explicitly
+        if not sidecar_exists:
+            settings["convergence_plane"] = gui_config["convergence_plane"]
+            settings["max_disparity_percentage"] = gui_config["max_disparity"]
+            settings["depth_gamma"] = gui_config["gamma"]
 
         return settings
-    
+
     def _initialize_video_and_depth_readers(self, video_path, actual_depth_map_path, process_length, task_settings, match_depth_res):
-        """
-        Initializes VideoReader objects for source video and depth map,
-        and returns their metadata.
-        Returns: (video_reader, depth_reader, processed_fps, current_processed_height, current_processed_width,
-                  video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width,
-                  depth_stream_info)
-        """
-        video_reader_input = None
-        processed_fps = 0.0
-        original_vid_h, original_vid_w = 0, 0
-        current_processed_height, current_processed_width = 0, 0
-        video_stream_info = None
-        total_frames_input = 0
-
-        depth_reader_input = None
-        total_frames_depth = 0
-        actual_depth_height, actual_depth_width = 0, 0
-        depth_stream_info = None # Initialize to None
-
-        try:
-            # 1. Initialize input video reader
-            video_reader_input, processed_fps, original_vid_h, original_vid_w, \
-            current_processed_height, current_processed_width, video_stream_info, \
-            total_frames_input = read_video_frames(
-                video_path, process_length,
-                set_pre_res=task_settings["set_pre_res"], pre_res_width=task_settings["target_width"], pre_res_height=task_settings["target_height"]
-            )
-        except Exception as e:
-            logger.error(f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
-            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
-
-        self.progress_queue.put(("update_info", {
-            "resolution": f"{current_processed_width}x{current_processed_height}",
-            "frames": total_frames_input
-        }))
-
-        try:
-            # 2. Initialize depth maps reader and capture depth_stream_info
-            depth_reader_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info = load_pre_rendered_depth(
-                actual_depth_map_path,
-                process_length=process_length,
-                target_height=current_processed_height,
-                target_width=current_processed_width,
-                match_resolution_to_target=match_depth_res
-            )
-        except Exception as e:
-            logger.error(f"==> Error initializing depth map reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
-            if video_reader_input: del video_reader_input
-            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
-
-        # CRITICAL CHECK: Ensure input video and depth map have consistent frame counts
-        if total_frames_input != total_frames_depth:
-            logger.error(f"==> Frame count mismatch for {os.path.basename(video_path)} {task_settings['name']} pass: Input video has {total_frames_input} frames, Depth map has {total_frames_depth} frames. Skipping.")
-            if video_reader_input: del video_reader_input
-            if depth_reader_input: del depth_reader_input
-            return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
-        
-        return (video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width,
-                video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info)
+            """
+            Initializes VideoReader objects for source video and depth map,
+            and returns their metadata.
+            Returns: (video_reader, depth_reader, processed_fps, current_processed_height, current_processed_width,
+                      video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width,
+                      depth_stream_info)
+            """
+            video_reader_input = None
+            processed_fps = 0.0
+            original_vid_h, original_vid_w = 0, 0
+            current_processed_height, current_processed_width = 0, 0
+            video_stream_info = None
+            total_frames_input = 0
     
+            depth_reader_input = None
+            total_frames_depth = 0
+            actual_depth_height, actual_depth_width = 0, 0
+            depth_stream_info = None # Initialize to None
+    
+            try:
+                # 1. Initialize input video reader
+                video_reader_input, processed_fps, original_vid_h, original_vid_w, \
+                current_processed_height, current_processed_width, video_stream_info, \
+                total_frames_input = read_video_frames(
+                    video_path, process_length,
+                    set_pre_res=task_settings["set_pre_res"], pre_res_width=task_settings["target_width"], pre_res_height=task_settings["target_height"]
+                )
+            except Exception as e:
+                logger.error(f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
+                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+                # Determine map source for Multi-Map
+                map_display = "N/A"
+                if self.multi_map_var.get():
+                    if self._current_video_sidecar_map:
+                        map_display = f"Sidecar > {self._current_video_sidecar_map}"
+                    elif self.selected_depth_map_var.get():
+                        map_display = f"Default > {self.selected_depth_map_var.get()}"
+
+            self.progress_queue.put(("update_info", {
+                "resolution": f"{current_processed_width}x{current_processed_height}",
+                "frames": total_frames_input
+            }))
+    
+            try:
+                # 2. Initialize depth maps reader and capture depth_stream_info
+                depth_reader_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info = load_pre_rendered_depth(
+                    actual_depth_map_path,
+                    process_length=process_length,
+                    target_height=current_processed_height,
+                    target_width=current_processed_width,
+                    match_resolution_to_target=match_depth_res
+                )
+            except Exception as e:
+                logger.error(f"==> Error initializing depth map reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
+                if video_reader_input: del video_reader_input
+                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+    
+            # CRITICAL CHECK: Ensure input video and depth map have consistent frame counts
+            if total_frames_input != total_frames_depth:
+                logger.error(f"==> Frame count mismatch for {os.path.basename(video_path)} {task_settings['name']} pass: Input video has {total_frames_input} frames, Depth map has {total_frames_depth} frames. Skipping.")
+                if video_reader_input: del video_reader_input
+                if depth_reader_input: del depth_reader_input
+                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+            
+            return (video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width,
+                    video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info)
+
     def _load_config(self):
         """Loads configuration from config_splat.json."""
         config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
@@ -2365,7 +2932,6 @@ class SplatterGUI(ThemedTk):
         batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
         # self._save_debug_image(batch_depth_numpy_float, "01_GRAYSCALE", debug_batch_index, debug_frame_index, debug_task_name)
 
-
         # 2. Gamma Adjustment (Only in RAW mode, otherwise skipped)
         is_global_norm_active = (global_depth_min != 0.0 or global_depth_max != 1.0) and not (global_depth_min == 0.0 and global_depth_max == 0.0)
         
@@ -2388,7 +2954,6 @@ class SplatterGUI(ThemedTk):
                 batch_depth_numpy_float = final_normalized_gamma * max_raw_value
 
         # self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
-
 
         # --- 3. Dilate and Blur (Now applies to ALL) ---
         needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
@@ -2433,7 +2998,6 @@ class SplatterGUI(ThemedTk):
 
         # --- DEBUG SAVE 4: Final Processed Image ---
         # self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
-
 
         return batch_depth_numpy_float
 
@@ -2484,11 +3048,12 @@ class SplatterGUI(ThemedTk):
         anchor_source = video_specific_settings["anchor_source"]
         max_disp_source = video_specific_settings["max_disp_source"]
         gamma_source = video_specific_settings["gamma_source"]
+        map_source = video_specific_settings.get("map_source", "N/A")
         current_depth_gamma = video_specific_settings["depth_gamma"]
         current_depth_dilate_size_x = video_specific_settings["depth_dilate_size_x"] 
         current_depth_dilate_size_y = video_specific_settings["depth_dilate_size_y"] 
         current_depth_blur_size_x = video_specific_settings["depth_blur_size_x"]     
-        current_depth_blur_size_y = video_specific_settings["depth_blur_size_y"]     
+        current_depth_blur_size_y = video_specific_settings["depth_blur_size_y"]          
         
         if not processing_tasks:
             logger.debug(f"==> No processing tasks configured for {video_name}. Skipping.")
@@ -2536,12 +3101,25 @@ class SplatterGUI(ThemedTk):
 
             logger.debug(f"\n==> Starting {task['name']} pass for {video_name}")
             self.progress_queue.put(("status", f"Processing {task['name']} for {video_name}"))
-            
+
+            # Decide what to show in the Map field
+            if self.multi_map_var.get():
+                # Multi-Map mode
+                if actual_depth_map_path and map_source not in ("", "N/A"):
+                    map_folder = os.path.basename(os.path.dirname(actual_depth_map_path)).strip()
+                    map_label = f"{map_folder} ({map_source})"
+                else:
+                    map_label = "N/A"
+            else:
+                # Normal mode
+                map_label = "Direct file" if is_single_file_mode else "Direct folder"
+
             self.progress_queue.put(("update_info", {
                 "task_name": task['name'],
                 "convergence": f"{current_zero_disparity_anchor:.2f} ({anchor_source})",
                 "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})",
                 "gamma": f"{current_depth_gamma:.2f} ({gamma_source})",
+                "map": map_label,
             }))
 
             video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width, \
@@ -2818,10 +3396,8 @@ class SplatterGUI(ThemedTk):
         else:
             left_eye_tensor_resized = left_eye_tensor.cuda() # Use original res
 
-        
         logger.debug(f"Preview Params: {params}")
         logger.debug(f"Target Resolution: {W_target}x{H_target} (Low-Res: {is_low_res_preview})")
-
 
         # --- Process Depth Frame ---
         depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -2910,7 +3486,6 @@ class SplatterGUI(ThemedTk):
         actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * W_target
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
-
         with torch.no_grad():
             # Use the potentially resized Left Eye
             right_eye_tensor_raw, occlusion_mask = stereo_projector(left_eye_tensor_resized, disp_map_tensor)
@@ -2924,7 +3499,6 @@ class SplatterGUI(ThemedTk):
                 right_eye_tensor = self._fill_right_edge_occlusions(right_eye_tensor_left_filled, occlusion_mask, boundary_width_pixels=3)
             else:
                 right_eye_tensor = right_eye_tensor_raw
-
 
         # --- NEW: Update Info Frame for Preview (using Target resolution) ---
         current_source_dict = getattr(self.previewer, 'current_source', {})
@@ -2942,7 +3516,6 @@ class SplatterGUI(ThemedTk):
         self.processing_resolution_var.set(f"{W_target}x{H_target}")
         self.processing_frames_var.set(frames_display) 
         # --- END NEW: Update Info Frame for Preview ---
-
 
         # --- Select Output for Display ---
         self.previewer.set_preview_source_options([
@@ -3104,70 +3677,177 @@ class SplatterGUI(ThemedTk):
 
     def _run_batch_process(self, settings):
         """
-        The main batch processing orchestrator, run in a separate thread.
-        It manages the overall flow, progress bar, and calls _process_single_video_tasks.
-        """
-        self.after(0, self.clear_processing_info) # Clear info display at start
+        Batch processing entry point.
 
+        In multi-file mode:
+          - 'From' and 'To' are treated as 1-based indices into the *GUI list*
+            (self.previewer.video_list), i.e. the same numbers you see when
+            jumping between clips.
+        In single-file mode:
+          - The From/To fields are ignored and the single video is processed.
+        """
         try:
-            # --- 1. Setup and Initial Checks ---
-            input_videos, is_single_file_mode, finished_source_folder, finished_depth_folder = self._setup_batch_processing(settings)
+            # --- 1. Basic setup (folder paths, discovered videos, etc.) ---
+            setup_result = self._setup_batch_processing(settings)
+            if "error" in setup_result:
+                logger.error(setup_result["error"])
+                messagebox.showerror("Batch Processing Error", setup_result["error"])
+                return
+
+            input_videos = setup_result["input_videos"]
+            is_single_file_mode = setup_result["is_single_file_mode"]
+            finished_source_folder = setup_result["finished_source_folder"]
+            finished_depth_folder = setup_result["finished_depth_folder"]
 
             if not input_videos:
-                logger.error("No video files found or invalid input setup. Processing stopped.")
-                self.progress_queue.put("finished")
+                logger.error("No input videos found for processing.")
+                messagebox.showerror("Processing Error", "No input videos found for processing.")
                 return
 
-            # --- 2. Determine total tasks for progress bar ---
-            total_processing_tasks_count = 0
-            tasks_per_video = len(self._get_defined_tasks(settings))
-            
-            for video_path in input_videos:
-                video_specific_settings_check = self._get_video_specific_settings(
-                    video_path,
-                    settings["input_depth_maps"],
-                    settings["zero_disparity_anchor"],
-                    settings["max_disp"],
-                    is_single_file_mode
+            # --- 2. Apply From/To range on the *preview list* when available ---
+            # In single-file mode, we always process the one file and ignore From/To.
+            if not is_single_file_mode and hasattr(self, "previewer") and getattr(self.previewer, "video_list", None):
+                # The previewer list is what you see in the GUI (1/XXXX, 2/XXXX, ...).
+                available_entries = self.previewer.video_list
+                total_videos = len(available_entries)
+
+                # Defaults: full range
+                start_index_0 = 0           # 0-based
+                end_index_0 = total_videos  # exclusive
+
+                # Parse "From" (1-based in UI)
+                from_str = self.process_from_var.get().strip()
+                if from_str:
+                    try:
+                        from_val = int(from_str)
+                        if from_val > 0:
+                            # convert to 0-based, clamp to bounds
+                            start_index_0 = max(0, min(total_videos, from_val - 1))
+                    except ValueError:
+                        logger.warning(f"Invalid 'From' value '{from_str}', ignoring.")
+
+                # Parse "To" (1-based in UI, inclusive)
+                to_str = self.process_to_var.get().strip()
+                if to_str:
+                    try:
+                        to_val = int(to_str)
+                        if to_val > 0:
+                            # convert to exclusive end index, clamp, and ensure at least 1 video
+                            end_index_0 = max(start_index_0 + 1, min(total_videos, to_val))
+                    except ValueError:
+                        logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
+
+                # Log the range in GUI-style indices if we're not using the full list
+                if start_index_0 > 0 or end_index_0 < total_videos:
+                    logger.info(
+                        f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
+                        f"(out of {total_videos} total)"
+                    )
+
+                # Slice the preview list and build the actual video path list
+                selected_entries = available_entries[start_index_0:end_index_0]
+                sliced_videos = [
+                    entry.get("source_video")
+                    for entry in selected_entries
+                    if entry.get("source_video")
+                ]
+
+                input_videos = sliced_videos
+
+            else:
+                # Multi-file mode with no previewer/video_list: treat From/To as simple
+                # 1-based indices over the discovered input_videos list (old behavior).
+                # In *single-file* mode, we intentionally ignore From/To and leave
+                # input_videos unchanged so the current preview clip always runs.
+                if not is_single_file_mode:
+                    total_videos = len(input_videos)
+                    start_index_0 = 0
+                    end_index_0 = total_videos
+
+                    from_str = self.process_from_var.get().strip()
+                    if from_str:
+                        try:
+                            from_val = int(from_str)
+                            if from_val > 0:
+                                start_index_0 = max(0, min(total_videos, from_val - 1))
+                        except ValueError:
+                            logger.warning(f"Invalid 'From' value '{from_str}', ignoring.")
+
+                    to_str = self.process_to_var.get().strip()
+                    if to_str:
+                        try:
+                            to_val = int(to_str)
+                            if to_val > 0:
+                                end_index_0 = max(start_index_0 + 1, min(total_videos, to_val))
+                        except ValueError:
+                            logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
+
+                    if start_index_0 > 0 or end_index_0 < total_videos:
+                        logger.info(
+                            f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
+                            f"(out of {total_videos} total)"
+                        )
+                    input_videos = input_videos[start_index_0:end_index_0]
+                # else: single-file mode -> From/To boxes are ignored on purpose
+
+            # After applying the range, make sure we still have something to do
+            if not input_videos:
+                logger.error("No input videos left to process after applying From/To range.")
+                messagebox.showerror(
+                    "Processing Error",
+                    "No input videos left to process after applying the From/To range.",
                 )
-                if not video_specific_settings_check.get("error"):
-                    total_processing_tasks_count += tasks_per_video
-
-            if total_processing_tasks_count == 0:
-                logger.error("==> Error: No resolution output enabled or no valid video/depth pairs found. Processing stopped.")
-                self.progress_queue.put("finished")
                 return
 
-            self.progress_queue.put(("total", total_processing_tasks_count))
+            # --- 3. Determine total tasks for the progress bar ---
+            processing_tasks = self._get_defined_tasks(settings)
+            if not processing_tasks:
+                logger.error("No processing tasks defined. Please enable at least one output resolution.")
+                messagebox.showerror(
+                    "Processing Error",
+                    "No processing tasks defined. Please enable at least one output resolution.",
+                )
+                return
+
+            tasks_per_video = len(processing_tasks)
+            total_tasks = len(input_videos) * tasks_per_video
+            logger.info(
+                f"Total tasks to process: {total_tasks} "
+                f"({len(input_videos)} videos × {tasks_per_video} tasks each)"
+            )
+            self.progress_queue.put(("total", total_tasks))
+
             overall_task_counter = 0
 
-            # --- 3. Main Processing Loop ---
+            # --- 4. Main processing loop ---
             for idx, video_path in enumerate(input_videos):
                 if self.stop_event.is_set():
                     logger.info("==> Stopping processing due to user request")
                     break
 
-                # Call the new function for single-video processing
+                # Delegates all per-video work to the helper
                 tasks_processed, _ = self._process_single_video_tasks(
-                    video_path=video_path, 
-                    settings=settings, 
-                    initial_overall_task_counter=overall_task_counter, 
+                    video_path=video_path,
+                    settings=settings,
+                    initial_overall_task_counter=overall_task_counter,
                     is_single_file_mode=is_single_file_mode,
-                    # Pass the finished folders (only non-None in batch mode)
-                    finished_source_folder=finished_source_folder, 
-                    finished_depth_folder=finished_depth_folder
+                    finished_source_folder=finished_source_folder,
+                    finished_depth_folder=finished_depth_folder,
                 )
-                
-                # Update the overall counter based on the tasks completed in the helper
+
                 overall_task_counter += tasks_processed
 
-            # --- 4. Final Cleanup ---
         except Exception as e:
             logger.error(f"An unexpected error occurred during batch processing: {e}", exc_info=True)
             self.progress_queue.put(("status", f"Error: {e}"))
-            # FIX: Capture the exception message in the lambda's default argument
-            error_message = str(e) # Convert exception object to string once
-            self.after(0, lambda msg=error_message: messagebox.showerror("Processing Error", f"An unexpected error occurred during batch processing: {msg}"))
+            error_message = str(e)
+            self.after(
+                0,
+                lambda msg=error_message: messagebox.showerror(
+                    "Processing Error",
+                    f"An unexpected error occurred during batch processing: {msg}",
+                ),
+            )
         finally:
             release_cuda_memory()
             self.progress_queue.put("finished")
@@ -3302,6 +3982,7 @@ class SplatterGUI(ThemedTk):
                 "depth_blur_size_x": float(self.depth_blur_size_x_var.get()),
                 "depth_blur_size_y": float(self.depth_blur_size_y_var.get()),
                 "disable_depth_normalization": self.enable_autogain_var.get(),
+                "selected_depth_map": self.selected_depth_map_var.get(),
             }
         except ValueError:
             logger.error("Sidecar Save: Invalid input value in GUI. Skipping save.")
@@ -3379,7 +4060,6 @@ class SplatterGUI(ThemedTk):
         filename_npz = os.path.join(debug_dir_npz, f"{frame_index:05d}_B{batch_index:02d}_{filename_tag}.npz")
         logger.debug(f"Save path {filename_tag}")
 
-
         try:
             np.savez_compressed(filename_npz, data=data)
             logger.debug(f"Saved debug array {filename_tag} (Shape: {data.shape}) to {os.path.basename(debug_dir_npz)}")
@@ -3436,7 +4116,6 @@ class SplatterGUI(ThemedTk):
                 
                 # Special handling for labels whose colors might need adjusting if they are linked to entry/button states
                 # (Not needed for simple ttk styles, but left for reference)
-
 
         # --- 1. Top-level Frames ---
         
@@ -3518,8 +4197,19 @@ class SplatterGUI(ThemedTk):
         """
         Handles input path validation, mode determination (single file vs batch),
         and creates necessary 'finished' folders.
-        Returns: input_videos (list), is_single_file_mode (bool),
-                 finished_source_folder (str/None), finished_depth_folder (str/None)
+
+        Returns a dict:
+
+            {
+                "input_videos": [...],
+                "is_single_file_mode": bool,
+                "finished_source_folder": str or None,
+                "finished_depth_folder": str or None,
+            }
+
+        or, on error:
+
+            { "error": "message" }
         """
         input_source_clips_path = settings["input_source_clips"]
         input_depth_maps_path = settings["input_depth_maps"]
@@ -3536,15 +4226,19 @@ class SplatterGUI(ThemedTk):
         is_single_file_mode = False
 
         if is_source_file and is_depth_file:
+            # Single-file mode
             is_single_file_mode = True
-            logger.debug("==> Running in single file mode. Files will not be moved to 'finished' folders (unless specifically enabled in Single Process mode).")
+            logger.debug(
+                "==> Running in single file mode. Files will not be moved to "
+                "'finished' folders (unless specifically enabled in Single Process mode)."
+            )
             input_videos.append(input_source_clips_path)
             os.makedirs(output_splatted, exist_ok=True)
 
         elif is_source_dir and is_depth_dir:
+            # Batch (folder) mode
             logger.debug("==> Running in batch (folder) mode.")
 
-            # --- Check GUI Setting for Finished Folders ---
             if settings["move_to_finished"]:
                 finished_source_folder = os.path.join(input_source_clips_path, "finished")
                 finished_depth_folder = os.path.join(input_depth_maps_path, "finished")
@@ -3552,24 +4246,37 @@ class SplatterGUI(ThemedTk):
                 os.makedirs(finished_depth_folder, exist_ok=True)
                 logger.debug("Finished folders enabled for batch mode.")
             else:
-                logger.debug("Finished folders DISABLED by user setting. Files will remain in input folders.")
+                logger.debug(
+                    "Finished folders DISABLED by user setting. "
+                    "Files will remain in input folders."
+                )
 
             os.makedirs(output_splatted, exist_ok=True)
 
-            video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv')
+            video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
             for ext in video_extensions:
                 input_videos.extend(glob.glob(os.path.join(input_source_clips_path, ext)))
             input_videos = sorted(input_videos)
+
         else:
-            logger.error("==> Error: Input Source Clips and Input Depth Maps must both be either files or directories. Skipping processing.")
-            return [], False, None, None
+            msg = (
+                "==> Error: Input Source Clips and Input Depth Maps must both be "
+                "either files or directories. Skipping processing."
+            )
+            logger.error(msg)
+            return {"error": msg}
 
         if not input_videos:
-            logger.error(f"No video files found in {input_source_clips_path}")
-            return [], False, None, None
+            msg = f"No video files found in {input_source_clips_path}"
+            logger.error(msg)
+            return {"error": msg}
 
-        return input_videos, is_single_file_mode, finished_source_folder, finished_depth_folder
-    
+        return {
+            "input_videos": input_videos,
+            "is_single_file_mode": is_single_file_mode,
+            "finished_source_folder": finished_source_folder,
+            "finished_depth_folder": finished_depth_folder,
+        }
     def show_about(self):
         """Displays the 'About' message box."""
         message = (
@@ -3614,7 +4321,7 @@ class SplatterGUI(ThemedTk):
         text_frame.pack(expand=True, fill="both")
 
         # Apply theme colors to the Text widget
-        text_widget = tk.Text(text_frame, wrap=tk.WORD, relief="flat", borderwidth=0, padx=5, pady=5, font=("Segoe UI", 9),
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, relief="flat", borderwidth=0, padx=5, pady=1, font=("Segoe UI", 9),
                               bg=bg_color, fg=fg_color, insertbackground=fg_color)
         text_widget.insert(tk.END, guide_content)
         text_widget.config(state=tk.DISABLED) # Make it read-only
@@ -3628,7 +4335,7 @@ class SplatterGUI(ThemedTk):
         button_frame = ttk.Frame(guide_window, padding=(0, 0, 0, 10))
         button_frame.pack()
         ok_button = ttk.Button(button_frame, text="Close", command=guide_window.destroy)
-        ok_button.pack(pady=10)
+        ok_button.pack(pady=2)
 
     def start_processing(self):
         """Starts the video processing in a separate thread."""
@@ -3694,7 +4401,6 @@ class SplatterGUI(ThemedTk):
             if depth_blur_size_x_val < 0 or depth_blur_size_y_val < 0:
                 raise ValueError("Depth Blur Sizes (X/Y) must be non-negative.")
 
-
         except ValueError as e:
             self.status_label.config(text=f"Error: {e}")
             self.start_button.config(state="normal")
@@ -3738,7 +4444,7 @@ class SplatterGUI(ThemedTk):
         Starts processing for the single video currently loaded in the previewer.
         It runs the batch logic in single-file mode.
         """
-        
+
         # --- CRITICAL FIX: Explicitly disable slider widgets ---
         if hasattr(self, 'widgets_to_disable'):
             for widget in self.widgets_to_disable:
@@ -3753,7 +4459,7 @@ class SplatterGUI(ThemedTk):
         if current_index == -1:
             messagebox.showwarning("Process Single Clip", "No video is currently selected for processing.")
             return
-            
+
         # 1. Get the current single file paths
         current_source_dict = self.previewer.video_list[current_index]
         single_video_path = current_source_dict.get('source_video')
@@ -3940,6 +4646,17 @@ class SplatterGUI(ThemedTk):
         Reads the sidecar config for the given depth map path and updates the
         Convergence, Max Disparity, and Gamma sliders.
         """
+        # Clear suppression flag when opening a NEW video
+        # (Allow sidecar to load for the first time on new video)
+        # Get current source video to track video changes (not depth map changes)
+        current_source_video = None
+        if hasattr(self, 'previewer') and self.previewer and 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
+            current_source_video = self.previewer.video_list[self.previewer.current_video_index].get('source_video')
+
+        # Clear suppression flag when opening a NEW video (not when changing maps)
+        if current_source_video and current_source_video != getattr(self, '_last_loaded_source_video', None):
+            self._suppress_sidecar_map_update = False
+            self._last_loaded_source_video = current_source_video  # Track source video, not depth map
         if not self.update_slider_from_sidecar_var.get():
             logger.debug("update_gui_from_sidecar: Feature is toggled OFF. Skipping update.")
             return
@@ -3950,7 +4667,10 @@ class SplatterGUI(ThemedTk):
         # 1. Determine sidecar path
         depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
         sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-        json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
+        # Use base folder for sidecars when Multi-Map is enabled
+        sidecar_folder = self._get_sidecar_base_folder()
+        json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
+        logger.info(f"Looking for sidecar at: {json_sidecar_path}")
         
         if not os.path.exists(json_sidecar_path):
             logger.debug(f"update_gui_from_sidecar: No sidecar found at {json_sidecar_path}. Skipping update.")
@@ -3997,14 +4717,40 @@ class SplatterGUI(ThemedTk):
         disable_norm_state = sidecar_config.get("disable_depth_normalization", self.enable_autogain_var.get())
         self.enable_autogain_var.set(bool(disable_norm_state))
 
-        # --- Re-run all updaters to ensure all labels/sliders reflect the new values ---
-        if hasattr(self, 'slider_label_updaters'):
-             for updater in self.slider_label_updaters:
-                 updater()
+        # Selected Depth Map (for Multi-Map mode)
+        # Check if Multi-Map is enabled
+        logger.info(f"Multi-Map enabled: {self.multi_map_var.get()}")
+        if self.multi_map_var.get():
+            selected_map_val = sidecar_config.get("selected_depth_map", "")
+            if selected_map_val:
+                # Update the radio button selection
+                logger.info(f"selected_map_val from sidecar: '{selected_map_val}'")
+                logger.info(f"BEFORE SET: selected_depth_map_var = {self.selected_depth_map_var.get()}")
+                self.selected_depth_map_var.set(selected_map_val)
+                logger.info(f"AFTER SET: selected_depth_map_var = {self.selected_depth_map_var.get()}")
+                
+                # Just call the handler once, marking it as from_sidecar
+                try:
+                    self._on_map_selection_changed(from_sidecar=True)
+                    logger.info(f"Depth map selection restored from sidecar: {selected_map_val}")
+                except Exception as e:
+                    logger.error(f"Failed to apply sidecar map '{selected_map_val}': {e}")
+                # Do not allow sidecar to override manual click after this point
+                self._suppress_sidecar_map_update = True
 
+        # --- FIX: Refresh slider labels after restoring sidecar values ---
+        if hasattr(self, "slider_label_updaters"):
+            for updater in self.slider_label_updaters:
+                updater()
+
+        # --- Fix: resync processing queue depth map paths after refresh ---
+        if hasattr(self.previewer, "video_list") and hasattr(self, "resolution_output_list"):
+            for i, video_entry in enumerate(self.previewer.video_list):
+                if i < len(self.resolution_output_list):
+                    self.resolution_output_list[i].depth_map = video_entry.get("depth_map", None)
         # 4. Refresh preview to show the new values
         self.on_slider_release(None)
-    
+
     def _update_sidecar_button_text(self):
         """Checks if a sidecar exists for the current preview video and updates the button text."""
         is_sidecar_present = False
@@ -4016,8 +4762,8 @@ class SplatterGUI(ThemedTk):
             if depth_map_path:
                 depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
                 sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
-                json_sidecar_path = os.path.join(os.path.dirname(depth_map_path), f"{depth_map_basename}{sidecar_ext}")
-                
+                sidecar_folder = self._get_sidecar_base_folder()  # Use proper folder for multi-map mode
+                json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
                 is_sidecar_present = os.path.exists(json_sidecar_path)
         
         button_text = "Update Sidecar" if is_sidecar_present else "Create Sidecar"

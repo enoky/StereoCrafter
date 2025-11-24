@@ -6,6 +6,7 @@
     "input_depth_maps_folder": "Browse for a folder containing corresponding depth maps (e.g., video_name_depth.mp4/npz) for batch processing.",
     "input_depth_maps_file": "Select a single depth map file corresponding to the selected source video.",
     "output_splatted": "Path to the folder where the splatted output videos will be saved.",
+    "multi_map": "Enable Multi-Map mode to use subfolders within the Input Depth Maps folder. Each subfolder containing *_depth.mp4 files will appear as a selectable option. Sidecars are stored in a 'sidecars' subfolder.",
     
     "enable_full_res": "When checked, will generate a splatted video at the original resolution of the input video. Use this for blending over the inpaint.",
     "full_res_batch_size": "The number of frames to process simultaneously when generating the full-resolution output. A higher value uses more VRAM but can be faster. Adjust based on your GPU's memory. Too high a value will bog down ffmpeg encode.",
@@ -33,6 +34,8 @@
    
     "start_single_button": "Start performs the depth splatting on current preview clip.",
     "start_button": "Starts the batch processing: loads videos, depth maps, and performs the depth splatting.",
+    "process_from": "Optional: Enter a starting video number (1-based) to begin processing from that point in the list. Leave empty to start from the beginning.",
+    "process_to": "Optional: Enter an ending video number (1-based) to stop processing at that point in the list. Leave empty to process to the end.",
     "stop_button": "Stops the currently running processing task cleanly.",
     "preview_auto_converge": "Runs the Auto-Convergence pre-pass on the current preview clip. The calculated value overrides the Convergence Point slider. Requires Auto-Convergence Mode to be 'Average' or 'Peak'.",
     "update_sidecar_button": "Saves/Edit the current depth setting to the to the sidecar file for inpainting_gui to process."
