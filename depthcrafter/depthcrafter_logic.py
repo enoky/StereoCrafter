@@ -63,19 +63,10 @@ class DepthCrafterDemo:
         cpu_offload: Union[str, None] = "model", 
         use_cudnn_benchmark: bool = False, 
         local_files_only: bool = False, 
-        disable_xformers=False,
-        target_device_id: int = 0,
+        disable_xformers=False
     ):
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
-            # --- START: Set the Default CUDA Device for this instance ---
-            # This ensures all subsequent PyTorch/Diffusers calls default to this ID
-            # if they don't explicitly target another device.
-            if torch.cuda.is_available():
-                torch.cuda.set_device(target_device_id) 
-                _logger.debug(f"PyTorch default device set to cuda:{target_device_id}.")
-            # --- END: Set Default CUDA Device ---
-
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
                 unet_path,
                 low_cpu_mem_usage=True,
@@ -91,25 +82,19 @@ class DepthCrafterDemo:
             )
             # for saving memory, we can offload the model to CPU, or even run the model sequentially to save more memory
             
-            # --- MODIFIED CPU OFFLOAD LOGIC ---
-            # Now, all subsequent offload/to('cuda') calls will target the set device (0 or 1)
-            cpu_offload_lower = ""
-            if isinstance(cpu_offload, str):
-                 cpu_offload_lower = cpu_offload.lower()
+            cpu_offload_lower = cpu_offload
 
             if cpu_offload_lower == "sequential":
-                # Offload will target the device set by set_device(target_device_id)
-                self.pipe.enable_sequential_cpu_offload() 
-                _logger.info(f"CPU Offload set to 'sequential' (Target: cuda:{target_device_id}).")
+                self.pipe.enable_sequential_cpu_offload()
+                _logger.info("CPU Offload set to 'sequential'.")
             elif cpu_offload_lower == "model":
-                # Offload will target the device set by set_device(target_device_id)
                 self.pipe.enable_model_cpu_offload()
-                _logger.info(f"CPU Offload set to 'model' (Target: cuda:{target_device_id}).")
+                _logger.info("CPU Offload set to 'model'.")
             else:
-                # No offload: we explicitly send to the target_device_id
-                device_str = f"cuda:{target_device_id}" 
-                self.pipe.to(device_str) 
-                _logger.info(f"Model loaded entirely on {device_str}.")
+                # If the value is "none", "None", or any other unrecognized string/value
+                # (or the legacy string "None"), we default to full CUDA.
+                self.pipe.to("cuda") 
+                _logger.info(f"CPU Offload set to '{cpu_offload}' (unrecognized/None option). Model loaded entirely on CUDA.")
 
                 
             # Decide if xFormers should be enabled:
