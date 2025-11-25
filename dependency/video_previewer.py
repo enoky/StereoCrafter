@@ -155,7 +155,7 @@ class VideoPreviewer(ttk.Frame):
 
         # Scrubber Frame
         scrubber_frame = ttk.Frame(self)
-        scrubber_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=5)
+        scrubber_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
         scrubber_frame.grid_columnconfigure(1, weight=1)
 
         self.frame_label = ttk.Label(scrubber_frame, textvariable=self.frame_label_var, width=15)
@@ -168,7 +168,7 @@ class VideoPreviewer(ttk.Frame):
         
         # Video Navigation Frame
         preview_button_frame = ttk.Frame(self)
-        preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=5)
+        preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
         
         # Bindings are placed on the top-level window for global detection
         self.root_window.bind('<Left>', self._key_jump_frames, add='+')
@@ -217,7 +217,7 @@ class VideoPreviewer(ttk.Frame):
 
         
         # --- MODIFIED: Add Preview Size Combobox (Percentage Scale) ---
-        PERCENTAGE_VALUES = ["200%", "150%", "100%", "75%", "50%", "25%"]
+        PERCENTAGE_VALUES = ["200%", "150%", "115%", "110%", "105%", "100%", "95%", "90%", "85%", "80%", "75%", "50%", "25%"]
         
         lbl_preview_scale = ttk.Label(preview_button_frame, text="Preview Scale:")
         lbl_preview_scale.pack(side="left", padx=(20, 5))
@@ -740,6 +740,39 @@ class VideoPreviewer(ttk.Frame):
         self.preview_inner_frame.update_idletasks()
         self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
 
+    def replace_source_path_for_current_video(self, key: str, path: str):
+        """Replace the source path for the currently loaded video for `key` (e.g., 'depth_map').
+        This closes the old reader (if any), opens a new VideoReader for the given path (if exists),
+        updates the internal source_readers, and triggers an immediate preview update.
+        """
+        # Close previous reader if present
+        try:
+            old_reader = self.source_readers.get(key)
+            if old_reader is not None:
+                try:
+                    del old_reader
+                except Exception:
+                    pass
+                self.source_readers[key] = None
+            # Attempt to open new reader if path is a valid file
+            if isinstance(path, str) and path and os.path.exists(path):
+                try:
+                    new_reader = VideoReader(path, ctx=cpu(0))
+                    self.source_readers[key] = new_reader
+                except Exception as e:
+                    logger.error(f"replace_source_path_for_current_video: failed to open {path}: {e}")
+                    self.source_readers[key] = None
+            else:
+                # Path invalid or missing - set None
+                self.source_readers[key] = None
+        except Exception as e:
+            logger.exception(f"Error replacing source reader for key '{key}': {e}")
+        # Force an immediate preview refresh using the new reader
+        try:
+            self.update_preview()
+        except Exception as e:
+            logger.exception(f"Error updating preview after replacing source path: {e}")
+            
     def _wiggle_step(self, show_left: bool):
         """A single step in the wigglegram animation."""
         if not hasattr(self, 'wiggle_left_tk'): return # Stop if resources were cleared
