@@ -651,6 +651,16 @@ class MergingGUI(ThemedTk):
         if folder:
             var.set(folder)
 
+    def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
+        """Scans a folder for a file matching the core_name with any common video extension."""
+        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm')
+        for ext in video_extensions:
+            # Check for the exact core_name followed by an extension
+            full_path = os.path.join(folder, f"{core_name}{ext[1:]}") # [1:] removes the '*'
+            if os.path.exists(full_path):
+                return full_path
+        return None
+
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
         # This now just collects parameters and sends them to the previewer module.
@@ -939,15 +949,18 @@ class MergingGUI(ThemedTk):
                 # --- FIX: Determine original_reader based on input type ---
                 original_reader = None # Assume None initially
                 if is_dual_input: # splatted2
-                    original_video_path = os.path.join(settings["original_folder"], f"{core_name}.mp4")
+                    # --- MODIFIED: Use helper to find original video with any extension ---
+                    original_video_path = self._find_video_by_core_name(settings["original_folder"], core_name)
                     original_video_path_to_move = original_video_path # Track for moving later
-                    if os.path.exists(original_video_path):
+                    
+                    if original_video_path and os.path.exists(original_video_path):
                         logger.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
                         original_reader = VideoReader(original_video_path, ctx=cpu(0))
                     else:
-                        logger.warning(f"Original video not found for dual-input mode: '{original_video_path}'.")
+                        logger.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
                         logger.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
                 else: # splatted4 (quad)
+                    
                     # For quad-splatted files, the splatted file itself is the source for the left eye.
                     # We can use the splatted_reader as a placeholder to indicate a valid left-eye source exists.
                     original_reader = splatted_reader
@@ -1312,12 +1325,13 @@ class MergingGUI(ThemedTk):
                 splatted_path = splatted2_matches[0]
                 logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted_path)}")
                 source_dict['splatted'] = splatted_path
-                original_path = os.path.join(self.original_folder_var.get(), f"{core_name}.mp4")
-                if os.path.exists(original_path):
+                original_path = self._find_video_by_core_name(self.original_folder_var.get(), core_name)
+                
+                if original_path:
                     logger.debug(f"  - Found matching original video: {os.path.basename(original_path)}")
                     source_dict['original'] = original_path
                 else:
-                    logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{os.path.basename(original_path)}' was not found. It will be treated as optional.")
+                    logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{core_name}.*' was not found. It will be treated as optional.")
             else:
                 logger.warning(f"Preview Scan: Skipping '{base_name}'. No matching splatted file found in '{mask_folder}'.")
                 continue # Skip to the next video if no splatted file is found
