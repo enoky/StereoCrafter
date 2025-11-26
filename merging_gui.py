@@ -21,11 +21,11 @@ from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     release_cuda_memory, set_util_logger_level, encode_frames_to_mp4,
     read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer,
-    create_single_slider_with_label_updater
+    create_single_slider_with_label_updater, apply_dubois_anaglyph, apply_optimized_anaglyph
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-30.1"
+GUI_VERSION = "25-11-26.2"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -1388,11 +1388,20 @@ class MergingGUI(ThemedTk):
                 is_dual_input = True # For clarity
 
             # Configure preview source dropdown based on input type
-            preview_options = ["Blended Image", "Original (Left Eye)", "Warped (Right BG)", "Processed Mask", "Anaglyph 3D", "Wigglegram"]
+            preview_options = [
+                "Blended Image", 
+                "Original (Left Eye)", 
+                "Warped (Right BG)", 
+                "Inpainted Right Eye", # <--- ADDED INPAINTED
+                "Processed Mask", 
+                "Anaglyph 3D", 
+                "Dubois Anaglyph",      # <--- ADDED ANAGLYPH
+                "Optimized Anaglyph",   # <--- ADDED ANAGLYPH
+                "Wigglegram"
+            ]            
             if not is_dual_input: # Depth map is only in quad-splatted files
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
-
 
             # Convert mask to grayscale
             mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -1439,6 +1448,9 @@ class MergingGUI(ThemedTk):
             if preview_source == "Blended Image":
                 logger.debug("  -> Displaying Blended Image.")
                 final_frame_4d = blended_frame
+            elif preview_source == "Inpainted Right Eye": # <--- ADDED INPAINTED
+                logger.debug("  -> Displaying Inpainted Right Eye.")
+                final_frame_4d = inpainted
             elif preview_source == "Original (Left Eye)":
                 logger.debug("  -> Displaying Original (Left Eye).")
                 # --- FIX: Handle missing original_tensor for quad input ---
@@ -1456,14 +1468,27 @@ class MergingGUI(ThemedTk):
                 logger.debug("  -> Displaying Processed Mask.")
                 final_frame_4d = processed_mask.repeat(1, 3, 1, 1) # Convert grayscale mask to 3-channel for display
             elif preview_source == "Anaglyph 3D":
-                logger.debug("  -> Displaying Anaglyph 3D.")
-                left_gray_np = cv2.cvtColor((original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                logger.debug(" -> Displaying Anaglyph 3D.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY) # Use standard for old red/cyan
                 anaglyph_np = right_np.copy()
                 anaglyph_np[:, :, 0] = left_gray_np # Red channel from grayscale left eye
                 final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            elif preview_source == "Dubois Anaglyph":
+                logger.debug(" -> Displaying Dubois Anaglyph.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_dubois_anaglyph(left_np, right_np) # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            elif preview_source == "Optimized Anaglyph":
+                logger.debug(" -> Displaying Optimized Anaglyph.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_optimized_anaglyph(left_np, right_np) # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
             elif preview_source == "Wigglegram":
-                logger.debug("  -> Starting Wigglegram animation.")
+                logger.debug(" -> Starting Wigglegram animation.")
                 self.previewer._start_wigglegram_animation(original_left, blended_frame)
                 return None # Wigglegram handles its own display
             elif preview_source == "Depth Map" and depth_map_vis is not None:
