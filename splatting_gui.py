@@ -1084,6 +1084,22 @@ class SplatterGUI(ThemedTk):
         self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
 
+        # Set the preview options ONCE at startup
+        self.previewer.preview_source_combo['values'] = [
+            "Splat Result",
+            "Splat Result(Low)",
+            "Occlusion Mask",
+            "Occlusion Mask(Low)",
+            "Original (Left Eye)",
+            "Depth Map",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Wigglegram",
+        ]
+        if not self.preview_source_var.get():
+            self.preview_source_var.set("Splat Result")
+
         # --- NEW: MAIN LAYOUT CONTAINER (Holds Settings Left and Info Right) ---
         self.main_layout_frame = ttk.Frame(self)
         self.main_layout_frame.pack(pady=2, padx=10, fill="x")
@@ -1879,6 +1895,70 @@ class SplatterGUI(ThemedTk):
             logger.debug("Skipping output sidecar creation: High-resolution output does not require spsidecar.")
                     
         return True
+
+    def _apply_dubois_anaglyph(self, left_rgb_np, right_rgb_np):
+        """Apply Dubois least-squares anaglyph transformation with proper channel separation."""
+        left_float = left_rgb_np.astype(np.float32) / 255.0
+        right_float = right_rgb_np.astype(np.float32) / 255.0
+        
+        # Dubois red-cyan matrices with proper channel separation
+        # Left eye -> Red channel (primarily)
+        left_matrix = np.array([
+            [ 0.456,  0.500,  0.176],  # Left contributes to Red
+            [-0.040, -0.038, -0.016],  # Left minimal to Green
+            [-0.015, -0.021, -0.005]   # Left minimal to Blue
+        ], dtype=np.float32)
+        
+        # Right eye -> Green and Blue channels (primarily)
+        right_matrix = np.array([
+            [-0.043, -0.088, -0.002],  # Right minimal to Red
+            [ 0.378,  0.734, -0.018],  # Right contributes to Green
+            [-0.072, -0.113,  1.226]   # Right contributes to Blue
+        ], dtype=np.float32)
+        
+        H, W = left_float.shape[:2]
+        left_flat = left_float.reshape(-1, 3)
+        right_flat = right_float.reshape(-1, 3)
+        
+        left_transformed = np.dot(left_flat, left_matrix.T)
+        right_transformed = np.dot(right_flat, right_matrix.T)
+        
+        anaglyph_flat = np.clip(left_transformed + right_transformed, 0.0, 1.0)
+        anaglyph_rgb = anaglyph_flat.reshape(H, W, 3)
+        
+        return (anaglyph_rgb * 255.0).astype(np.uint8)
+
+    def _apply_optimized_anaglyph(self, left_rgb_np, right_rgb_np):
+        """Optimized anaglyph with minimal retinal rivalry and reduced ghosting."""
+        left_float = left_rgb_np.astype(np.float32) / 255.0
+        right_float = right_rgb_np.astype(np.float32) / 255.0
+        
+        # Optimized matrices for minimal eye strain
+        # Left eye -> Red channel (weighted from green and blue)
+        left_matrix = np.array([
+            [ 0.0,  0.7,  0.3],   # Left contributes to Red (G+B weighted)
+            [ 0.0,  0.0,  0.0],   # No green
+            [ 0.0,  0.0,  0.0]    # No blue
+        ], dtype=np.float32)
+        
+        # Right eye -> Green and Blue channels (full color)
+        right_matrix = np.array([
+            [ 0.0,  0.0,  0.0],   # No red
+            [ 0.0,  1.0,  0.0],   # Full green from right
+            [ 0.0,  0.0,  1.0]    # Full blue from right
+        ], dtype=np.float32)
+        
+        H, W = left_float.shape[:2]
+        left_flat = left_float.reshape(-1, 3)
+        right_flat = right_float.reshape(-1, 3)
+        
+        left_transformed = np.dot(left_flat, left_matrix.T)
+        right_transformed = np.dot(right_flat, right_matrix.T)
+        
+        anaglyph_flat = np.clip(left_transformed + right_transformed, 0.0, 1.0)
+        anaglyph_rgb = anaglyph_flat.reshape(H, W, 3)
+        
+        return (anaglyph_rgb * 255.0).astype(np.uint8)
 
     def _determine_auto_convergence(self, depth_map_path: str, total_frames_to_process: int, batch_size: int, fallback_value: float) -> Tuple[float, float]:
         """
@@ -3517,18 +3597,6 @@ class SplatterGUI(ThemedTk):
         self.processing_frames_var.set(frames_display) 
         # --- END NEW: Update Info Frame for Preview ---
 
-        # --- Select Output for Display ---
-        self.previewer.set_preview_source_options([
-            "Splat Result",
-            "Splat Result(Low)",
-            "Occlusion Mask",
-            "Occlusion Mask(Low)",
-            "Original (Left Eye)",
-            "Depth Map", 
-            "Anaglyph 3D", 
-            "Wigglegram",
-        ])
-
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor.cpu()
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
@@ -3559,6 +3627,16 @@ class SplatterGUI(ThemedTk):
             left_gray_np = cv2.cvtColor(left_np_anaglyph, cv2.COLOR_RGB2GRAY)
             anaglyph_np = right_np_anaglyph.copy()
             anaglyph_np[:, :, 0] = left_gray_np
+            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+        elif preview_source == "Dubois Anaglyph":
+            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = self._apply_dubois_anaglyph(left_np_anaglyph, right_np_anaglyph)
+            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+        elif preview_source == "Optimized Anaglyph":
+            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = self._apply_optimized_anaglyph(left_np_anaglyph, right_np_anaglyph)
             final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
         elif preview_source == "Wigglegram":
             # Pass the resized left eye and the splatted right eye
