@@ -79,7 +79,6 @@ class SidecarConfigManager:
         "depth_dilate_size_y": (float, 0.0),
         "depth_blur_size_x": (float, 0.0),
         "depth_blur_size_y": (float, 0.0),
-        "disable_depth_normalization": (bool, False),
         "selected_depth_map": (str, ""),
         # Add future keys here
     }
