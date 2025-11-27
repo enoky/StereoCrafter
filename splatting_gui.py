@@ -43,7 +43,7 @@ from dependency.stereocrafter_util import (
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
     start_ffmpeg_pipe_process, custom_blur, custom_dilate,
     create_single_slider_with_label_updater, create_dual_slider_layout,
-    SidecarConfigManager
+    SidecarConfigManager, apply_dubois_anaglyph, apply_optimized_anaglyph
 )
 try:
     from Forward_Warp import forward_warp
@@ -53,7 +53,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-28.1"
+GUI_VERSION = "25-11-26.2"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -342,6 +342,8 @@ class SplatterGUI(ThemedTk):
         self._is_auto_conv_running = False 
         self.slider_label_updaters = [] 
         self.set_convergence_value_programmatically = None
+        self._clip_norm_cache: Dict[str, Tuple[float, float]] = {} 
+        self._gn_warning_shown: bool = False
 
         self._load_config()
         self._load_help_texts()
@@ -379,7 +381,7 @@ class SplatterGUI(ThemedTk):
         self.batch_size_var = tk.StringVar(value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"]))
         
         self.dual_output_var = tk.BooleanVar(value=self.app_config.get("dual_output", False))
-        self.enable_autogain_var = tk.BooleanVar(value=self.app_config.get("enable_autogain", False)) 
+        self.enable_global_norm_var = tk.BooleanVar(value=self.app_config.get("enable_global_norm", False)) 
         self.enable_full_res_var = tk.BooleanVar(value=self.app_config.get("enable_full_resolution", True))
         self.enable_low_res_var = tk.BooleanVar(value=self.app_config.get("enable_low_resolution", True))
         self.pre_res_width_var = tk.StringVar(value=self.app_config.get("pre_res_width", "1024"))
@@ -606,6 +608,62 @@ class SplatterGUI(ThemedTk):
         file_path = filedialog.askopenfilename(initialdir=initial_dir, filetypes=filetypes_list)
         if file_path:
             var.set(file_path)
+
+    def _compute_clip_global_depth_stats(self, depth_map_path: str, chunk_size: int = 100) -> Tuple[float, float]:
+        """
+        [NEW HELPER] Computes the global min and max depth values from a depth video 
+        by reading it in chunks. Used only for the preview's GN cache.
+        """
+        logger.info(f"==> Starting clip-local depth stats pre-pass for {os.path.basename(depth_map_path)}...")
+        global_min, global_max = np.inf, -np.inf
+
+        try:
+            temp_reader = VideoReader(depth_map_path, ctx=cpu(0))
+            total_frames = len(temp_reader)
+            
+            if total_frames == 0:
+                 logger.error("Depth reader found 0 frames for global stats.")
+                 return 0.0, 1.0 # Fallback
+
+            for i in range(0, total_frames, chunk_size):
+                if self.stop_event.is_set():
+                    logger.warning("Global stats scan stopped by user.")
+                    return 0.0, 1.0
+                    
+                current_indices = list(range(i, min(i + chunk_size, total_frames)))
+                chunk_numpy_raw = temp_reader.get_batch(current_indices).asnumpy()
+                
+                # Handle RGB vs Grayscale depth maps
+                if chunk_numpy_raw.ndim == 4:
+                    if chunk_numpy_raw.shape[-1] == 3: # RGB
+                        chunk_numpy = chunk_numpy_raw.mean(axis=-1)
+                    else: # Grayscale with channel dim
+                        chunk_numpy = chunk_numpy_raw.squeeze(-1)
+                else:
+                    chunk_numpy = chunk_numpy_raw
+                
+                chunk_min = chunk_numpy.min()
+                chunk_max = chunk_numpy.max()
+                
+                if chunk_min < global_min:
+                    global_min = chunk_min
+                if chunk_max > global_max:
+                    global_max = chunk_max
+                
+                # Skip progress bar for speed, use console log if needed
+
+            logger.info(f"==> Clip-local depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
+            
+            # Cache the result before returning
+            self._clip_norm_cache[depth_map_path] = (float(global_min), float(global_max))
+            
+            return float(global_min), float(global_max)
+
+        except Exception as e:
+            logger.error(f"Error during clip-local depth stats scan for preview: {e}")
+            return 0.0, 1.0 # Fallback
+        finally:
+             gc.collect()
 
     def _on_multi_map_toggle(self):
         """Called when Multi-Map checkbox is toggled."""
@@ -1084,6 +1142,22 @@ class SplatterGUI(ThemedTk):
         self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
 
+        # Set the preview options ONCE at startup
+        self.previewer.preview_source_combo['values'] = [
+            "Splat Result",
+            "Splat Result(Low)",
+            "Occlusion Mask",
+            "Occlusion Mask(Low)",
+            "Original (Left Eye)",
+            "Depth Map",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Wigglegram",
+        ]
+        if not self.preview_source_var.get():
+            self.preview_source_var.set("Splat Result")
+
         # --- NEW: MAIN LAYOUT CONTAINER (Holds Settings Left and Info Right) ---
         self.main_layout_frame = ttk.Frame(self)
         self.main_layout_frame.pack(pady=2, padx=10, fill="x")
@@ -1286,22 +1360,22 @@ class SplatterGUI(ThemedTk):
         # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
         setter_func_conv = create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Convergence:",
-            self.zero_disparity_anchor_var, 0.0, 1.0, all_settings_row, decimals=2,
+            self.zero_disparity_anchor_var, 0.0, 2.0, all_settings_row, decimals=2, # Range changed to 2.0
             tooltip_key="convergence_point",
             )
         self.set_convergence_value_programmatically = setter_func_conv 
         
         all_settings_row += 1
         
-        # Autogain Checkbox (MOVED FROM OUTPUT FRAME, placed in column 2/3)
-        self.autogain_checkbox = ttk.Checkbutton(
-            self.depth_all_settings_frame, text="Disable Normalization",
-            variable=self.enable_autogain_var,
+        # --- RENAMED/REPURPOSED CHECKBOX ---
+        self.global_norm_checkbox = ttk.Checkbutton(
+            self.depth_all_settings_frame, text="Enable Global Normalization",
+            variable=self.enable_global_norm_var, # New variable name
             command=lambda: self.on_slider_release(None),
             width=28
             )
-        self.autogain_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
-        self._create_hover_tooltip(self.autogain_checkbox, "no_normalization")   
+        self.global_norm_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
+        self._create_hover_tooltip(self.global_norm_checkbox, "enable_global_normalization") 
 
         all_settings_row += 1
         
@@ -2348,7 +2422,7 @@ class SplatterGUI(ThemedTk):
             "depth_gamma": self.depth_gamma_var.get(),
             "max_disp": self.max_disp_var.get(),
             "convergence_point": self.zero_disparity_anchor_var.get(),
-            "enable_autogain": self.enable_autogain_var.get(),
+            "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "move_to_finished": self.move_to_finished_var.get(),
         }
         return config
@@ -2367,13 +2441,12 @@ class SplatterGUI(ThemedTk):
                 "max_disp": float(self.max_disp_var.get()),
                 "convergence_point": float(self.zero_disparity_anchor_var.get()),
                 "depth_gamma": float(self.depth_gamma_var.get()),
-                # --- CRITICAL FIX: Use safe_float_conversion for fractional settings ---
                 "depth_dilate_size_x": safe_float_conversion(self.depth_dilate_size_x_var),
                 "depth_dilate_size_y": safe_float_conversion(self.depth_dilate_size_y_var),
                 "depth_blur_size_x": safe_float_conversion(self.depth_blur_size_x_var),
                 "depth_blur_size_y": safe_float_conversion(self.depth_blur_size_y_var),
                 "preview_size": self.preview_size_var.get(),
-                "enable_autogain": self.enable_autogain_var.get(),
+                "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             }
         except (ValueError, tk.TclError) as e:
             logger.error(f"Invalid preview setting value: {e}")
@@ -2616,7 +2689,17 @@ class SplatterGUI(ThemedTk):
             map_source = "Sidecar" if sidecar_exists else "GUI/Default"
         else:
             map_source = "N/A"
-
+            
+        # --- NEW: Determine Global Normalization Policy ---
+        enable_global_norm_policy = self.enable_global_norm_var.get()
+        if sidecar_exists:
+            # Policy: If a sidecar exists, GN is DISABLED (manual mode)
+            enable_global_norm_policy = False
+            logger.debug(f"GN Policy: Sidecar exists for {video_name}. GN forced OFF.")
+        
+        # Determine the source for GN info
+        gn_source = "Sidecar" if sidecar_exists else ("GUI/ON" if enable_global_norm_policy else "GUI/OFF")
+        
         settings = {
             "actual_depth_map_path": actual_depth_map_path,
             "convergence_plane": merged_config.get("convergence_plane", gui_config["convergence_plane"]),
@@ -2634,6 +2717,8 @@ class SplatterGUI(ThemedTk):
             "max_disp_source": "Sidecar" if sidecar_exists else "GUI/Default",
             "gamma_source": "Sidecar" if sidecar_exists else "GUI/Default",
             "map_source": map_source,
+            "enable_global_norm": enable_global_norm_policy, 
+            "gn_source": gn_source,
         }
 
         # If no sidecar file exists at all, enforce GUI values explicitly
@@ -2717,8 +2802,21 @@ class SplatterGUI(ThemedTk):
         config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
         # --- MODIFIED: Use the new dictionary constant ---
         if os.path.exists(config_filename):
-            with open(config_filename, "r") as f:
-                self.app_config = json.load(f)
+            try:
+                with open(config_filename, "r") as f:
+                    self.app_config = json.load(f)
+                
+                # --- BACKWARD COMPATIBILITY FIX: Handle the old 'enable_autogain' key ---
+                # Old meaning: True = Raw Input / Disable Normalization (GN OFF)
+                # New meaning: True = Enable Global Normalization (GN ON)
+                if "enable_autogain" in self.app_config:
+                    old_value = self.app_config.pop("enable_autogain") # Remove old key
+                    # New value is the inverse of the old value
+                    self.app_config["enable_global_norm"] = not bool(old_value)
+                # --- END FIX ---
+            except Exception as e:
+                logger.error(f"Failed to load config file: {e}. Using defaults.")
+                self.app_config = {}
 
     def _load_help_texts(self):
         """Loads help texts from a JSON file."""
@@ -3062,6 +3160,23 @@ class SplatterGUI(ThemedTk):
         # --- Auto-Convergence Logic (BEFORE initializing readers) ---
         auto_conv_mode = settings["auto_convergence_mode"]
 
+        # --- NEW: Global Normalization Policy variables ---
+        enable_global_norm_policy = video_specific_settings["enable_global_norm"]
+        gn_source = video_specific_settings["gn_source"]
+
+        if video_specific_settings["sidecar_found"] and self.enable_global_norm_var.get():
+             # Policy: Sidecar exists AND GUI toggle is ON. Policy forces GN OFF.
+             if not self._gn_warning_shown:
+                 messagebox.showwarning(
+                    "GN Policy Warning", 
+                    f"Sidecar found for '{video_name}'.\n"
+                    f"Global Normalization is DISABLED for this clip, overriding the GUI setting.\n"
+                    f"Further warnings will be logged to console only."
+                 )
+                 self._gn_warning_shown = True # Set flag to log to console only next time
+             else:
+                  logger.warning(f"GN Policy: Sidecar found for {video_name}. GN forced OFF (console log only).")
+
         # --- NEW LOGIC: Sidecar overrides Auto-Convergence ---
         if anchor_source == "Sidecar" and auto_conv_mode != "Off":
             logger.info(f"Sidecar found for {video_name}. Convergence Point locked to Sidecar value ({current_zero_disparity_anchor:.4f}). Auto-Convergence SKIPPED.")
@@ -3138,9 +3253,10 @@ class SplatterGUI(ThemedTk):
                 release_cuda_memory()
                 continue
 
-            assume_raw_input_mode = settings["enable_autogain"] 
+            # --- MODIFIED: Use the policy to determine the mode ---
+            assume_raw_input_mode = not enable_global_norm_policy # If GN is OFF, assume RAW Input
             global_depth_min = 0.0 
-            global_depth_max = 1.0 
+            global_depth_max = 1.0
 
             # --- UNCONDITIONAL Max Content Value Scan for RAW/Normalization Modes ---
             max_content_value = 1.0 
@@ -3409,9 +3525,41 @@ class SplatterGUI(ThemedTk):
         if max_raw_content_value < 1.0: 
             max_raw_content_value = 1.0 # Fallback for already 0-1 normalized content
 
-        # Determine the scaling factor
+        # --- NEW: Get Global Normalization Policy for Preview (Sidecar check) ---
+        enable_global_norm = params.get("enable_global_norm", False)
+        
+        # Policy Check: Sidecar existence forces GN OFF
+        sidecar_exists = False
+        if depth_map_path:
+             sidecar_folder = self._get_sidecar_base_folder()
+             depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
+             sidecar_ext = self.APP_CONFIG_DEFAULTS['SIDECAR_EXT']
+             json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
+             sidecar_exists = os.path.exists(json_sidecar_path)
+
+        if sidecar_exists:
+            # Policy: If sidecar exists, GN is forced OFF
+            enable_global_norm = False
+            
+        # --- NEW: Determine Global Min/Max from cache if GN is ON ---
+        global_min, global_max = 0.0, 1.0
+        
+        if enable_global_norm and depth_map_path:
+            if depth_map_path not in self._clip_norm_cache:
+                # --- CACHE MISS: Run the slow scan synchronously ---
+                logger.info(f"Preview GN: Cache miss for {os.path.basename(depth_map_path)}. Running clip-local scan...")
+                global_min, global_max = self._compute_clip_global_depth_stats(depth_map_path)
+            else:
+                # --- CACHE HIT: Use cached values ---
+                global_min, global_max = self._clip_norm_cache[depth_map_path]
+                logger.debug(f"Preview GN: Cache hit for {os.path.basename(depth_map_path)}. Min/Max: {global_min:.3f}/{global_max:.3f}")
+                
+        # --- END NEW CACHE LOGIC ---
+
+        # Determine the scaling factor (Only relevant for MANUAL/RAW mode)
         final_scaling_factor = 1.0
-        if params['enable_autogain']:
+        
+        if not enable_global_norm: # MANUAL/RAW INPUT MODE
             if max_raw_content_value <= 256.0 and max_raw_content_value > 1.0:
                 final_scaling_factor = 255.0
             elif max_raw_content_value > 256.0 and max_raw_content_value <= 1024.0:
@@ -3420,8 +3568,11 @@ class SplatterGUI(ThemedTk):
                 final_scaling_factor = 65535.0
             else:
                 final_scaling_factor = 1.0 
-        else:
-            final_scaling_factor = 1.0 # Normalization enabled path doesn't need scaling here
+        else: # GLOBAL NORMALIZATION MODE
+            # Use the global max from the cache/scan as the "max value" for scaling (only to correctly apply pre-processing if needed)
+            final_scaling_factor = max(global_max, 1e-5) 
+        
+        logger.debug(f"Preview: GN={enable_global_norm}. Final Scaling Factor for Pre-Proc: {final_scaling_factor:.3f}")
 
         depth_numpy_processed = self._process_depth_batch(
             batch_depth_numpy_raw=np.expand_dims(depth_numpy_raw, axis=0),
@@ -3441,19 +3592,21 @@ class SplatterGUI(ThemedTk):
         # 2. Normalize based on the 'enable_autogain' (Disable Normalization) setting
         depth_normalized = depth_numpy_processed.squeeze(0)
 
-        if params['enable_autogain']:
-            # RAW INPUT MODE: Normalize by the determined scaling factor
+        if not enable_global_norm:
+            # MANUAL/RAW INPUT MODE: Normalize by the determined scaling factor
             depth_normalized = depth_normalized / final_scaling_factor
             logger.debug(f"Preview: Applied raw scaling by {final_scaling_factor:.2f}")
         else:
-            # NORMALIZATION ENABLED: Perform min/max normalization on the processed result
-            min_val, max_val = depth_numpy_processed.min(), depth_numpy_processed.max()
-            if max_val > min_val:
-                depth_normalized = (depth_numpy_processed.squeeze(0) - min_val) / (max_val - min_val)
+            # GLOBAL NORMALIZATION MODE: Perform min/max normalization using the clip's global range
+            min_val, max_val = global_min, global_max
+            depth_range = max_val - min_val
+            
+            if depth_range > 1e-5:
+                depth_normalized = (depth_numpy_processed.squeeze(0) - min_val) / depth_range
             else:
                 depth_normalized = np.zeros_like(depth_numpy_processed.squeeze(0))
             
-            # Apply gamma AFTER normalization for the Global Norm path (as skipped in helper)
+            # Apply gamma AFTER normalization
             if round(params['depth_gamma'], 2) != 1.0:
                 
                 gamma_val = params['depth_gamma']
@@ -3517,18 +3670,6 @@ class SplatterGUI(ThemedTk):
         self.processing_frames_var.set(frames_display) 
         # --- END NEW: Update Info Frame for Preview ---
 
-        # --- Select Output for Display ---
-        self.previewer.set_preview_source_options([
-            "Splat Result",
-            "Splat Result(Low)",
-            "Occlusion Mask",
-            "Occlusion Mask(Low)",
-            "Original (Left Eye)",
-            "Depth Map", 
-            "Anaglyph 3D", 
-            "Wigglegram",
-        ])
-
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor.cpu()
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
@@ -3559,6 +3700,16 @@ class SplatterGUI(ThemedTk):
             left_gray_np = cv2.cvtColor(left_np_anaglyph, cv2.COLOR_RGB2GRAY)
             anaglyph_np = right_np_anaglyph.copy()
             anaglyph_np[:, :, 0] = left_gray_np
+            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+        elif preview_source == "Dubois Anaglyph":
+            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = apply_dubois_anaglyph(left_np_anaglyph, right_np_anaglyph)
+            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+        elif preview_source == "Optimized Anaglyph":
+            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = apply_optimized_anaglyph(left_np_anaglyph, right_np_anaglyph)
             final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
         elif preview_source == "Wigglegram":
             # Pass the resized left eye and the splatted right eye
@@ -3591,7 +3742,7 @@ class SplatterGUI(ThemedTk):
         self.pre_res_height_var.set("1080")
         self.low_res_batch_size_var.set("50")
         self.dual_output_var.set(False)
-        self.enable_autogain_var.set(False) # Default: Global Depth Normalization
+        self.enable_global_norm_var.set(False)
         self.zero_disparity_anchor_var.set("0.5")
         self.output_crf_var.set("23")        
         self.move_to_finished_var.set(True)
@@ -3981,7 +4132,6 @@ class SplatterGUI(ThemedTk):
                 "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
                 "depth_blur_size_x": float(self.depth_blur_size_x_var.get()),
                 "depth_blur_size_y": float(self.depth_blur_size_y_var.get()),
-                "disable_depth_normalization": self.enable_autogain_var.get(),
                 "selected_depth_map": self.selected_depth_map_var.get(),
             }
         except ValueError:
@@ -4277,6 +4427,7 @@ class SplatterGUI(ThemedTk):
             "finished_source_folder": finished_source_folder,
             "finished_depth_folder": finished_depth_folder,
         }
+    
     def show_about(self):
         """Displays the 'About' message box."""
         message = (
@@ -4421,7 +4572,7 @@ class SplatterGUI(ThemedTk):
             "low_res_batch_size": int(self.low_res_batch_size_var.get()),
             "dual_output": self.dual_output_var.get(),
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
-            "enable_autogain": self.enable_autogain_var.get(),
+            "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "match_depth_res": True,
             "move_to_finished": self.move_to_finished_var.get(),
             "output_crf": int(self.output_crf_var.get()),
@@ -4520,7 +4671,7 @@ class SplatterGUI(ThemedTk):
             "low_res_batch_size": int(self.low_res_batch_size_var.get()),
             "dual_output": self.dual_output_var.get(),
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
-            "enable_autogain": self.enable_autogain_var.get(),
+            "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "match_depth_res": True,
             "output_crf": int(self.output_crf_var.get()),
             
@@ -4713,10 +4864,6 @@ class SplatterGUI(ThemedTk):
         blur_y_val = sidecar_config.get("depth_blur_size_y", self.depth_blur_size_y_var.get())
         self.depth_blur_size_y_var.set(blur_y_val)
         
-        # Disable Normalization Checkbox (Boolean)
-        disable_norm_state = sidecar_config.get("disable_depth_normalization", self.enable_autogain_var.get())
-        self.enable_autogain_var.set(bool(disable_norm_state))
-
         # Selected Depth Map (for Multi-Map mode)
         # Check if Multi-Map is enabled
         logger.info(f"Multi-Map enabled: {self.multi_map_var.get()}")

@@ -21,11 +21,11 @@ from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     release_cuda_memory, set_util_logger_level, encode_frames_to_mp4,
     read_video_frames_decord, start_ffmpeg_pipe_process, apply_color_transfer,
-    create_single_slider_with_label_updater
+    create_single_slider_with_label_updater, apply_dubois_anaglyph, apply_optimized_anaglyph
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-10-30.1"
+GUI_VERSION = "25-11-26.2"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -651,6 +651,16 @@ class MergingGUI(ThemedTk):
         if folder:
             var.set(folder)
 
+    def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
+        """Scans a folder for a file matching the core_name with any common video extension."""
+        video_extensions = ('*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm')
+        for ext in video_extensions:
+            # Check for the exact core_name followed by an extension
+            full_path = os.path.join(folder, f"{core_name}{ext[1:]}") # [1:] removes the '*'
+            if os.path.exists(full_path):
+                return full_path
+        return None
+
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
         # This now just collects parameters and sends them to the previewer module.
@@ -939,15 +949,18 @@ class MergingGUI(ThemedTk):
                 # --- FIX: Determine original_reader based on input type ---
                 original_reader = None # Assume None initially
                 if is_dual_input: # splatted2
-                    original_video_path = os.path.join(settings["original_folder"], f"{core_name}.mp4")
+                    # --- MODIFIED: Use helper to find original video with any extension ---
+                    original_video_path = self._find_video_by_core_name(settings["original_folder"], core_name)
                     original_video_path_to_move = original_video_path # Track for moving later
-                    if os.path.exists(original_video_path):
+                    
+                    if original_video_path and os.path.exists(original_video_path):
                         logger.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
                         original_reader = VideoReader(original_video_path, ctx=cpu(0))
                     else:
-                        logger.warning(f"Original video not found for dual-input mode: '{original_video_path}'.")
+                        logger.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
                         logger.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
                 else: # splatted4 (quad)
+                    
                     # For quad-splatted files, the splatted file itself is the source for the left eye.
                     # We can use the splatted_reader as a placeholder to indicate a valid left-eye source exists.
                     original_reader = splatted_reader
@@ -1312,12 +1325,13 @@ class MergingGUI(ThemedTk):
                 splatted_path = splatted2_matches[0]
                 logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted_path)}")
                 source_dict['splatted'] = splatted_path
-                original_path = os.path.join(self.original_folder_var.get(), f"{core_name}.mp4")
-                if os.path.exists(original_path):
+                original_path = self._find_video_by_core_name(self.original_folder_var.get(), core_name)
+                
+                if original_path:
                     logger.debug(f"  - Found matching original video: {os.path.basename(original_path)}")
                     source_dict['original'] = original_path
                 else:
-                    logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{os.path.basename(original_path)}' was not found. It will be treated as optional.")
+                    logger.warning(f"  - For dual-splatted input '{base_name}', the original video '{core_name}.*' was not found. It will be treated as optional.")
             else:
                 logger.warning(f"Preview Scan: Skipping '{base_name}'. No matching splatted file found in '{mask_folder}'.")
                 continue # Skip to the next video if no splatted file is found
@@ -1374,11 +1388,20 @@ class MergingGUI(ThemedTk):
                 is_dual_input = True # For clarity
 
             # Configure preview source dropdown based on input type
-            preview_options = ["Blended Image", "Original (Left Eye)", "Warped (Right BG)", "Processed Mask", "Anaglyph 3D", "Wigglegram"]
+            preview_options = [
+                "Blended Image", 
+                "Original (Left Eye)", 
+                "Warped (Right BG)", 
+                "Inpainted Right Eye", # <--- ADDED INPAINTED
+                "Processed Mask", 
+                "Anaglyph 3D", 
+                "Dubois Anaglyph",      # <--- ADDED ANAGLYPH
+                "Optimized Anaglyph",   # <--- ADDED ANAGLYPH
+                "Wigglegram"
+            ]            
             if not is_dual_input: # Depth map is only in quad-splatted files
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
-
 
             # Convert mask to grayscale
             mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -1425,6 +1448,9 @@ class MergingGUI(ThemedTk):
             if preview_source == "Blended Image":
                 logger.debug("  -> Displaying Blended Image.")
                 final_frame_4d = blended_frame
+            elif preview_source == "Inpainted Right Eye": # <--- ADDED INPAINTED
+                logger.debug("  -> Displaying Inpainted Right Eye.")
+                final_frame_4d = inpainted
             elif preview_source == "Original (Left Eye)":
                 logger.debug("  -> Displaying Original (Left Eye).")
                 # --- FIX: Handle missing original_tensor for quad input ---
@@ -1442,14 +1468,27 @@ class MergingGUI(ThemedTk):
                 logger.debug("  -> Displaying Processed Mask.")
                 final_frame_4d = processed_mask.repeat(1, 3, 1, 1) # Convert grayscale mask to 3-channel for display
             elif preview_source == "Anaglyph 3D":
-                logger.debug("  -> Displaying Anaglyph 3D.")
-                left_gray_np = cv2.cvtColor((original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                logger.debug(" -> Displaying Anaglyph 3D.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY) # Use standard for old red/cyan
                 anaglyph_np = right_np.copy()
                 anaglyph_np[:, :, 0] = left_gray_np # Red channel from grayscale left eye
                 final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            elif preview_source == "Dubois Anaglyph":
+                logger.debug(" -> Displaying Dubois Anaglyph.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_dubois_anaglyph(left_np, right_np) # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            elif preview_source == "Optimized Anaglyph":
+                logger.debug(" -> Displaying Optimized Anaglyph.")
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_optimized_anaglyph(left_np, right_np) # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
             elif preview_source == "Wigglegram":
-                logger.debug("  -> Starting Wigglegram animation.")
+                logger.debug(" -> Starting Wigglegram animation.")
                 self.previewer._start_wigglegram_animation(original_left, blended_frame)
                 return None # Wigglegram handles its own display
             elif preview_source == "Depth Map" and depth_map_vis is not None:

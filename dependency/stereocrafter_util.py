@@ -79,7 +79,6 @@ class SidecarConfigManager:
         "depth_dilate_size_y": (float, 0.0),
         "depth_blur_size_x": (float, 0.0),
         "depth_blur_size_y": (float, 0.0),
-        "disable_depth_normalization": (bool, False),
         "selected_depth_map": (str, ""),
         # Add future keys here
     }
@@ -230,6 +229,74 @@ def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor)
     except Exception as e:
         logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
         return target_frame
+
+def apply_dubois_anaglyph(left_rgb_np: np.ndarray, right_rgb_np: np.ndarray) -> np.ndarray:
+    """
+    Apply Dubois least-squares anaglyph transformation.
+    Expects input as HWC NumPy arrays (uint8, 0-255).
+    Returns HWC NumPy array (uint8, 0-255).
+    """
+    left_float = left_rgb_np.astype(np.float32) / 255.0
+    right_float = right_rgb_np.astype(np.float32) / 255.0
+    
+    # Dubois red-cyan matrices (from splatting_gui)
+    left_matrix = np.array([
+        [ 0.456,  0.500,  0.176],  # Left contributes to Red
+        [-0.040, -0.038, -0.016],  # Left minimal to Green
+        [-0.015, -0.021, -0.005]   # Left minimal to Blue
+    ], dtype=np.float32)
+    
+    right_matrix = np.array([
+        [-0.043, -0.088, -0.002],  # Right minimal to Red
+        [ 0.378,  0.734, -0.018],  # Right contributes to Green
+        [-0.072, -0.113,  1.226]   # Right contributes to Blue
+    ], dtype=np.float32)
+    
+    H, W = left_float.shape[:2]
+    left_flat = left_float.reshape(-1, 3)
+    right_flat = right_float.reshape(-1, 3)
+    
+    left_transformed = np.dot(left_flat, left_matrix.T)
+    right_transformed = np.dot(right_flat, right_matrix.T)
+    
+    anaglyph_flat = np.clip(left_transformed + right_transformed, 0.0, 1.0)
+    anaglyph_rgb = anaglyph_flat.reshape(H, W, 3)
+    
+    return (anaglyph_rgb * 255.0).astype(np.uint8)
+
+def apply_optimized_anaglyph(left_rgb_np: np.ndarray, right_rgb_np: np.ndarray) -> np.ndarray:
+    """
+    Apply Optimized Half-Color (minimal ghosting) anaglyph transformation.
+    Expects input as HWC NumPy arrays (uint8, 0-255).
+    Returns HWC NumPy array (uint8, 0-255).
+    """
+    left_float = left_rgb_np.astype(np.float32) / 255.0
+    right_float = right_rgb_np.astype(np.float32) / 255.0
+    
+    # Optimized matrices for minimal eye strain
+    left_matrix = np.array([
+        [ 0.0,  0.7,  0.3],   # Left contributes to Red (G+B weighted)
+        [ 0.0,  0.0,  0.0],   # No green
+        [ 0.0,  0.0,  0.0]    # No blue
+    ], dtype=np.float32)
+    
+    right_matrix = np.array([
+        [ 0.0,  0.0,  0.0],   # No red
+        [ 0.0,  1.0,  0.0],   # Full green from right
+        [ 0.0,  0.0,  1.0]    # Full blue from right
+    ], dtype=np.float32)
+    
+    H, W = left_float.shape[:2]
+    left_flat = left_float.reshape(-1, 3)
+    right_flat = right_float.reshape(-1, 3)
+    
+    left_transformed = np.dot(left_flat, left_matrix.T)
+    right_transformed = np.dot(right_flat, right_matrix.T)
+    
+    anaglyph_flat = np.clip(left_transformed + right_transformed, 0.0, 1.0)
+    anaglyph_rgb = anaglyph_flat.reshape(H, W, 3)
+    
+    return (anaglyph_rgb * 255.0).astype(np.uint8)
 
 def create_single_slider_with_label_updater(
     GUI_self,
