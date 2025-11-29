@@ -4824,7 +4824,9 @@ class SplatterGUI(ThemedTk):
         logger.info(f"Looking for sidecar at: {json_sidecar_path}")
         
         if not os.path.exists(json_sidecar_path):
-            logger.debug(f"update_gui_from_sidecar: No sidecar found at {json_sidecar_path}. Skipping update.")
+            logger.debug(f"update_gui_from_sidecar: No sidecar found at {json_sidecar_path}. Calling _on_map_selection_changed to sync preview.")
+            # FIXED: When no sidecar, update previewer with currently-selected map
+            self._on_map_selection_changed(from_sidecar=False)
             return
 
         # 2. Load merged config (Sidecar values merged with defaults)
