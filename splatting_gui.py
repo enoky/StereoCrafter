@@ -339,7 +339,8 @@ class SplatterGUI(ThemedTk):
         # --- NEW CACHE AND STATE ---
         self._auto_conv_cache = {"Average": None, "Peak": None}
         self._auto_conv_cached_path = None
-        self._is_auto_conv_running = False 
+        self._is_auto_conv_running = False
+        self._preview_debounce_timer = None 
         self.slider_label_updaters = [] 
         self.set_convergence_value_programmatically = None
         self._clip_norm_cache: Dict[str, Tuple[float, float]] = {} 
@@ -1315,11 +1316,11 @@ class SplatterGUI(ThemedTk):
         create_dual_slider_layout(
             self, self.depth_prep_frame, "Dilate X:", "Y:",
             self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 35,
-            row_inner, decimals=0, is_integer=False,
+            row_inner, decimals=1, is_integer=False,  # <--- CHANGED: decimals=1
             tooltip_key_x="depth_dilate_size_x",
             tooltip_key_y="depth_dilate_size_y",
-            trough_increment=2.0,
-            display_next_odd_integer=True,
+            trough_increment=0.5,                     # <--- CHANGED: Step 0.5
+            display_next_odd_integer=False,           # <--- CHANGED: Show actual float value
             )
         row_inner += 1
         create_dual_slider_layout(
@@ -2707,8 +2708,8 @@ class SplatterGUI(ThemedTk):
             "input_bias": merged_config.get("input_bias"),
             "depth_gamma": merged_config.get("gamma", gui_config["gamma"]),
             # GUI-derived depth pre-processing settings
-            "depth_dilate_size_x": int(float(self.depth_dilate_size_x_var.get())),
-            "depth_dilate_size_y": int(float(self.depth_dilate_size_y_var.get())),
+            "depth_dilate_size_x": float(self.depth_dilate_size_x_var.get()),
+            "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
             "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
             "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
             # Tracking / info sources
@@ -2997,13 +2998,31 @@ class SplatterGUI(ThemedTk):
         # Cache miss, run the calculation (using the existing run_preview_auto_converge logic)
         self.run_preview_auto_converge(force_run=True)
 
-    def on_slider_release(self, event):
-        """Called when a slider is released. Updates the preview."""
+    def on_slider_release(self, event=None):
+        """Called when a slider is released. Updates the preview with DEBOUNCING."""
+        # 1. Stop any current wigglegram animation immediately for responsiveness
+        if hasattr(self, 'previewer'):
+             self.previewer._stop_wigglegram_animation()
+
+        # 2. Cancel any pending update timer (this is the "debounce" logic)
+        if self._preview_debounce_timer is not None:
+            self.after_cancel(self._preview_debounce_timer)
+            self._preview_debounce_timer = None
+
+        # 3. Start a new timer. 
+        # 350ms is a good "norm" for responsiveness vs. stability. 
+        # If you click 10 times quickly, this only fires after the 10th click.
+        self._preview_debounce_timer = self.after(350, self._perform_delayed_preview_update)
+
+    def _perform_delayed_preview_update(self):
+        """Actually triggers the heavy preview processing once the delay expires."""
+        self._preview_debounce_timer = None # Clear timer reference
+        
         if hasattr(self, 'previewer') and self.previewer.source_readers:
-            self.previewer._stop_wigglegram_animation() 
+            # Trigger the standard preview update
             self.previewer.update_preview()            
             
-            # Use the combined function here:
+            # Sync the clip state text (if applicable)
             if hasattr(self, '_update_clip_state_and_text'):
                  self._update_clip_state_and_text()
 
@@ -4822,7 +4841,7 @@ class SplatterGUI(ThemedTk):
         sidecar_folder = self._get_sidecar_base_folder()
         json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
         logger.info(f"Looking for sidecar at: {json_sidecar_path}")
-        
+
         if not os.path.exists(json_sidecar_path):
             logger.debug(f"update_gui_from_sidecar: No sidecar found at {json_sidecar_path}. Calling _on_map_selection_changed to sync preview.")
             # FIXED: When no sidecar, update previewer with currently-selected map
