@@ -547,75 +547,104 @@ def custom_dilate(
     max_content_value: float = 1.0,
 ) -> torch.Tensor:
     """
-    Applies dilation using an integer kernel and incorporates the fractional part
-    via blurring (most stable simulation of fractional dilation).
+    Applies fractional dilation by blending results of nearest integer kernels.
     
-    Interprets kernel_size_x/y as the final desired integer kernel size.
-    Expects a 4D tensor (B, C, H, W) in [0,1].
+    Mapping Strategy:
+    - 0.0 to 3.0: Blends between Identity (1x1) and 3x3 kernel.
+    - 3.0 to 5.0: Blends between 3x3 and 5x5 kernel.
+    - etc.
     """
-    k_x_int = int(kernel_size_x)
-    k_y_int = int(kernel_size_y)
     
-    if k_x_int <= 0 and k_y_int <= 0:
-        return tensor
+    # --- Helper: Get interpolation parameters for a single dimension ---
+    def get_dilation_params(value):
+        if value <= 1e-5:
+            # Below 0: Pure Identity (Kernel 1)
+            return 1, 1, 0.0
+        elif value < 3.0:
+            # 0 to 3: Blend Identity(1) -> 3
+            # Ratio is linear progress from 0 to 3
+            ratio = value / 3.0
+            return 1, 3, ratio
+        else:
+            # 3+: Blend Odd -> Odd + 2
+            # e.g., 3.5 -> Base 3, Next 5, Ratio 0.25 (Wait, 3->5 is range of 2)
+            base = 3 + 2 * int((value - 3) // 2)
+            next_k = base + 2
+            ratio = (value - base) / 2.0
+            return base, next_k, ratio
 
-    device = torch.device('cpu')
+    # 1. Calculate parameters for X and Y
+    kx_low, kx_high, tx = get_dilation_params(kernel_size_x)
+    ky_low, ky_high, ty = get_dilation_params(kernel_size_y)
+
+    # Optimization: Check if we are exactly on an integer step (ratio ~0)
+    # This avoids computing 4 blends when simple integer dilation is requested.
+    is_x_int = (tx <= 1e-4)
+    is_y_int = (ty <= 1e-4)
+    
+    device = torch.device('cpu') # Force CPU for OpenCV compatibility
     tensor = tensor.to(device)
     processed_frames = []
-    
-    # 1. Determine Kernel and Fractional Sigma
-    # Kernel must be odd
-    k_x = k_x_int if k_x_int % 2 == 1 else k_x_int + 1
-    k_y = k_y_int if k_y_int % 2 == 1 else k_y_int + 1
-    
-    # Calculate fractional part for blurring
-    frac_x = kernel_size_x - k_x_int
-    frac_y = kernel_size_y - k_y_int
 
     for t in range(tensor.shape[0]):
-        # Get frame (C, H, W) raw float data
-        frame_float = tensor[t].cpu().numpy() # shape: (C, H, W)
-        
-        # 1. Get the single-channel depth data (shape: H, W)
+        # --- PREPARE IMAGE ---
+        frame_float = tensor[t].cpu().numpy() # (C, H, W)
         frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
-
-        # 2. Use the provided max_content_value for normalization/rescaling
-        #    If max_content_value is 0 or near 0, treat it as 1.0 to prevent division by zero.
+        
         effective_max_value = max(max_content_value, 1e-5)
-        
-        # 3. Normalize to 0-1 and scale to 0-255 for OpenCV's uint8
         frame_norm_2d = frame_2d_raw / effective_max_value
-        frame_cv_uint8 = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
+        src_img = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
 
-        # --- DILATION (Integer Part) ---
-        if k_x_int > 0 or k_y_int > 0:
-            # Use the odd kernel size for dilation
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x, k_y))
-            processed_cv_uint8 = cv2.dilate(frame_cv_uint8, kernel, iterations=1)
-        else:
-             processed_cv_uint8 = frame_cv_uint8
-             
-        # --- FRACTIONAL BLUR (Fractional Part) ---
-        # If there is a fractional component, apply a slight blur to simulate subpixel expansion
-        if frac_x > 0.0 or frac_y > 0.0:
-            # Use the fractional part to scale the blur sigma (e.g., 0.5 blur for 0.5 fractional part)
-            sigma_x = frac_x * 0.5 
-            sigma_y = frac_y * 0.5 
+        # --- HELPER: Perform specific kernel dilation ---
+        def do_dilate(k_w, k_h, img):
+            # If both are 1, it's identity
+            if k_w <= 1 and k_h <= 1:
+                return img.astype(np.float32)
             
-            # Apply Gaussian Blur (kernel size 0 means it's auto-derived from sigma)
-            # Use a tiny kernel to force the subpixel effect
-            kernel_frac = (max(3, int(sigma_x*6) | 1), max(3, int(sigma_y*6) | 1)) # Smallest odd kernel > 1
-            processed_cv_uint8 = cv2.GaussianBlur(processed_cv_uint8, kernel_frac, sigmaX=sigma_x, sigmaY=sigma_y)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
+            res = cv2.dilate(img, kernel, iterations=1)
+            return res.astype(np.float32)
 
-        # --- RESCALE BACK TO ORIGINAL RAW FLOAT RANGE ---
-        # 1. Convert back to float 0-1
-        processed_norm_float = processed_cv_uint8.astype(np.float32) / 255.0
+        # --- BLENDING LOGIC ---
         
-        # 2. Scale back to the provided effective_max_value
-        processed_raw_float = processed_norm_float * effective_max_value
+        # Case 1: Exact Integer X and Y (Fastest)
+        if is_x_int and is_y_int:
+            final_float = do_dilate(kx_low, ky_low, src_img)
 
-        # Convert back to PyTorch format: (C, H, W)
-        # Use unsqueeze(0) to ensure C=1 dim is present
+        # Case 2: Fractional X, Integer Y
+        elif not is_x_int and is_y_int:
+            res_low = do_dilate(kx_low, ky_low, src_img)
+            res_high = do_dilate(kx_high, ky_low, src_img)
+            final_float = (1.0 - tx) * res_low + tx * res_high
+
+        # Case 3: Integer X, Fractional Y
+        elif is_x_int and not is_y_int:
+            res_low = do_dilate(kx_low, ky_low, src_img)
+            res_high = do_dilate(kx_low, ky_high, src_img)
+            final_float = (1.0 - ty) * res_low + ty * res_high
+
+        # Case 4: Fractional X and Y (Full Bilinear Blend)
+        else:
+            # 11: Low X, Low Y
+            res_11 = do_dilate(kx_low, ky_low, src_img)
+            # 12: Low X, High Y
+            res_12 = do_dilate(kx_low, ky_high, src_img)
+            # 21: High X, Low Y
+            res_21 = do_dilate(kx_high, ky_low, src_img)
+            # 22: High X, High Y
+            res_22 = do_dilate(kx_high, ky_high, src_img)
+            
+            # Blend Y first
+            res_left = (1.0 - ty) * res_11 + ty * res_12   # Fixed X (Low)
+            res_right = (1.0 - ty) * res_21 + ty * res_22  # Fixed X (High)
+            
+            # Blend X
+            final_float = (1.0 - tx) * res_left + tx * res_right
+
+        # --- RESCALE AND PACK ---
+        processed_norm_float = final_float / 255.0
+        processed_raw_float = processed_norm_float * effective_max_value
+        
         dilated_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float().to(tensor.device)
         processed_frames.append(dilated_tensor)
     
