@@ -28,20 +28,42 @@ from dependency.video_previewer import VideoPreviewer
 GUI_VERSION = "25-11-26.2"
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
-def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
-    if kernel_size <= 0: return mask
-    kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-    
+def _odd_kernel_size(value: int) -> int:
+    return value if value % 2 == 1 else value + 1
+
+def apply_mask_dilation(mask: torch.Tensor, kernel_size: float, use_gpu: bool = True) -> torch.Tensor:
+    if kernel_size <= 0:
+        return mask
+
+    lower = int(np.floor(kernel_size))
+    upper = int(np.ceil(kernel_size))
+    lower = max(1, lower)
+    upper = max(1, upper)
+    lower_val = _odd_kernel_size(lower)
+    upper_val = _odd_kernel_size(upper)
+    blend = float(kernel_size - lower)
+
     if use_gpu:
-        padding = kernel_val // 2
-        return F.max_pool2d(mask, kernel_size=kernel_val, stride=1, padding=padding)
+        padding_low = lower_val // 2
+        dilated_low = F.max_pool2d(mask, kernel_size=lower_val, stride=1, padding=padding_low)
+        if lower_val == upper_val:
+            return dilated_low
+        padding_up = upper_val // 2
+        dilated_up = F.max_pool2d(mask, kernel_size=upper_val, stride=1, padding=padding_up)
+        return dilated_low * (1.0 - blend) + dilated_up * blend
     else:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_val, kernel_val))
+        kernel_low = cv2.getStructuringElement(cv2.MORPH_RECT, (lower_val, lower_val))
+        kernel_up = cv2.getStructuringElement(cv2.MORPH_RECT, (upper_val, upper_val))
         processed_frames = []
         for t in range(mask.shape[0]):
             frame_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
-            dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
+            dilated_low = cv2.dilate(frame_np, kernel_low, iterations=1)
+            if lower_val == upper_val:
+                blended = dilated_low
+            else:
+                dilated_up = cv2.dilate(frame_np, kernel_up, iterations=1)
+                blended = (dilated_low.astype(np.float32) * (1.0 - blend) + dilated_up.astype(np.float32) * blend)
+            dilated_tensor = torch.from_numpy(blended).float() / 255.0
             processed_frames.append(dilated_tensor.unsqueeze(0))
         return torch.stack(processed_frames).to(mask.device)
 
@@ -142,29 +164,6 @@ def apply_mask_edge_refine(mask: torch.Tensor, diameter: int, sigma_color: float
     refined_mask = torch.stack(processed_frames).to(mask.device)
     return torch.clamp(refined_mask, 0.0, 1.0)
 
-def apply_temporal_smoothing(mask: torch.Tensor, alpha: float, prev_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Applies exponential moving average smoothing over time for a mask sequence.
-    Expected shape: (T, C, H, W). Returns (smoothed, last_mask).
-    """
-    if mask is None or mask.ndim != 4:
-        return mask, prev_mask
-
-    alpha = float(alpha)
-    if alpha <= 0.0:
-        return mask, prev_mask
-
-    smoothed_frames = []
-    for t in range(mask.shape[0]):
-        current = mask[t]
-        if prev_mask is None:
-            smoothed = current
-        else:
-            smoothed = prev_mask * (1.0 - alpha) + current * alpha
-        smoothed_frames.append(smoothed)
-        prev_mask = smoothed
-    return torch.stack(smoothed_frames), prev_mask
-
 def upscale_tensor_lanczos(tensor: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
     """
     Upscales a 4D tensor (T, C, H, W) to (H, W) using Lanczos resampling on CPU.
@@ -206,8 +205,6 @@ class MergingGUI(ThemedTk):
         "mask_edge_refine_diameter": 7,
         "mask_edge_refine_sigma_color": 0.1,
         "mask_edge_refine_sigma_space": 5.0,
-        "mask_temporal_smooth_enabled": False,
-        "mask_temporal_smooth_alpha": 0.6,
         "use_gpu": False,
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
@@ -256,8 +253,6 @@ class MergingGUI(ThemedTk):
         self.mask_edge_refine_diameter_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_diameter", self.APP_DEFAULTS["mask_edge_refine_diameter"])))
         self.mask_edge_refine_sigma_color_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_color", self.APP_DEFAULTS["mask_edge_refine_sigma_color"])))
         self.mask_edge_refine_sigma_space_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_space", self.APP_DEFAULTS["mask_edge_refine_sigma_space"])))
-        self.mask_temporal_smooth_enabled_var = tk.BooleanVar(value=self.app_config.get("mask_temporal_smooth_enabled", self.APP_DEFAULTS["mask_temporal_smooth_enabled"]))
-        self.mask_temporal_smooth_alpha_var = tk.DoubleVar(value=float(self.app_config.get("mask_temporal_smooth_alpha", self.APP_DEFAULTS["mask_temporal_smooth_alpha"])))
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"]))
         self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", self.APP_DEFAULTS["output_format"]))
@@ -638,20 +633,16 @@ class MergingGUI(ThemedTk):
         param_frame.grid_columnconfigure(0, weight=1)
         param_frame.grid_columnconfigure(1, weight=1)
         param_frame.grid_columnconfigure(2, weight=1)
-        param_frame.grid_columnconfigure(3, weight=1)
 
         param_left = ttk.Frame(param_frame)
         param_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        param_mid_left = ttk.Frame(param_frame)
-        param_mid_left.grid(row=0, column=1, sticky="nsew", padx=6)
-        param_mid_right = ttk.Frame(param_frame)
-        param_mid_right.grid(row=0, column=2, sticky="nsew", padx=6)
+        param_mid = ttk.Frame(param_frame)
+        param_mid.grid(row=0, column=1, sticky="nsew", padx=6)
         param_right = ttk.Frame(param_frame)
-        param_right.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
+        param_right.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
 
         param_left.grid_columnconfigure(1, weight=1)
-        param_mid_left.grid_columnconfigure(1, weight=1)
-        param_mid_right.grid_columnconfigure(1, weight=1)
+        param_mid.grid_columnconfigure(1, weight=1)
         param_right.grid_columnconfigure(1, weight=1)
 
         # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
@@ -696,25 +687,15 @@ class MergingGUI(ThemedTk):
         #     slider.bind("<Button-1>", on_trough_click)
 
         create_single_slider_with_label_updater(self, param_left, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
-        create_single_slider_with_label_updater(self, param_left, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
+        create_single_slider_with_label_updater(self, param_left, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 1, 10, 1, decimals=1)
         create_single_slider_with_label_updater(self, param_left, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
         create_single_slider_with_label_updater(self, param_left, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
 
-        temporal_smooth_check = ttk.Checkbutton(
-            param_mid_left,
-            text="Temporal Mask Smoothing",
-            variable=self.mask_temporal_smooth_enabled_var,
-            command=lambda: self.on_slider_release(None),
-        )
-        temporal_smooth_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
-        self._create_hover_tooltip(temporal_smooth_check, "mask_temporal_smooth_enabled")
-        self.widgets_to_disable.append(temporal_smooth_check)
-        create_single_slider_with_label_updater(self, param_mid_left, "Temporal Smooth Alpha:", self.mask_temporal_smooth_alpha_var, 0.0, 1.0, 1, decimals=2)
 
-        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 0, decimals=2)
-        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 1, decimals=2)
-        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 2, decimals=2)
-        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 3, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 0, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 1, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 2, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 3, decimals=2)
         edge_refine_check = ttk.Checkbutton(
             param_right,
             text="Edge-Aware Mask Refine",
@@ -986,7 +967,7 @@ class MergingGUI(ThemedTk):
                 "preview_size": self.preview_size_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
-                "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
+                "mask_dilate_kernel_size": float(self.mask_dilate_kernel_size_var.get()),
                 "mask_blur_kernel_size": int(self.mask_blur_kernel_size_var.get()),
                 "shadow_shift": int(self.shadow_shift_var.get()),
                 "shadow_start_opacity": float(self.shadow_start_opacity_var.get()),
@@ -997,8 +978,6 @@ class MergingGUI(ThemedTk):
                 "mask_edge_refine_diameter": int(self.mask_edge_refine_diameter_var.get()),
                 "mask_edge_refine_sigma_color": float(self.mask_edge_refine_sigma_color_var.get()),
                 "mask_edge_refine_sigma_space": float(self.mask_edge_refine_sigma_space_var.get()),
-                "mask_temporal_smooth_enabled": bool(self.mask_temporal_smooth_enabled_var.get()),
-                "mask_temporal_smooth_alpha": float(self.mask_temporal_smooth_alpha_var.get()),
             }
             return settings
         except (ValueError, TypeError) as e:
@@ -1195,7 +1174,6 @@ class MergingGUI(ThemedTk):
                 stderr_thread.start()
 
                 # 4. Loop through chunks
-                prev_smoothed_mask = None
                 chunk_size = settings.get("batch_chunk_size", 32)
                 for frame_start in range(0, num_frames, chunk_size):
                     if self.stop_event.is_set(): break
@@ -1253,7 +1231,7 @@ class MergingGUI(ThemedTk):
                     if settings["mask_binarize_threshold"] >= 0.0:
                         processed_mask = (mask > settings["mask_binarize_threshold"]).float()
 
-                    if settings["mask_dilate_kernel_size"] > 0: processed_mask = apply_mask_dilation(processed_mask, settings["mask_dilate_kernel_size"], use_gpu)
+                    if settings["mask_dilate_kernel_size"] > 0: processed_mask = apply_mask_dilation(processed_mask, float(settings["mask_dilate_kernel_size"]), use_gpu)
                     if settings["mask_blur_kernel_size"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["mask_blur_kernel_size"], use_gpu)
 
                     if settings["shadow_shift"] > 0: processed_mask = apply_shadow_blur(processed_mask, settings["shadow_shift"], settings["shadow_start_opacity"], settings["shadow_opacity_decay"], settings["shadow_min_opacity"], settings["shadow_decay_gamma"], use_gpu)
@@ -1264,13 +1242,6 @@ class MergingGUI(ThemedTk):
                             settings.get("mask_edge_refine_sigma_color", 0.1),
                             settings.get("mask_edge_refine_sigma_space", 5.0),
                         )
-                    if settings.get("mask_temporal_smooth_enabled", False):
-                        processed_mask, prev_smoothed_mask = apply_temporal_smoothing(
-                            processed_mask,
-                            settings.get("mask_temporal_smooth_alpha", 0.6),
-                            prev_smoothed_mask,
-                        )
-
                     blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
 
                     # --- NEW: Assemble final frame based on output format ---
@@ -1582,7 +1553,7 @@ class MergingGUI(ThemedTk):
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone() # No need to unsqueeze, it's already 4D
             if params.get("mask_binarize_threshold", -1.0) >= 0.0: processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
-            if params.get("mask_dilate_kernel_size", 0) > 0: processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
+            if params.get("mask_dilate_kernel_size", 0) > 0: processed_mask = apply_mask_dilation(processed_mask, float(params["mask_dilate_kernel_size"]), use_gpu)
             if params.get("mask_blur_kernel_size", 0) > 0: processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
             if params.get("shadow_shift", 0) > 0: processed_mask = apply_shadow_blur(processed_mask, params["shadow_shift"], params["shadow_start_opacity"], params["shadow_opacity_decay"], params["shadow_min_opacity"], params["shadow_decay_gamma"], use_gpu)
             if params.get("mask_edge_refine_enabled", False):
@@ -1592,51 +1563,6 @@ class MergingGUI(ThemedTk):
                     float(params.get("mask_edge_refine_sigma_color", 0.1)),
                     float(params.get("mask_edge_refine_sigma_space", 5.0)),
                 )
-            if params.get("mask_temporal_smooth_enabled", False):
-                alpha = float(params.get("mask_temporal_smooth_alpha", 0.6))
-                if alpha > 0.0 and hasattr(self, "previewer") and hasattr(self.previewer, "source_readers"):
-                    frame_idx = int(self.previewer.frame_scrubber_var.get())
-                    prev_reader = self.previewer.source_readers.get("splatted")
-                    if prev_reader is not None and frame_idx > 0:
-                        prev_np = prev_reader.get_batch([frame_idx - 1]).asnumpy()
-                        prev_splatted = torch.from_numpy(prev_np).permute(0, 3, 1, 2).float() / 255.0
-                        _, _, prev_h, prev_w = prev_splatted.shape
-                        if is_quad_input:
-                            half_h, half_w = prev_h // 2, prev_w // 2
-                            prev_mask_raw = prev_splatted[:, :, half_h:, :half_w]
-                        else:
-                            prev_mask_raw = prev_splatted[:, :, :, :prev_w // 2]
-                        prev_mask_np = prev_mask_raw.permute(0, 2, 3, 1).cpu().numpy()
-                        prev_mask_gray = np.mean(prev_mask_np, axis=3)
-                        prev_mask = torch.from_numpy(prev_mask_gray).float().unsqueeze(1)
-                        if prev_mask.shape[2] != hires_H or prev_mask.shape[3] != hires_W:
-                            prev_mask = upscale_tensor_lanczos(prev_mask, (hires_H, hires_W))
-
-                        prev_mask = prev_mask.to(device)
-                        if params.get("mask_binarize_threshold", -1.0) >= 0.0:
-                            prev_mask = (prev_mask > params["mask_binarize_threshold"]).float()
-                        if params.get("mask_dilate_kernel_size", 0) > 0:
-                            prev_mask = apply_mask_dilation(prev_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
-                        if params.get("mask_blur_kernel_size", 0) > 0:
-                            prev_mask = apply_gaussian_blur(prev_mask, int(params["mask_blur_kernel_size"]), use_gpu)
-                        if params.get("shadow_shift", 0) > 0:
-                            prev_mask = apply_shadow_blur(
-                                prev_mask,
-                                params["shadow_shift"],
-                                params["shadow_start_opacity"],
-                                params["shadow_opacity_decay"],
-                                params["shadow_min_opacity"],
-                                params["shadow_decay_gamma"],
-                                use_gpu,
-                            )
-                        if params.get("mask_edge_refine_enabled", False):
-                            prev_mask = apply_mask_edge_refine(
-                                prev_mask,
-                                int(params.get("mask_edge_refine_diameter", 7)),
-                                float(params.get("mask_edge_refine_sigma_color", 0.1)),
-                                float(params.get("mask_edge_refine_sigma_space", 5.0)),
-                            )
-                        processed_mask = prev_mask * (1.0 - alpha) + processed_mask * alpha
             processed_mask = processed_mask.squeeze(0) # Remove batch dim
 
             if params.get("enable_color_transfer", False):
