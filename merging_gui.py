@@ -142,6 +142,29 @@ def apply_mask_edge_refine(mask: torch.Tensor, diameter: int, sigma_color: float
     refined_mask = torch.stack(processed_frames).to(mask.device)
     return torch.clamp(refined_mask, 0.0, 1.0)
 
+def apply_temporal_smoothing(mask: torch.Tensor, alpha: float, prev_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Applies exponential moving average smoothing over time for a mask sequence.
+    Expected shape: (T, C, H, W). Returns (smoothed, last_mask).
+    """
+    if mask is None or mask.ndim != 4:
+        return mask, prev_mask
+
+    alpha = float(alpha)
+    if alpha <= 0.0:
+        return mask, prev_mask
+
+    smoothed_frames = []
+    for t in range(mask.shape[0]):
+        current = mask[t]
+        if prev_mask is None:
+            smoothed = current
+        else:
+            smoothed = prev_mask * (1.0 - alpha) + current * alpha
+        smoothed_frames.append(smoothed)
+        prev_mask = smoothed
+    return torch.stack(smoothed_frames), prev_mask
+
 def upscale_tensor_lanczos(tensor: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
     """
     Upscales a 4D tensor (T, C, H, W) to (H, W) using Lanczos resampling on CPU.
@@ -183,6 +206,8 @@ class MergingGUI(ThemedTk):
         "mask_edge_refine_diameter": 7,
         "mask_edge_refine_sigma_color": 0.1,
         "mask_edge_refine_sigma_space": 5.0,
+        "mask_temporal_smooth_enabled": False,
+        "mask_temporal_smooth_alpha": 0.6,
         "use_gpu": False,
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
@@ -231,6 +256,8 @@ class MergingGUI(ThemedTk):
         self.mask_edge_refine_diameter_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_diameter", self.APP_DEFAULTS["mask_edge_refine_diameter"])))
         self.mask_edge_refine_sigma_color_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_color", self.APP_DEFAULTS["mask_edge_refine_sigma_color"])))
         self.mask_edge_refine_sigma_space_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_space", self.APP_DEFAULTS["mask_edge_refine_sigma_space"])))
+        self.mask_temporal_smooth_enabled_var = tk.BooleanVar(value=self.app_config.get("mask_temporal_smooth_enabled", self.APP_DEFAULTS["mask_temporal_smooth_enabled"]))
+        self.mask_temporal_smooth_alpha_var = tk.DoubleVar(value=float(self.app_config.get("mask_temporal_smooth_alpha", self.APP_DEFAULTS["mask_temporal_smooth_alpha"])))
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"]))
         self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", self.APP_DEFAULTS["output_format"]))
@@ -685,6 +712,16 @@ class MergingGUI(ThemedTk):
         create_single_slider_with_label_updater(self, param_right, "Edge Refine Diameter:", self.mask_edge_refine_diameter_var, 1, 31, 2)
         create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Color:", self.mask_edge_refine_sigma_color_var, 0.0, 1.0, 3, decimals=2)
         create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Space:", self.mask_edge_refine_sigma_space_var, 0.0, 20.0, 4, decimals=2)
+        temporal_smooth_check = ttk.Checkbutton(
+            param_right,
+            text="Temporal Mask Smoothing",
+            variable=self.mask_temporal_smooth_enabled_var,
+            command=lambda: self.on_slider_release(None),
+        )
+        temporal_smooth_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        self._create_hover_tooltip(temporal_smooth_check, "mask_temporal_smooth_enabled")
+        self.widgets_to_disable.append(temporal_smooth_check)
+        create_single_slider_with_label_updater(self, param_right, "Temporal Smooth Alpha:", self.mask_temporal_smooth_alpha_var, 0.0, 1.0, 6, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
@@ -955,6 +992,8 @@ class MergingGUI(ThemedTk):
                 "mask_edge_refine_diameter": int(self.mask_edge_refine_diameter_var.get()),
                 "mask_edge_refine_sigma_color": float(self.mask_edge_refine_sigma_color_var.get()),
                 "mask_edge_refine_sigma_space": float(self.mask_edge_refine_sigma_space_var.get()),
+                "mask_temporal_smooth_enabled": bool(self.mask_temporal_smooth_enabled_var.get()),
+                "mask_temporal_smooth_alpha": float(self.mask_temporal_smooth_alpha_var.get()),
             }
             return settings
         except (ValueError, TypeError) as e:
@@ -1151,6 +1190,7 @@ class MergingGUI(ThemedTk):
                 stderr_thread.start()
 
                 # 4. Loop through chunks
+                prev_smoothed_mask = None
                 chunk_size = settings.get("batch_chunk_size", 32)
                 for frame_start in range(0, num_frames, chunk_size):
                     if self.stop_event.is_set(): break
@@ -1218,6 +1258,12 @@ class MergingGUI(ThemedTk):
                             settings.get("mask_edge_refine_diameter", 7),
                             settings.get("mask_edge_refine_sigma_color", 0.1),
                             settings.get("mask_edge_refine_sigma_space", 5.0),
+                        )
+                    if settings.get("mask_temporal_smooth_enabled", False):
+                        processed_mask, prev_smoothed_mask = apply_temporal_smoothing(
+                            processed_mask,
+                            settings.get("mask_temporal_smooth_alpha", 0.6),
+                            prev_smoothed_mask,
                         )
 
                     blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
@@ -1540,6 +1586,12 @@ class MergingGUI(ThemedTk):
                     int(params.get("mask_edge_refine_diameter", 7)),
                     float(params.get("mask_edge_refine_sigma_color", 0.1)),
                     float(params.get("mask_edge_refine_sigma_space", 5.0)),
+                )
+            if params.get("mask_temporal_smooth_enabled", False):
+                processed_mask, _ = apply_temporal_smoothing(
+                    processed_mask,
+                    float(params.get("mask_temporal_smooth_alpha", 0.6)),
+                    None,
                 )
             processed_mask = processed_mask.squeeze(0) # Remove batch dim
 
