@@ -102,6 +102,46 @@ def apply_shadow_blur(mask: torch.Tensor, shift_per_step: int, start_opacity: fl
             processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
         return torch.stack(processed_frames).to(mask.device)
 
+def apply_color_transfer_temporal(reference: torch.Tensor, target: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    Applies a chunk-wide color transfer using running statistics to reduce flicker.
+    Expected shape: (T, C, H, W)
+    """
+    if reference is None or target is None:
+        return target
+    if reference.ndim != 4 or target.ndim != 4:
+        return target
+
+    ref_mean = reference.mean(dim=(0, 2, 3), keepdim=True)
+    ref_std = reference.std(dim=(0, 2, 3), keepdim=True, unbiased=False).clamp_min(eps)
+    tgt_mean = target.mean(dim=(0, 2, 3), keepdim=True)
+    tgt_std = target.std(dim=(0, 2, 3), keepdim=True, unbiased=False).clamp_min(eps)
+    matched = (target - tgt_mean) * (ref_std / tgt_std) + ref_mean
+    return torch.clamp(matched, 0.0, 1.0)
+
+def apply_mask_edge_refine(mask: torch.Tensor, diameter: int, sigma_color: float, sigma_space: float) -> torch.Tensor:
+    """
+    Applies edge-aware refinement to a mask using a bilateral filter.
+    Expected shape: (T, 1, H, W)
+    """
+    if mask is None:
+        return mask
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        return mask
+
+    d = int(diameter)
+    if d <= 1:
+        return mask
+
+    mask_cpu = mask.detach().cpu()
+    processed_frames = []
+    for t in range(mask_cpu.shape[0]):
+        frame = mask_cpu[t, 0].numpy().astype(np.float32)
+        refined = cv2.bilateralFilter(frame, d, float(sigma_color), float(sigma_space))
+        processed_frames.append(torch.from_numpy(refined).unsqueeze(0))
+    refined_mask = torch.stack(processed_frames).to(mask.device)
+    return torch.clamp(refined_mask, 0.0, 1.0)
+
 class MergingGUI(ThemedTk):
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
@@ -117,6 +157,10 @@ class MergingGUI(ThemedTk):
         "shadow_start_opacity": 0.87,
         "shadow_opacity_decay": 0.08,
         "shadow_min_opacity": 0.14,
+        "mask_edge_refine_enabled": False,
+        "mask_edge_refine_diameter": 7,
+        "mask_edge_refine_sigma_color": 0.1,
+        "mask_edge_refine_sigma_space": 5.0,
         "use_gpu": False,
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
@@ -161,6 +205,10 @@ class MergingGUI(ThemedTk):
         self.shadow_start_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_start_opacity", self.APP_DEFAULTS["shadow_start_opacity"])))
         self.shadow_opacity_decay_var = tk.DoubleVar(value=float(self.app_config.get("shadow_opacity_decay", self.APP_DEFAULTS["shadow_opacity_decay"])))
         self.shadow_min_opacity_var = tk.DoubleVar(value=float(self.app_config.get("shadow_min_opacity", self.APP_DEFAULTS["shadow_min_opacity"])))
+        self.mask_edge_refine_enabled_var = tk.BooleanVar(value=self.app_config.get("mask_edge_refine_enabled", self.APP_DEFAULTS["mask_edge_refine_enabled"]))
+        self.mask_edge_refine_diameter_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_diameter", self.APP_DEFAULTS["mask_edge_refine_diameter"])))
+        self.mask_edge_refine_sigma_color_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_color", self.APP_DEFAULTS["mask_edge_refine_sigma_color"])))
+        self.mask_edge_refine_sigma_space_var = tk.DoubleVar(value=float(self.app_config.get("mask_edge_refine_sigma_space", self.APP_DEFAULTS["mask_edge_refine_sigma_space"])))
 
         self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"]))
         self.output_format_var = tk.StringVar(value=self.app_config.get("output_format", self.APP_DEFAULTS["output_format"]))
@@ -589,6 +637,18 @@ class MergingGUI(ThemedTk):
         create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 5, decimals=2)
         create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 6, decimals=2)
         create_single_slider_with_label_updater(self, param_frame, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 7, decimals=2)
+        edge_refine_check = ttk.Checkbutton(
+            param_frame,
+            text="Edge-Aware Mask Refine",
+            variable=self.mask_edge_refine_enabled_var,
+            command=lambda: self.on_slider_release(None),
+        )
+        edge_refine_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        self._create_hover_tooltip(edge_refine_check, "mask_edge_refine_enabled")
+        self.widgets_to_disable.append(edge_refine_check)
+        create_single_slider_with_label_updater(self, param_frame, "Edge Refine Diameter:", self.mask_edge_refine_diameter_var, 1, 31, 9)
+        create_single_slider_with_label_updater(self, param_frame, "Edge Refine Sigma Color:", self.mask_edge_refine_sigma_color_var, 0.0, 1.0, 10, decimals=2)
+        create_single_slider_with_label_updater(self, param_frame, "Edge Refine Sigma Space:", self.mask_edge_refine_sigma_space_var, 0.0, 20.0, 11, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
@@ -855,6 +915,10 @@ class MergingGUI(ThemedTk):
                 "shadow_opacity_decay": float(self.shadow_opacity_decay_var.get()),
                 "shadow_min_opacity": float(self.shadow_min_opacity_var.get()),
                 "shadow_decay_gamma": float(self.shadow_decay_gamma_var.get()),
+                "mask_edge_refine_enabled": bool(self.mask_edge_refine_enabled_var.get()),
+                "mask_edge_refine_diameter": int(self.mask_edge_refine_diameter_var.get()),
+                "mask_edge_refine_sigma_color": float(self.mask_edge_refine_sigma_color_var.get()),
+                "mask_edge_refine_sigma_space": float(self.mask_edge_refine_sigma_space_var.get()),
             }
             return settings
         except (ValueError, TypeError) as e:
@@ -1101,11 +1165,7 @@ class MergingGUI(ThemedTk):
                         mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
 
                     if settings["enable_color_transfer"]:
-                        adjusted_frames = []
-                        for frame_idx in range(inpainted.shape[0]):
-                            adjusted_frame = apply_color_transfer(original_left[frame_idx].cpu(), inpainted[frame_idx].cpu())
-                            adjusted_frames.append(adjusted_frame.to(device))
-                        inpainted = torch.stack(adjusted_frames)
+                        inpainted = apply_color_transfer_temporal(original_left, inpainted)
 
                     processed_mask = mask.clone()
                     # --- NEW: Binarization as the first step ---
@@ -1116,6 +1176,13 @@ class MergingGUI(ThemedTk):
                     if settings["mask_blur_kernel_size"] > 0: processed_mask = apply_gaussian_blur(processed_mask, settings["mask_blur_kernel_size"], use_gpu)
 
                     if settings["shadow_shift"] > 0: processed_mask = apply_shadow_blur(processed_mask, settings["shadow_shift"], settings["shadow_start_opacity"], settings["shadow_opacity_decay"], settings["shadow_min_opacity"], settings["shadow_decay_gamma"], use_gpu)
+                    if settings.get("mask_edge_refine_enabled", False):
+                        processed_mask = apply_mask_edge_refine(
+                            processed_mask,
+                            settings.get("mask_edge_refine_diameter", 7),
+                            settings.get("mask_edge_refine_sigma_color", 0.1),
+                            settings.get("mask_edge_refine_sigma_space", 5.0),
+                        )
 
                     blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
 
@@ -1431,12 +1498,19 @@ class MergingGUI(ThemedTk):
             if params.get("mask_dilate_kernel_size", 0) > 0: processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
             if params.get("mask_blur_kernel_size", 0) > 0: processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
             if params.get("shadow_shift", 0) > 0: processed_mask = apply_shadow_blur(processed_mask, params["shadow_shift"], params["shadow_start_opacity"], params["shadow_opacity_decay"], params["shadow_min_opacity"], params["shadow_decay_gamma"], use_gpu)
+            if params.get("mask_edge_refine_enabled", False):
+                processed_mask = apply_mask_edge_refine(
+                    processed_mask,
+                    int(params.get("mask_edge_refine_diameter", 7)),
+                    float(params.get("mask_edge_refine_sigma_color", 0.1)),
+                    float(params.get("mask_edge_refine_sigma_space", 5.0)),
+                )
             processed_mask = processed_mask.squeeze(0) # Remove batch dim
 
             if params.get("enable_color_transfer", False):
                 if original_left is not None:
                     logger.debug("Applying color transfer to preview frame...")
-                    inpainted = apply_color_transfer(original_left.cpu(), inpainted.cpu()).to(device)
+                    inpainted = apply_color_transfer_temporal(original_left, inpainted)
 
             blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
