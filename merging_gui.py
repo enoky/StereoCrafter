@@ -638,16 +638,20 @@ class MergingGUI(ThemedTk):
         param_frame.grid_columnconfigure(0, weight=1)
         param_frame.grid_columnconfigure(1, weight=1)
         param_frame.grid_columnconfigure(2, weight=1)
+        param_frame.grid_columnconfigure(3, weight=1)
 
         param_left = ttk.Frame(param_frame)
-        param_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        param_mid = ttk.Frame(param_frame)
-        param_mid.grid(row=0, column=1, sticky="nsew", padx=8)
+        param_left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        param_mid_left = ttk.Frame(param_frame)
+        param_mid_left.grid(row=0, column=1, sticky="nsew", padx=6)
+        param_mid_right = ttk.Frame(param_frame)
+        param_mid_right.grid(row=0, column=2, sticky="nsew", padx=6)
         param_right = ttk.Frame(param_frame)
-        param_right.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        param_right.grid(row=0, column=3, sticky="nsew", padx=(6, 0))
 
         param_left.grid_columnconfigure(1, weight=1)
-        param_mid.grid_columnconfigure(1, weight=1)
+        param_mid_left.grid_columnconfigure(1, weight=1)
+        param_mid_right.grid_columnconfigure(1, weight=1)
         param_right.grid_columnconfigure(1, weight=1)
 
         # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
@@ -693,35 +697,36 @@ class MergingGUI(ThemedTk):
 
         create_single_slider_with_label_updater(self, param_left, "Binarize Thresh (<0=Off):", self.mask_binarize_threshold_var, -0.01, 1.0, 0, decimals=2)
         create_single_slider_with_label_updater(self, param_left, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1)
-        create_single_slider_with_label_updater(self, param_left, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2)
-        create_single_slider_with_label_updater(self, param_left, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 3, decimals=2)
 
-        create_single_slider_with_label_updater(self, param_mid, "Shadow Shift:", self.shadow_shift_var, 0, 50, 0)
-        create_single_slider_with_label_updater(self, param_mid, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 1, decimals=2)
-        create_single_slider_with_label_updater(self, param_mid, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 2, decimals=2)
-        create_single_slider_with_label_updater(self, param_mid, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 3, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid_left, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 0)
+        create_single_slider_with_label_updater(self, param_mid_left, "Shadow Shift:", self.shadow_shift_var, 0, 50, 1)
+
+        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 0, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Start:", self.shadow_start_opacity_var, 0.0, 1.0, 1, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Decay:", self.shadow_opacity_decay_var, 0.0, 1.0, 2, decimals=2)
+        create_single_slider_with_label_updater(self, param_mid_right, "Shadow Opacity Min:", self.shadow_min_opacity_var, 0.0, 1.0, 3, decimals=2)
         edge_refine_check = ttk.Checkbutton(
             param_right,
             text="Edge-Aware Mask Refine",
             variable=self.mask_edge_refine_enabled_var,
             command=lambda: self.on_slider_release(None),
         )
-        edge_refine_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        edge_refine_check.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
         self._create_hover_tooltip(edge_refine_check, "mask_edge_refine_enabled")
         self.widgets_to_disable.append(edge_refine_check)
-        create_single_slider_with_label_updater(self, param_right, "Edge Refine Diameter:", self.mask_edge_refine_diameter_var, 1, 31, 2)
-        create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Color:", self.mask_edge_refine_sigma_color_var, 0.0, 1.0, 3, decimals=2)
-        create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Space:", self.mask_edge_refine_sigma_space_var, 0.0, 20.0, 4, decimals=2)
+        create_single_slider_with_label_updater(self, param_right, "Edge Refine Diameter:", self.mask_edge_refine_diameter_var, 1, 31, 1)
+        create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Color:", self.mask_edge_refine_sigma_color_var, 0.0, 1.0, 2, decimals=2)
+        create_single_slider_with_label_updater(self, param_right, "Edge Refine Sigma Space:", self.mask_edge_refine_sigma_space_var, 0.0, 20.0, 3, decimals=2)
         temporal_smooth_check = ttk.Checkbutton(
             param_right,
             text="Temporal Mask Smoothing",
             variable=self.mask_temporal_smooth_enabled_var,
             command=lambda: self.on_slider_release(None),
         )
-        temporal_smooth_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
+        temporal_smooth_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(6, 2))
         self._create_hover_tooltip(temporal_smooth_check, "mask_temporal_smooth_enabled")
         self.widgets_to_disable.append(temporal_smooth_check)
-        create_single_slider_with_label_updater(self, param_right, "Temporal Smooth Alpha:", self.mask_temporal_smooth_alpha_var, 0.0, 1.0, 6, decimals=2)
+        create_single_slider_with_label_updater(self, param_right, "Temporal Smooth Alpha:", self.mask_temporal_smooth_alpha_var, 0.0, 1.0, 5, decimals=2)
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
