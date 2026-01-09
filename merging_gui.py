@@ -1593,11 +1593,50 @@ class MergingGUI(ThemedTk):
                     float(params.get("mask_edge_refine_sigma_space", 5.0)),
                 )
             if params.get("mask_temporal_smooth_enabled", False):
-                processed_mask, _ = apply_temporal_smoothing(
-                    processed_mask,
-                    float(params.get("mask_temporal_smooth_alpha", 0.6)),
-                    None,
-                )
+                alpha = float(params.get("mask_temporal_smooth_alpha", 0.6))
+                if alpha > 0.0 and hasattr(self, "previewer") and hasattr(self.previewer, "source_readers"):
+                    frame_idx = int(self.previewer.frame_scrubber_var.get())
+                    prev_reader = self.previewer.source_readers.get("splatted")
+                    if prev_reader is not None and frame_idx > 0:
+                        prev_np = prev_reader.get_batch([frame_idx - 1]).asnumpy()
+                        prev_splatted = torch.from_numpy(prev_np).permute(0, 3, 1, 2).float() / 255.0
+                        _, _, prev_h, prev_w = prev_splatted.shape
+                        if is_quad_input:
+                            half_h, half_w = prev_h // 2, prev_w // 2
+                            prev_mask_raw = prev_splatted[:, :, half_h:, :half_w]
+                        else:
+                            prev_mask_raw = prev_splatted[:, :, :, :prev_w // 2]
+                        prev_mask_np = prev_mask_raw.permute(0, 2, 3, 1).cpu().numpy()
+                        prev_mask_gray = np.mean(prev_mask_np, axis=3)
+                        prev_mask = torch.from_numpy(prev_mask_gray).float().unsqueeze(1)
+                        if prev_mask.shape[2] != hires_H or prev_mask.shape[3] != hires_W:
+                            prev_mask = upscale_tensor_lanczos(prev_mask, (hires_H, hires_W))
+
+                        prev_mask = prev_mask.to(device)
+                        if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                            prev_mask = (prev_mask > params["mask_binarize_threshold"]).float()
+                        if params.get("mask_dilate_kernel_size", 0) > 0:
+                            prev_mask = apply_mask_dilation(prev_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
+                        if params.get("mask_blur_kernel_size", 0) > 0:
+                            prev_mask = apply_gaussian_blur(prev_mask, int(params["mask_blur_kernel_size"]), use_gpu)
+                        if params.get("shadow_shift", 0) > 0:
+                            prev_mask = apply_shadow_blur(
+                                prev_mask,
+                                params["shadow_shift"],
+                                params["shadow_start_opacity"],
+                                params["shadow_opacity_decay"],
+                                params["shadow_min_opacity"],
+                                params["shadow_decay_gamma"],
+                                use_gpu,
+                            )
+                        if params.get("mask_edge_refine_enabled", False):
+                            prev_mask = apply_mask_edge_refine(
+                                prev_mask,
+                                int(params.get("mask_edge_refine_diameter", 7)),
+                                float(params.get("mask_edge_refine_sigma_color", 0.1)),
+                                float(params.get("mask_edge_refine_sigma_space", 5.0)),
+                            )
+                        processed_mask = prev_mask * (1.0 - alpha) + processed_mask * alpha
             processed_mask = processed_mask.squeeze(0) # Remove batch dim
 
             if params.get("enable_color_transfer", False):
