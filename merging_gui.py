@@ -142,6 +142,28 @@ def apply_mask_edge_refine(mask: torch.Tensor, diameter: int, sigma_color: float
     refined_mask = torch.stack(processed_frames).to(mask.device)
     return torch.clamp(refined_mask, 0.0, 1.0)
 
+def upscale_tensor_lanczos(tensor: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
+    """
+    Upscales a 4D tensor (T, C, H, W) to (H, W) using Lanczos resampling on CPU.
+    """
+    if tensor is None or tensor.ndim != 4:
+        return tensor
+
+    target_h, target_w = size_hw
+    if tensor.shape[2] == target_h and tensor.shape[3] == target_w:
+        return tensor
+
+    tensor_cpu = tensor.detach().cpu()
+    processed_frames = []
+    for t in range(tensor_cpu.shape[0]):
+        frame = tensor_cpu[t].permute(1, 2, 0).numpy().astype(np.float32)
+        resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        if resized.ndim == 2:
+            resized = resized[:, :, None]
+        processed_frames.append(torch.from_numpy(resized).permute(2, 0, 1))
+    upscaled = torch.stack(processed_frames)
+    return torch.clamp(upscaled, 0.0, 1.0)
+
 class MergingGUI(ThemedTk):
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
@@ -1156,13 +1178,13 @@ class MergingGUI(ThemedTk):
                     mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
 
                     # Process chunk
+                    if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                        inpainted = upscale_tensor_lanczos(inpainted, (hires_H, hires_W))
+                        mask = upscale_tensor_lanczos(mask, (hires_H, hires_W))
+
                     use_gpu = settings["use_gpu"] and torch.cuda.is_available()
                     device = "cuda" if use_gpu else "cpu"
                     mask, inpainted, original_left, warped_original = mask.to(device), inpainted.to(device), original_left.to(device), warped_original.to(device)
-                    
-                    if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
-                        inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
-                        mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
 
                     if settings["enable_color_transfer"]:
                         inpainted = apply_color_transfer_temporal(original_left, inpainted)
@@ -1476,6 +1498,12 @@ class MergingGUI(ThemedTk):
             mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
 
             # 3. Process the frames
+            hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
+            if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                logger.debug(f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}")
+                inpainted = upscale_tensor_lanczos(inpainted, (hires_H, hires_W))
+                mask = upscale_tensor_lanczos(mask, (hires_H, hires_W))
+
             # Define the processing device based on the 'use_gpu' parameter
             use_gpu = params.get("use_gpu", False) and torch.cuda.is_available()
             device = "cuda" if use_gpu else "cpu"
@@ -1485,12 +1513,6 @@ class MergingGUI(ThemedTk):
             inpainted = inpainted.to(device)
             original_left = original_left.to(device)
             right_eye_original = right_eye_original.to(device)
-
-            hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
-            if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
-                logger.debug(f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}")
-                inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
-                mask = F.interpolate(mask, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
 
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone() # No need to unsqueeze, it's already 4D
