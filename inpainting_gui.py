@@ -30,7 +30,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline
 )
 
-GUI_VERSION = "25-10-14.0"
+GUI_VERSION = "26-01-13.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1547,12 +1547,25 @@ class InpaintingGUI(ThemedTk):
             mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
             actual_sliced_length = original_input_frames_slice.shape[0]
 
-            padding_needed_for_pipeline_input = 0
-            if actual_sliced_length <= 4:
-                target_length = 6
-                padding_needed_for_pipeline_input = target_length - actual_sliced_length
-                logger.debug(f"End-of-video optimization: Short chunk of {actual_sliced_length} frames padded to minimum {target_length}.")
+            # Skip useless tail chunks that would contribute no new frames (only overlap)
+            if i > 0 and overlap > 0 and actual_sliced_length <= overlap:
+                logger.debug(
+                    f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {actual_sliced_length}) "
+                    f"because it contributes no new frames (overlap={overlap})."
+                )
+                break
             
+            padding_needed_for_pipeline_input = 0
+            # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
+            min_tail_frames = 3
+            target_length = max(6, overlap + min_tail_frames)
+            if actual_sliced_length < target_length:
+                padding_needed_for_pipeline_input = target_length - actual_sliced_length
+                logger.debug(
+                    f"End-of-video optimization: Short tail chunk ({actual_sliced_length} frames) "
+                    f"padded to minimum {target_length} (overlap={overlap})."
+                )
+
             if padding_needed_for_pipeline_input > 0:
                 logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
                 last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
