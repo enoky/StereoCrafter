@@ -1,14 +1,14 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.7.0
-torchvision==0.22.0
-torchaudio==2.7.0
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
 diffusers
 numpy==1.26.4
 matplotlib
 transformers
 accelerate
-xformers==0.0.30
+xformers==0.0.33.post2
 mediapy
 fire
 decord
