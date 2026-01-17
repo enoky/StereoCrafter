@@ -1,17 +1,19 @@
 import os
+import json
 import gc
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Optional, Callable, Dict, Any, Union
 import torch
 import numpy as np
-from PIL import Image, ImageTk
+import subprocess
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 from decord import VideoReader, cpu
 
 # Import release_cuda_memory from the util module
-from .stereocrafter_util import Tooltip, logger, release_cuda_memory
+from .stereocrafter_util import Tooltip, logger, release_cuda_memory, get_video_stream_info
 
-VERSION = "25-10-24.2"
+VERSION = "26-01-17.1"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -56,6 +58,14 @@ class VideoPreviewer(ttk.Frame):
         """
         super().__init__(parent, **kwargs)
         self.parent = parent
+        
+        # Depth-map decode state (10-bit+ aware)
+        self._depth_path: Optional[str] = None
+        self._depth_bit_depth: int = 8
+        self._depth_is_high_bit: bool = False
+        self._depth_native_w: Optional[int] = None
+        self._depth_native_h: Optional[int] = None
+        self._depth_msb_shift: Optional[int] = None
         self.processing_callback = processing_callback
         self.help_data = help_data if help_data else {}
         self.find_sources_callback = find_sources_callback
@@ -76,7 +86,24 @@ class VideoPreviewer(ttk.Frame):
         self.root_window = self.parent.winfo_toplevel() 
         self.last_loaded_video_path: Optional[str] = None
         self.last_loaded_frame_index: int = 0 
+        # --- Playback (preview-only) ---
+        self._play_after_id: Optional[str] = None
+        self._is_playing: bool = False
+        self._play_step: int = 1  # 1=Play, 5=Fast Forward
 
+
+        self.loop_playback_var = tk.BooleanVar(value=False)
+        # Restore Loop state from the main GUI config file (lightweight; safe if missing)
+        try:
+            # Prefer the canonical .splatcfg default config file; fall back to legacy .json
+            cfg_path = "config_splat.splatcfg" if os.path.exists("config_splat.splatcfg") else ("config_splat.json" if os.path.exists("config_splat.json") else "config_splat.splatcfg")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r") as f:
+                    _cfg = json.load(f) or {}
+                if "loop_playback" in _cfg:
+                    self.loop_playback_var.set(bool(_cfg.get("loop_playback", False)))
+        except Exception:
+            pass
         # --- GUI Variables ---
         self.frame_scrubber_var = tk.DoubleVar(value=0)
         self.video_jump_to_var = tk.StringVar(value="1")
@@ -84,14 +111,36 @@ class VideoPreviewer(ttk.Frame):
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
         self._is_dragging = False
 
+        # Crosshair overlay state (preview only). Controlled by parent GUI.
+        self.crosshair_enabled = False
+        self.crosshair_white = False
+        self.crosshair_multi = False  # show additional bullseyes/dots (preview only)
+        self.depth_pop_depth_pct = None  # background separation (% of width)
+        self.depth_pop_pop_pct = None    # foreground separation (% of width)
+        self.depth_pop_enabled = False    # show Depth/Pop readout (preview only)
+
         self._create_widgets()
 
     def cleanup(self):
         """Public method to be called when the parent GUI is closing."""
+        # Persist Loop state back into the main GUI config file (merge; do not clobber)
+        try:
+            # Prefer the canonical .splatcfg default config file; fall back to legacy .json
+            cfg_path = "config_splat.splatcfg" if os.path.exists("config_splat.splatcfg") else ("config_splat.json" if os.path.exists("config_splat.json") else "config_splat.splatcfg")
+            _cfg = {}
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r") as f:
+                    _cfg = json.load(f) or {}
+            _cfg["loop_playback"] = bool(self.loop_playback_var.get())
+            with open(cfg_path, "w") as f:
+                json.dump(_cfg, f, indent=4)
+        except Exception:
+            pass
         self._clear_preview_resources()
 
     def _clear_preview_resources(self):
         """Closes all preview-related video readers and clears the preview display."""
+        self._stop_playback()
         self._stop_wigglegram_animation()
 
         for key in list(self.source_readers.keys()):
@@ -107,6 +156,22 @@ class VideoPreviewer(ttk.Frame):
         self.preview_image_tk = None
         # --- END FIX ---
         self.pil_image_for_preview = None
+
+
+        # Reset depth-map decode state
+
+        self._depth_path = None
+
+        self._depth_bit_depth = 8
+
+        self._depth_is_high_bit = False
+
+        self._depth_native_w = None
+
+        self._depth_native_h = None
+
+        self._depth_msb_shift = None
+
         gc.collect()
         logger.debug("Preview resources and file handles have been released.")
 
@@ -124,10 +189,12 @@ class VideoPreviewer(ttk.Frame):
 
         # Canvas with scrollbars for the image
         self.preview_canvas = tk.Canvas(self)
-        v_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.preview_canvas.yview)
-        h_scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self.preview_canvas.xview)
+        v_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._on_preview_vscroll)
+        h_scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self._on_preview_hscroll)
         self.preview_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
         self.preview_canvas.bind("<Configure>", lambda e: self._update_preview_layout())
+        # Keep crosshair centered when scrolling (does not override scroll behavior)
+
 
         self.preview_canvas.grid(row=0, column=0, sticky="nsew")
         v_scrollbar.grid(row=0, column=1, sticky="ns")
@@ -177,6 +244,15 @@ class VideoPreviewer(ttk.Frame):
         self.root_window.bind('<Shift-Right>', self._key_jump_frames, add='+')
         self.root_window.bind('<Control-Left>', self._key_jump_clips, add='+')
         self.root_window.bind('<Control-Right>', self._key_jump_clips, add='+')
+        # Optional: Up/Down to navigate between clips (only if not already bound elsewhere)
+        if not self.root_window.bind('<Up>'):
+            self.root_window.bind('<Up>', self._key_nav_clips_updown, add='+')
+        if not self.root_window.bind('<Down>'):
+            self.root_window.bind('<Down>', self._key_nav_clips_updown, add='+')
+        # Playback shortcuts (preview-only)
+        self.root_window.bind('<space>', self._key_toggle_play_pause, add='+')
+        self.root_window.bind('<Shift-space>', self._key_shift_space_fast_forward, add='+')
+
         logger.debug("Global key bindings for frame jumping installed on root window.")
 
         # Add Preview Source dropdown
@@ -184,7 +260,13 @@ class VideoPreviewer(ttk.Frame):
         lbl_preview_source.pack(side="left", padx=(0, 5))
         self.preview_source_combo = ttk.Combobox(preview_button_frame, state="readonly", width=18)
         self.preview_source_combo.pack(side="left", padx=5)
-        self.preview_source_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
+        # Prevent this combobox from stealing focus/keyboard shortcuts (space/enter)
+        self.preview_source_combo.configure(takefocus=False)
+        self.preview_source_combo.bind("<<ComboboxSelected>>", lambda e: (self.on_slider_release(e), self.preview_canvas.focus_set()))
+        self.preview_source_combo.bind("<space>", lambda e: (self._key_toggle_play_pause(e) or "break"))
+        self.preview_source_combo.bind("<Shift-space>", lambda e: (self._key_shift_space_fast_forward(e) or "break"))
+        self.preview_source_combo.bind("<Return>", lambda e: (self.root_window.focus_set() or self.root_window.event_generate("<Return>") or "break"))
+        self.preview_source_combo.bind("<KP_Enter>", lambda e: (self.root_window.focus_set() or self.root_window.event_generate("<Return>") or "break"))
         tip_preview_source = "Select which image layer to display in the preview window for diagnostic purposes."
         self._create_hover_tooltip(lbl_preview_source, "preview_source", tip_preview_source)
         self._create_hover_tooltip(self.preview_source_combo, "preview_source", tip_preview_source)
@@ -215,12 +297,41 @@ class VideoPreviewer(ttk.Frame):
         self._create_hover_tooltip(self.video_jump_entry, "jump_to_video", tip_jump_to_video)
         self._create_hover_tooltip(lbl_video_jump_info, "jump_to_info", tip_jump_info)
 
+        # --- NEW: Playback controls (preview-only) ---
+        self.play_pause_button = ttk.Button(preview_button_frame, text="▶", width=3, command=self._toggle_play_pause, takefocus=False)
+        self.play_pause_button.pack(side="left", padx=(5, 2))
+        tip_play_pause = "Play/Pause (frame-by-frame). Shortcut: Spacebar"
+        self._create_hover_tooltip(self.play_pause_button, "preview_play_pause", tip_play_pause)
+
+        self.fast_forward_button = ttk.Button(preview_button_frame, text=">>", width=3, command=self._toggle_fast_forward, takefocus=False)
+        self.fast_forward_button.pack(side="left", padx=(2, 5))
+        tip_fast_forward = "Fast Forward (step 5 frames). Shortcut: Shift+Spacebar (Spacebar pauses)"
+        self._create_hover_tooltip(self.fast_forward_button, "preview_fast_forward", tip_fast_forward)
+        # Prevent focused buttons from also consuming Space/Return via ttk default bindings.
+        # This avoids double-toggling when the user clicks Fast Forward (button gains focus) then presses Space.
+        self.play_pause_button.bind("<space>", lambda e: (self._toggle_play_pause(), "break")[1])
+        self.play_pause_button.bind("<Return>", lambda e: (self._toggle_play_pause(), "break")[1])
+        self.fast_forward_button.bind("<space>", lambda e: (self._toggle_play_pause(), "break")[1])
+        self.fast_forward_button.bind("<Return>", lambda e: (self._toggle_play_pause(), "break")[1])
+        # Loop indicator (clickable). Avoid ttk color limitations by using a tk.Label.
+        self.loop_label = tk.Label(preview_button_frame, text="🔁", cursor="hand2")
+        self.loop_label.pack(side="left", padx=(4, 4))
+        self.loop_label.bind("<Button-1>", self._toggle_loop)
+        tip_loop = "Loop playback. When reaching the end, wrap to the first frame and continue."
+        self._create_hover_tooltip(self.loop_label, "preview_loop", tip_loop)
+        self._update_loop_indicator()
+
+
         
         # --- MODIFIED: Add Preview Size Combobox (Percentage Scale) ---
-        PERCENTAGE_VALUES = ["200%", "150%", "115%", "110%", "105%", "100%", "95%", "90%", "85%", "80%", "75%", "50%", "25%"]
+        PERCENTAGE_VALUES = [
+                "250%", "240%", "230%", "220%", "210%", "200%", "190%", "180%", "170%", "160%", 
+                "150%", "145%", "140%", "135%", "130%", "125%", "120%", "115%", "110%", "105%", 
+                "100%", "95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%", "25%"
+            ]
         
         lbl_preview_scale = ttk.Label(preview_button_frame, text="Preview Scale:")
-        lbl_preview_scale.pack(side="left", padx=(20, 5))
+        lbl_preview_scale.pack(side="left", padx=(10, 5))
         tip_preview_scale = "Select the size of the video preview. Larger images may impact performance."
         self._create_hover_tooltip(lbl_preview_scale, "preview_scale", tip_preview_scale)
         
@@ -229,7 +340,7 @@ class VideoPreviewer(ttk.Frame):
             textvariable=self.preview_size_var, 
             values=PERCENTAGE_VALUES, 
             state="readonly", # Make it selection-only
-            width=7
+            width=5
         )
         self.preview_size_combo.pack(side="left")
         self._create_hover_tooltip(self.preview_size_combo, "preview_scale", tip_preview_scale)
@@ -244,39 +355,69 @@ class VideoPreviewer(ttk.Frame):
         # --- END MODIFIED ---
 
         # --- NEW: Store widgets to be disabled ---
-        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button,
+        self.widgets_to_disable = [self.load_preview_button, self.prev_video_button, self.next_video_button, self.play_pause_button, self.fast_forward_button,
                                    self.video_jump_entry, self.frame_scrubber, self.preview_source_combo, self.preview_size_combo]
 
-    def _drag_scroll(self, event):
-        """Scrolls the canvas using scan_dragto."""
-        if not self._is_dragging:
-            return
-
-        # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
-        content_x = int(self.preview_canvas.canvasx(event.x))
-        content_y = int(self.preview_canvas.canvasy(event.y))
-
-        # Drag the canvas view based on the current cursor position
-        self.preview_canvas.scan_dragto(content_x, content_y, gain=5) 
+        # --- [START OF ADDITION] ZOOM & DRAG INTERACTION BINDINGS ---
+        self.preview_canvas.bind("<Enter>", lambda e: self.preview_canvas.focus_set())
         
-        logger.debug(f"_drag_scroll: Scan DragTo at X={content_x}, Y={content_y}")
+        # Universal Zoom (Mousewheel)
+        for w in [self.preview_canvas, self.preview_label]:
+            w.bind("<MouseWheel>", self._handle_zoom)
+            w.bind("<Button-4>", self._handle_zoom)
+            w.bind("<Button-5>", self._handle_zoom)
+            # Right Click to reset zoom to 100%
+            w.bind("<Button-3>", lambda e: (self.preview_size_var.set("100%"), self.on_slider_release(None)))
+
+        # Universal Drag (Left Click and Middle Click)
+        for b in ["<ButtonPress-1>", "<ButtonPress-2>"]:
+            self.preview_label.bind(b, self._start_drag_scroll)
+        for b in ["<B1-Motion>", "<B2-Motion>"]:
+            self.preview_label.bind(b, self._drag_scroll)
+        for b in ["<ButtonRelease-1>", "<ButtonRelease-2>"]:
+            self.preview_label.bind(b, self._end_drag_scroll)
+
+    def _start_drag_scroll(self, event):
+        """Initiates panning logic if image is larger than the window."""
+        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
+            self._is_dragging = True
+            self.preview_canvas.config(cursor="fleur")
+            self.preview_canvas.scan_mark(int(event.x), int(event.y))
 
     def _end_drag_scroll(self, event):
-        """Ends the drag-to-scroll operation."""
+        """Resets the cursor and dragging state when the mouse button is released."""
+        self._is_dragging = False
+        # Remove the 'fleur' panning cursor
+        self.preview_canvas.config(cursor="")
+        logger.debug("_end_drag_scroll: Panning operation concluded.")
+
+    def _drag_scroll(self, event):
+        """Standard Canvas panning using gain=1 for 1:1 mouse movement."""
         if self._is_dragging:
-            self._is_dragging = False
-            self.preview_canvas.config(cursor="")
-            logger.debug("_end_drag_scroll: Dragging ended.")
+            self.preview_canvas.scan_dragto(int(event.x), int(event.y), gain=1)
+
+    def _handle_zoom(self, event):
+        """Standard Mousewheel Zoom stepping through the percentage list."""
+        if not self.preview_size_var: return
+        vals = ["250%", "240%", "230%", "220%", "210%", "200%", "190%", "180%", "170%", "160%", 
+        "150%", "145%", "140%", "135%", "130%", "125%", "120%", "115%", "110%", "105%", 
+        "100%", "95%", "90%", "85%", "80%", "75%", "70%", "65%", "60%", "55%", "50%", "25%"
+    ]
+        curr = self.preview_size_var.get()
+        try: idx = vals.index(curr)
+        except ValueError: idx = vals.index("100%")
         
-    # AND BINDINGS (in _create_widgets):
-        self.preview_label.bind("<ButtonPress-1>", 
-                                lambda e: (self._start_drag_scroll(e), "break")[1])
-        self.preview_label.bind("<B1-Motion>", 
-                                lambda e: (self._drag_scroll(e), "break")[1])
-        self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
+        delta = 1 if (event.num == 4 or (hasattr(event, 'delta') and event.delta > 0)) else -1
+        new_idx = max(0, min(len(vals) - 1, idx - delta))
+        
+        if new_idx != idx:
+            self.preview_size_var.set(vals[new_idx])
+            if hasattr(self.parent, 'on_slider_release'): self.parent.on_slider_release(None)
+            else: self.on_slider_release(None)
                 
     def _handle_load_refresh(self):
         """Internal handler for the 'Load/Refresh List' button."""
+        self._stop_playback()
         if self.find_sources_callback:
             self.load_video_list(find_sources_callback=self.find_sources_callback)
         else:
@@ -285,6 +426,7 @@ class VideoPreviewer(ttk.Frame):
 
     def _jump_to_video(self, event=None):
         """Jump to a specific video number in the preview list."""
+        self._stop_playback()
         if not self.video_list:
             return
         
@@ -316,16 +458,55 @@ class VideoPreviewer(ttk.Frame):
         # Call the existing navigation function
         self._nav_preview_video(direction)
 
+
+    def _key_nav_clips_updown(self, event):
+        """Handler for Up/Down arrow keys to navigate between clips."""
+        if not self.video_list:
+            return
+
+        # Don't hijack Up/Down inside text/entry/combobox widgets (let them behave normally)
+        try:
+            wclass = event.widget.winfo_class()
+        except Exception:
+            wclass = ""
+        if wclass in ("TEntry", "Entry", "TCombobox", "Combobox", "TSpinbox", "Spinbox", "Text"):
+            return
+
+        if event.keysym == "Up":
+            self._nav_preview_video(1)
+            return "break"
+        elif event.keysym == "Down":
+            self._nav_preview_video(-1)
+            return "break"
+        return
+    def _jump_frames_by(self, delta: int):
+        """Core frame-stepping logic shared by arrow keys and playback controls."""
+        if not self.source_readers:
+            return
+
+        current_frame = int(self.frame_scrubber_var.get())
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+
+        new_frame = current_frame + int(delta)
+
+        # Clamp the new frame index
+        new_frame = max(0, min(new_frame, total_frames - 1))
+
+        if new_frame != current_frame:
+            self.frame_scrubber_var.set(new_frame)
+            self.on_scrubber_move(new_frame)  # Update label
+            self.update_preview()  # Update display
+
     def _key_jump_frames(self, event):
         """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
         if not self.source_readers:
             return
 
-        # Determine jump size: 10 for normal, 100 for Shift (state mask 0x1)
+        # Determine jump size: 1 for normal, 10 for Shift (state mask 0x1)
         jump_size = 1
-        if event.state & 0x1: # 0x1 is the mask for the Shift key state
+        if event.state & 0x1:  # 0x1 is the mask for the Shift key state
             jump_size = 10
-            
+
         direction_multiplier = 0
         if event.keysym == "Left":
             direction_multiplier = -1
@@ -335,21 +516,201 @@ class VideoPreviewer(ttk.Frame):
             # Ignore just the Shift keypress itself if it somehow triggered the event
             return
         else:
-            return # Should not happen
+            return  # Should not happen
+
+        self._jump_frames_by(direction_multiplier * jump_size)
+
+    def _key_toggle_play_pause(self, event=None):
+        """Spacebar: Play/Pause (frame-by-frame)."""
+        # Don't hijack inside text/entry/combobox widgets (let them behave normally)
+        try:
+            wclass = event.widget.winfo_class() if event else ""
+        except Exception:
+            wclass = ""
+        if wclass in ("TEntry", "Entry", "TCombobox", "Combobox", "TSpinbox", "Spinbox", "Text"):
+            return
+
+        self._toggle_play_pause()
+        return "break"
+
+    def _key_shift_space_fast_forward(self, event=None):
+        """Shift+Spacebar: Start Fast Forward (step 5). Spacebar pauses."""
+        # Don't hijack inside text/entry/combobox widgets (let them behave normally)
+        try:
+            wclass = event.widget.winfo_class() if event else ""
+        except Exception:
+            wclass = ""
+        if wclass in ("TEntry", "Entry", "TCombobox", "Combobox", "TSpinbox", "Spinbox", "Text"):
+            return
+
+        if self._is_playing and self._play_step == 5:
+            self._stop_playback()
+        else:
+            self._start_playback(step=5)
+        return "break"
+
+    def _toggle_play_pause(self):
+        """Button/Spacebar handler: toggles 1-frame playback."""
+        if self._is_playing:
+            self._stop_playback()
+        else:
+            self._start_playback(step=1)
+
+        # Keep focus off the playback buttons so Spacebar shortcuts don't double-trigger.
+        try:
+            self.preview_canvas.focus_set()
+        except Exception:
+            pass
+
+
+
+    def _toggle_fast_forward(self):
+        """Button handler: toggles fast-forward playback (step 5)."""
+        if self._is_playing and self._play_step == 5:
+            self._stop_playback()
+        else:
+            self._start_playback(step=5)
+
+        # Keep focus off the playback buttons so Spacebar shortcuts don't double-trigger.
+        try:
+            self.preview_canvas.focus_set()
+        except Exception:
+            pass
+
+
+
+    def _start_playback(self, step: int = 1):
+        """Starts preview playback using the existing frame-advance pathway."""
+        if not self.source_readers:
+            return
+
+        # Ensure any prior scheduled tick is cancelled before starting.
+        if self._is_playing:
+            self._stop_playback()
+
+        self._is_playing = True
+        self._play_step = 5 if int(step) == 5 else 1
+        self._update_playback_button_labels()
+        self._update_loop_indicator()
+        self._schedule_playback_tick()
+
+    def _stop_playback(self):
+        """Stops preview playback and cancels any scheduled tick."""
+        self._is_playing = False
+        if getattr(self, "_play_after_id", None):
+            try:
+                self.root_window.after_cancel(self._play_after_id)
+            except Exception:
+                pass
+        self._play_after_id = None
+        self._update_playback_button_labels()
+        self._update_loop_indicator()
+
+    def _schedule_playback_tick(self):
+        """Schedules the next playback tick (yields to Tk event loop)."""
+        if not self._is_playing:
+            return
+
+        if getattr(self, "_play_after_id", None):
+            try:
+                self.root_window.after_cancel(self._play_after_id)
+            except Exception:
+                pass
+            self._play_after_id = None
+
+        # Use after(0) to yield to Tk's event loop (keeps UI responsive during playback).
+        self._play_after_id = self.root_window.after(0, self._playback_tick)
+
+    def _playback_tick(self):
+        """Advances frames repeatedly until paused or reaching the end."""
+        self._play_after_id = None
+
+        if not self._is_playing:
+            return
+        if not self.source_readers:
+            self._stop_playback()
+            return
+
+        total_frames = int(self.frame_scrubber.cget("to")) + 1
+        if total_frames <= 0:
+            self._stop_playback()
+            return
 
         current_frame = int(self.frame_scrubber_var.get())
-        total_frames = int(self.frame_scrubber.cget("to")) + 1
-        
-        direction = direction_multiplier * jump_size
-        new_frame = current_frame + direction
-        
-        # Clamp the new frame index
-        new_frame = max(0, min(new_frame, total_frames - 1))
+        if current_frame >= total_frames - 1:
+            if getattr(self, "loop_playback_var", None) is not None and bool(self.loop_playback_var.get()) and total_frames > 1:
+                self.frame_scrubber_var.set(0)
+                self.on_scrubber_move(0)
+                self.update_preview()
+                self._schedule_playback_tick()
+                return
+            self._stop_playback()
+            return
 
-        if new_frame != current_frame:
-            self.frame_scrubber_var.set(new_frame)
-            self.on_scrubber_move(new_frame) # Update label
-            self.update_preview() # Update display
+        prev_frame = current_frame
+        self._jump_frames_by(self._play_step)
+        new_frame = int(self.frame_scrubber_var.get())
+
+        # Stop when we hit the end (or couldn't advance).
+        if new_frame >= total_frames - 1 or new_frame == prev_frame:
+            if getattr(self, "loop_playback_var", None) is not None and bool(self.loop_playback_var.get()) and total_frames > 1:
+                self.frame_scrubber_var.set(0)
+                self.on_scrubber_move(0)
+                self.update_preview()
+                self._schedule_playback_tick()
+                return
+            self._stop_playback()
+            return
+
+        self._schedule_playback_tick()
+
+    def _update_playback_button_labels(self):
+        """Updates the Play/Pause button label. Safe to call even before widgets exist."""
+        if hasattr(self, "play_pause_button"):
+            try:
+                self.play_pause_button.config(text="⏸" if self._is_playing else "▶")
+            except Exception:
+                pass
+    def _toggle_loop(self, event=None):
+        """Toggle loop playback on/off (UI-only state)."""
+        try:
+            self.loop_playback_var.set(not bool(self.loop_playback_var.get()))
+        except Exception:
+            # If somehow not initialized, default to enabling
+            try:
+                self.loop_playback_var = tk.BooleanVar(value=True)
+            except Exception:
+                return
+        self._update_loop_indicator()
+
+    def _update_loop_indicator(self):
+        """Update the loop indicator appearance (latched + dim when stopped)."""
+        if not hasattr(self, "loop_label"):
+            return
+        try:
+            loop_on = bool(self.loop_playback_var.get())
+        except Exception:
+            loop_on = False
+
+        # Dim when playback is stopped; brighter while actively playing.
+        if loop_on:
+            fg = "#2f5fb8" if self._is_playing else "#5f5f5f"  # dark blue / dark gray
+            relief = "sunken"
+            bd = 1
+            padx = 3
+            pady = 0
+        else:
+            fg = "#5f5f5f" if self._is_playing else "#9a9a9a"  # dark gray / gray
+            relief = "flat"
+            bd = 0
+            padx = 0
+            pady = 0
+
+        try:
+            self.loop_label.config(fg=fg, relief=relief, bd=bd, padx=padx, pady=pady)
+        except Exception:
+            pass
+
 
     def load_video_list(self, find_sources_callback: Callable):
         """
@@ -440,6 +801,44 @@ class VideoPreviewer(ttk.Frame):
                     if key in ['inpainted', 'splatted']:
                          raise ValueError(f"Critical source file '{key}' failed to load: {e}")
 
+            # Depth-map stream probe (bit depth) - cached per clip
+            self._depth_path = source_paths.get('depth_map') if isinstance(source_paths, dict) else None
+            self._depth_msb_shift = None
+            self._depth_bit_depth = 8
+            self._depth_is_high_bit = False
+            self._depth_native_w = None
+            self._depth_native_h = None
+
+            if self._depth_path and os.path.exists(self._depth_path):
+                try:
+                    depth_info = get_video_stream_info(self._depth_path)
+                    pix = str((depth_info or {}).get("pix_fmt", "")).lower()
+                    profile = str((depth_info or {}).get("profile", "")).lower()
+
+                    # Conservative, best-effort inference
+                    if "p16" in pix or "16" in pix or pix.startswith("gray16"):
+                        self._depth_bit_depth = 16
+                    elif "p12" in pix or "12" in pix:
+                        self._depth_bit_depth = 12
+                    elif "p10" in pix or "10" in pix or "main10" in profile:
+                        self._depth_bit_depth = 10
+                    else:
+                        self._depth_bit_depth = 8
+
+                    self._depth_is_high_bit = self._depth_bit_depth > 8
+                except Exception as e:
+                    logger.warning(f"Previewer: depth bit-depth probe failed for '{self._depth_path}': {e}")
+
+            # Cache native depth size for ffmpeg single-frame decode
+            depth_reader = self.source_readers.get("depth_map")
+            if depth_reader:
+                try:
+                    _df0 = depth_reader.get_batch([0]).asnumpy()
+                    self._depth_native_h, self._depth_native_w = _df0.shape[1:3]
+                except Exception:
+                    pass
+
+
             # Configure the scrubber
             self.frame_scrubber.config(to=num_frames - 1)
             initial_frame = min(initial_frame, num_frames - 1) 
@@ -461,6 +860,7 @@ class VideoPreviewer(ttk.Frame):
 
     def _nav_preview_video(self, direction: int):
         """Navigate to the previous or next video in the preview list."""
+        self._stop_playback()
         if not self.video_list:
             return
         
@@ -563,25 +963,6 @@ class VideoPreviewer(ttk.Frame):
                     widget.config(state=state)
             except tk.TclError:
                 pass # Ignore if widgets don't exist yet
-
-    def _start_drag_scroll(self, event):
-        """Records the starting position for a drag-to-scroll operation using scan_mark."""
-        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
-            self._is_dragging = True
-            self.preview_canvas.config(cursor="fleur")
-            
-            # --- CRITICAL FIX: Use canvasx/canvasy for content-relative coordinates ---
-            content_x = int(self.preview_canvas.canvasx(event.x))
-            content_y = int(self.preview_canvas.canvasy(event.y))
-            
-            self.preview_canvas.scan_mark(content_x, content_y)
-            logger.debug(f"_start_drag_scroll: Scan Mark at X={content_x}, Y={content_y}")
-        else:
-            logger.debug("_start_drag_scroll: Drag ignored.")
-            
-        # Reset the jump counter/filter (if you still have it, for safety)
-        if hasattr(self, '_consecutive_jumps'):
-            self._consecutive_jumps = 0
             
     def _start_wigglegram_animation(self, left_frame: torch.Tensor, right_frame: torch.Tensor):
         """Starts the wigglegram animation loop."""
@@ -654,8 +1035,16 @@ class VideoPreviewer(ttk.Frame):
             source_frames = {}
             for key, reader in self.source_readers.items():
                 if reader:
-                    frame_np = reader.get_batch([frame_idx]).asnumpy()
-                    frame_tensor = torch.from_numpy(frame_np).permute(0, 3, 1, 2).float() / 255.0
+                    if key == 'depth_map':
+                        if self._depth_is_high_bit and self._depth_path and self._depth_native_w and self._depth_native_h:
+                            frame_np = self._read_depth_frame_ffmpeg(frame_idx)
+                        else:
+                            frame_np = reader.get_batch([frame_idx]).asnumpy()
+                        # IMPORTANT: keep depth as RAW values (8-bit stays 0..255, 10-bit stays 0..1023+)
+                        frame_tensor = torch.from_numpy(frame_np).permute(0, 3, 1, 2).float()
+                    else:
+                        frame_np = reader.get_batch([frame_idx]).asnumpy()
+                        frame_tensor = torch.from_numpy(frame_np).permute(0, 3, 1, 2).float() / 255.0
                     source_frames[key] = frame_tensor # Keep batch dim: [1, C, H, W]
 
             # Call the user-provided processing function
@@ -690,6 +1079,109 @@ class VideoPreviewer(ttk.Frame):
                 logger.debug(f"Preview scaled by {scale_percent_str} to {new_width}x{new_height}.")
             # --- END MODIFIED ---
 
+                        # Preview-only crosshair/bullseye overlay (drawn onto the preview image so it always shows)
+            if getattr(self, "crosshair_enabled", False) and self._crosshair_allowed_for_current_source():
+                try:
+                    draw = ImageDraw.Draw(display_image)
+                    w_img, h_img = display_image.size
+                    cx, cy = w_img // 2, h_img // 2
+                    color = (255, 255, 255) if getattr(self, "crosshair_white", False) else (0, 0, 0)
+
+                    def _draw_bullseye(x: int, y: int, half_len: int, r: int, line_w: int):
+                        # cross
+                        draw.line((x - half_len, y, x + half_len, y), fill=color, width=line_w)
+                        draw.line((x, y - half_len, x, y + half_len), fill=color, width=line_w)
+                        # ring
+                        draw.ellipse((x - r, y - r, x + r, y + r), outline=color, width=max(1, line_w))
+
+                    def _draw_dot(x: int, y: int, r: int):
+                        draw.ellipse((x - r, y - r, x + r, y + r), fill=color, outline=color)
+
+                    # Center bullseye (slightly larger)
+                    base = max(8, min(50, int(min(w_img, h_img) * 0.04)))
+                    _draw_bullseye(cx, cy, half_len=base, r=max(4, base // 3), line_w=3)
+
+                    if getattr(self, "crosshair_multi", False):
+                        # Outer targets: halfway between screen edge and center -> rectangle around center.
+                        dx = w_img // 4
+                        dy = h_img // 4
+
+                        # Make outer targets a bit smaller than center
+                        outer_len = max(6, int(base * 0.65))
+                        outer_r = max(3, outer_len // 3)
+                        outer_w = 2
+
+                        # 8 outer target positions (4 midpoints + 4 corners)
+                        outer = [
+                            (cx - dx, cy), (cx + dx, cy), (cx, cy - dy), (cx, cy + dy),
+                            (cx - dx, cy - dy), (cx + dx, cy - dy), (cx - dx, cy + dy), (cx + dx, cy + dy),
+                        ]
+                        for (x, y) in outer:
+                            _draw_bullseye(x, y, half_len=outer_len, r=outer_r, line_w=outer_w)
+
+                        # Dots between center and each outer target (2 per line)
+                        dot_r = 2
+                        for (x, y) in outer:
+                            for t in (1/3, 2/3):
+                                mx = int(round(cx + (x - cx) * t))
+                                my = int(round(cy + (y - cy) * t))
+                                _draw_dot(mx, my, dot_r)
+
+                        # Dots along the rectangle path between outer targets (2 per segment)
+                        # Order around the perimeter (clockwise), using 8 points (midpoints + corners)
+                        ring = [
+                            (cx, cy - dy), (cx + dx, cy - dy), (cx + dx, cy), (cx + dx, cy + dy),
+                            (cx, cy + dy), (cx - dx, cy + dy), (cx - dx, cy), (cx - dx, cy - dy),
+                        ]
+                        for i in range(len(ring)):
+                            x0, y0 = ring[i]
+                            x1, y1 = ring[(i + 1) % len(ring)]
+                            for t in (1/3, 2/3):
+                                mx = int(round(x0 + (x1 - x0) * t))
+                                my = int(round(y0 + (y1 - y0) * t))
+                                _draw_dot(mx, my, dot_r)
+
+
+                except Exception:
+                    pass
+            # Depth/Pop separation readout (preview-only; percent of screen width)
+            # Independent of the crosshair toggle; color follows the White checkbox.
+            if getattr(self, "depth_pop_enabled", False) and self._crosshair_allowed_for_current_source():
+                try:
+                    d_pct = getattr(self, "depth_pop_depth_pct", None)
+                    p_pct = getattr(self, "depth_pop_pop_pct", None)
+                    if d_pct is not None and p_pct is not None:
+                        draw = ImageDraw.Draw(display_image)
+                        w_img, h_img = display_image.size
+                        cx = w_img // 2
+                        color = (255, 255, 255) if getattr(self, "crosshair_white", False) else (0, 0, 0)
+
+                        # Keep a dash separator, but avoid a confusing "double minus" when pop is negative
+                        txt = f"{float(d_pct):.1f}/{float(p_pct):.1f}%"
+
+                        # Slightly larger font (fallbacks safely if TTF isn't available)
+                        try:
+                            font_size = max(10, min(20, int(h_img * 0.025)))
+                            font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+                        except Exception:
+                            try:
+                                font_size = max(10, min(20, int(h_img * 0.025)))
+                                font = ImageFont.truetype("arial.ttf", font_size)
+                            except Exception:
+                                font = ImageFont.load_default()
+
+                        try:
+                            bbox = draw.textbbox((0, 0), txt, font=font)
+                            tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+                        except Exception:
+                            tw, th = draw.textsize(txt, font=font)
+
+                        x_txt = cx - (tw // 2)
+                        y_txt = h_img - th - 10
+                        draw.text((x_txt, y_txt), txt, fill=color, font=font)
+                except Exception:
+                    pass
+
             self.preview_image_tk = ImageTk.PhotoImage(display_image)
             # --- FIX: Attach the image reference to the widget to prevent garbage collection ---
             self.preview_label.config(image=self.preview_image_tk, text="")
@@ -710,6 +1202,87 @@ class VideoPreviewer(ttk.Frame):
         finally:
             release_cuda_memory()
             self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+
+    def _read_depth_frame_ffmpeg(self, frame_idx: int) -> np.ndarray:
+        """Decode a single depth frame preserving 10-bit+ using ffmpeg (fast seek)."""
+        depth_reader = self.source_readers.get("depth_map")
+        if not depth_reader or not self._depth_path or not self._depth_native_w or not self._depth_native_h:
+            raise RuntimeError("Depth reader/path/size not initialized for ffmpeg decode.")
+
+        # Prefer depth reader FPS (should match source), fallback to source_video FPS.
+        fps = 0.0
+        try:
+            fps = float(depth_reader.get_avg_fps())
+        except Exception:
+            try:
+                src = self.source_readers.get("source_video")
+                fps = float(src.get_avg_fps()) if src else 0.0
+            except Exception:
+                fps = 0.0
+
+        t = (float(frame_idx) / fps) if fps and fps > 0 else 0.0
+        w, h = int(self._depth_native_w), int(self._depth_native_h)
+        expected_bytes = w * h * 2  # gray16le
+
+        def _run(vf: str) -> bytes:
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-nostdin",
+                "-ss", f"{t:.6f}",
+                "-i", self._depth_path,
+                "-an", "-sn", "-dn",
+                "-frames:v", "1",
+                "-vf", vf,
+                "-f", "rawvideo",
+                "pipe:1",
+            ]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out = b""
+            try:
+                if p.stdout:
+                    out = p.stdout.read(expected_bytes)
+            finally:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            return out
+
+        # First try extracting luma plane (best for yuv depth encodes)
+        buf = _run("extractplanes=y,format=gray16le")
+        if len(buf) != expected_bytes:
+            # Fallback for true gray sources (extractplanes may not apply)
+            buf = _run("format=gray16le")
+
+        if len(buf) != expected_bytes:
+            logger.warning(f"Previewer: ffmpeg depth decode returned {len(buf)} bytes (expected {expected_bytes}); falling back to Decord 8-bit.")
+            return depth_reader.get_batch([frame_idx]).asnumpy()
+
+        arr = np.frombuffer(buf, dtype=np.uint16).reshape(1, h, w, 1)
+
+        # Detect MSB-aligned samples (common when decoding 10-bit into 16-bit containers)
+        if self._depth_msb_shift is None:
+            bd = int(self._depth_bit_depth) if self._depth_bit_depth else 16
+            if 0 < bd < 16:
+                expected_max = (1 << bd) - 1
+                max_val = int(arr.max(initial=0))
+                if max_val > expected_max:
+                    shift = 16 - bd
+                    if shift > 0 and (max_val % (1 << shift) == 0):
+                        self._depth_msb_shift = shift
+                    else:
+                        self._depth_msb_shift = 0
+                else:
+                    self._depth_msb_shift = 0
+            else:
+                self._depth_msb_shift = 0
+
+        if self._depth_msb_shift:
+            arr = (arr >> self._depth_msb_shift).astype(np.uint16, copy=False)
+
+        return arr.copy()
 
     def _update_preview_layout(self):
         """Centers the image if it's smaller than the canvas, and hides/shows scrollbars."""
@@ -738,12 +1311,14 @@ class VideoPreviewer(ttk.Frame):
         
         self.preview_canvas.coords(self.preview_canvas_window_id, x, y)
         self.preview_inner_frame.update_idletasks()
-        self.preview_canvas.config(scrollregion=self.preview_canvas.bbox("all"))
+        # REPLACED VERSION: Force scrollregion to encompass full image boundaries
+        self.preview_canvas.config(scrollregion=(0, 0, max(canvas_w, img_w), max(canvas_h, img_h)))
 
     def replace_source_path_for_current_video(self, key: str, path: str):
         """Replace the source path for the currently loaded video for `key` (e.g., 'depth_map').
-        This closes the old reader (if any), opens a new VideoReader for the given path (if exists),
-        updates the internal source_readers, and triggers an immediate preview update.
+
+        This closes the old reader (if any), opens a new VideoReader for the given path (if it exists),
+        updates internal caches used by the preview pipeline, and triggers an immediate preview update.
         """
         # Close previous reader if present
         try:
@@ -754,25 +1329,67 @@ class VideoPreviewer(ttk.Frame):
                 except Exception:
                     pass
                 self.source_readers[key] = None
+
             # Attempt to open new reader if path is a valid file
+            opened_reader = None
             if isinstance(path, str) and path and os.path.exists(path):
                 try:
-                    new_reader = VideoReader(path, ctx=cpu(0))
-                    self.source_readers[key] = new_reader
+                    opened_reader = VideoReader(path, ctx=cpu(0))
+                    self.source_readers[key] = opened_reader
                 except Exception as e:
                     logger.error(f"replace_source_path_for_current_video: failed to open {path}: {e}")
                     self.source_readers[key] = None
             else:
                 # Path invalid or missing - set None
                 self.source_readers[key] = None
+
+            # IMPORTANT (10-bit preview path):
+            # update cached depth-map probe fields so map switches actually take effect.
+            if key == "depth_map":
+                self._depth_path = path if (isinstance(path, str) and path and os.path.exists(path)) else None
+                self._depth_msb_shift = None
+                self._depth_bit_depth = 8
+                self._depth_is_high_bit = False
+                self._depth_native_w = None
+                self._depth_native_h = None
+
+                if self._depth_path:
+                    try:
+                        depth_info = get_video_stream_info(self._depth_path)
+                        pix = str((depth_info or {}).get("pix_fmt", "")).lower()
+                        profile = str((depth_info or {}).get("profile", "")).lower()
+
+                        if "p16" in pix or "16" in pix or pix.startswith("gray16"):
+                            self._depth_bit_depth = 16
+                        elif "p12" in pix or "12" in pix:
+                            self._depth_bit_depth = 12
+                        elif "p10" in pix or "10" in pix or "main10" in profile:
+                            self._depth_bit_depth = 10
+                        else:
+                            self._depth_bit_depth = 8
+
+                        self._depth_is_high_bit = self._depth_bit_depth > 8
+                    except Exception as e:
+                        logger.warning(f"Previewer: depth bit-depth probe failed for '{self._depth_path}': {e}")
+
+                    # Cache native depth size for ffmpeg single-frame decode
+                    try:
+                        rdr = opened_reader or self.source_readers.get("depth_map")
+                        if rdr is not None:
+                            _df0 = rdr.get_batch([0]).asnumpy()
+                            self._depth_native_h, self._depth_native_w = _df0.shape[1:3]
+                    except Exception:
+                        pass
+
         except Exception as e:
             logger.exception(f"Error replacing source reader for key '{key}': {e}")
+
         # Force an immediate preview refresh using the new reader
         try:
             self.update_preview()
         except Exception as e:
             logger.exception(f"Error updating preview after replacing source path: {e}")
-            
+
     def _wiggle_step(self, show_left: bool):
         """A single step in the wigglegram animation."""
         if not hasattr(self, 'wiggle_left_tk'): return # Stop if resources were cleared
@@ -780,3 +1397,57 @@ class VideoPreviewer(ttk.Frame):
         self.preview_label.config(image=current_image)
         self.preview_label.image = current_image # Prevent garbage collection
         self.wiggle_after_id = self.parent.after(60, self._wiggle_step, not show_left)
+    
+
+    def _on_preview_vscroll(self, *args):
+        """Vertical scrollbar handler."""
+        self.preview_canvas.yview(*args)
+
+    def _on_preview_hscroll(self, *args):
+        """Horizontal scrollbar handler."""
+        self.preview_canvas.xview(*args)
+
+    
+    def _crosshair_allowed_for_current_source(self) -> bool:
+        """
+        Crosshair is only meaningful for anaglyph preview modes.
+        Return True when the current preview source is one of the anaglyph modes.
+        """
+        try:
+            src = self.preview_source_combo.get()
+        except Exception:
+            src = ""
+        return src in ("Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph")
+
+# --- Crosshair overlay (preview only) ---
+    def set_crosshair_settings(self, enabled: bool, white: bool = False, multi: bool = False):
+        """Enable/disable a center crosshair overlay. Preview-only (never exported)."""
+        self.crosshair_enabled = bool(enabled)
+        self.crosshair_white = bool(white)
+        self.crosshair_multi = bool(multi)
+        # Redraw the current preview image so the crosshair appears/disappears immediately
+        try:
+            self.update_preview()
+        except Exception:
+            pass
+
+
+
+    def set_depth_pop_enabled(self, enabled: bool):
+        """Enable/disable the Depth/Pop readout overlay. Preview-only (never exported)."""
+        self.depth_pop_enabled = bool(enabled)
+        # Redraw so toggling this checkbox updates immediately
+        try:
+            self.update_preview()
+        except Exception:
+            pass
+
+    def set_depth_pop_metrics(self, depth_pct: Optional[float], pop_pct: Optional[float]):
+        """Store preview-only depth/pop separation metrics (percent of screen width).
+
+        - depth_pct: positive percentage for far/background separation (screen-behind)
+        - pop_pct:   positive percentage for near/foreground separation (screen-out)
+        Pass None to clear.
+        """
+        self.depth_pop_depth_pct = depth_pct
+        self.depth_pop_pop_pct = pop_pct
