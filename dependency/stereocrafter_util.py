@@ -7,6 +7,7 @@ import tkinter as tk # Required for Tooltip class
 from tkinter import Toplevel, Label, ttk
 from typing import Optional, Tuple
 import logging
+import math
 
 import numpy as np
 import torch
@@ -17,7 +18,7 @@ import cv2
 import gc
 import time
 
-VERSION = "25-11-02.1"
+VERSION = "26-01-17.1"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -26,6 +27,20 @@ if not logging.root.handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
+
+# --- Slider default tick marker appearance (tweak if desired) ---
+
+DEFAULT_TICK_RELY = 0.6 #moves tick up and down
+DEFAULT_TICK_RELHEIGHT = 0.6 #tick length
+DEFAULT_TICK_WIDTH = 2 #tick thickness
+DEFAULT_TICK_COLOR = "#6b7280" # "#ff0000" → red, "#00ff00" → green, "#0000ff" → blue,
+#"#6b7280" → cool slate gray, "#5f6368" → G**gle-style dark gray, "#4b5563" → darker slate
+
+# Horizontal alignment tweaks for default tick markers:
+# - DEFAULT_TICK_TRACK_PAD_PCT nudges ticks inward from both ends of the trough (0.0 = no pad).
+# - DEFAULT_TICK_X_OFFSET_PX applies a final pixel offset (positive = right, negative = left).
+DEFAULT_TICK_TRACK_PAD_PCT = 0.0
+DEFAULT_TICK_X_OFFSET_PX = 5
 
 # --- Global Flags ---
 CUDA_AVAILABLE = False
@@ -79,6 +94,9 @@ class SidecarConfigManager:
         "depth_dilate_size_y": (float, 0.0),
         "depth_blur_size_x": (float, 0.0),
         "depth_blur_size_y": (float, 0.0),
+        "depth_dilate_left": (float, 0.0),
+        "depth_blur_left": (float, 0.0),
+        "depth_blur_left_mix": (float, 0.5),
         "selected_depth_map": (str, ""),
         # Add future keys here
     }
@@ -298,6 +316,10 @@ def apply_optimized_anaglyph(left_rgb_np: np.ndarray, right_rgb_np: np.ndarray) 
     
     return (anaglyph_rgb * 255.0).astype(np.uint8)
 
+from typing import Optional, Tuple, Callable # Ensure Callable is in your imports at the top
+
+from typing import Optional, Tuple, Callable # Add Callable to your imports at the top
+
 def create_single_slider_with_label_updater(
     GUI_self,
     parent: ttk.Frame, 
@@ -310,233 +332,180 @@ def create_single_slider_with_label_updater(
     tooltip_key: Optional[str] = None,
     trough_increment: float = -1.0,
     display_next_odd_integer: bool = False,
+    custom_label_formula: Optional[Callable] = None,
+    step_size: Optional[float] = None,
+    default_value: Optional[float] = None,
 ) -> None:
-    """Creates a single slider, its value label, and all necessary event bindings."""
-    
+    """
+    Creates a single slider using Discrete Step Mapping.
+    FIXED: Uses actual_step for all internal math to prevent disappearing labels
+    when step_size is not explicitly provided (Blur/Dilation).
+    """
+    VALUE_LABEL_FIXED_WIDTH = 5 
 
-    # --- NEW: Calculate Incremental Step Size ---
-    # Step size should be 10 * the precision. 
-    # For decimals=0 (int), precision is 1. Step is 10.
-    # For decimals=2 (0.01), precision is 0.01. Step is 0.1.
-    precision = 1 ** (-decimals)
-    INCREMENTAL_STEP = precision * 1
-    VALUE_LABEL_FIXED_WIDTH = 4
-
-    # 1. Widgets
     label = ttk.Label(parent, text=text, anchor="e")
     label.grid(row=row, column=0, sticky="ew", padx=0, pady=2)
-    slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
+    
+    if tooltip_key and hasattr(GUI_self, '_create_hover_tooltip'):
+        GUI_self._create_hover_tooltip(label, tooltip_key)
+
+    # REVERT/FIX: Use actual_step for all calculations.
+    # If no step_size is passed, it correctly defaults to your original 0.5/1.0 logic.
+    actual_step = step_size if step_size is not None else (0.5 if decimals > 0 else 1.0)
+    
+    total_steps = int((to - from_) / actual_step)
+    internal_int_var = tk.IntVar(value=int((float(var.get()) - from_) / actual_step))
+
+    def update_label_only(value_float: float) -> None:
+        try:
+            if custom_label_formula:
+                value_label.config(text=custom_label_formula(value_float))
+                return
+
+            display_value = value_float
+            if display_next_odd_integer:
+                k_int = int(round(value_float))
+                if k_int > 0 and k_int % 2 == 0: display_value = k_int + 1
+                elif k_int > 0: display_value = k_int
+                elif k_int == 0: display_value = 0
+            
+            value_label.config(text=f"{display_value:.{decimals}f}")
+        except Exception: pass
+
+    def on_slider_move(val):
+        notch = int(float(val))
+        # Use actual_step to ensure math works for all sliders
+        actual_val = from_ + (notch * actual_step)
+        actual_val = max(from_, min(to, actual_val))
+        
+        var.set(actual_val)
+        update_label_only(actual_val)
+
+    slider = ttk.Scale(
+        parent, from_=0, to=total_steps, variable=internal_int_var, 
+        orient="horizontal", command=on_slider_move
+    )
     slider.grid(row=row, column=1, sticky="ew", padx=2)
 
-    value_label = ttk.Label(parent, text="", width=VALUE_LABEL_FIXED_WIDTH) # Start with empty text
+    value_label = ttk.Label(parent, text="", width=VALUE_LABEL_FIXED_WIDTH)
     value_label.grid(row=row, column=2, sticky="w", padx=0)
-    
-    # Column 0 (Label) has no weight (fixed width via 'width' option)
-    # Column 1 (Slider) must have weight=1 to expand
-    parent.grid_columnconfigure(0, weight=0)
     parent.grid_columnconfigure(1, weight=1)
-    parent.grid_columnconfigure(2, weight=0)
 
-    # --- Tooltip and State Management ---
-    if tooltip_key and hasattr(GUI_self, '_create_hover_tooltip'):
-        # Apply tooltip to both the label and the slider for better UX
-        GUI_self._create_hover_tooltip(label, tooltip_key)
-        GUI_self._create_hover_tooltip(slider, tooltip_key) # <--- Apply to slider
-
-    # 2. Command/Update Logic
-    def update_label_and_preview(value_str: str) -> None:
-        """Updates the text label. Called by user interaction."""
-        try:
-            value = float(value_str)
-            display_value = value
-            
-            # --- NEW LOGIC: Display Next Odd Integer ---
-            if display_next_odd_integer:
-                # The actual kernel size that will be used is the next odd number.
-                # Cast to int for kernel calculation
-                k_int = int(round(value))
-                if k_int < 0:
-                    k_int = 0
-                
-                # Logic: If 0, display 0. If positive and even, display next odd. If odd, display itself.
-                if k_int > 0 and k_int % 2 == 0:
-                    display_value = k_int + 1
-                elif k_int > 0 and k_int % 2 != 0:
-                    display_value = k_int
-                elif k_int == 0:
-                    display_value = 0
-                
-                value_label.config(text=f"{display_value:.{decimals}f}")
-            # --- END NEW LOGIC ---
-            else:
-                # Only update the label with the formatted display value
-                value_label.config(text=f"{display_value:.{decimals}f}")
-
-        except ValueError:
-            pass
-
-    def set_value_and_update_label(new_value: float) -> None:
-        """Programmatically sets the slider's value and updates its label."""
-        
-        try:
-             new_value = float(new_value)
-        except (ValueError, TypeError):
-             logger.error(f"Value '{new_value}' could not be converted to float in slider setter.", exc_info=True)
-             return # Abort if conversion fails
-        
-        rounded_value = round(new_value, decimals)
-        var.set(rounded_value)
-        update_label_and_preview(str(rounded_value))
-
-    def on_trough_click(event):
-        """Handles clicks on the slider's trough for precise positioning or incremental change."""
-        
-        element = slider.identify(event.x, event.y)
-        
-        # If the click is on the slider thumb, do NOTHING and let the default behavior (dragging) execute.
-        if element == 'slider':
-             return 
-        
-        # Now we know it is a trough or other element, proceed with custom logic
-        if 'trough' not in element:
-             return "break"
-        
-        slider.update_idletasks()
-        
-        # Calculate the X position as a percentage of the slider width
-        click_ratio = event.x / slider.winfo_width()
-        
-        # Calculate the value at the click position
-        from_val, to_val = float(slider.cget("from")), float(slider.cget("to"))
-        value_at_click = from_val + (to_val - from_val) * click_ratio
-        
-        current_value = var.get()
-        if isinstance(current_value, str):
-             try:
-                 current_value = float(current_value)
-             except ValueError:
-                 current_value = from_val # Safety fallback
-
-        # --- MODIFIED LOGIC: Check for increment value > 0 ---
-        if trough_increment > 0:
-            # --- INCREMENTAL MODE ---
-            if value_at_click > current_value:
-                # Click is to the right of the thumb, so increment
-                new_value = current_value + trough_increment
-            else:
-                # Click is to the left of the thumb, so decrement
-                new_value = current_value - trough_increment
-            
-            # Clamp the new value to the slider's bounds
-            new_value = max(from_val, min(to_val, new_value))
-            
-            # Use the dedicated setter to round and update all components
-            set_value_and_update_label(new_value)
-            
-        else: # -1.0 or 0, implies jump mode
-            # --- JUMP MODE ---
-            new_value = value_at_click
-            # Use the dedicated setter to round and update all components
-            set_value_and_update_label(new_value)
-            
-        # --- END MODIFIED LOGIC ---
-
-        # Manually trigger preview update only if the value actually changed (or on jump mode)
-        # Check if we were in jump mode OR if the value actually changed after clamping/rounding
-        is_jump_mode = trough_increment <= 0
-        if is_jump_mode or round(new_value, decimals) != round(current_value, decimals):
-            GUI_self.on_slider_release(event) 
-            
-        return "break"
-    
-    # ----------------------------------------------------
-    # Ensure a minimum step of 1 for integer-like fields, but let float logic handle smaller
-    if decimals == 0 and INCREMENTAL_STEP == 10:
-         pass # Keep 10
-    elif INCREMENTAL_STEP == 0:
-         INCREMENTAL_STEP = 1.0 # Safety fallback
-    # --- END NEW ---
-
-    # 3. Bindings & Configuration
-    slider.configure(command=update_label_and_preview)
     slider.bind("<ButtonRelease-1>", GUI_self.on_slider_release)
-    slider.bind("<Button-1>", on_trough_click) # Trough click handler    
-    update_label_and_preview(str(var.get()))
+    
+    def sync_external_change():
+        try:
+            current_f = float(var.get())
+            # Use actual_step for synchronization
+            new_notch = int((current_f - from_) / actual_step)
+            internal_int_var.set(new_notch)
+            update_label_only(current_f)
+        except Exception: pass
 
-    # --- Tooltip and State Management ---
-    # Assuming GUI_self has _create_hover_tooltip and widgets_to_disable
-    help_key = text.lower().replace(":", "").replace(" ", "_").replace(".", "")
-    if hasattr(GUI_self, '_create_hover_tooltip'):
-        GUI_self._create_hover_tooltip(label, help_key)
-        
+    sync_external_change()
+
+    # --- Default marker & right-click reset (does not affect layout) ---
+    if default_value is not None:
+        def _reset_to_default(event=None):
+            try:
+                var.set(default_value)
+                sync_external_change()
+
+                # Keep UX consistent with a normal slider release: refresh preview immediately.
+                try:
+                    if hasattr(GUI_self, "on_slider_release"):
+                        GUI_self.on_slider_release(None)
+                    elif hasattr(GUI_self, "update_preview_from_controls"):
+                        GUI_self.update_preview_from_controls()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return "break"
+
+        # Right-click reset (Windows: Button-3; some systems: Button-2)
+        for _w in (slider, value_label):
+            try:
+                _w.bind("<Button-3>", _reset_to_default)
+                _w.bind("<Button-2>", _reset_to_default)
+            except Exception:
+                pass
+
+        # Tick marker at default position (overlayed on top of the Scale trough)
+        try:
+            _default_notch = int(round((float(default_value) - from_) / actual_step))
+            _default_notch = max(0, min(total_steps, _default_notch))
+            _pad = DEFAULT_TICK_TRACK_PAD_PCT
+            _pad = max(0.0, min(0.49, float(_pad)))
+            if total_steps:
+                _relx = _pad + (_default_notch / float(total_steps)) * (1.0 - 2.0 * _pad)
+            else:
+                _relx = 0.0
+            _relx = max(0.0, min(1.0, _relx))
+
+            _marker = tk.Frame(parent, width=DEFAULT_TICK_WIDTH, bg=DEFAULT_TICK_COLOR)
+            _marker.place(in_=slider, relx=_relx, x=DEFAULT_TICK_X_OFFSET_PX, rely=DEFAULT_TICK_RELY, relheight=DEFAULT_TICK_RELHEIGHT, anchor="center")
+        except Exception:
+            pass
     if hasattr(GUI_self, 'slider_label_updaters'):
-        GUI_self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get()))
-        
+        GUI_self.slider_label_updaters.append(sync_external_change)
     if hasattr(GUI_self, 'widgets_to_disable'):
         GUI_self.widgets_to_disable.append(slider)
     
-    return set_value_and_update_label
+    return lambda val: (var.set(val), sync_external_change())
 
 def create_dual_slider_layout(
     GUI_self,
-    parent: ttk.Frame, 
-    text_x: str, 
-    text_y: str, 
-    var_x: tk.Variable, 
-    var_y: tk.Variable, 
-    from_: float, 
-    to: float, 
-    row: int, 
+    parent: ttk.Frame,
+    text_x: str,
+    text_y: str,
+    var_x: tk.Variable,
+    var_y: tk.Variable,
+    from_: float,
+    to: float,
+    row: int,
     decimals: int = 0,
     is_integer: bool = True,
     tooltip_key_x: Optional[str] = None,
     tooltip_key_y: Optional[str] = None,
-    trough_increment: float = -1.0,
+    trough_increment: float = -1,
     display_next_odd_integer: bool = False,
+    custom_label_formula: Optional[Callable] = None,  # Passed through to label display
+    default_x: Optional[float] = None,
+    default_y: Optional[float] = None,
 ) -> None:
-    """
-    Creates a dual (X/Y) slider layout by composing two single sliders.
-    The layout uses one grid row in the parent, with two packed sub-frames.
-    
-    NOTE: The single slider helper must be adapted to use PACK for its internal widgets
-          or this function must manually place the output of the single slider.
-          Since the single slider currently uses GRID (row=row, col=0, 1, 2) this composition
-          needs to ensure the inner frames only use row 0.
-    """
-    
-    # 1. Create a container frame that will sit in the parent's grid
+    """Creates a two-column (X/Y) slider row with optional default ticks + right-click reset."""
     xy_frame = ttk.Frame(parent)
     xy_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=5, pady=0)
-    
-    # Configure the container to hold two expanding columns
     xy_frame.grid_columnconfigure(0, weight=1)
     xy_frame.grid_columnconfigure(1, weight=1)
-    
-    # --- X SLIDER ---
-    x_inner_frame = ttk.Frame(xy_frame)
-    x_inner_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-    x_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
-    
-    # Call the single slider creator for the X components.
-    # We pass the inner frame, and it will use its grid (row=0, col=0, 1, 2)
+
+    x_frame = ttk.Frame(xy_frame)
+    x_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+    x_frame.grid_columnconfigure(1, weight=1)
     create_single_slider_with_label_updater(
-        GUI_self, x_inner_frame, text_x, var_x, from_, to, 0, decimals, 
+        GUI_self, x_frame, text_x, var_x,
+        from_, to, 0,
+        decimals=decimals,
         tooltip_key=tooltip_key_x,
         trough_increment=trough_increment,
-        display_next_odd_integer=display_next_odd_integer 
+        display_next_odd_integer=display_next_odd_integer,
+        custom_label_formula=custom_label_formula,
+        default_value=default_x,
     )
-    
-    # --- Y SLIDER ---
-    y_inner_frame = ttk.Frame(xy_frame)
-    y_inner_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-    y_inner_frame.grid_columnconfigure(1, weight=1) # The slider column
 
-    # Call the single slider creator for the Y components.
+    y_frame = ttk.Frame(xy_frame)
+    y_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+    y_frame.grid_columnconfigure(1, weight=1)
     create_single_slider_with_label_updater(
-        GUI_self, y_inner_frame, text_y, var_y, from_, to, 0, decimals, 
+        GUI_self, y_frame, text_y, var_y,
+        from_, to, 0,
+        decimals=decimals,
         tooltip_key=tooltip_key_y,
         trough_increment=trough_increment,
-        display_next_odd_integer=display_next_odd_integer 
+        display_next_odd_integer=display_next_odd_integer,
+        custom_label_formula=custom_label_formula,
+        default_value=default_y,
     )
 
 def custom_dilate(
@@ -547,108 +516,198 @@ def custom_dilate(
     max_content_value: float = 1.0,
 ) -> torch.Tensor:
     """
-    Applies fractional dilation by blending results of nearest integer kernels.
-    
-    Mapping Strategy:
-    - 0.0 to 3.0: Blends between Identity (1x1) and 3x3 kernel.
-    - 3.0 to 5.0: Blends between 3x3 and 5x5 kernel.
-    - etc.
+    Applies 16-bit fractional dilation or erosion to preserve 10-bit+ depth fidelity.
     """
-    
-    # --- Helper: Get interpolation parameters for a single dimension ---
+    kx_raw = float(kernel_size_x)
+    ky_raw = float(kernel_size_y)
+
+    if abs(kx_raw) <= 1e-5 and abs(ky_raw) <= 1e-5:
+        return tensor
+
+    if (kx_raw > 0 and ky_raw < 0) or (kx_raw < 0 and ky_raw > 0):
+        tensor = custom_dilate(tensor, kx_raw, 0, use_gpu, max_content_value)
+        return custom_dilate(tensor, 0, ky_raw, use_gpu, max_content_value)
+
+    is_erosion = (kx_raw < 0 or ky_raw < 0)
+    kx_abs, ky_abs = abs(kx_raw), abs(ky_raw)
+
     def get_dilation_params(value):
-        if value <= 1e-5:
-            # Below 0: Pure Identity (Kernel 1)
-            return 1, 1, 0.0
-        elif value < 3.0:
-            # 0 to 3: Blend Identity(1) -> 3
-            # Ratio is linear progress from 0 to 3
-            ratio = value / 3.0
-            return 1, 3, ratio
+        if value <= 1e-5: return 1, 1, 0.0
+        elif value < 3.0: return 1, 3, (value / 3.0)
         else:
-            # 3+: Blend Odd -> Odd + 2
-            # e.g., 3.5 -> Base 3, Next 5, Ratio 0.25 (Wait, 3->5 is range of 2)
             base = 3 + 2 * int((value - 3) // 2)
-            next_k = base + 2
-            ratio = (value - base) / 2.0
-            return base, next_k, ratio
+            return base, base + 2, (value - base) / 2.0
 
-    # 1. Calculate parameters for X and Y
-    kx_low, kx_high, tx = get_dilation_params(kernel_size_x)
-    ky_low, ky_high, ty = get_dilation_params(kernel_size_y)
-
-    # Optimization: Check if we are exactly on an integer step (ratio ~0)
-    # This avoids computing 4 blends when simple integer dilation is requested.
-    is_x_int = (tx <= 1e-4)
-    is_y_int = (ty <= 1e-4)
+    kx_low, kx_high, tx = get_dilation_params(kx_abs)
+    ky_low, ky_high, ty = get_dilation_params(ky_abs)
     
-    device = torch.device('cpu') # Force CPU for OpenCV compatibility
-    tensor = tensor.to(device)
+    device = torch.device('cpu') 
+    tensor_cpu = tensor.to(device)
     processed_frames = []
 
-    for t in range(tensor.shape[0]):
-        # --- PREPARE IMAGE ---
-        frame_float = tensor[t].cpu().numpy() # (C, H, W)
+    for t in range(tensor_cpu.shape[0]):
+        frame_float = tensor_cpu[t].numpy() 
         frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
-        
         effective_max_value = max(max_content_value, 1e-5)
-        frame_norm_2d = frame_2d_raw / effective_max_value
-        src_img = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
+        
+        # MODIFIED: Use uint16 (65535) instead of uint8 (255)
+        src_img = np.ascontiguousarray(np.clip((frame_2d_raw / effective_max_value) * 65535, 0, 65535).astype(np.uint16))
 
-        # --- HELPER: Perform specific kernel dilation ---
-        def do_dilate(k_w, k_h, img):
-            # If both are 1, it's identity
-            if k_w <= 1 and k_h <= 1:
-                return img.astype(np.float32)
-            
+        def do_op(k_w, k_h, img):
+            if k_w <= 1 and k_h <= 1: return img.astype(np.float32)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
-            res = cv2.dilate(img, kernel, iterations=1)
-            return res.astype(np.float32)
+            if is_erosion:
+                return cv2.erode(img, kernel, iterations=1).astype(np.float32)
+            return cv2.dilate(img, kernel, iterations=1).astype(np.float32)
 
-        # --- BLENDING LOGIC ---
-        
-        # Case 1: Exact Integer X and Y (Fastest)
+        is_x_int, is_y_int = (tx <= 1e-4), (ty <= 1e-4)
         if is_x_int and is_y_int:
-            final_float = do_dilate(kx_low, ky_low, src_img)
-
-        # Case 2: Fractional X, Integer Y
+            final_float = do_op(kx_low, ky_low, src_img)
         elif not is_x_int and is_y_int:
-            res_low = do_dilate(kx_low, ky_low, src_img)
-            res_high = do_dilate(kx_high, ky_low, src_img)
-            final_float = (1.0 - tx) * res_low + tx * res_high
-
-        # Case 3: Integer X, Fractional Y
+            final_float = (1.0 - tx) * do_op(kx_low, ky_low, src_img) + tx * do_op(kx_high, ky_low, src_img)
         elif is_x_int and not is_y_int:
-            res_low = do_dilate(kx_low, ky_low, src_img)
-            res_high = do_dilate(kx_low, ky_high, src_img)
-            final_float = (1.0 - ty) * res_low + ty * res_high
-
-        # Case 4: Fractional X and Y (Full Bilinear Blend)
+            final_float = (1.0 - ty) * do_op(kx_low, ky_low, src_img) + ty * do_op(kx_low, ky_high, src_img)
         else:
-            # 11: Low X, Low Y
-            res_11 = do_dilate(kx_low, ky_low, src_img)
-            # 12: Low X, High Y
-            res_12 = do_dilate(kx_low, ky_high, src_img)
-            # 21: High X, Low Y
-            res_21 = do_dilate(kx_high, ky_low, src_img)
-            # 22: High X, High Y
-            res_22 = do_dilate(kx_high, ky_high, src_img)
-            
-            # Blend Y first
-            res_left = (1.0 - ty) * res_11 + ty * res_12   # Fixed X (Low)
-            res_right = (1.0 - ty) * res_21 + ty * res_22  # Fixed X (High)
-            
-            # Blend X
-            final_float = (1.0 - tx) * res_left + tx * res_right
+            r11, r12 = do_op(kx_low, ky_low, src_img), do_op(kx_low, ky_high, src_img)
+            r21, r22 = do_op(kx_high, ky_low, src_img), do_op(kx_high, ky_high, src_img)
+            final_float = (1.0-tx)*((1.0-ty)*r11 + ty*r12) + tx*((1.0-ty)*r21 + ty*r22)
 
-        # --- RESCALE AND PACK ---
-        processed_norm_float = final_float / 255.0
-        processed_raw_float = processed_norm_float * effective_max_value
-        
-        dilated_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float().to(tensor.device)
-        processed_frames.append(dilated_tensor)
+        # MODIFIED: Rescale back using 65535.0
+        processed_raw = (final_float / 65535.0) * effective_max_value
+        processed_frames.append(torch.from_numpy(processed_raw).unsqueeze(0).float())
     
     return torch.stack(processed_frames).to(tensor.device)
+
+
+def custom_dilate_left(
+    tensor: torch.Tensor,
+    kernel_size: float,
+    use_gpu: bool = False,
+    max_content_value: float = 1.0,
+) -> torch.Tensor:
+    """
+    Directional (one-sided) 16-bit fractional dilation to the LEFT (negative X direction in image space).
+    Expands values leftward by propagating pixels from right neighbors (max filter), preserving 10-bit+ fidelity.
+
+    kernel_size: 0 disables. Fractional values blend between two integer kernel widths, similar to custom_dilate().
+    """
+    k_raw = float(kernel_size)
+    if abs(k_raw) <= 1e-5:
+        return tensor
+
+    # Negative values mean directional erosion (min filter) to the LEFT.
+    is_erosion = k_raw < 0
+    k_raw = abs(k_raw)
+
+    # Match custom_dilate() semantics: value -> odd kernel widths with fractional blend.
+    def get_dilation_params(value: float):
+        if value <= 1e-5: return 1, 1, 0.0
+        elif value < 3.0: return 1, 3, (value / 3.0)
+        else:
+            base = 3 + 2 * int((value - 3) // 2)
+            return base, base + 2, (value - base) / 2.0
+
+    k_w_low, k_w_high, t = get_dilation_params(k_raw)
+
+    # Convert odd kernel widths (1,3,5,...) into a one-sided "reach" (radius) in pixels.
+    # Standard dilation expands by radius = k_w//2 on each side; left-only uses that radius as reach.
+    k_low = int(k_w_low // 2)
+    k_high = int(k_w_high // 2)
+
+    if k_low <= 0 and k_high <= 0:
+        return tensor
+
+    effective_max_value = max(float(max_content_value), 1e-5)
+
+    device = torch.device('cpu')
+    tensor = tensor.to(device)
+
+    def do_op(k_int: int, src_img: np.ndarray) -> np.ndarray:
+        if k_int <= 0:
+            return src_img.astype(np.float32)
+
+        # Width of kernel in pixels: reach is k_int pixels to the right, affecting current pixel.
+        # Kernel shape: 1 x (k_int + 1) so that k_int=1 expands by 1 pixel.
+        k_w = int(k_int) + 1
+        kernel = np.ones((1, k_w), dtype=np.uint8)
+
+        # Anchor at leftmost column so the kernel extends to the right: values propagate RIGHT->LEFT.
+        anchor = (0, 0)
+
+        if is_erosion:
+            return cv2.erode(src_img, kernel, anchor=anchor, iterations=1).astype(np.float32)
+        return cv2.dilate(src_img, kernel, anchor=anchor, iterations=1).astype(np.float32)
+
+    processed_frames = []
+    for t_idx in range(tensor.shape[0]):
+        frame_float = tensor[t_idx].cpu().numpy()
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
+
+        frame_norm_2d = frame_2d_raw / effective_max_value
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
+
+        src = frame_cv_uint16.astype(np.float32)
+
+        if abs(t) <= 1e-4:
+            out = do_op(k_low, src)
+        else:
+            out_low = do_op(k_low, src)
+            out_high = do_op(k_high, src)
+            out = (1.0 - t) * out_low + t * out_high
+
+        out_u16 = np.ascontiguousarray(np.clip(out, 0, 65535).astype(np.uint16))
+        out_float = (out_u16.astype(np.float32) / 65535.0) * effective_max_value
+
+        if frame_float.shape[0] == 1:
+            processed = out_float[None, ...]
+        else:
+            processed = np.transpose(out_float, (2, 0, 1))
+
+        processed_frames.append(processed)
+
+    out_tensor = torch.from_numpy(np.stack(processed_frames, axis=0)).to(device)
+    return out_tensor
+
+
+def custom_blur_left_masked(
+    tensor_before: torch.Tensor,
+    tensor_after: torch.Tensor,
+    kernel_size: int,
+    use_gpu: bool = False,
+    max_content_value: float = 1.0,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Applies Gaussian blur ONLY to pixels that changed between tensor_before and tensor_after.
+    Intended to soften the region created/affected by custom_dilate_left (or other directional ops).
+    If kernel_size <= 0, returns tensor_after unchanged.
+    """
+    k = int(float(kernel_size))
+    if k <= 0:
+        return tensor_after
+
+    # Blur expects odd kernel sizes; match existing behavior by snapping up to the next odd >= 1.
+    if k % 2 == 0:
+        k += 1
+    k = max(k, 1)
+
+    # If nothing changed, skip work.
+    if mask is None:
+        changed = (tensor_after - tensor_before).abs() > 1e-12
+    else:
+        changed = mask
+        if changed.ndim == 3:
+            changed = changed.unsqueeze(1)
+        if changed.dtype != torch.bool:
+            changed = changed > 0.5
+        changed = changed.to(device=tensor_after.device)
+    if not bool(changed.any().item()):
+        return tensor_after
+
+    blurred = custom_blur(tensor_after, k, k, use_gpu=use_gpu, max_content_value=max_content_value)
+
+    # Apply only where changed; elsewhere keep tensor_after.
+    return torch.where(changed, blurred, tensor_after)
 
 def custom_blur(
         tensor: torch.Tensor,
@@ -658,64 +717,41 @@ def custom_blur(
         max_content_value: float = 1.0,
     ) -> torch.Tensor:
     """
-    Applies Gaussian blur with separate X and Y kernel sizes to a tensor.
-    Expects a 4D tensor (B, C, H, W).
+    Applies 16-bit Gaussian blur to prevent banding and maintain gamma accuracy.
     """
     k_x = int(kernel_size_x)
     k_y = int(kernel_size_y)
     if k_x <= 0 and k_y <= 0:
         return tensor
 
-    # GaussianBlur requires odd kernel sizes
     k_x_orig, k_y_orig = k_x, k_y 
     k_x = k_x if k_x % 2 == 1 else k_x + 1
     k_y = k_y if k_y % 2 == 1 else k_y + 1
 
-    if k_x != k_x_orig or k_y != k_y_orig:
-        logger.debug(f"custom_blur: Adjusted kernel from {k_x_orig}x{k_y_orig} to odd size {k_x}x{k_y}.")
-    
-    device = torch.device('cpu')  # <--- FORCING CPU FOR STABILITY
+    device = torch.device('cpu')
     tensor = tensor.to(device)
 
-    if False: # <--- BYPASSING GPU PATH FOR STABILITY
-        # ... (GPU logic removed) ...
-        pass
-    else:
-        # FIXED CPU path
-        processed_frames = []
-        for t in range(tensor.shape[0]):
-            
-            frame_float = tensor[t].cpu().numpy() # shape: (C, H, W)
+    processed_frames = []
+    for t in range(tensor.shape[0]):
+        frame_float = tensor[t].cpu().numpy()
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
+        effective_max_value = max(max_content_value, 1e-5)
+        
+        # MODIFIED: Scale to 65535 for uint16 processing
+        frame_norm_2d = frame_2d_raw / effective_max_value
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
 
-            # 1. Get the single-channel depth data (shape: H, W)
-            frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
-
-            # 2. Use the provided max_content_value for normalization/rescaling
-            effective_max_value = max(max_content_value, 1e-5)
+        # Apply Blur directly to 16-bit buffer
+        processed_cv_uint16 = cv2.GaussianBlur(frame_cv_uint16, (k_x, k_y), 0)
+        
+        # MODIFIED: Rescale back using 65535.0
+        processed_norm_float = processed_cv_uint16.astype(np.float32) / 65535.0
+        processed_raw_float = processed_norm_float * effective_max_value
+        
+        blurred_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float()
+        processed_frames.append(blurred_tensor)
             
-            # 3. Normalize to 0-1 and scale to 0-255 for OpenCV's uint8
-            frame_norm_2d = frame_2d_raw / effective_max_value
-            frame_cv_uint8 = np.ascontiguousarray(np.clip(frame_norm_2d * 255, 0, 255).astype(np.uint8))
-
-
-            # Apply Gaussian Blur
-            # Use the new safe uint8 frame
-            processed_cv_uint8 = cv2.GaussianBlur(frame_cv_uint8, (k_x, k_y), 0)
-            
-            
-            # --- RESCALE BACK TO ORIGINAL RAW FLOAT RANGE ---
-            # 1. Convert back to float 0-1
-            processed_norm_float = processed_cv_uint8.astype(np.float32) / 255.0
-            
-            # 2. Scale back to the provided effective_max_value
-            processed_raw_float = processed_norm_float * effective_max_value
-            
-            # Convert back to PyTorch format: (C, H, W)
-            # Use unsqueeze(0) to ensure C=1 dim is present
-            blurred_tensor = torch.from_numpy(processed_raw_float).unsqueeze(0).float()
-            processed_frames.append(blurred_tensor)
-            
-        return torch.stack(processed_frames).to(tensor.device)
+    return torch.stack(processed_frames).to(tensor.device)
 
 def check_cuda_availability():
     """
@@ -897,8 +933,16 @@ def encode_frames_to_mp4(
             ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
         if video_stream_info.get("color_space"):
             ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
+        # Ensure color range metadata is tagged when available (metadata-only)
+        if video_stream_info.get("color_range") in ("tv", "pc"):
+            ffmpeg_cmd.extend(["-color_range", video_stream_info["color_range"]])
 
     # Final output path
+    # Write color info into the container (MP4/MOV) so tags survive in downstream tools
+    _ext = os.path.splitext(final_output_mp4_path)[1].lower()
+    if _ext in (".mp4", ".mov", ".m4v"):
+        ffmpeg_cmd.extend(["-movflags", "+write_colr"])
+
     ffmpeg_cmd.append(final_output_mp4_path)
     logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")    
     process = None
@@ -992,7 +1036,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0", # Select the first video stream
-        "-show_entries", "stream=codec_name,profile,pix_fmt,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+        "-show_entries", "stream=codec_name,profile,pix_fmt,color_range,color_primaries,transfer_characteristics,color_space,r_frame_rate",
         "-show_entries", "side_data=mastering_display_metadata,max_content_light_level", # ADDED entries
         "-of", "json",
         video_path
@@ -1012,14 +1056,14 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', timeout=500)
         data = json.loads(result.stdout)
         
         stream_info = {}
         if "streams" in data and len(data["streams"]) > 0:
             s = data["streams"][0]
             # Common video stream properties
-            for key in ["codec_name", "profile", "pix_fmt", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
+            for key in ["codec_name", "profile", "pix_fmt", "color_range", "color_primaries", "transfer_characteristics", "color_space", "r_frame_rate"]:
                 if key in s:
                     stream_info[key] = s[key]
             
@@ -1166,7 +1210,8 @@ def start_ffmpeg_pipe_process(
     video_stream_info: Optional[dict],
     output_format_str: str = "", # Make argument optional with a default value
     user_output_crf: Optional[int] = None,
-    pad_to_16_9: bool = False
+    pad_to_16_9: bool = False,
+    debug_label: Optional[str] = None
 ) -> Optional[subprocess.Popen]:
     """
     Builds an FFmpeg command and starts a subprocess configured to accept
@@ -1297,10 +1342,52 @@ def start_ffmpeg_pipe_process(
     transfer_characteristics = video_stream_info.get("transfer_characteristics", "bt709") if video_stream_info is not None else "bt709"
     color_space = video_stream_info.get("color_space", "bt709") if video_stream_info is not None else "bt709"
 
+
+    # --- DEBUG: Dump ffprobe-derived color metadata + encoding flags (Hi/Lo parity checks) ---
+    # Non-invasive: only logs + tags the spawned process with a dict.
+    try:
+        src_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
+        src_range = video_stream_info.get("color_range") if video_stream_info else None
+        src_prim = video_stream_info.get("color_primaries") if video_stream_info else None
+        src_trc = video_stream_info.get("transfer_characteristics") if video_stream_info else None
+        src_matrix = video_stream_info.get("color_space") if video_stream_info else None
+    except Exception:
+        src_pix_fmt = src_range = src_prim = src_trc = src_matrix = None
+
+    quality_mode = "qp" if "nvenc" in output_codec else "crf"
+    quality_value = default_nvenc_cq if "nvenc" in output_codec else default_cpu_crf
+
+    sc_encode_flags = {
+        "enc_codec": output_codec,
+        "enc_pix_fmt": output_pix_fmt,
+        "enc_profile": output_profile,
+        "enc_color_primaries": color_primaries,
+        "enc_color_trc": transfer_characteristics,
+        "enc_colorspace": color_space,
+        # NOTE: we currently do not set -color_range explicitly on output; record the source for debugging.
+        "src_pix_fmt": src_pix_fmt,
+        "src_color_range": src_range,
+        "src_color_primaries": src_prim,
+        "src_color_trc": src_trc,
+        "src_colorspace": src_matrix,
+        "quality_mode": quality_mode,
+        "quality_value": quality_value,
+    }
+
+    if debug_label:
+        logger.info(
+            f"[COLOR_META][{debug_label}] src(pix_fmt={src_pix_fmt}, range={src_range}, primaries={src_prim}, trc={src_trc}, matrix={src_matrix}) "
+            f"-> enc(codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, primaries={color_primaries}, trc={transfer_characteristics}, matrix={color_space}, {quality_mode}={quality_value})"
+        )
+    # --- END DEBUG ---
+
     # Add the determined or default flags to the command
     ffmpeg_cmd.extend(["-color_primaries", color_primaries])
     ffmpeg_cmd.extend(["-color_trc", transfer_characteristics])
     ffmpeg_cmd.extend(["-colorspace", color_space])
+    # Ensure color range metadata is tagged when available (metadata-only)
+    if video_stream_info and video_stream_info.get("color_range") in ("tv", "pc"):
+        ffmpeg_cmd.extend(["-color_range", video_stream_info["color_range"]])
     # --- END MODIFICATION ---
 
     # --- NEW: Add video filters if any are defined ---
@@ -1308,11 +1395,20 @@ def start_ffmpeg_pipe_process(
         ffmpeg_cmd.extend(["-vf", ",".join(vf_options)])
     # --- END NEW ---
 
+    # Write color info into the container (MP4/MOV) so tags survive in downstream tools
+    _ext = os.path.splitext(final_output_mp4_path)[1].lower()
+    if _ext in (".mp4", ".mov", ".m4v"):
+        ffmpeg_cmd.extend(["-movflags", "+write_colr"])
+
     ffmpeg_cmd.append(final_output_mp4_path)
     logger.debug(f"FFmpeg pipe command: {' '.join(ffmpeg_cmd)}")
 
     try:
         process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            process.sc_encode_flags = sc_encode_flags  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return process
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")

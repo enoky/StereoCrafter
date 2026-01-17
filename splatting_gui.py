@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 import cv2
 import glob
 import shutil
@@ -11,6 +12,7 @@ from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
+import tkinter.font as tkfont
 from ttkthemes import ThemedTk
 import json
 import threading
@@ -18,9 +20,17 @@ import queue
 import subprocess
 import time
 import logging
-from typing import Optional, Tuple, Optional
+from typing import Optional, Tuple, Any
 from PIL import Image
 import math # <--- ADD THIS
+
+# --- Depth Map Visualization Levels ---
+# These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
+# not the depth values used for splatting.
+DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
+DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
+DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
+
 try:
     from moviepy.editor import VideoFileClip
 except ImportError:
@@ -41,7 +51,7 @@ CUDA_AVAILABLE = False # start state, will check automaticly later
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
     check_cuda_availability, release_cuda_memory, CUDA_AVAILABLE, set_util_logger_level,
-    start_ffmpeg_pipe_process, custom_blur, custom_dilate,
+    start_ffmpeg_pipe_process, custom_blur, custom_dilate, custom_dilate_left,
     create_single_slider_with_label_updater, create_dual_slider_layout,
     SidecarConfigManager, apply_dubois_anaglyph, apply_optimized_anaglyph
 )
@@ -53,7 +63,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "25-11-26.2"
+GUI_VERSION = "26-01-17_Tru10"
 
 class FusionSidecarGenerator:
     """Handles parsing Fusion Export files, matching them to depth maps,
@@ -289,6 +299,12 @@ class ForwardWarpStereo(nn.Module):
             return res, occlu_map
 
 class SplatterGUI(ThemedTk):
+    # --- UI MINIMUM WIDTHS (tweak these numbers) ---
+    # These are used as grid column *minimums* for the left (settings) and middle (sliders) columns.
+    # Tkinter's grid doesn't support true max-width caps, so the previous max-width clamp code was removed.
+    UI_PROCESS_COL_MIN = 330
+    UI_DEPTH_COL_MIN   = 520
+
     # --- GLOBAL CONFIGURATION DICTIONARY ---
     APP_CONFIG_DEFAULTS = {
         # File Extensions
@@ -309,7 +325,10 @@ class SplatterGUI(ThemedTk):
         "DEPTH_DILATE_SIZE_X": "3",
         "DEPTH_DILATE_SIZE_Y": "3",
         "DEPTH_BLUR_SIZE_X": "5",
-        "DEPTH_BLUR_SIZE_Y": "5"
+        "DEPTH_BLUR_SIZE_Y": "5",
+        "DEPTH_DILATE_LEFT": "0",
+        "DEPTH_BLUR_LEFT": "0",
+        "DEPTH_BLUR_LEFT_MIX": "0.5"
     }
             # ---------------------------------------
             # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
@@ -321,6 +340,9 @@ class SplatterGUI(ThemedTk):
         "depth_dilate_size_y": "DEPTH_DILATE_SIZE_Y",
         "depth_blur_size_x": "DEPTH_BLUR_SIZE_X",
         "depth_blur_size_y": "DEPTH_BLUR_SIZE_Y",
+        "depth_dilate_left": "DEPTH_DILATE_LEFT",
+        "depth_blur_left": "DEPTH_BLUR_LEFT",
+        "depth_blur_left_mix": "DEPTH_BLUR_LEFT_MIX",
         "frame_overlap": "FRAME_OVERLAP",
         "input_bias": "INPUT_BIAS",
         "selected_depth_map": "SELECTED_DEPTH_MAP"
@@ -364,7 +386,7 @@ class SplatterGUI(ThemedTk):
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.input_source_clips_var = tk.StringVar(value=self.app_config.get("input_source_clips", "./input_source_clips"))
         self.input_depth_maps_var = tk.StringVar(value=self.app_config.get("input_depth_maps", "./input_depth_maps"))
-        self.multi_map_var = tk.BooleanVar(value=False)
+        self.multi_map_var = tk.BooleanVar(value=bool(self.app_config.get("multi_map_enabled", False)))
         self.selected_depth_map_var = tk.StringVar(value="")
         self.depth_map_subfolders = []  # List of valid subfolders
         self.depth_map_radio_buttons = []         # keep list for UI management
@@ -390,16 +412,52 @@ class SplatterGUI(ThemedTk):
         self.low_res_batch_size_var = tk.StringVar(value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"]))
         self.zero_disparity_anchor_var = tk.StringVar(value=self.app_config.get("convergence_point", defaults["CONV_POINT"]))
         self.output_crf_var = tk.StringVar(value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"]))
+        # Separate CRF values for Full vs Low output (fallback to legacy "output_crf")
+        _legacy_crf = self.app_config.get("output_crf", defaults["CRF_OUTPUT"])
+        self.output_crf_full_var = tk.StringVar(value=self.app_config.get("output_crf_full", _legacy_crf))
+        self.output_crf_low_var = tk.StringVar(value=self.app_config.get("output_crf_low", _legacy_crf))
+        # Output color metadata tags (metadata-only; does not affect splat math)
+        self.color_tags_mode_var = tk.StringVar(value=self.app_config.get("color_tags_mode", "Auto"))
+
+        # Dev Tools (not saved to config)
+        self.skip_lowres_preproc_var = tk.BooleanVar(value=bool(self.app_config.get("skip_lowres_preproc", False)))
+
+
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
+
+        # Crosshair overlay for convergence checking (preview-only; not exported)
+        self.crosshair_enabled_var = tk.BooleanVar(value=bool(self.app_config.get("crosshair_enabled", False)))
+        self.crosshair_white_var = tk.BooleanVar(value=bool(self.app_config.get("crosshair_white", False)))
+        self.crosshair_multi_var = tk.BooleanVar(value=bool(self.app_config.get("crosshair_multi", False)))
+        self.depth_pop_enabled_var = tk.BooleanVar(value=bool(self.app_config.get("depth_pop_enabled", False)))
+
 
         self.auto_convergence_mode_var = tk.StringVar(value=self.app_config.get("auto_convergence_mode", "Off"))
 
         # --- Depth Pre-processing Variables ---
         self.depth_gamma_var = tk.StringVar(value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"]))
-        self.depth_dilate_size_x_var = tk.StringVar(value=self.app_config.get("depth_dilate_size_x", defaults["DEPTH_DILATE_SIZE_X"]))
-        self.depth_dilate_size_y_var = tk.StringVar(value=self.app_config.get("depth_dilate_size_y", defaults["DEPTH_DILATE_SIZE_Y"]))
+        _ddx = self.app_config.get("depth_dilate_size_x", defaults["DEPTH_DILATE_SIZE_X"])
+        _ddy = self.app_config.get("depth_dilate_size_y", defaults["DEPTH_DILATE_SIZE_Y"])
+        # Backward compatibility: older configs used 30..40 to represent erosion (-0..-10)
+        try:
+            _ddx_f = float(_ddx)
+            if 30.0 < _ddx_f <= 40.0:
+                _ddx = -(_ddx_f - 30.0)
+        except Exception:
+            pass
+        try:
+            _ddy_f = float(_ddy)
+            if 30.0 < _ddy_f <= 40.0:
+                _ddy = -(_ddy_f - 30.0)
+        except Exception:
+            pass
+        self.depth_dilate_size_x_var = tk.StringVar(value=str(_ddx))
+        self.depth_dilate_size_y_var = tk.StringVar(value=str(_ddy))
         self.depth_blur_size_x_var = tk.StringVar(value=self.app_config.get("depth_blur_size_x", defaults["DEPTH_BLUR_SIZE_X"]))
         self.depth_blur_size_y_var = tk.StringVar(value=self.app_config.get("depth_blur_size_y", defaults["DEPTH_BLUR_SIZE_Y"]))
+        self.depth_dilate_left_var = tk.StringVar(value=self.app_config.get("depth_dilate_left", defaults["DEPTH_DILATE_LEFT"]))
+        self.depth_blur_left_var = tk.StringVar(value=self.app_config.get("depth_blur_left", defaults["DEPTH_BLUR_LEFT"]))
+        self.depth_blur_left_mix_var = tk.StringVar(value=self.app_config.get("depth_blur_left_mix", defaults["DEPTH_BLUR_LEFT_MIX"]))
         # --- NEW: Sidecar Control Toggle Variables ---
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_gamma", True))
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=self.app_config.get("enable_sidecar_blur_dilate", True))
@@ -407,7 +465,7 @@ class SplatterGUI(ThemedTk):
         self.auto_save_sidecar_var = tk.BooleanVar(value=self.app_config.get("auto_save_sidecar", False))
 
         # --- NEW: Previewer Variables ---
-        self.preview_source_var = tk.StringVar(value="Splat Result")
+        self.preview_source_var = tk.StringVar(value=self.app_config.get("preview_source", "Splat Result"))
         self.preview_size_var = tk.StringVar(value=self.app_config.get("preview_size", "75%"))
 
         # --- Variables for "Current Processing Information" display ---
@@ -441,6 +499,16 @@ class SplatterGUI(ThemedTk):
 
         self.after(10, self.toggle_processing_settings_fields) # Set initial state
         self.after(10, self._toggle_sidecar_update_button_state)
+
+        # If Multi-Map is enabled at startup (from config), we must populate the map selector UI once.
+        # (Initial BooleanVar state does not trigger the checkbox command.)
+        if self.multi_map_var.get():
+            self.after(15, self._on_multi_map_toggle)
+
+        # Apply preview-only overlay toggles (Crosshair / D/P) at startup.
+        # (Initial BooleanVar state does not trigger the checkbox command.)
+        self.after(20, self._apply_preview_overlay_toggles)
+
         self.after(100, self.check_queue) # Start checking progress queue
 
         # Bind closing protocol
@@ -717,6 +785,22 @@ class SplatterGUI(ThemedTk):
             logger.warning("No valid depth map subfolders found")
             self.selected_depth_map_var.set("")
 
+    def _update_map_selector_highlight(self):
+        """Visually emphasize the currently selected map radio button (no layout change)."""
+        try:
+            sel = (self.selected_depth_map_var.get() or "").strip()
+            # Only applies when radio buttons exist
+            rb_dict = getattr(self, 'depth_map_radio_dict', {}) or {}
+            for name, rb in rb_dict.items():
+                if not rb:
+                    continue
+                try:
+                    rb.configure(style="MapSelSelected.TRadiobutton" if name == sel else "MapSel.TRadiobutton")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _clear_depth_map_radio_buttons(self):
         """Removes all depth map radio buttons from the GUI."""
         for widget in self.depth_map_radio_buttons:
@@ -735,18 +819,41 @@ class SplatterGUI(ThemedTk):
         # The radio buttons should be added to the same frame as preview_size_combo
         preview_button_frame = self.previewer.preview_size_combo.master
 
+        # --- Map selector styles (selected vs unselected) ---
+        if not getattr(self, '_map_selector_styles_inited', False):
+            try:
+                style = ttk.Style()
+                base_font = tkfont.nametofont('TkDefaultFont')
+                bold_font = tkfont.Font(
+                    root=preview_button_frame,
+                    family=base_font.cget('family'),
+                    size=base_font.cget('size'),
+                    weight='bold'
+                )
+                style.configure('MapSel.TRadiobutton', font=base_font)
+                style.configure('MapSelSelected.TRadiobutton', font=bold_font)
+            except Exception:
+                # Fail quietly; styles are optional
+                pass
+            self._map_selector_styles_inited = True
+
+
         for subfolder_name in self.depth_map_subfolders:
             rb = ttk.Radiobutton(
                 preview_button_frame,
                 text=subfolder_name,
                 variable=self.selected_depth_map_var,
                 value=subfolder_name,
+                style='MapSel.TRadiobutton',
                 command=self._on_map_selection_changed
             )
             rb.pack(side="left", padx=5)
             self.depth_map_radio_buttons.append(rb)
-            self.depth_map_radio_dict[subfolder_name] = rb   # NEW
+            self.depth_map_radio_dict[subfolder_name] = rb
 
+
+        # Apply visual emphasis to the current selection
+        self._update_map_selector_highlight()
     def _on_map_selection_changed(self, from_sidecar=False):
         """
         Called when the user changes the depth map selection (radio buttons),
@@ -755,10 +862,25 @@ class SplatterGUI(ThemedTk):
         In Multi-Map mode this now ONLY updates the CURRENT video’s depth map
         path instead of iterating over every video.
         """
-        logger.info(f"Depth map selection changed. from_sidecar={from_sidecar}")
+        _sel = self.selected_depth_map_var.get()
+        _last = getattr(self, "_last_map_change_log", None)
+        if _sel != _last:
+            logger.info(f"Depth map selection changed -> {_sel} (from_sidecar={from_sidecar})")
+            self._last_map_change_log = _sel
         if not from_sidecar:
             # User clicked a radio button – suppress sidecar overwrites
             self._suppress_sidecar_map_update = True
+
+        # Keep UI + info panel in sync with the currently selected map (no heavy work)
+        try:
+            self._update_map_selector_highlight()
+        except Exception:
+            pass
+        try:
+            self._update_processing_info_for_preview_clip()
+        except Exception:
+            pass
+
 
         # Compute the folder for the newly selected map
         new_depth_folder = self._get_effective_depth_map_folder()
@@ -810,6 +932,16 @@ class SplatterGUI(ThemedTk):
         # Keep the processing queue entry (if present) in sync for this one video
         if hasattr(self, "resolution_output_list") and 0 <= current_index < len(self.resolution_output_list):
             self.resolution_output_list[current_index].depth_map = depth_path
+
+        # Post-switch: update info panel + visual emphasis
+        try:
+            self._update_processing_info_for_preview_clip()
+        except Exception:
+            pass
+        try:
+            self._update_map_selector_highlight()
+        except Exception:
+            pass
 
     def _get_effective_depth_map_folder(self, base_folder=None):
         """Returns the effective depth map folder based on Multi-Map settings.
@@ -921,7 +1053,7 @@ class SplatterGUI(ThemedTk):
                         self.processing_disparity_var.set(info_data["disparity"])
                     if "convergence" in info_data:
                         self.processing_convergence_var.set(info_data["convergence"])
-                    if "gamma" in info_data: # <--- ADD THIS CHECK
+                    if "gamma" in info_data:
                         self.processing_gamma_var.set(info_data["gamma"])
                     if "map" in info_data:
                         self.processing_map_var.set(info_data["map"])
@@ -954,7 +1086,7 @@ class SplatterGUI(ThemedTk):
         self.btn_auto_converge_preview.config(state="normal")
         self.start_button.config(state="normal")
         self.start_single_button.config(state="normal")
-        self.auto_convergence_combo.config(state="readonly") # Re-enable combo
+        self.auto_convergence_combo.config(state="readonly")
 
         if self.stop_event.is_set():
             self.status_label.config(text="Auto-Converge pre-pass was stopped.")
@@ -1030,6 +1162,7 @@ class SplatterGUI(ThemedTk):
             Tooltip(widget, self.help_texts[key])
 
     def _create_widgets(self):
+
         """Initializes and places all GUI widgets."""
 
         current_row = 0
@@ -1151,6 +1284,7 @@ class SplatterGUI(ThemedTk):
             "Occlusion Mask(Low)",
             "Original (Left Eye)",
             "Depth Map",
+			"Depth Map (Color)",
             "Anaglyph 3D",
             "Dubois Anaglyph",
             "Optimized Anaglyph",
@@ -1163,7 +1297,7 @@ class SplatterGUI(ThemedTk):
         self.main_layout_frame = ttk.Frame(self)
         self.main_layout_frame.pack(pady=2, padx=10, fill="x")
         self.main_layout_frame.grid_columnconfigure(0, weight=1) # Left settings column
-        self.main_layout_frame.grid_columnconfigure(1, weight=1) # Right info column (fixed width)
+        self.main_layout_frame.grid_columnconfigure(1, weight=0) # Right info column (fixed width)
 
         # --- LEFT COLUMN: Settings Stack Frame ---
         self.settings_stack_frame = ttk.Frame(self.main_layout_frame)
@@ -1172,8 +1306,25 @@ class SplatterGUI(ThemedTk):
         # --- Settings Container Frame (to hold two side-by-side frames) ---
         self.settings_container_frame = ttk.Frame(self.settings_stack_frame)
         self.settings_container_frame.pack(pady=(0, 2), fill="x") # Pack it inside the stack frame
-        self.settings_container_frame.grid_columnconfigure(0, weight=1)
-        self.settings_container_frame.grid_columnconfigure(1, weight=1)
+        # Spacer columns on BOTH SIDES of the depth/sliders column:
+        #   - col 0: left/process settings (fixed)
+        #   - col 1: spacer (expands)
+        #   - col 2: depth/sliders (expands more than spacers)
+        #   - col 3: spacer (expands)
+        #
+        # This keeps the slider column visually centered within the available space
+        # (while the process/settings column stays pinned left).
+        self.settings_container_frame.grid_columnconfigure(0, weight=0, minsize=int(self.UI_PROCESS_COL_MIN))
+        self.settings_container_frame.grid_columnconfigure(1, weight=1, minsize=0)
+        self.settings_container_frame.grid_columnconfigure(2, weight=2, minsize=int(self.UI_DEPTH_COL_MIN))
+        self.settings_container_frame.grid_columnconfigure(3, weight=1, minsize=0)
+
+        self.settings_container_spacer_left = ttk.Frame(self.settings_container_frame)
+        self.settings_container_spacer_left.grid(row=0, column=1, sticky="nsew")
+
+        self.settings_container_spacer_right = ttk.Frame(self.settings_container_frame)
+        self.settings_container_spacer_right.grid(row=0, column=3, sticky="nsew")
+
 
         # ===================================================================
         # LEFT SIDE: Process Resolution and Settings Frame
@@ -1187,122 +1338,171 @@ class SplatterGUI(ThemedTk):
         # --- 1. Process Resolution Frame (Top Left) ---
         self.preprocessing_frame = ttk.LabelFrame(self.process_settings_container, text="Process Resolution")
         self.preprocessing_frame.grid(row=0, column=0, padx=(0, 5), sticky="nsew") # <-- Grid 0,0 in process_settings_container
-        self.preprocessing_frame.grid_columnconfigure(1, weight=1) # Allow Entry to expand
+        self.preprocessing_frame.grid_columnconfigure(1, weight=0) # Allow Entry to expand
 
         current_row = 0
 
-         # --- Enable Full Resolution Section (ROW 0) ---
-        
-        # Container for Checkbox and Label/Entry
-        self.full_res_control_frame = ttk.Frame(self.preprocessing_frame)
-        self.full_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5)
-        self.full_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
-        
-        # Checkbox (Left side of the container)
-        self.enable_full_res_checkbox = ttk.Checkbutton(self.full_res_control_frame, text="Enable Full Res", variable=self.enable_full_res_var,
-                                                        command=self.toggle_processing_settings_fields, width=15)
-        self.enable_full_res_checkbox.grid(row=0, column=0, sticky="w")
+        # --- Enable Full/Low Resolution + Tests (Compact 3x3 Grid) ---
+        # Layout:
+        #   Row 0: [Enable Full Res]  [Batch Size]  [Dual Output Only]
+        #   Row 1: [Enable Low Res ]  [Batch Size]  [Splat Test]
+        #   Row 2: [Width]           [Height]      [Map Test]
+        # Keep vertical padding minimal so preview area can expand.
+
+        # Ensure 3 primary columns exist
+        self.preprocessing_frame.grid_columnconfigure(0, weight=0)
+        self.preprocessing_frame.grid_columnconfigure(1, weight=0)
+        self.preprocessing_frame.grid_columnconfigure(2, weight=0)
+
+        # --- Row 0: Full res ---
+        self.enable_full_res_checkbox = ttk.Checkbutton(
+            self.preprocessing_frame,
+            text="Enable Full Res",
+            variable=self.enable_full_res_var,
+            command=self.toggle_processing_settings_fields,
+            width=15
+        )
+        self.enable_full_res_checkbox.grid(row=0, column=0, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.enable_full_res_checkbox, "enable_full_res")
-        
-        # Label/Entry (Right side of the container)
-        self.lbl_full_res_batch_size = ttk.Label(self.full_res_control_frame, text="Batch Size:")
-        self.lbl_full_res_batch_size.grid(row=0, column=1, sticky="w", padx=(10, 2))
-        self.entry_full_res_batch_size = ttk.Entry(self.full_res_control_frame, textvariable=self.batch_size_var, width=5)
-        self.entry_full_res_batch_size.grid(row=0, column=2, sticky="w", padx=(0, 0))
+
+        self.full_batch_frame = ttk.Frame(self.preprocessing_frame)
+        self.full_batch_frame.grid(row=0, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_full_res_batch_size = ttk.Label(self.full_batch_frame, text="Batch Size:")
+        self.lbl_full_res_batch_size.pack(side="left", padx=(0, 2))
+        self.entry_full_res_batch_size = ttk.Entry(self.full_batch_frame, textvariable=self.batch_size_var, width=5)
+        self.entry_full_res_batch_size.pack(side="left")
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
-        current_row += 1
 
-        # --- Enable Low Resolution Section (ROW 1) ---
-        
-        # Container for Checkbox and Label/Entry
-        self.low_res_control_frame = ttk.Frame(self.preprocessing_frame)
-        self.low_res_control_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 2))
-        self.low_res_control_frame.grid_columnconfigure(0, weight=1) # Checkbox takes most space
+        self.dual_output_checkbox = ttk.Checkbutton(
+            self.preprocessing_frame,
+            text="Dual Output Only",
+            variable=self.dual_output_var
+        )
+        self.dual_output_checkbox.grid(row=0, column=2, sticky="w", padx=5, pady=0)
+        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
 
-        # Checkbox (Left side of the container)
-        self.enable_low_res_checkbox = ttk.Checkbutton(self.low_res_control_frame, text="Enable Low Res", variable=self.enable_low_res_var,
-                                                       command=self.toggle_processing_settings_fields, width=15)
-        self.enable_low_res_checkbox.grid(row=0, column=0, sticky="w")
+        # --- Row 1: Low res ---
+        self.enable_low_res_checkbox = ttk.Checkbutton(
+            self.preprocessing_frame,
+            text="Enable Low Res",
+            variable=self.enable_low_res_var,
+            command=self.toggle_processing_settings_fields,
+            width=15
+        )
+        self.enable_low_res_checkbox.grid(row=1, column=0, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.enable_low_res_checkbox, "enable_low_res")
-        
-        # Label/Entry (Right side of the container)
-        self.lbl_low_res_batch_size = ttk.Label(self.low_res_control_frame, text="Batch Size:")
-        self.lbl_low_res_batch_size.grid(row=0, column=1, sticky="w", padx=(10, 2))
-        self.entry_low_res_batch_size = ttk.Entry(self.low_res_control_frame, textvariable=self.low_res_batch_size_var, width=5)
-        self.entry_low_res_batch_size.grid(row=0, column=2, sticky="w", padx=(0, 0))
+
+        self.low_batch_frame = ttk.Frame(self.preprocessing_frame)
+        self.low_batch_frame.grid(row=1, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_low_res_batch_size = ttk.Label(self.low_batch_frame, text="Batch Size:")
+        self.lbl_low_res_batch_size.pack(side="left", padx=(0, 2))
+        self.entry_low_res_batch_size = ttk.Entry(self.low_batch_frame, textvariable=self.low_res_batch_size_var, width=5)
+        self.entry_low_res_batch_size.pack(side="left")
         self._create_hover_tooltip(self.lbl_low_res_batch_size, "low_res_batch_size")
         self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
-        current_row += 1
-        
-        # --- Low Res Width/Height (Squeezed onto one row) (ROW 2) ---
-        
-        # Frame for Width/Height fields (Grid under the Low Res checkbox/batch size row)
-        self.low_res_wh_frame = ttk.Frame(self.preprocessing_frame)
-        self.low_res_wh_frame.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
-        
-        self.pre_res_width_label = ttk.Label(self.low_res_wh_frame, text="Width:")
+
+        # Tests (mutually exclusive)
+        self.splat_test_var = tk.BooleanVar(value=False)
+        self.map_test_var = tk.BooleanVar(value=False)
+
+        # --- Row 2: Width/Height + Map Test ---
+        self.width_frame = ttk.Frame(self.preprocessing_frame)
+        self.width_frame.grid(row=2, column=0, sticky="w", padx=5, pady=0)
+        self.pre_res_width_label = ttk.Label(self.width_frame, text="Width:")
         self.pre_res_width_label.pack(side="left", padx=(0, 2))
-        self.pre_res_width_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_width_var, width=9)
-        self.pre_res_width_entry.pack(side="left", padx=(0, 10))
-
-        self.pre_res_height_label = ttk.Label(self.low_res_wh_frame, text="Height:")
-        self.pre_res_height_label.pack(side="left", padx=(0, 2))
-        self.pre_res_height_entry = ttk.Entry(self.low_res_wh_frame, textvariable=self.pre_res_height_var, width=9)
-        self.pre_res_height_entry.pack(side="left", padx=(0, 0))
-
+        self.pre_res_width_entry = ttk.Entry(self.width_frame, textvariable=self.pre_res_width_var, width=8)
+        self.pre_res_width_entry.pack(side="left")
         self._create_hover_tooltip(self.pre_res_width_label, "low_res_width")
         self._create_hover_tooltip(self.pre_res_width_entry, "low_res_width")
+
+        self.height_frame = ttk.Frame(self.preprocessing_frame)
+        self.height_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
+        self.pre_res_height_label = ttk.Label(self.height_frame, text="Height:")
+        self.pre_res_height_label.pack(side="left", padx=(0, 2))
+        self.pre_res_height_entry = ttk.Entry(self.height_frame, textvariable=self.pre_res_height_var, width=8)
+        self.pre_res_height_entry.pack(side="left")
         self._create_hover_tooltip(self.pre_res_height_label, "low_res_height")
         self._create_hover_tooltip(self.pre_res_height_entry, "low_res_height")
-        current_row += 1
-        
-        # Dual Output Checkbox (Row 3, Column 0/1)
-        self.dual_output_checkbox = ttk.Checkbutton(self.preprocessing_frame, text="Dual Output Only", variable=self.dual_output_var)
-        self.dual_output_checkbox.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
-        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
-        
         # --- 2. Splatting & Output Settings Frame (Bottom Left) ---
-        # *** THIS IS THE MOVED FRAME: now attached to self.process_settings_container at row=1 ***
-        current_row = 0 # Reset for internal use of output_settings_frame
+        # Compact 2x2 layout:
+        #   Row 0: Process Length | Auto-Convergence
+        #   Row 1: Output CRF Full | Output CRF Low
+
         self.output_settings_frame = ttk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings")
-        self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(2, 0)) # <-- Grid 1,0 in process_settings_container
-        self.output_settings_frame.grid_columnconfigure(1, weight=1)
-                
-        # Process Length (Remains Entry)
-        self.lbl_process_length = ttk.Label(self.output_settings_frame, text="Process Length:")
-        self.lbl_process_length.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
-        self.entry_process_length = ttk.Entry(self.output_settings_frame, textvariable=self.process_length_var, width=15)
-        self.entry_process_length.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
+        self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(2, 0))
+        self.output_settings_frame.grid_columnconfigure(0, weight=0)
+        self.output_settings_frame.grid_columnconfigure(1, weight=0)
+
+        # Row 0, Col 0: Process Length
+        self.proc_len_frame = ttk.Frame(self.output_settings_frame)
+        self.proc_len_frame.grid(row=0, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_process_length = ttk.Label(self.proc_len_frame, text="Process Length:")
+        self.lbl_process_length.pack(side="left", padx=(0, 3))
+        self.entry_process_length = ttk.Entry(self.proc_len_frame, textvariable=self.process_length_var, width=6)
+        self.entry_process_length.pack(side="left")
         self._create_hover_tooltip(self.lbl_process_length, "process_length")
         self._create_hover_tooltip(self.entry_process_length, "process_length")
-        current_row += 1
-        
-        # Output CRF setting (Remains Entry)
-        self.lbl_output_crf = ttk.Label(self.output_settings_frame, text="Output CRF:")
-        self.lbl_output_crf.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
-        self.entry_output_crf = ttk.Entry(self.output_settings_frame, textvariable=self.output_crf_var, width=15)
-        self.entry_output_crf.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
-        self._create_hover_tooltip(self.lbl_output_crf, "output_crf")
-        self._create_hover_tooltip(self.entry_output_crf, "output_crf")
-        current_row += 1
 
-        # Auto-Convergence Combo (Row 2, Column 0/1)
-        self.lbl_auto_convergence = ttk.Label(self.output_settings_frame, text="Auto-Convergence:")
-        self.lbl_auto_convergence.grid(row=current_row, column=0, sticky="e", padx=5, pady=0)
-        self.auto_convergence_combo = ttk.Combobox(self.output_settings_frame, textvariable=self.auto_convergence_mode_var, values=["Off", "Average", "Peak"], state="readonly", width=15)
-        self.auto_convergence_combo.grid(row=current_row, column=1, sticky="w", padx=5, pady=0)
+        # Row 0, Col 1: Auto-Convergence
+        self.auto_conv_frame = ttk.Frame(self.output_settings_frame)
+        self.auto_conv_frame.grid(row=0, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_auto_convergence = ttk.Label(self.auto_conv_frame, text="Auto-Convergence:")
+        self.lbl_auto_convergence.pack(side="left", padx=(0, 3))
+        self.auto_convergence_combo = ttk.Combobox(
+            self.auto_conv_frame,
+            textvariable=self.auto_convergence_mode_var,
+            values=["Off", "Average", "Peak"],
+            state="readonly",
+            width=10
+        )
+        self.auto_convergence_combo.pack(side="left")
         self._create_hover_tooltip(self.lbl_auto_convergence, "auto_convergence_toggle")
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
 
-        current_row = 0 # Reset for next frame
+        # Row 1, Col 0: Output CRF Full
+        self.crf_full_frame = ttk.Frame(self.output_settings_frame)
+        self.crf_full_frame.grid(row=1, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_output_crf_full = ttk.Label(self.crf_full_frame, text="Output CRF Full:")
+        self.lbl_output_crf_full.pack(side="left", padx=(0, 3))
+        self.entry_output_crf_full = ttk.Entry(self.crf_full_frame, textvariable=self.output_crf_full_var, width=3)
+        self.entry_output_crf_full.pack(side="left")
+        self._create_hover_tooltip(self.lbl_output_crf_full, "output_crf")
+        self._create_hover_tooltip(self.entry_output_crf_full, "output_crf")
 
+        # Row 1, Col 1: Output CRF Low
+        self.crf_low_frame = ttk.Frame(self.output_settings_frame)
+        self.crf_low_frame.grid(row=1, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_output_crf_low = ttk.Label(self.crf_low_frame, text="Output CRF Low:")
+        self.lbl_output_crf_low.pack(side="left", padx=(0, 3))
+        self.entry_output_crf_low = ttk.Entry(self.crf_low_frame, textvariable=self.output_crf_low_var, width=3)
+        self.entry_output_crf_low.pack(side="left")
+        self._create_hover_tooltip(self.lbl_output_crf_low, "output_crf")
+        self._create_hover_tooltip(self.entry_output_crf_low, "output_crf")
+
+        # Row 2, Col 0: Output color tag mode (metadata-only; written into output file headers)
+        self.color_tags_frame = ttk.Frame(self.output_settings_frame)
+        self.color_tags_frame.grid(row=2, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_color_tags_mode = ttk.Label(self.color_tags_frame, text="Color Tags:")
+        self.lbl_color_tags_mode.pack(side="left", padx=(0, 3))
+        self.combo_color_tags_mode = ttk.Combobox(
+            self.color_tags_frame,
+            textvariable=self.color_tags_mode_var,
+            values=["Auto", "BT.709 L", "BT.709 F", "BT.2020 PQ", "BT.2020 HLG"],
+            state="readonly",
+            width=10
+        )
+        self.combo_color_tags_mode.pack(side="left")
+        self._create_hover_tooltip(self.lbl_color_tags_mode, "color_tags_mode")
+        self._create_hover_tooltip(self.combo_color_tags_mode, "color_tags_mode")
+
+        current_row = 0 # Reset for next frame
         # ===================================================================
         # RIGHT SIDE: Depth Map Pre-processing Frame
         # ===================================================================
         self.depth_settings_container = ttk.Frame(self.settings_container_frame)
-        self.depth_settings_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+        self.depth_settings_container.grid(row=0, column=2, padx=(5, 0), sticky="nsew")
         self.depth_settings_container.grid_columnconfigure(0, weight=1)
         
         # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
@@ -1312,16 +1512,19 @@ class SplatterGUI(ThemedTk):
         self.depth_prep_frame.grid_columnconfigure(1, weight=1)
 
         # Slider Implementation for dilate and blur
+        # --- MODIFIED: Dilation Slider with Expanded Erosion Range (Slider goes to 40) ---
         row_inner = 0
         create_dual_slider_layout(
             self, self.depth_prep_frame, "Dilate X:", "Y:",
-            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, 0, 35,
-            row_inner, decimals=1, is_integer=False,  # <--- CHANGED: decimals=1
+            self.depth_dilate_size_x_var, self.depth_dilate_size_y_var, -10.0, 30.0,
+            row_inner, decimals=1, is_integer=False,
             tooltip_key_x="depth_dilate_size_x",
             tooltip_key_y="depth_dilate_size_y",
-            trough_increment=0.5,                     # <--- CHANGED: Step 0.5
-            display_next_odd_integer=False,           # <--- CHANGED: Show actual float value
-            )
+            trough_increment=0.5,
+            display_next_odd_integer=False,
+            default_x=0.0,
+            default_y=0.0,
+        )
         row_inner += 1
         create_dual_slider_layout(
             self, self.depth_prep_frame, "   Blur X:", "Y:",
@@ -1330,144 +1533,312 @@ class SplatterGUI(ThemedTk):
             tooltip_key_x="depth_blur_size_x",
             tooltip_key_y="depth_blur_size_y",
             trough_increment=1.0,
+            default_x=0.0,
+            default_y=0.0,
             )
         
+
+        row_inner += 1
+
+        # Dilate Left (0.5 steps) + Blur Left (integer steps)
+        # NOTE: We avoid create_dual_slider_layout here because Dilate Left needs fractional steps
+        # while Blur Left should be integer-only (kernel sizing is effectively integer).
+        left_xy_frame = ttk.Frame(self.depth_prep_frame)
+        left_xy_frame.grid(row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=0)
+        left_xy_frame.grid_columnconfigure(0, weight=1)
+        left_xy_frame.grid_columnconfigure(1, weight=1)
+
+        left_dilate_frame = ttk.Frame(left_xy_frame)
+        left_dilate_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left_dilate_frame.grid_columnconfigure(1, weight=1)
+        create_single_slider_with_label_updater(
+            self, left_dilate_frame, "Dilate Left:", self.depth_dilate_left_var,
+            0.0, 20.0, 0,
+            decimals=1,
+            tooltip_key="depth_dilate_left",
+            trough_increment=0.5,
+            display_next_odd_integer=False,
+            default_value=0.0,
+        )
+
+        left_blur_frame = ttk.Frame(left_xy_frame)
+        left_blur_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        left_blur_frame.grid_columnconfigure(1, weight=1)
+        create_single_slider_with_label_updater(
+            self, left_blur_frame, "Blur Left:", self.depth_blur_left_var,
+            0.0, 20.0, 0,
+            decimals=0,
+            tooltip_key="depth_blur_left",
+            trough_increment=1.0,
+            display_next_odd_integer=False,
+            default_value=0.0,
+        )
+
+        # Blur Left H↔V balance (0.0 = all horizontal, 1.0 = all vertical; 0.5 = 50/50)
+        try:
+            mix_values = [f"{i/10:.1f}" for i in range(0, 11)]
+        except Exception:
+            mix_values = ["0.0","0.1","0.2","0.3","0.4","0.5","0.6","0.7","0.8","0.9","1.0"]
+
+        # Place a small selector immediately after the Blur Left slider (keep it compact so the row doesn't grow).
+        left_blur_mix_combo = ttk.Combobox(
+            left_blur_frame,
+            textvariable=self.depth_blur_left_mix_var,
+            values=mix_values,
+            width=4,
+            state="readonly"
+        )
+        # Most slider layouts use columns 0-2; put this in the next free column.
+        left_blur_mix_combo.grid(row=0, column=3, sticky="w", padx=(4, 0))
+        self._create_hover_tooltip(left_blur_mix_combo, "depth_blur_left_mix")
+        # Trigger an immediate preview refresh when the mix selector changes
+        left_blur_mix_combo.bind("<<ComboboxSelected>>", lambda e: self.previewer.update_preview() if getattr(self, 'previewer', None) else None)
+
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
         self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Stereo Projection")
         self.depth_all_settings_frame.grid(row=current_depth_row, column=0, sticky="ew", pady=(2, 0)) # Pack it below Hi-Res frame
-        # self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
-        # self.depth_all_settings_frame.grid_columnconfigure(3, weight=1)
+        self.depth_all_settings_frame.grid_columnconfigure(0, weight=0)
+        self.depth_all_settings_frame.grid_columnconfigure(1, weight=1)
+        self.depth_all_settings_frame.grid_columnconfigure(2, weight=0)
 
         all_settings_row = 0
 
-        # Gamma Slider
+        # Gamma + Disparity (same row)
+        gamma_disp_row_frame = ttk.Frame(self.depth_all_settings_frame)
+        gamma_disp_row_frame.grid(row=all_settings_row, column=0, columnspan=3, sticky="ew")
+        gamma_disp_row_frame.grid_columnconfigure(0, weight=1)
+        gamma_disp_row_frame.grid_columnconfigure(1, weight=1)
+
+        gamma_subframe = ttk.Frame(gamma_disp_row_frame)
+        gamma_subframe.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        gamma_subframe.grid_columnconfigure(1, weight=1)
+
+        disp_subframe = ttk.Frame(gamma_disp_row_frame)
+        disp_subframe.grid(row=0, column=1, sticky="ew")
+        disp_subframe.grid_columnconfigure(1, weight=1)
+
         create_single_slider_with_label_updater(
-            self, self.depth_all_settings_frame, "Gamma:",
-            self.depth_gamma_var, 0.1, 3.0, all_settings_row, decimals=1,
+            self, gamma_subframe, "Gamma:",
+            self.depth_gamma_var, 0.1, 3.0, 0, decimals=2,
             tooltip_key="depth_gamma",
-            trough_increment=0.1
-            )
-        all_settings_row += 1
-        
-        # Max Disparity Slider (MOVED FROM OUTPUT FRAME)
+            trough_increment=0.05,
+            step_size=0.05,
+            default_value=1.0
+        )
+
         self.set_disparity_value_programmatically = create_single_slider_with_label_updater(
-            self, self.depth_all_settings_frame, "Disparity:",
-            self.max_disp_var, 0.0, 100.0, all_settings_row, decimals=0,
+            self, disp_subframe, "Disparity:",
+            self.max_disp_var, 0.0, 100.0, 0, decimals=0,
             tooltip_key="max_disp",
-            )
+            step_size=1.0,
+            default_value=30.0
+        )
         all_settings_row += 1
-        
-        # Convergence Point Slider (MOVED FROM OUTPUT FRAME)
+
+        # Convergence Point Slider
         setter_func_conv = create_single_slider_with_label_updater(
             self, self.depth_all_settings_frame, "Convergence:",
-            self.zero_disparity_anchor_var, 0.0, 2.0, all_settings_row, decimals=2, # Range changed to 2.0
+            self.zero_disparity_anchor_var, 0.0, 2.0, all_settings_row, decimals=2,
             tooltip_key="convergence_point",
-            )
+            step_size=0.01,
+            default_value=0.5
+        )
         self.set_convergence_value_programmatically = setter_func_conv 
-        
         all_settings_row += 1
-        
-        # --- RENAMED/REPURPOSED CHECKBOX ---
-        self.global_norm_checkbox = ttk.Checkbutton(
-            self.depth_all_settings_frame, text="Enable Global Normalization",
-            variable=self.enable_global_norm_var, # New variable name
-            command=lambda: self.on_slider_release(None),
-            width=28
-            )
-        self.global_norm_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
-        self._create_hover_tooltip(self.global_norm_checkbox, "enable_global_normalization") 
+        # --- Global Normalization + Resume (packed in a sub-frame so slider columns stay aligned) ---
+        checkbox_row = ttk.Frame(self.depth_all_settings_frame)
+        checkbox_row.grid(row=all_settings_row, column=0, columnspan=3, sticky="w", padx=5, pady=0)
 
-        all_settings_row += 1
-        
-        # --- NEW: Move to Finished Folder Checkbox ---
+        self.global_norm_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="Enable Global Normalization",
+            variable=self.enable_global_norm_var,
+            command=self.on_slider_release
+        )
+        self.global_norm_checkbox.pack(side="left")
+        self._create_hover_tooltip(self.global_norm_checkbox, "enable_global_normalization")
+
         self.move_to_finished_checkbox = ttk.Checkbutton(
-            self.depth_all_settings_frame, text="Resume",
-            variable=self.move_to_finished_var,
-            width=28
-            )
-        self.move_to_finished_checkbox.grid(row=all_settings_row, column=0, columnspan=2, sticky="w", padx=5, pady=0)
+            checkbox_row,
+            text="Resume",
+            variable=self.move_to_finished_var
+        )
+        self.move_to_finished_checkbox.pack(side="left", padx=(10, 0))
         self._create_hover_tooltip(self.move_to_finished_checkbox, "move_to_finished_folder")
+        # Crosshair overlay controls (preview only)
+        self.crosshair_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="Crosshair",
+            variable=self.crosshair_enabled_var,
+            takefocus=False,
+            command=lambda: (self.previewer.set_crosshair_settings(
+                self.crosshair_enabled_var.get(),
+                self.crosshair_white_var.get(),
+                self.crosshair_multi_var.get()
+            ), getattr(self.previewer, "preview_canvas", self.previewer).focus_set()) if getattr(self, 'previewer', None) else None
+        )
+        self.crosshair_checkbox.pack(side="left", padx=(24, 0))
+        self._create_hover_tooltip(self.crosshair_checkbox, "crosshair_enabled")
+
+        self.crosshair_white_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="White",
+            variable=self.crosshair_white_var,
+            takefocus=False,
+            command=lambda: (self.previewer.set_crosshair_settings(
+                self.crosshair_enabled_var.get(),
+                self.crosshair_white_var.get(),
+                self.crosshair_multi_var.get()
+            ), getattr(self.previewer, "preview_canvas", self.previewer).focus_set()) if getattr(self, 'previewer', None) else None
+        )
+        self.crosshair_white_checkbox.pack(side="left", padx=(6, 0))
+        self._create_hover_tooltip(self.crosshair_white_checkbox, "crosshair_white")
+
+        self.crosshair_multi_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="Multi",
+            variable=self.crosshair_multi_var,
+            takefocus=False,
+            command=lambda: (self.previewer.set_crosshair_settings(
+                self.crosshair_enabled_var.get(),
+                self.crosshair_white_var.get(),
+                self.crosshair_multi_var.get()
+            ), getattr(self.previewer, "preview_canvas", self.previewer).focus_set()) if getattr(self, 'previewer', None) else None
+        )
+        self.crosshair_multi_checkbox.pack(side="left", padx=(6, 0))
+        self._create_hover_tooltip(self.crosshair_multi_checkbox, "crosshair_multi")
+        self.depth_pop_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="D/P",
+            variable=self.depth_pop_enabled_var,
+            takefocus=False,
+            command=lambda: (
+                getattr(self.previewer, "set_depth_pop_enabled", lambda *_: None)(self.depth_pop_enabled_var.get()),
+                getattr(self.previewer, "preview_canvas", self.previewer).focus_set()
+            ) if getattr(self, 'previewer', None) else None
+        )
+        self.depth_pop_checkbox.pack(side="left", padx=(24, 0))
+        self._create_hover_tooltip(self.depth_pop_checkbox, "depth_pop_readout")
         all_settings_row += 1
 
         current_row = 0 # Reset for next frame
         # ===================================================================
         # --- RIGHT COLUMN: Current Processing Information frame ---
         # ===================================================================
-        self.info_frame = ttk.LabelFrame(self.main_layout_frame, text="Current Processing Information") # Target main layout frame
-        self.info_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 0)) # Stick to North (Top)
-        self.info_frame.grid_columnconfigure(1, weight=1) # Allow value column to expand (if frame is stretched)
+                # --- RIGHT COLUMN STACK (Current Processing Information + Dev Tools) ---
+        self.right_column_stack = ttk.Frame(self.main_layout_frame)
+        self.right_column_stack.grid(row=0, column=1, sticky="nsew", padx=(0, 0))
+        self.right_column_stack.grid_columnconfigure(0, weight=1, minsize=0)
+        self.right_column_stack.grid_rowconfigure(0, weight=0)
+        self.right_column_stack.grid_rowconfigure(1, weight=0)
 
-        self.info_labels = [] # List to hold the tk.Label widgets for easy iteration
+        # --- Current Processing Information frame ---
+        self.info_frame = ttk.LabelFrame(self.right_column_stack, text="Current Processing Information")
+        self.info_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 2))
 
-        LABEL_VALUE_WIDTH = 25
+        # Two-column pairs: [Label, Value] [Label, Value]
+        self.info_frame.grid_columnconfigure(0, weight=0)
+        self.info_frame.grid_columnconfigure(1, weight=1, minsize=0)
+        self.info_frame.grid_columnconfigure(2, weight=0)
+        self.info_frame.grid_columnconfigure(3, weight=1, minsize=0)
+
+        self.info_labels = []  # List to hold the tk.Label widgets for easy iteration
+        LABEL_VALUE_WIDTH = 18
         info_row = 0
 
-        # Row 0: Filename
+        # Row 0: Filename (span across)
         lbl_filename_static = tk.Label(self.info_frame, text="Filename:")
         lbl_filename_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
         lbl_filename_value = tk.Label(self.info_frame, textvariable=self.processing_filename_var, anchor="w", width=LABEL_VALUE_WIDTH)
-        lbl_filename_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
+        lbl_filename_value.grid(row=info_row, column=1, columnspan=3, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_filename_static, lbl_filename_value])
         info_row += 1
 
-        # Row 1: Task Name
+        # Row 1: Task (span across)
         lbl_task_static = tk.Label(self.info_frame, text="Task:")
         lbl_task_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
         lbl_task_value = tk.Label(self.info_frame, textvariable=self.processing_task_name_var, anchor="w", width=LABEL_VALUE_WIDTH)
-        lbl_task_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
+        lbl_task_value.grid(row=info_row, column=1, columnspan=3, sticky="ew", padx=5, pady=1)
         self.info_labels.extend([lbl_task_static, lbl_task_value])
         info_row += 1
 
-        # Row 2: Resolution
+        # Row 2: Resolution | Disparity
         lbl_resolution_static = tk.Label(self.info_frame, text="Resolution:")
         lbl_resolution_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
         lbl_resolution_value = tk.Label(self.info_frame, textvariable=self.processing_resolution_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_resolution_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_resolution_static, lbl_resolution_value])
+
+        lbl_disparity_static = tk.Label(self.info_frame, text="Disparity:")
+        lbl_disparity_static.grid(row=info_row, column=2, sticky="e", padx=5, pady=1)
+        lbl_disparity_value = tk.Label(self.info_frame, textvariable=self.processing_disparity_var, anchor="w", width=LABEL_VALUE_WIDTH)
+        lbl_disparity_value.grid(row=info_row, column=3, sticky="ew", padx=5, pady=1)
+
+        self.info_labels.extend([lbl_resolution_static, lbl_resolution_value, lbl_disparity_static, lbl_disparity_value])
         info_row += 1
 
-        # Row 3: Total Frames for current task
+        # Row 3: Frames | Converge
         lbl_frames_static = tk.Label(self.info_frame, text="Frames:")
         lbl_frames_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
         lbl_frames_value = tk.Label(self.info_frame, textvariable=self.processing_frames_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_frames_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_frames_static, lbl_frames_value])
+
+        lbl_converge_static = tk.Label(self.info_frame, text="Converge:")
+        lbl_converge_static.grid(row=info_row, column=2, sticky="e", padx=5, pady=1)
+        lbl_converge_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w", width=LABEL_VALUE_WIDTH)
+        lbl_converge_value.grid(row=info_row, column=3, sticky="ew", padx=5, pady=1)
+
+        self.info_labels.extend([lbl_frames_static, lbl_frames_value, lbl_converge_static, lbl_converge_value])
         info_row += 1
 
-        # --- NEW ROW 6: Gamma ---
+        # Row 4: Gamma | Map
         lbl_gamma_static = tk.Label(self.info_frame, text="Gamma:")
         lbl_gamma_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
         lbl_gamma_value = tk.Label(self.info_frame, textvariable=self.processing_gamma_var, anchor="w", width=LABEL_VALUE_WIDTH)
         lbl_gamma_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_gamma_static, lbl_gamma_value])
-        info_row += 1
-        # ------------------------
 
-        # Row 4: Max Disparity
-        lbl_disparity_static = tk.Label(self.info_frame, text="Disparity:")
-        lbl_disparity_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
-        lbl_disparity_value = tk.Label(self.info_frame, textvariable=self.processing_disparity_var, anchor="w", width=LABEL_VALUE_WIDTH)
-        lbl_disparity_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_disparity_static, lbl_disparity_value])
-        info_row += 1
-
-        # Row 5: Convergence Point
-        lbl_convergence_static = tk.Label(self.info_frame, text="Converge:")
-        lbl_convergence_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
-        lbl_convergence_value = tk.Label(self.info_frame, textvariable=self.processing_convergence_var, anchor="w", width=LABEL_VALUE_WIDTH)
-        lbl_convergence_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_convergence_static, lbl_convergence_value])
-        info_row += 1
-
-        # Row 6: Depth Map Source (Multi-Map)
         lbl_map_static = tk.Label(self.info_frame, text="Map:")
-        lbl_map_static.grid(row=info_row, column=0, sticky="e", padx=5, pady=1)
+        lbl_map_static.grid(row=info_row, column=2, sticky="e", padx=5, pady=1)
         lbl_map_value = tk.Label(self.info_frame, textvariable=self.processing_map_var, anchor="w", width=LABEL_VALUE_WIDTH)
-        lbl_map_value.grid(row=info_row, column=1, sticky="ew", padx=5, pady=1)
-        self.info_labels.extend([lbl_map_static, lbl_map_value])
+        lbl_map_value.grid(row=info_row, column=3, sticky="ew", padx=5, pady=1)
 
-        # --- Progress frame ---
+        self.info_labels.extend([lbl_gamma_static, lbl_gamma_value, lbl_map_static, lbl_map_value])
+
+        # --- Dev Tools (right column) ---
+        self.dev_tools_frame = ttk.LabelFrame(self.right_column_stack, text="Dev Tools")
+        self.dev_tools_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 0))
+        self.dev_tools_frame.grid_columnconfigure(0, weight=0)
+        self.dev_tools_frame.grid_columnconfigure(1, weight=0)
+        self.dev_tools_frame.grid_columnconfigure(2, weight=0)
+        self.dev_tools_frame.grid_columnconfigure(3, weight=1)
+
+        self.chk_skip_lowres_preproc = ttk.Checkbutton(
+            self.dev_tools_frame,
+            text="Skip Low-Res Pre-proc",
+            variable=self.skip_lowres_preproc_var
+        )
+        self.chk_skip_lowres_preproc.grid(row=0, column=0, sticky="w", padx=5, pady=0)
+        self._create_hover_tooltip(self.chk_skip_lowres_preproc, "skip_lowres_preproc")
+
+        self.chk_map_test = ttk.Checkbutton(
+            self.dev_tools_frame,
+            text="Map Test",
+            variable=self.map_test_var,
+            command=lambda: self.splat_test_var.set(False) if self.map_test_var.get() else None
+        )
+        self.chk_map_test.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=0)
+        self._create_hover_tooltip(self.chk_map_test, "map_test")
+
+        self.chk_splat_test = ttk.Checkbutton(
+            self.dev_tools_frame,
+            text="Splat Test",
+            variable=self.splat_test_var,
+            command=lambda: self.map_test_var.set(False) if self.splat_test_var.get() else None
+        )
+        self.chk_splat_test.grid(row=0, column=2, sticky="w", padx=(10, 0), pady=0)
+        self._create_hover_tooltip(self.chk_splat_test, "splat_test")
+
+
         progress_frame = ttk.LabelFrame(self, text="Progress")
         progress_frame.pack(pady=2, padx=10, fill="x")
         self.progress_var = tk.DoubleVar()
@@ -1515,12 +1886,6 @@ class SplatterGUI(ThemedTk):
         self.update_sidecar_button = ttk.Button(button_frame, text="Update Sidecar", command=self.update_sidecar_file)
         self.update_sidecar_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.update_sidecar_button, "update_sidecar_button")
-
-        # --- Current Processing Information frame ---
-        self.info_frame = ttk.LabelFrame(self, text="Current Processing Information") # Store frame as instance attribute
-        self.info_frame.pack(pady=2, padx=10, fill="x")
-        self.info_frame.grid_columnconfigure(1, weight=1)
-
     def _setup_keyboard_shortcuts(self):
         """Sets up keyboard shortcuts for quick adjustments.
 
@@ -1535,9 +1900,17 @@ class SplatterGUI(ThemedTk):
         """Handles keyboard shortcuts, but only when not in a text entry."""
         # Check if focus is in an Entry or Text widget
         focused_widget = self.focus_get()
-        if isinstance(focused_widget, (tk.Entry, tk.Text, ttk.Entry)):
+        if isinstance(focused_widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Spinbox)):
             # User is typing in a text field - don't intercept
             return
+
+        # ENTER: Update sidecar (confirmation dialog will appear as usual)
+        if event.keysym in ("Return", "KP_Enter"):
+            try:
+                self.update_sidecar_file()
+            except Exception as e:
+                logger.error(f"Enter-key sidecar update failed: {e}", exc_info=True)
+            return "break"
 
         # Map shortcuts
         if event.char == '7':
@@ -1650,6 +2023,8 @@ class SplatterGUI(ThemedTk):
             depth_dilate_size_y: float = 0.0,
             depth_blur_size_x: float = 0.0,
             depth_blur_size_y: float = 0.0,
+            depth_dilate_left: float = 0.0,
+            depth_blur_left: float = 0.0,
         ):
         logger.debug("==> Initializing ForwardWarpStereo module")
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -1664,19 +2039,120 @@ class SplatterGUI(ThemedTk):
         res_suffix = f"_{width}"
         final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
 
+
+        # --- DEBUG: Log ffprobe-derived color metadata for this pass (Hi/Lo parity checks) ---
+        task_name = "LowRes" if is_low_res_task else "HiRes"
+        try:
+            logger.info(
+                f"[COLOR_META][{task_name}] input ffprobe: "
+                f"pix_fmt={video_stream_info.get('pix_fmt') if video_stream_info else None}, "
+                f"range={video_stream_info.get('color_range') if video_stream_info else None}, "
+                f"primaries={video_stream_info.get('color_primaries') if video_stream_info else None}, "
+                f"trc={video_stream_info.get('transfer_characteristics') if video_stream_info else None}, "
+                f"matrix={video_stream_info.get('color_space') if video_stream_info else None}"
+            )
+        except Exception:
+            pass
+        # --- END DEBUG ---
+
         # --- Start FFmpeg pipe process ---
-        ffmpeg_process = start_ffmpeg_pipe_process(
-            content_width=grid_width,
-            content_height=grid_height,
-            final_output_mp4_path=final_output_video_path,
-            fps=processed_fps,
-            video_stream_info=video_stream_info,
-            user_output_crf=user_output_crf,
-            output_format_str="splatted_grid" # Pass a placeholder for the new argument
-        )
-        if ffmpeg_process is None:
-            logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
-            return False
+        is_test_mode = bool((getattr(self, 'map_test_var', None) and self.map_test_var.get()) or (getattr(self, 'splat_test_var', None) and self.splat_test_var.get()))
+        ffmpeg_process = None
+        if is_test_mode:
+            # In test mode we don't want to create/overwrite any output video files.
+            logger.debug("Test mode active: skipping FFmpeg encoding (no output video will be written).")
+        else:
+            # --- Start FFmpeg pipe process ---
+            # Apply output color tag mode (metadata-only; does not change splat math)
+            encode_stream_info = dict(video_stream_info) if isinstance(video_stream_info, dict) else {}
+            try:
+                _ct_mode = self.color_tags_mode_var.get() if hasattr(self, "color_tags_mode_var") else "Auto"
+            except Exception:
+                _ct_mode = "Auto"
+
+            def _ct_defaults(d: dict) -> dict:
+                d.setdefault("color_primaries", "bt709")
+                d.setdefault("transfer_characteristics", "bt709")
+                d.setdefault("color_space", "bt709")
+                # Only metadata; used for tagging if missing. Preserve source if present.
+                d.setdefault("color_range", "tv")
+                return d
+
+            if _ct_mode == "Auto":
+                encode_stream_info = _ct_defaults(encode_stream_info)
+            elif _ct_mode == "BT.709 L":
+                encode_stream_info.update({
+                    "color_primaries": "bt709",
+                    "transfer_characteristics": "bt709",
+                    "color_space": "bt709",
+                    "color_range": "tv",
+                })
+            elif _ct_mode == "BT.709 F":
+                encode_stream_info.update({
+                    "color_primaries": "bt709",
+                    "transfer_characteristics": "bt709",
+                    "color_space": "bt709",
+                    "color_range": "pc",
+                })
+            elif _ct_mode == "BT.2020 PQ":
+                encode_stream_info.update({
+                    "color_primaries": "bt2020",
+                    "transfer_characteristics": "smpte2084",
+                    "color_space": "bt2020nc",
+                    "color_range": "tv",
+                })
+            elif _ct_mode == "BT.2020 HLG":
+                encode_stream_info.update({
+                    "color_primaries": "bt2020",
+                    "transfer_characteristics": "arib-std-b67",
+                    "color_space": "bt2020nc",
+                    "color_range": "tv",
+                })
+            else:
+                # Unknown/legacy value; keep current behavior
+                encode_stream_info = _ct_defaults(encode_stream_info)
+
+            ffmpeg_process = start_ffmpeg_pipe_process(
+                content_width=grid_width,
+                content_height=grid_height,
+                final_output_mp4_path=final_output_video_path,
+                fps=processed_fps,
+                video_stream_info=encode_stream_info,
+                user_output_crf=user_output_crf,
+                output_format_str="splatted_grid", # Pass a placeholder for the new argument
+                debug_label=task_name
+            )
+            if ffmpeg_process is None:
+                logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
+                return False
+
+
+
+        # --- DEBUG: Capture and compare encoding flags between HiRes and LowRes passes ---
+        try:
+            flags = getattr(ffmpeg_process, "sc_encode_flags", None)
+            if flags:
+                if not hasattr(self, "_sc_color_encode_flags"):
+                    self._sc_color_encode_flags = {}
+                subset_keys = [
+                    "enc_codec", "enc_pix_fmt", "enc_profile",
+                    "enc_color_primaries", "enc_color_trc", "enc_colorspace",
+                    "quality_mode", "quality_value",
+                ]
+                subset = {k: flags.get(k) for k in subset_keys}
+                self._sc_color_encode_flags[task_name] = subset
+
+                other_name = "HiRes" if task_name == "LowRes" else "LowRes"
+                if other_name in self._sc_color_encode_flags:
+                    other = self._sc_color_encode_flags[other_name]
+                    diffs = {k: (other.get(k), subset.get(k)) for k in subset_keys if other.get(k) != subset.get(k)}
+                    if diffs:
+                        logger.warning(f"[COLOR_META] Encoding flags differ ({other_name} vs {task_name}): {diffs}")
+                    else:
+                        logger.info(f"[COLOR_META] Encoding flags match between {other_name} and {task_name}.")
+        except Exception:
+            pass
+        # --- END DEBUG ---
 
         # --- Determine max_expected_raw_value for consistent Gamma ---
         max_expected_raw_value = 1.0
@@ -1698,10 +2174,21 @@ class SplatterGUI(ThemedTk):
         encoding_successful = True # Assume success unless an error occurs
 
         try:
-            for i in range(0, num_frames, batch_size):
+            # Map/Splat Test: render the *same frame* the preview is showing.
+            test_target_frame_idx = None
+            try:
+                if (getattr(self, 'map_test_var', None) and self.map_test_var.get()) or (getattr(self, 'splat_test_var', None) and self.splat_test_var.get()):
+                    if hasattr(self, 'previewer') and getattr(self.previewer, 'last_loaded_frame_index', None) is not None:
+                        test_target_frame_idx = int(self.previewer.last_loaded_frame_index)
+                        test_target_frame_idx = max(0, min(int(num_frames) - 1, test_target_frame_idx))
+            except Exception:
+                test_target_frame_idx = None
+            
+            frame_index_iter = [test_target_frame_idx] if test_target_frame_idx is not None else range(0, num_frames, batch_size)
+            for i in frame_index_iter:
                 t_start_batch = time.perf_counter() # <--- TIMER START: Total Batch
-                if self.stop_event.is_set() or ffmpeg_process.poll() is not None:
-                    if ffmpeg_process.poll() is not None:
+                if self.stop_event.is_set() or (ffmpeg_process is not None and ffmpeg_process.poll() is not None):
+                    if ffmpeg_process is not None and ffmpeg_process.poll() is not None:
                         logger.error("FFmpeg process terminated unexpectedly. Stopping frame processing.")
                     else:
                         logger.warning("Stop event received. Terminating FFmpeg process.")
@@ -1711,7 +2198,7 @@ class SplatterGUI(ThemedTk):
                 # --- TIMER 1: Video/Depth I/O (Disk/Decode/Resize) ---
                 t_start_io = time.perf_counter()
 
-                current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
+                current_frame_indices = [i] if test_target_frame_idx is not None else list(range(i, min(i + batch_size, num_frames)))
                 if not current_frame_indices:
                     break
 
@@ -1741,6 +2228,43 @@ class SplatterGUI(ThemedTk):
                 
                 # self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, file_frame_idx, task_name) 
                 # --- TIMER 2: CPU Pre-processing (Dilate, Blur, Grayscale, Gamma, Min/Max Calc) ---
+                # --- 8-bit resize parity (Map Test Preview vs Render) ---
+                # For 8-bit depth videos, Decord's decode-time scaling can differ by ~1-2 code values vs OpenCV.
+                # To match the Preview path, decode at native res (see load_pre_rendered_depth) and resize here
+                # BEFORE preprocessing using the same OpenCV interpolation policy.
+                _bd = _infer_depth_bit_depth(depth_stream_info) if depth_stream_info else 8
+                if _bd <= 8:
+                    # Determine pre-processing resolution (matches preview/render ordering).
+                    _target_w = int(batch_frames_numpy.shape[2])
+                    _target_h = int(batch_frames_numpy.shape[1])
+                    if is_low_res_task:
+                        _skip_lr = bool(getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get())
+                        if not _skip_lr:
+                            # For Low-Res tasks we want to apply preprocessing at the incoming depth-reader resolution
+                            # (typically clip-sized when match_resolution_to_target is enabled), then downscale after preprocessing.
+                            _target_w = int(batch_depth_numpy_raw.shape[2])
+                            _target_h = int(batch_depth_numpy_raw.shape[1])
+
+                    # Reduce to a single channel (depth maps are grayscale-encoded).
+                    if batch_depth_numpy_raw.ndim == 4:
+                        if batch_depth_numpy_raw.shape[-1] == 3:
+                            _depth_1c = batch_depth_numpy_raw[..., 0]
+                        elif batch_depth_numpy_raw.shape[-1] == 1:
+                            _depth_1c = batch_depth_numpy_raw[..., 0]
+                        else:
+                            _depth_1c = batch_depth_numpy_raw.squeeze(-1)
+                    else:
+                        _depth_1c = batch_depth_numpy_raw
+
+                    if (_depth_1c.shape[1] != _target_h) or (_depth_1c.shape[2] != _target_w):
+                        _interp = cv2.INTER_LINEAR if (_target_w > _depth_1c.shape[2] or _target_h > _depth_1c.shape[1]) else cv2.INTER_AREA
+                        _resized = np.empty((_depth_1c.shape[0], _target_h, _target_w), dtype=_depth_1c.dtype)
+                        for _di in range(_depth_1c.shape[0]):
+                            _resized[_di] = cv2.resize(_depth_1c[_di], (_target_w, _target_h), interpolation=_interp)
+                        batch_depth_numpy_raw = _resized[..., None]
+                    else:
+                        batch_depth_numpy_raw = _depth_1c[..., None]
+
                 t_start_preproc = time.perf_counter()
                 
                 batch_depth_numpy = self._process_depth_batch(
@@ -1751,61 +2275,68 @@ class SplatterGUI(ThemedTk):
                     depth_dilate_size_y=depth_dilate_size_y,
                     depth_blur_size_x=depth_blur_size_x,
                     depth_blur_size_y=depth_blur_size_y,
+                    depth_dilate_left=depth_dilate_left,
+                    depth_blur_left=depth_blur_left,
                     is_low_res_task=is_low_res_task,
                     max_raw_value=max_expected_raw_value,
                     global_depth_min=global_depth_min,
                     global_depth_max=global_depth_max,
-                    # --- NEW DEBUG ARGS ---
                     debug_batch_index=i,
                     debug_frame_index=file_frame_idx,
                     debug_task_name=task_name,
-                    # --- END NEW DEBUG ARGS ---
                 )
+
+                # If the depth batch resolution differs from the source frames,
+                # resize AFTER preprocessing so dilation/erosion/blur parity is preserved.
+                if (batch_depth_numpy.shape[1] != batch_frames_numpy.shape[1]) or (batch_depth_numpy.shape[2] != batch_frames_numpy.shape[2]):
+                    target_h = batch_frames_numpy.shape[1]
+                    target_w = batch_frames_numpy.shape[2]
+                    # INTER_AREA seems best for downscaling depth maps (minimizes aliasing/jaggies-cv2.INTER_LANCZOS4 works too).
+                    if target_w < batch_depth_numpy.shape[2] and target_h < batch_depth_numpy.shape[1]:
+                        interp = cv2.INTER_AREA
+                    else:
+                        interp = cv2.INTER_LINEAR
+                    resized_depth = np.empty((batch_depth_numpy.shape[0], target_h, target_w), dtype=batch_depth_numpy.dtype)
+                    for _di in range(batch_depth_numpy.shape[0]):
+                        resized_depth[_di] = cv2.resize(batch_depth_numpy[_di], (target_w, target_h), interpolation=interp)
+                    batch_depth_numpy = resized_depth
+
                 # self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, file_frame_idx, task_name)
 
                 batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
-                batch_depth_normalized = batch_depth_numpy.copy()
-
+                
+                # 1. Normalize based on mode
                 if assume_raw_input:
                     if global_depth_max > 1.0:
                         batch_depth_normalized = batch_depth_numpy / global_depth_max
+                    else:
+                        batch_depth_normalized = batch_depth_numpy.copy()
                 else:                    
                     depth_range = global_depth_max - global_depth_min
-                    if depth_range > 1e-5: # Use a small epsilon to detect non-zero range
+                    if depth_range > 1e-5:
                         batch_depth_normalized = (batch_depth_numpy - global_depth_min) / depth_range
                     else:
-                        # If range is zero, fill with a neutral value (e.g., 0.5) to prevent NaN/Inf
                         batch_depth_normalized = np.full_like(batch_depth_numpy, fill_value=zero_disparity_anchor_val, dtype=np.float32)
-                        logger.warning(f"Normalization collapsed to zero range ({global_depth_min:.4f} - {global_depth_max:.4f}). Filling with anchor value ({zero_disparity_anchor_val:.2f}).")
+                        logger.warning(f"Normalization collapsed to zero range ({global_depth_min:.4f} - {global_depth_max:.4f}).")
+
+                # 2. Unified Inverted Gamma (Matches Preview Math exactly)
+                if round(float(depth_gamma), 2) != 1.0:
+                    # Math: 1.0 - (1.0 - depth)^gamma
+                    batch_depth_normalized = 1.0 - np.power(1.0 - np.clip(batch_depth_normalized, 0, 1), depth_gamma)
+                    # (Normal) Depth gamma applied in normalized space; no warning log.
 
                 batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
 
-                if not assume_raw_input and depth_gamma != 1.0:
-                     batch_depth_normalized = np.power(batch_depth_normalized, depth_gamma)
-                
-                # self._save_debug_numpy(batch_depth_normalized, "03_FINAL_NORMALIZED", i, file_frame_idx, task_name) 
-                
-                # --- NEW LOGIC: Invert Gamma Effect (Gamma > 1.0 makes near-field brighter) ---
-                if not assume_raw_input and round(depth_gamma, 2) != 1.0:
-                    logger.debug(f"Applying gamma reversal for intuitive control (Gamma={depth_gamma:.2f}).")
-                    # Step 1: Invert normalized depth
-                    inverted_depth = 1.0 - batch_depth_normalized
-                    # Step 2: Apply gamma to the inverted depth
-                    gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
-                    # Step 3: Invert back
-                    batch_depth_normalized = 1.0 - gamma_applied_inverted
-                    # Clamp to ensure no float inaccuracies push values outside [0, 1]
-                    batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
-
+                # --- START OF DIAGNOSTIC SYNC BLOCK ---
+                # Keeps depth visualization at 16-bit to prevent banding in the Render output
                 batch_depth_vis_list = []
                 for d_frame in batch_depth_normalized:
-                    d_frame_vis = d_frame.copy()
-                    if d_frame_vis.max() > d_frame_vis.min(): 
-                        cv2.normalize(d_frame_vis, d_frame_vis, 0, 1, cv2.NORM_MINMAX)
-                    vis_frame_uint8 = (d_frame_vis * 255).astype(np.uint8)
-                    vis_frame = cv2.applyColorMap(vis_frame_uint8, cv2.COLORMAP_VIRIDIS)
-                    batch_depth_vis_list.append(vis_frame.astype("float32") / 255.0)
+                    # We keep this as float32 for the assembly to prevent 8-bit quantization
+                    vis_gray_3ch = np.stack([d_frame] * 3, axis=-1)
+                    batch_depth_vis_list.append(vis_gray_3ch.astype("float32"))
+                
                 batch_depth_vis = np.stack(batch_depth_vis_list, axis=0) 
+                # --- END OF DIAGNOSTIC SYNC BLOCK ---
 
                 t_end_preproc = time.perf_counter()
                 # --- END TIMER 2 ---
@@ -1827,22 +2358,8 @@ class SplatterGUI(ThemedTk):
 
                 with torch.no_grad():
                     right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(left_video_tensor, disp_map_tensor)
-                    if is_low_res_task:
-                        # 1. Fill Left Edge Occlusions
-                        right_video_tensor_left_filled = self._fill_left_edge_occlusions(right_video_tensor_raw, occlusion_mask_tensor, boundary_width_pixels=3)
-                        
-                        # 2. Fill Right Edge Occlusions (New Call)
-                        right_video_tensor = self._fill_right_edge_occlusions(right_video_tensor_left_filled, occlusion_mask_tensor, boundary_width_pixels=3)
-                    else:
-                        right_video_tensor = right_video_tensor_raw
+                    right_video_tensor = right_video_tensor_raw
 
-                torch.cuda.synchronize() # Force synchronization after compute
-                t_end_compute = time.perf_counter()
-                # --- END TIMER 4 ---
-
-                # --- TIMER 5: DtoH Transfer (GPU to CPU) ---
-                t_start_transfer_DtoH = time.perf_counter()
-                
                 right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
                 occlusion_mask_numpy = occlusion_mask_tensor.cpu().permute(0, 2, 3, 1).numpy().repeat(3, axis=-1)
 
@@ -1852,6 +2369,95 @@ class SplatterGUI(ThemedTk):
                 # --- TIMER 6: FFmpeg Write (Blocking I/O) ---
                 t_start_write = time.perf_counter()
 
+                # --- START OF DIAGNOSTIC TEST ASSEMBLY ---
+                test_generated_this_task = False
+                if self.map_test_var.get() or self.splat_test_var.get():
+                    for j in range(len(batch_frames_numpy)):
+                        # Capture logic
+                        clean_base = os.path.splitext(output_video_path_base)[0].replace("_splatted2", "").replace("_splatted4", "")
+                        base_img_path = f"{clean_base}_{width}"
+                        
+                        # Emergency pump to ensure the 100% scale update_preview finished
+                        for _ in range(25): 
+                            self.update_idletasks(); self.update()
+                            if self.previewer.pil_image_for_preview is not None: break
+                            time.sleep(0.1)
+
+                        if self.previewer.pil_image_for_preview is None:
+                            logger.error("Diagnostic Capture Failed: Preview image is missing."); return False
+
+                        preview_pil = self.previewer.pil_image_for_preview.convert("RGB")
+                        # Resize preview to match RENDER resolution for SBS parity
+                        preview_pil = preview_pil.resize((width, height), Image.Resampling.LANCZOS)
+                        preview_side = np.array(preview_pil).astype(np.float32) / 255.0
+
+                        
+                        if self.map_test_var.get():
+                            # Render depth visualization (apply the same visualization-only TV->full expansion for 10-bit, when tagged 'tv')
+                            render_map_vis = batch_depth_vis[j]
+                            try:
+                                if DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT:
+                                    bd = int(_infer_depth_bit_depth(depth_stream_info)) if depth_stream_info else 8
+                                    rng = str((depth_stream_info or {}).get("color_range") or (depth_stream_info or {}).get("range") or "").lower()
+                                    if bd >= 10 and rng == "tv":
+                                        render_map_vis = (render_map_vis - DEPTH_VIS_TV10_BLACK_NORM) / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                            except Exception:
+                                pass
+
+                            # Save labeled PREVIEW / RENDER single images
+                            try:
+                                prev_u8 = (np.clip(preview_side, 0, 1) * 255).astype(np.uint8)
+                                prev_bgr = cv2.cvtColor(prev_u8, cv2.COLOR_RGB2BGR)
+                                cv2.putText(prev_bgr, "PREVIEW", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                                cv2.imwrite(f"{base_img_path}_map_test_preview.png", prev_bgr)
+
+                                rend_u8 = (np.clip(render_map_vis, 0, 1) * 255).astype(np.uint8)
+                                rend_bgr = cv2.cvtColor(rend_u8, cv2.COLOR_RGB2BGR)
+                                cv2.putText(rend_bgr, "RENDER", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                                cv2.imwrite(f"{base_img_path}_map_test_render.png", rend_bgr)
+                            except Exception:
+                                pass
+
+                            # SBS (kept for convenience)
+                            sbs_map = np.concatenate([preview_side, render_map_vis], axis=1)
+                            sbs_map_uint8 = (np.clip(sbs_map, 0, 1) * 255).astype(np.uint8)
+                            sbs_map_bgr = cv2.cvtColor(sbs_map_uint8, cv2.COLOR_RGB2BGR)
+                            cv2.putText(sbs_map_bgr, "PREVIEW", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                            cv2.putText(sbs_map_bgr, "RENDER", (width + 10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                            cv2.imwrite(f"{base_img_path}_map_test.png", sbs_map_bgr)
+                            logger.info(f"Saved Map Test: {os.path.basename(base_img_path)}_map_test.png")
+
+                        if self.splat_test_var.get():
+                            # Save labeled PREVIEW / RENDER single images
+                            try:
+                                prev_u8 = (np.clip(preview_side, 0, 1) * 255).astype(np.uint8)
+                                prev_bgr = cv2.cvtColor(prev_u8, cv2.COLOR_RGB2BGR)
+                                cv2.putText(prev_bgr, "PREVIEW", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                                cv2.imwrite(f"{base_img_path}_splat_test_preview.png", prev_bgr)
+
+                                rend_u8 = (np.clip(right_video_numpy[j], 0, 1) * 255).astype(np.uint8)
+                                rend_bgr = cv2.cvtColor(rend_u8, cv2.COLOR_RGB2BGR)
+                                cv2.putText(rend_bgr, "RENDER", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                                cv2.imwrite(f"{base_img_path}_splat_test_render.png", rend_bgr)
+                            except Exception:
+                                pass
+
+                            # SBS (kept for convenience)
+                            sbs_splat = np.concatenate([preview_side, right_video_numpy[j]], axis=1)
+                            sbs_splat_uint8 = (np.clip(sbs_splat, 0, 1) * 255).astype(np.uint8)
+                            sbs_splat_bgr = cv2.cvtColor(sbs_splat_uint8, cv2.COLOR_RGB2BGR)
+                            cv2.putText(sbs_splat_bgr, "PREVIEW", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                            cv2.putText(sbs_splat_bgr, "RENDER", (width + 10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+                            cv2.imwrite(f"{base_img_path}_splat_test.png", sbs_splat_bgr)
+                            logger.info(f"Saved Splat Test: {os.path.basename(base_img_path)}_splat_test.png")
+
+                        test_generated_this_task = True
+                        break # Only process one frame for images
+                    
+                    if test_generated_this_task:
+                        return True # Exit early: NO VIDEO encoding occurs
+
+                # --- STANDARD VIDEO ENCODING (Only reached if NO tests enabled) ---
                 for j in range(len(batch_frames_numpy)):
                     if dual_output:
                         video_grid = np.concatenate([occlusion_mask_numpy[j], right_video_numpy[j]], axis=1)
@@ -1861,11 +2467,9 @@ class SplatterGUI(ThemedTk):
                         video_grid = np.concatenate([video_grid_top, video_grid_bottom], axis=0)
 
                     video_grid_uint16 = (np.clip(video_grid, 0.0, 1.0) * 65535.0).astype(np.uint16)
-                    video_grid_bgr = cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR)
-                    
-                    # --- SEND FRAME TO FFMPEG PIPE ---
-                    ffmpeg_process.stdin.write(video_grid_bgr.tobytes())
+                    ffmpeg_process.stdin.write(cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR).tobytes())
                     frame_count += 1
+                # --- END OF FRAME ASSEMBLY ---
 
                 t_end_write = time.perf_counter()
                 # --- END TIMER 6 ---
@@ -1905,22 +2509,26 @@ class SplatterGUI(ThemedTk):
             gc.collect()
 
             # --- Finalize FFmpeg process ---
-            if ffmpeg_process.stdin:
-                ffmpeg_process.stdin.close() # Close the pipe to signal end of input
-            
-            # Wait for the process to finish and get output
-            stdout, stderr = ffmpeg_process.communicate(timeout=120)
-            
-            if self.stop_event.is_set():
-                ffmpeg_process.terminate()
-                logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_video_path)}.")
-                encoding_successful = False
-            elif ffmpeg_process.returncode != 0:
-                logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_video_path)} (return code {ffmpeg_process.returncode}):\n{stderr.decode()}")
-                encoding_successful = False
+            if ffmpeg_process is not None:
+                if ffmpeg_process.stdin:
+                    ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
+                
+                # Wait for the process to finish and get output
+                stdout, stderr = ffmpeg_process.communicate(timeout=120)
+                
+                if self.stop_event.is_set():
+                    ffmpeg_process.terminate()
+                    logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_video_path)}.")
+                    encoding_successful = False
+                elif ffmpeg_process.returncode != 0:
+                    logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_video_path)} (return code {ffmpeg_process.returncode}):\n{stderr.decode()}")
+                    encoding_successful = False
+                else:
+                    logger.info(f"Successfully encoded video to {final_output_video_path}")
+                    logger.debug(f"FFmpeg stderr log:\n{stderr.decode()}")
             else:
-                logger.info(f"Successfully encoded video to {final_output_video_path}")
-                logger.debug(f"FFmpeg stderr log:\n{stderr.decode()}")
+                # Test mode: no encoding step was started, so nothing to finalize.
+                pass
         
         if not encoding_successful:
             return False
@@ -2103,151 +2711,6 @@ class SplatterGUI(ThemedTk):
         release_cuda_memory()
         self.destroy()
 
-    def _fill_left_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
-        """
-        [VECTORIZED] Creates a thin, content-filled boundary at the absolute left edge of the screen
-        by replicating the first visible pixels (from the right) into the leftmost columns.
-        """
-        B, C, H, W = right_video_tensor.shape
-        boundary_width_pixels = min(W, boundary_width_pixels)
-        if boundary_width_pixels <= 0:
-            logger.debug("Boundary width for left-edge occlusions is 0 or less, skipping fill.")
-            return right_video_tensor
-
-        modified_right_video_tensor = right_video_tensor.clone()
-        
-        # 1. Determine the first visible pixel index for every (B, H) slice.
-        #    occlusion_mask_tensor is 1.0 for occluded, 0.0 for visible.
-        #    visible_mask is True for visible (where mask < 0.5)
-        visible_mask = (occlusion_mask_tensor[:, 0, :, :] < 0.5) # Shape [B, H, W]
-
-        # Use argmax to find the index of the FIRST True value along the W dimension.
-        # Note: If a row is all False (all occluded), argmax returns index 0.
-        # We handle this by clamping/fallback later.
-        first_visible_index = torch.argmax(visible_mask.int(), dim=2, keepdim=True) # Shape [B, H, 1]
-        
-        # Fallback: If a row is entirely occluded (all False), argmax returns 0.
-        # The correct fallback is W-1 if W>0, or just leave it at 0 and hope the source pixel is black.
-        # Find rows where argmax returned 0, AND the actual first column is occluded (0.0).
-        # A visible_mask where all values are False (all occluded) will result in argmax=0 for that row.
-        # We need to find if there's *any* visible pixel. Sum(W) > 0.
-        fully_occluded = (visible_mask.sum(dim=2, keepdim=True) == 0) # [B, H, 1] True if fully occluded
-        
-        # Set the index to W-1 for fully occluded rows to pull a border pixel (safer than 0)
-        # Note: We must ensure this operation runs on the GPU with the tensors.
-        # Clamp to ensure index is always valid (max index is W-1)
-        source_column_indices = torch.clamp(first_visible_index, 0, W - 1)
-        
-        # Override source index for fully occluded rows to a safe boundary (W-1)
-        source_column_indices[fully_occluded] = W - 1 
-
-        # 2. Gather the source pixels for filling (Shape [B, C, H])
-        #    We need to reshape the right_video_tensor [B, C, H, W] to gather the source_column_indices [B, H, 1].
-        #    torch.gather() is the vectorized way to do this.
-        #    Gather on dimension W (dim=3), using indices expanded to [B, C, H, 1]
-        source_column_indices_expanded = source_column_indices.unsqueeze(1).repeat(1, C, 1, 1) # Shape [B, C, H, 1]
-        
-        # Gather the color from the source column for all rows
-        source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
-        source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
-
-        # 3. Create a mask of the leftmost columns that are currently occluded
-        #    This mask is True only for pixels (B, C, H, W) that are BOTH in the boundary AND occluded.
-        #    Boundary mask [W]: True for x < boundary_width_pixels
-        boundary_region_mask = torch.zeros(W, dtype=torch.bool, device=right_video_tensor.device)
-        if boundary_width_pixels > 0:
-            boundary_region_mask[:boundary_width_pixels] = True
-            
-        # Occlusion mask (1.0 for occluded)
-        is_occluded_4d = (occlusion_mask_tensor > 0.5) # Shape [B, 1, H, W]
-        
-        # Combine the masks
-        # [B, 1, H, W] AND [W] -> [B, 1, H, W]
-        fill_target_mask = is_occluded_4d & boundary_region_mask.view(1, 1, 1, W)
-        
-        # 4. Apply the gathered pixel values to the masked regions
-        #    Apply fill mask to the source values to match shape for where the fill should occur.
-        #    source_pixel_values_3d is [B, C, H]. Expand it to [B, C, H, W]
-        source_to_apply = source_pixel_values_3d.unsqueeze(3).repeat(1, 1, 1, W)
-
-        # Use torch.where to conditionally update the tensor:
-        modified_right_video_tensor = torch.where(
-            fill_target_mask.repeat(1, C, 1, 1), # Use C-channel mask
-            source_to_apply,                     # Value to use if mask is True
-            modified_right_video_tensor          # Value to use if mask is False (original pixel)
-        )
-        
-        logger.debug(f"[Vectorized] Created {boundary_width_pixels}-pixel left-edge content boundary.")
-        return modified_right_video_tensor
-
-    def _fill_right_edge_occlusions(self, right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, boundary_width_pixels: int = 3) -> torch.Tensor:
-        """
-        [VECTORIZED] Creates a thin, content-filled boundary at the absolute right edge of the screen
-        by replicating the last visible pixels (from the left) into the rightmost columns.
-        """
-        B, C, H, W = right_video_tensor.shape
-        boundary_width_pixels = min(W, boundary_width_pixels)
-        if boundary_width_pixels <= 0:
-            logger.debug("Boundary width for right-edge occlusions is 0 or less, skipping fill.")
-            return right_video_tensor
-
-        modified_right_video_tensor = right_video_tensor.clone()
-        
-        # 1. Determine the LAST visible pixel index for every (B, H) slice.
-        #    occlusion_mask_tensor is 1.0 for occluded, 0.0 for visible.
-        #    visible_mask is True for visible (where mask < 0.5)
-        visible_mask = (occlusion_mask_tensor[:, 0, :, :] < 0.5) # Shape [B, H, W]
-
-        # Use argmax on the REVERSED tensor to find the index of the first True from the right.
-        # The true index is W - 1 - (index in the reversed tensor).
-        visible_mask_reversed = torch.flip(visible_mask, dims=[2])
-        first_visible_index_reversed = torch.argmax(visible_mask_reversed.int(), dim=2, keepdim=True) # Shape [B, H, 1]
-
-        # Calculate the actual index of the LAST visible pixel (from 0 to W-1)
-        last_visible_index = W - 1 - first_visible_index_reversed # Shape [B, H, 1]
-        
-        # Fallback: Find rows that are fully occluded (no visible pixels)
-        fully_occluded = (visible_mask.sum(dim=2, keepdim=True) == 0) # [B, H, 1] True if fully occluded
-
-        # Override source index for fully occluded rows to a safe boundary (0)
-        source_column_indices = torch.clamp(last_visible_index, 0, W - 1)
-        source_column_indices[fully_occluded] = 0 # If fully occluded, use index 0 as source (safer than W-1)
-
-        # 2. Gather the source pixels for filling (Shape [B, C, H])
-        #    Gather on dimension W (dim=3), using indices expanded to [B, C, H, 1]
-        source_column_indices_expanded = source_column_indices.unsqueeze(1).repeat(1, C, 1, 1) # Shape [B, C, H, 1]
-        
-        # Gather the color from the source column for all rows (the last visible pixel's color)
-        source_pixel_values_4d = torch.gather(right_video_tensor, dim=3, index=source_column_indices_expanded) # Shape [B, C, H, 1]
-        source_pixel_values_3d = source_pixel_values_4d.squeeze(3) # Shape [B, C, H]
-
-        # 3. Create a mask of the rightmost columns that are currently occluded
-        #    Boundary mask [W]: True for x >= W - boundary_width_pixels
-        boundary_region_mask = torch.zeros(W, dtype=torch.bool, device=right_video_tensor.device)
-        if boundary_width_pixels > 0:
-            boundary_region_mask[W - boundary_width_pixels:] = True
-            
-        # Occlusion mask (1.0 for occluded)
-        is_occluded_4d = (occlusion_mask_tensor > 0.5) # Shape [B, 1, H, W]
-        
-        # Combine the masks
-        # [B, 1, H, W] AND [W] -> [B, 1, H, W]
-        fill_target_mask = is_occluded_4d & boundary_region_mask.view(1, 1, 1, W)
-
-        # 4. Apply the gathered pixel values to the masked regions
-        #    Expand source values to [B, C, H, W]
-        source_to_apply = source_pixel_values_3d.unsqueeze(3).repeat(1, 1, 1, W)
-
-        # Use torch.where to conditionally update the tensor:
-        modified_right_video_tensor = torch.where(
-            fill_target_mask.repeat(1, C, 1, 1), # Use C-channel mask
-            source_to_apply,                     # Value to use if mask is True
-            modified_right_video_tensor          # Value to use if mask is False (original pixel)
-        )
-        
-        logger.debug(f"[Vectorized] Created {boundary_width_pixels}-pixel right-edge content boundary.")
-        return modified_right_video_tensor
-
     def _find_preview_sources_callback(self) -> list:
         """
         Callback for VideoPreviewer. Scans for matching source video and depth map pairs.
@@ -2385,6 +2848,9 @@ class SplatterGUI(ThemedTk):
                 f"Preview Scan: Found {len(video_source_list)} matching source/depth pairs."
             )
     
+
+        # Ensure preview-only overlay toggles are applied on Refresh/Reload as well.
+        self._apply_preview_overlay_toggles()
         return video_source_list
 
     def _get_current_config(self):
@@ -2403,6 +2869,16 @@ class SplatterGUI(ThemedTk):
             "update_slider_from_sidecar": self.update_slider_from_sidecar_var.get(),
             "auto_save_sidecar": self.auto_save_sidecar_var.get(),
 
+            "multi_map_enabled": self.multi_map_var.get(),
+            "skip_lowres_preproc": self.skip_lowres_preproc_var.get(),
+            "crosshair_enabled": self.crosshair_enabled_var.get(),
+            "crosshair_white": self.crosshair_white_var.get(),
+            "crosshair_multi": self.crosshair_multi_var.get(),
+            "depth_pop_enabled": self.depth_pop_enabled_var.get(),
+            "debug_logging_enabled": self.debug_logging_var.get(),
+            "loop_playback": bool(getattr(getattr(self, "previewer", None), "loop_playback_var", tk.BooleanVar(value=False)).get()),
+
+
             "enable_full_resolution": self.enable_full_res_var.get(),
             "batch_size": self.batch_size_var.get(),
             "enable_low_resolution": self.enable_low_res_var.get(),
@@ -2414,9 +2890,17 @@ class SplatterGUI(ThemedTk):
             "depth_dilate_size_y": self.depth_dilate_size_y_var.get(),
             "depth_blur_size_x": self.depth_blur_size_x_var.get(),
             "depth_blur_size_y": self.depth_blur_size_y_var.get(),
+            "depth_dilate_left": self.depth_dilate_left_var.get(),
+            "depth_blur_left": self.depth_blur_left_var.get(),
+            "depth_blur_left_mix": self.depth_blur_left_mix_var.get(),
+            "preview_size": self.preview_size_var.get(),
+            "preview_source": self.preview_source_var.get(),
 
             "process_length": self.process_length_var.get(),
-            "output_crf": self.output_crf_var.get(),
+            "output_crf": self.output_crf_full_var.get(),  # legacy
+            "output_crf_full": self.output_crf_full_var.get(),
+            "output_crf_low": self.output_crf_low_var.get(),
+            "color_tags_mode": getattr(self, "color_tags_mode_var", tk.StringVar(value="Auto")).get(),
             "dual_output": self.dual_output_var.get(),
             "auto_convergence_mode": self.auto_convergence_mode_var.get(),
             
@@ -2426,6 +2910,15 @@ class SplatterGUI(ThemedTk):
             "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "move_to_finished": self.move_to_finished_var.get(),
         }
+        # Avoid persisting test-forced preview settings
+        try:
+            test_active = bool(self.splat_test_var.get()) or bool(self.map_test_var.get())
+        except Exception:
+            test_active = False
+        if test_active:
+            config["preview_source"] = self.app_config.get("preview_source", "Splat Result")
+            config["preview_size"] = self.app_config.get("preview_size", "75%")
+
         return config
 
     def get_current_preview_settings(self) -> dict:
@@ -2438,7 +2931,7 @@ class SplatterGUI(ThemedTk):
                  except ValueError:
                      return default
 
-            return {
+            settings = {
                 "max_disp": float(self.max_disp_var.get()),
                 "convergence_point": float(self.zero_disparity_anchor_var.get()),
                 "depth_gamma": float(self.depth_gamma_var.get()),
@@ -2446,9 +2939,14 @@ class SplatterGUI(ThemedTk):
                 "depth_dilate_size_y": safe_float_conversion(self.depth_dilate_size_y_var),
                 "depth_blur_size_x": safe_float_conversion(self.depth_blur_size_x_var),
                 "depth_blur_size_y": safe_float_conversion(self.depth_blur_size_y_var),
+                "depth_dilate_left": safe_float_conversion(self.depth_dilate_left_var),
+                "depth_blur_left": safe_float_conversion(self.depth_blur_left_var),
                 "preview_size": self.preview_size_var.get(),
-                "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
+            "preview_source": self.preview_source_var.get(),
+                "enable_global_norm": self.enable_global_norm_var.get(),
             }
+            return settings
+
         except (ValueError, tk.TclError) as e:
             logger.error(f"Invalid preview setting value: {e}")
             return None
@@ -2565,8 +3063,12 @@ class SplatterGUI(ThemedTk):
             if os.path.isfile(base_folder):
                 actual_depth_map_path = base_folder
                 logger.info(f"Single-file mode: using depth map file '{actual_depth_map_path}'")
-                # Optional: show map as "Direct file" in the info panel
-                self.progress_queue.put(("update_info", {"map": "Direct file"}))
+                # Info panel: in Multi-Map mode, still show the clip's sidecar-selected map (if any).
+                _mm_map_info = "Direct file"
+                if self.multi_map_var.get() and selected_map_for_video:
+                    _mm_map_info = f"{selected_map_for_video} (Sidecar)"
+                    logger.info(f"[MM] USING sidecar map '{selected_map_for_video}' for '{video_name}'")
+                self.progress_queue.put(("update_info", {"map": _mm_map_info}))
             else:
                 return {
                     "error": (
@@ -2712,6 +3214,10 @@ class SplatterGUI(ThemedTk):
             "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
             "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
             "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
+            # Left-edge depth pre-processing defaults (must behave like other GUI settings)
+            "depth_dilate_left": float(self.depth_dilate_left_var.get()),
+            "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
+            "depth_blur_left_mix": float(self.depth_blur_left_mix_var.get()),
             # Tracking / info sources
             "sidecar_found": sidecar_exists,
             "anchor_source": "Sidecar" if sidecar_exists else "GUI/Default",
@@ -2721,6 +3227,20 @@ class SplatterGUI(ThemedTk):
             "enable_global_norm": enable_global_norm_policy, 
             "gn_source": gn_source,
         }
+
+        # If a sidecar exists and Sidecar Blur/Dilate is enabled, use its depth pre-processing values.
+        # (Render should respect sidecars for both Single and Batch processing.)
+        if sidecar_exists and getattr(self, "enable_sidecar_blur_dilate_var", None) and self.enable_sidecar_blur_dilate_var.get():
+            try:
+                settings["depth_dilate_size_x"] = float(merged_config.get("depth_dilate_size_x", settings["depth_dilate_size_x"]))
+                settings["depth_dilate_size_y"] = float(merged_config.get("depth_dilate_size_y", settings["depth_dilate_size_y"]))
+                settings["depth_blur_size_x"] = int(float(merged_config.get("depth_blur_size_x", settings["depth_blur_size_x"])))
+                settings["depth_blur_size_y"] = int(float(merged_config.get("depth_blur_size_y", settings["depth_blur_size_y"])))
+                settings["depth_dilate_left"] = float(merged_config.get("depth_dilate_left", settings["depth_dilate_left"]))
+                settings["depth_blur_left"] = int(float(merged_config.get("depth_blur_left", settings["depth_blur_left"])))
+                settings["depth_blur_left_mix"] = float(merged_config.get("depth_blur_left_mix", settings["depth_blur_left_mix"]))
+            except Exception:
+                pass
 
         # If no sidecar file exists at all, enforce GUI values explicitly
         if not sidecar_exists:
@@ -2734,7 +3254,7 @@ class SplatterGUI(ThemedTk):
             """
             Initializes VideoReader objects for source video and depth map,
             and returns their metadata.
-            Returns: (video_reader, depth_reader, processed_fps, current_processed_height, current_processed_width,
+            Returns: (video_reader, depth_reader, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width,
                       video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width,
                       depth_stream_info)
             """
@@ -2760,7 +3280,7 @@ class SplatterGUI(ThemedTk):
                 )
             except Exception as e:
                 logger.error(f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
-                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+                return None, None, 0.0, 0, 0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
                 # Determine map source for Multi-Map
                 map_display = "N/A"
                 if self.multi_map_var.get():
@@ -2776,30 +3296,47 @@ class SplatterGUI(ThemedTk):
     
             try:
                 # 2. Initialize depth maps reader and capture depth_stream_info
+                # For low-res rendering we need depth preprocessing parity with preview/full-res:
+                # preprocess at the original clip resolution, then downscale to the low-res splat size.
+                depth_target_h = current_processed_height
+                depth_target_w = current_processed_width
+                depth_match = match_depth_res
+                if task_settings.get("is_low_res"):
+                    if getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get():
+                        # Dev Tools: load depth directly at low-res and skip parity pre-proc path.
+                        depth_target_h = current_processed_height
+                        depth_target_w = current_processed_width
+                        depth_match = match_depth_res
+                    else:
+                        # Default: load depth at clip resolution so low-res pre-processing matches full-res preview/render.
+                        depth_target_h = original_vid_h
+                        depth_target_w = original_vid_w
+                        depth_match = True
+
                 depth_reader_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info = load_pre_rendered_depth(
                     actual_depth_map_path,
                     process_length=process_length,
-                    target_height=current_processed_height,
-                    target_width=current_processed_width,
-                    match_resolution_to_target=match_depth_res
+                    target_height=depth_target_h,
+                    target_width=depth_target_w,
+                    match_resolution_to_target=depth_match
                 )
             except Exception as e:
                 logger.error(f"==> Error initializing depth map reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass.")
                 if video_reader_input: del video_reader_input
-                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+                return None, None, 0.0, 0, 0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
     
             # CRITICAL CHECK: Ensure input video and depth map have consistent frame counts
             if total_frames_input != total_frames_depth:
                 logger.error(f"==> Frame count mismatch for {os.path.basename(video_path)} {task_settings['name']} pass: Input video has {total_frames_input} frames, Depth map has {total_frames_depth} frames. Skipping.")
                 if video_reader_input: del video_reader_input
                 if depth_reader_input: del depth_reader_input
-                return None, None, 0.0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
+                return None, None, 0.0, 0, 0, 0, 0, None, 0, 0, 0, 0, None # Return None for depth_stream_info
             
-            return (video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width,
+            return (video_reader_input, depth_reader_input, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width,
                     video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width, depth_stream_info)
 
     def _load_config(self):
-        """Loads configuration from config_splat.json."""
+        """Loads configuration from default config file."""
         config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
         # --- MODIFIED: Use the new dictionary constant ---
         if os.path.exists(config_filename):
@@ -2822,7 +3359,7 @@ class SplatterGUI(ThemedTk):
     def _load_help_texts(self):
         """Loads help texts from a JSON file."""
         try:
-            with open(os.path.join("dependency", "splatter_help.json"), "r") as f:
+            with open(os.path.join("dependency", "splatter_help.json"), "r", encoding="utf-8") as f:
                 self.help_texts = json.load(f)
         except FileNotFoundError:
             logger.error("Error: splatter_help.json not found. Tooltips will not be available.")
@@ -3017,104 +3554,131 @@ class SplatterGUI(ThemedTk):
     def _perform_delayed_preview_update(self):
         """Actually triggers the heavy preview processing once the delay expires."""
         self._preview_debounce_timer = None # Clear timer reference
-        
+
         if hasattr(self, 'previewer') and self.previewer.source_readers:
             # Trigger the standard preview update
-            self.previewer.update_preview()            
-            
-            # Sync the clip state text (if applicable)
-            if hasattr(self, '_update_clip_state_and_text'):
-                 self._update_clip_state_and_text()
+            self.previewer.update_preview()
+
+            # IMPORTANT: Do not refresh the "Current Processing Information" panel here.
+            # This function is called by the slider debounce and would cause that panel to
+            # flash on every slider move. Clip/state + info should update only when the clip changes.
 
     def _process_depth_batch(self, batch_depth_numpy_raw: np.ndarray, depth_stream_info: Optional[dict], depth_gamma: float,
                               depth_dilate_size_x: float, depth_dilate_size_y: float, depth_blur_size_x: float, depth_blur_size_y: float, 
                               is_low_res_task: bool, max_raw_value: float,
                               global_depth_min: float, global_depth_max: float,
+                              depth_dilate_left: float = 0.0, depth_blur_left: float = 0.0,
                               debug_batch_index: int = 0, debug_frame_index: int = 0, debug_task_name: str = "PreProcess",
                               ) -> np.ndarray:
         """
-        Loads, converts, and pre-processes the raw depth map batch using stable NumPy/OpenCV CPU calls.
+        Unified depth processor. Pre-processes filters in float space.
+        Gamma is now unified to occur in normalized space.
         """
-        device = torch.device('cpu')
-
-        # 1. Grayscale Conversion (Standard NumPy)
-        if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3: # RGB
+        if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
             batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
-        elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
-            batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
         else:
-            batch_depth_numpy = batch_depth_numpy_raw
+            batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1) if batch_depth_numpy_raw.ndim == 4 else batch_depth_numpy_raw
         
-        # Convert to float32 for processing
         batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
-        # self._save_debug_image(batch_depth_numpy_float, "01_GRAYSCALE", debug_batch_index, debug_frame_index, debug_task_name)
 
-        # 2. Gamma Adjustment (Only in RAW mode, otherwise skipped)
-        is_global_norm_active = (global_depth_min != 0.0 or global_depth_max != 1.0) and not (global_depth_min == 0.0 and global_depth_max == 0.0)
-        
-        if round(float(depth_gamma), 2) != 1.0:
-            if is_global_norm_active:
-                logger.debug("Gamma adjustment SKIPPED in helper: Applied post-normalization (Global Norm Mode).")
-            else:
-                # --- MODIFIED LOGIC: Apply Inverted Gamma Correction to Raw Input ---
-                logger.debug(f"Applying INVERTED depth gamma adjustment on raw range {max_raw_value:.1f}: {depth_gamma:.2f}")
-                
-                # Step 1: Normalize down to 0-1 range based on the expected raw max
-                normalized_chunk = batch_depth_numpy_float / max_raw_value
-                
-                # Step 2: Invert, Apply Gamma, and Invert Back
-                inverted_depth = 1.0 - normalized_chunk
-                gamma_applied_inverted = np.power(inverted_depth, depth_gamma)
-                final_normalized_gamma = 1.0 - gamma_applied_inverted
-                
-                # Step 3: Scale back up to the raw value range
-                batch_depth_numpy_float = final_normalized_gamma * max_raw_value
+        # Dev Tools: allow skipping ALL low-res preprocessing (gamma/dilate/blur)
+        if is_low_res_task and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get():
+            return batch_depth_numpy_float
 
-        # self._save_debug_image(batch_depth_numpy_float, "02_POST_GAMMA", debug_batch_index, debug_frame_index, debug_task_name)
+        # Apply Filters BEFORE Gamma (Standard pipeline)
+        current_width = batch_depth_numpy_raw.shape[2] if batch_depth_numpy_raw.ndim == 4 else batch_depth_numpy_raw.shape[1]
+        res_scale = math.sqrt(current_width / 960.0)
 
-        # --- 3. Dilate and Blur (Now applies to ALL) ---
-        needs_processing = depth_dilate_size_x > 0 or depth_dilate_size_y > 0 or depth_blur_size_x > 0 or depth_blur_size_y > 0
-        
-        if needs_processing:
-            # --- PREPARE TENSOR FOR UTILITY FUNCTIONS ---
-            # batch_depth_numpy_float is (B, H, W) (needs to be B, C, H, W)
-            # Unsqueeze to add a channel dimension C=1
-            depth_tensor_4d = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).to(device) 
+        def map_val(v):
+            f_v = float(v)
+            # Backward compatibility: older configs stored erosion as 30..40 => -0..-10
+            if f_v > 30.0 and f_v <= 40.0:
+                return -(f_v - 30.0)
+            return f_v
             
-            processed_tensor = depth_tensor_4d
-            
-            # 1. DILATE (using fractional)
-            if depth_dilate_size_x > 0 or depth_dilate_size_y > 0:
-                logger.debug(f"dilate x = {depth_dilate_size_x}, y = {depth_dilate_size_y}")
-                # Cast the integer sizes to float for fractional dilation
-                processed_tensor = custom_dilate(
-                    processed_tensor, 
-                    float(depth_dilate_size_x), 
-                    float(depth_dilate_size_y), 
-                    use_gpu=False,
-                    max_content_value=max_raw_value
-                )
-            
-            # 2. BLUR (using standard integer blur)
-            if depth_blur_size_x > 0 or depth_blur_size_y > 0:
-                # Cast to int for the blur function (which handles odd size logic)
-                processed_tensor = custom_blur(
-                    processed_tensor, 
-                    int(depth_blur_size_x), 
-                    int(depth_blur_size_y), 
-                    use_gpu=False,
-                    max_content_value=max_raw_value
-                )
+        render_dilate_x = map_val(depth_dilate_size_x) * res_scale
+        render_dilate_y = map_val(depth_dilate_size_y) * res_scale
+        render_blur_x = depth_blur_size_x * res_scale
+        render_blur_y = depth_blur_size_y * res_scale
+        render_dilate_left = float(depth_dilate_left) * res_scale
+        render_blur_left = float(depth_blur_left) * res_scale
 
-            # Convert back to (B, H, W) numpy float (squeeze channel dim)
-            batch_depth_numpy_float = processed_tensor.squeeze(1).cpu().numpy()
-            
-            # Clean up VRAM just in case
-            del depth_tensor_4d, processed_tensor
-            release_cuda_memory()
+        if (abs(render_dilate_left) > 1e-5 or render_blur_left > 0 or abs(render_dilate_x) > 1e-5 or abs(render_dilate_y) > 1e-5 or render_blur_x > 0 or render_blur_y > 0):
+            device = torch.device('cpu')
+            tensor_4d = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).to(device) 
+            # Left-only pre-step (directional): applied before normal X/Y dilate/blur to preserve parity
 
-        # --- DEBUG SAVE 4: Final Processed Image ---
-        # self._save_debug_image(batch_depth_numpy_float, "04_POST_BLUR_FINAL", debug_batch_index, debug_frame_index, debug_task_name)
+            # Dilate Left (directional) - optional
+            if abs(render_dilate_left) > 1e-5:
+                tensor_before = tensor_4d
+                tensor_4d = custom_dilate_left(tensor_before, float(render_dilate_left), False, max_raw_value)
+
+            if render_blur_left > 0:
+                # Blur Left: blur *only* along strong left edges (dark->bright when moving left->right).
+                # This avoids blurring smooth gradients that typically don't create warp/splat jaggies.
+                effective_max_value = max(max_raw_value, 1e-5)
+                EDGE_STEP_8BIT = 3.0  # raise to blur fewer edges; lower to blur more edges
+                step_thresh = effective_max_value * (EDGE_STEP_8BIT / 255.0)
+
+                dx = tensor_4d[:, :, :, 1:] - tensor_4d[:, :, :, :-1]
+                edge_core = dx > step_thresh
+
+                edge_mask = torch.zeros_like(tensor_4d, dtype=torch.float32)
+                edge_mask[:, :, :, 1:] = edge_core.float()
+
+                # Expand into a small band around the edge (both sides) so it feels like a normal blur (no hard cut-off).
+                k_blur = int(round(render_blur_left))
+                if k_blur <= 0:
+                    k_blur = 1
+                if k_blur % 2 == 0:
+                    k_blur += 1
+
+                # Keep the band relatively tight around the detected edge so we don't soften large interior regions.
+                band_half = max(1, int(math.ceil(k_blur / 4.0)))
+                edge_band = (F.max_pool2d(edge_mask, kernel_size=(1, 2 * band_half + 1), stride=1, padding=(0, band_half)) > 0.5).float()
+
+                # Feather the band so the blend ramps on/off smoothly.
+                alpha = custom_blur(edge_band, 7, 1, False, 1.0)
+                alpha = torch.clamp(alpha, 0.0, 1.0)
+
+                # Two-pass blur for Blur Left:
+                # - Horizontal-only blur helps anti-alias along X (like your regular Blur X behavior),
+                # - Vertical-only blur helps smooth stair-steps along the edge.
+                # We blend horizontal/vertical Blur Left based on a compact UI selector:
+                #   0.0 = all horizontal, 1.0 = all vertical, 0.5 = 50/50.
+                try:
+                    mix_f = float(self.depth_blur_left_mix_var.get())
+                except Exception:
+                    mix_f = 0.5
+                mix_f = max(0.0, min(1.0, mix_f))
+
+                BLUR_LEFT_V_WEIGHT = mix_f
+                BLUR_LEFT_H_WEIGHT = 1.0 - mix_f
+
+                blurred_h = None
+                blurred_v = None
+                if BLUR_LEFT_H_WEIGHT > 1e-6:
+                    blurred_h = custom_blur(tensor_4d, k_blur, 1, False, max_raw_value)
+                if BLUR_LEFT_V_WEIGHT > 1e-6:
+                    blurred_v = custom_blur(tensor_4d, 1, k_blur, False, max_raw_value)
+
+                if blurred_h is not None and blurred_v is not None:
+                    wsum = (BLUR_LEFT_H_WEIGHT + BLUR_LEFT_V_WEIGHT)
+                    blurred = (blurred_h * BLUR_LEFT_H_WEIGHT + blurred_v * BLUR_LEFT_V_WEIGHT) / max(wsum, 1e-6)
+                elif blurred_h is not None:
+                    blurred = blurred_h
+                elif blurred_v is not None:
+                    blurred = blurred_v
+                else:
+                    blurred = tensor_4d
+
+                tensor_4d = tensor_4d * (1.0 - alpha) + blurred * alpha
+            if abs(render_dilate_x) > 1e-5 or abs(render_dilate_y) > 1e-5:
+                tensor_4d = custom_dilate(tensor_4d, float(render_dilate_x), float(render_dilate_y), False, max_raw_value)
+            if render_blur_x > 0 or render_blur_y > 0:
+                tensor_4d = custom_blur(tensor_4d, float(render_blur_x), float(render_blur_y), False, max_raw_value)
+            batch_depth_numpy_float = tensor_4d.squeeze(1).cpu().numpy()
+            release_cuda_memory() 
 
         return batch_depth_numpy_float
 
@@ -3130,6 +3694,9 @@ class SplatterGUI(ThemedTk):
         current_depth_dilate_size_y = 0
         current_depth_blur_size_x = 0
         current_depth_blur_size_y = 0
+        current_depth_dilate_left = 0.0
+        current_depth_blur_left = 0.0
+        current_depth_blur_left_mix = 0.0
         
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         logger.info(f"==> Processing Video: {video_name}")
@@ -3171,6 +3738,9 @@ class SplatterGUI(ThemedTk):
         current_depth_dilate_size_y = video_specific_settings["depth_dilate_size_y"] 
         current_depth_blur_size_x = video_specific_settings["depth_blur_size_x"]     
         current_depth_blur_size_y = video_specific_settings["depth_blur_size_y"]          
+        current_depth_dilate_left = float(video_specific_settings.get("depth_dilate_left", settings.get("depth_dilate_left", 0.0)))
+        current_depth_blur_left = float(video_specific_settings.get("depth_blur_left", settings.get("depth_blur_left", 0.0)))
+        current_depth_blur_left_mix = float(video_specific_settings.get("depth_blur_left_mix", getattr(self, "depth_blur_left_mix_var", None).get() if getattr(self, "depth_blur_left_mix_var", None) else 0.0))
         
         if not processing_tasks:
             logger.debug(f"==> No processing tasks configured for {video_name}. Skipping.")
@@ -3256,7 +3826,7 @@ class SplatterGUI(ThemedTk):
                 "map": map_label,
             }))
 
-            video_reader_input, depth_reader_input, processed_fps, current_processed_height, current_processed_width, \
+            video_reader_input, depth_reader_input, processed_fps, original_vid_h, original_vid_w, current_processed_height, current_processed_width, \
             video_stream_info, total_frames_input, total_frames_depth, actual_depth_height, actual_depth_width, \
             depth_stream_info = self._initialize_video_and_depth_readers(
                     video_path, actual_depth_map_path, settings["process_length"],
@@ -3281,7 +3851,23 @@ class SplatterGUI(ThemedTk):
             max_content_value = 1.0 
             raw_depth_reader_temp = None
             try:
-                raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0))
+                depth_info_tmp = get_video_stream_info(actual_depth_map_path)
+
+                bit_depth_tmp = _infer_depth_bit_depth(depth_info_tmp)
+
+                pix_fmt_tmp = str((depth_info_tmp or {}).get("pix_fmt", ""))
+
+                # Use source/processing dimensions for the content scan (avoids NameError and keeps preview/render parity)
+                scan_w = original_vid_w or current_processed_width or actual_depth_width
+                scan_h = original_vid_h or current_processed_height or actual_depth_height
+
+                if bit_depth_tmp > 8:
+
+                    raw_depth_reader_temp = FFmpegDepthPipeReader(actual_depth_map_path, out_w=scan_w, out_h=scan_h, bit_depth=bit_depth_tmp, num_frames=total_frames_depth, pix_fmt=pix_fmt_tmp)
+
+                else:
+
+                    raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0), width=scan_w, height=scan_h)
                 
                 if len(raw_depth_reader_temp) > 0:
                     _, max_content_value = compute_global_depth_stats(
@@ -3296,6 +3882,11 @@ class SplatterGUI(ThemedTk):
                 logger.error(f"Failed to scan max content depth: {e}")
             finally:
                 if raw_depth_reader_temp:
+                    if hasattr(raw_depth_reader_temp, "close"):
+                        try:
+                            raw_depth_reader_temp.close()
+                        except Exception:
+                            pass
                     del raw_depth_reader_temp
                     gc.collect()
             # --- END UNCONDITIONAL SCAN ---
@@ -3305,7 +3896,19 @@ class SplatterGUI(ThemedTk):
                 
                 raw_depth_reader_temp = None
                 try:
-                    raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0))
+                    depth_info_tmp = get_video_stream_info(actual_depth_map_path)
+
+                    bit_depth_tmp = _infer_depth_bit_depth(depth_info_tmp)
+
+                    pix_fmt_tmp = str((depth_info_tmp or {}).get("pix_fmt", ""))
+
+                    if bit_depth_tmp > 8:
+
+                        raw_depth_reader_temp = FFmpegDepthPipeReader(actual_depth_map_path, out_w=actual_depth_width, out_h=actual_depth_height, bit_depth=bit_depth_tmp, num_frames=total_frames_depth, pix_fmt=pix_fmt_tmp)
+
+                    else:
+
+                        raw_depth_reader_temp = VideoReader(actual_depth_map_path, ctx=cpu(0), width=actual_depth_width, height=actual_depth_height)
                     
                     if len(raw_depth_reader_temp) > 0:
                         global_depth_min, global_depth_max = compute_global_depth_stats(
@@ -3322,6 +3925,11 @@ class SplatterGUI(ThemedTk):
                     global_depth_max = 1.0
                 finally:
                     if raw_depth_reader_temp:
+                        if hasattr(raw_depth_reader_temp, "close"):
+                            try:
+                                raw_depth_reader_temp.close()
+                            except Exception:
+                                pass
                         del raw_depth_reader_temp
                         gc.collect()
             else:
@@ -3334,8 +3942,8 @@ class SplatterGUI(ThemedTk):
                     final_scaling_factor = 255.0
                     logger.debug(f"Content Max {max_content_value:.2f} <= 8-bit. SCALING BY 255.0.")
                 elif max_content_value > 256.0 and max_content_value <= 1024.0:
-                    final_scaling_factor = max_content_value
-                    logger.debug(f"Content Max {max_content_value:.2f} (9-10bit). SCALING BY CONTENT MAX.")
+                    final_scaling_factor = 1023.0
+                    logger.debug(f"Content Max {max_content_value:.2f} (9-10bit). SCALING BY 1023.0 (expected 10-bit max) for preview parity.")
                 else:
                     final_scaling_factor = 1023.0 
                     logger.warning(f"Max content value is too high/low ({max_content_value:.2f}). Using fallback 1023.0.")
@@ -3346,7 +3954,31 @@ class SplatterGUI(ThemedTk):
                 logger.debug(f"Raw Input Final Scaling Factor set to: {global_depth_max:.3f}")
 
             if not (actual_depth_height == current_processed_height and actual_depth_width == current_processed_width):
-                logger.warning(f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned.")
+                # Low-res parity path intentionally loads depth at clip resolution so dilation/blur happens pre-resize.
+                # The depth frames are resized to match the (possibly low-res) video frames *after* preprocessing inside depthSplatting().
+                if task.get("is_low_res"):
+                    skip_lr_preproc = bool(getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get())
+                    if (not skip_lr_preproc) and (actual_depth_width == original_vid_w and actual_depth_height == original_vid_h):
+                        logger.info(
+                            f"==> Low-Resolution pass: Upscaling depthmap to clip resolution ({actual_depth_width}x{actual_depth_height}) "
+                            f"before preprocessing for parity; it will be resized to ({current_processed_width}x{current_processed_height}) after preprocessing."
+                        )
+                    else:
+                        _bd_warn = _infer_depth_bit_depth(depth_stream_info) if depth_stream_info else 8
+                        if _bd_warn > 8:
+                            logger.warning(
+                                f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed "
+                                f"video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. "
+                                f"This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned."
+                            )
+                else:
+                    _bd_warn = _infer_depth_bit_depth(depth_stream_info) if depth_stream_info else 8
+                    if _bd_warn > 8:
+                        logger.warning(
+                            f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed "
+                            f"video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. "
+                            f"This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned."
+                        )
 
             actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
             actual_max_disp_pixels = (actual_percentage_for_calculation / 100.0) * current_processed_width
@@ -3377,13 +4009,16 @@ class SplatterGUI(ThemedTk):
                 global_depth_min=global_depth_min,
                 global_depth_max=global_depth_max,
                 depth_stream_info=depth_stream_info,
-                user_output_crf=settings["output_crf"],
+                        user_output_crf=(settings.get("output_crf_low") if task["is_low_res"] else settings.get("output_crf_full", settings.get("output_crf"))),
                 is_low_res_task=task["is_low_res"],
                 depth_gamma=current_depth_gamma,
-                depth_dilate_size_x=current_depth_dilate_size_x,
-                depth_dilate_size_y=current_depth_dilate_size_y,
-                depth_blur_size_x=current_depth_blur_size_x,
-                depth_blur_size_y=current_depth_blur_size_y
+                depth_dilate_size_x=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else current_depth_dilate_size_x),
+                depth_dilate_size_y=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else current_depth_dilate_size_y),
+                depth_blur_size_x=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else current_depth_blur_size_x),
+                depth_blur_size_y=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else current_depth_blur_size_y),
+                depth_dilate_left=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else float(current_depth_dilate_left)),
+                depth_blur_left=(0.0 if (task["is_low_res"] and getattr(self, "skip_lowres_preproc_var", None) is not None and self.skip_lowres_preproc_var.get()) else float(current_depth_blur_left)),
+
             )
 
             if self.stop_event.is_set():
@@ -3440,7 +4075,8 @@ class SplatterGUI(ThemedTk):
         """
         Callback for VideoPreviewer. Performs splatting on a single frame for preview.
         """
-        self.clear_processing_info() # Clear info at the start of a new preview attempt
+        # NOTE: Do not clear the 'Current Processing Information' panel on every preview render.
+        # Clearing here caused filename/task info to briefly appear and then reset to N/A each time the preview updates.
 
         if not globals()['CUDA_AVAILABLE']:
             logger.error("Preview processing requires a CUDA-enabled GPU.")
@@ -3538,7 +4174,25 @@ class SplatterGUI(ThemedTk):
         depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
         logger.debug(f"Raw depth numpy shape: {depth_numpy_raw.shape}, range: [{depth_numpy_raw.min():.2f}, {depth_numpy_raw.max():.2f}]")
         
-        # 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME (for AutoGain scaling)
+                # Ensure depth pre-processing happens at the same resolution as the *render* pipeline.
+        # - Full-res preview: pre-proc at clip resolution (W_orig/H_orig).
+        # - Low-res preview: pre-proc at clip resolution, then downscale to low-res AFTER pre-proc.
+        #   This matches the low-res render ordering and avoids the "extra thick" low-res preview look.
+        W_preproc, H_preproc = (W_orig, H_orig)
+        if depth_numpy_raw.ndim == 2:
+            depth_numpy_raw = depth_numpy_raw[:, :, None]
+        if depth_numpy_raw.shape[0] != H_preproc or depth_numpy_raw.shape[1] != W_preproc:
+            try:
+                had_singleton_channel = (depth_numpy_raw.ndim == 3 and depth_numpy_raw.shape[2] == 1)
+                interp = cv2.INTER_LINEAR if (W_preproc > depth_numpy_raw.shape[1] or H_preproc > depth_numpy_raw.shape[0]) else cv2.INTER_AREA
+                depth_numpy_raw = cv2.resize(depth_numpy_raw, (W_preproc, H_preproc), interpolation=interp)
+                if had_singleton_channel and depth_numpy_raw.ndim == 2:
+                    depth_numpy_raw = depth_numpy_raw[:, :, None]
+                logger.debug(f"Preview depth resized for pre-proc: {depth_numpy_raw.shape}")
+            except Exception as e:
+                logger.error(f"Preview depth resize (pre-proc) failed: {e}. Continuing with raw depth resolution.", exc_info=True)
+        
+# 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME (for AutoGain scaling)
         # We need the max *raw* value of the depth frame content
         max_raw_content_value = depth_numpy_raw.max()
         if max_raw_content_value < 1.0: 
@@ -3601,46 +4255,58 @@ class SplatterGUI(ThemedTk):
             depth_dilate_size_y=params['depth_dilate_size_y'],
             depth_blur_size_x=params['depth_blur_size_x'],
             depth_blur_size_y=params['depth_blur_size_y'],
+            depth_dilate_left=params.get('depth_dilate_left', 0.0),
+            depth_blur_left=params.get('depth_blur_left', 0.0),
             is_low_res_task=is_low_res_preview,
             max_raw_value=final_scaling_factor,
             global_depth_min=0.0,
-            global_depth_max=1.0 
+            global_depth_max=1.0,
+            debug_task_name="Preview"
         )
         logger.debug(f"Processed depth numpy shape: {depth_numpy_processed.shape}, range: [{depth_numpy_processed.min():.2f}, {depth_numpy_processed.max():.2f}]")
 
-        # 2. Normalize based on the 'enable_autogain' (Disable Normalization) setting
+        # Low-Res preview: downscale the *processed* depth AFTER dilation/blur (matches render ordering).
+        if is_low_res_preview and (depth_numpy_processed.shape[1] != H_target or depth_numpy_processed.shape[2] != W_target):
+            try:
+                _d = depth_numpy_processed.squeeze(0)
+                _interp = cv2.INTER_AREA if (W_target < _d.shape[1] and H_target < _d.shape[0]) else cv2.INTER_LINEAR
+                _d = cv2.resize(_d, (W_target, H_target), interpolation=_interp)
+                depth_numpy_processed = np.expand_dims(_d.astype(np.float32), axis=0)
+                logger.debug(f"Low-Res preview: resized processed depth to target {W_target}x{H_target}.")
+            except Exception as e:
+                logger.error(f"Low-Res preview post-preproc resize failed: {e}. Continuing with processed depth resolution.", exc_info=True)
+
+        # 2. Normalize based on the 'enable_global_norm' policy
         depth_normalized = depth_numpy_processed.squeeze(0)
 
-        if not enable_global_norm:
-            # MANUAL/RAW INPUT MODE: Normalize by the determined scaling factor
-            depth_normalized = depth_normalized / final_scaling_factor
-            logger.debug(f"Preview: Applied raw scaling by {final_scaling_factor:.2f}")
-        else:
-            # GLOBAL NORMALIZATION MODE: Perform min/max normalization using the clip's global range
+        # Match render behavior:
+        # - In GN mode: normalize using cached/scanned min/max
+        # - In Manual/RAW mode: scale into 0-1 using the detected scaling factor
+        if enable_global_norm:
             min_val, max_val = global_min, global_max
             depth_range = max_val - min_val
-            
             if depth_range > 1e-5:
-                depth_normalized = (depth_numpy_processed.squeeze(0) - min_val) / depth_range
+                depth_normalized = (depth_normalized - min_val) / depth_range
             else:
-                depth_normalized = np.zeros_like(depth_numpy_processed.squeeze(0))
-            
-            # Apply gamma AFTER normalization
-            if round(params['depth_gamma'], 2) != 1.0:
-                
-                gamma_val = params['depth_gamma']
-                logger.debug(f"Applied gamma reversal for intuitive control (Gamma={gamma_val:.2f}).")
-                
-                # Step 1: Invert normalized depth
-                inverted_depth = 1.0 - depth_normalized
-                # Step 2: Apply gamma to the inverted depth
-                gamma_applied_inverted = np.power(inverted_depth, gamma_val)
-                # Step 3: Invert back
-                depth_normalized = 1.0 - gamma_applied_inverted
-                logger.debug(f"Applied gamma ({params['depth_gamma']}) post-normalization.")
+                depth_normalized = np.zeros_like(depth_normalized)
+        else:
+            # In manual mode, preview frames may arrive as uint8/uint16-like ranges.
+            # Scale to 0..1 (render path uses the clip's max content value for this).
+            if final_scaling_factor and final_scaling_factor > 1.0 + 1e-5:
+                depth_normalized = depth_normalized / float(final_scaling_factor)
 
         depth_normalized = np.clip(depth_normalized, 0, 1)
-        logger.debug(f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]")
+
+        # 3. Apply the SAME gamma math as the render path (so preview == output)
+        depth_gamma_val = float(params.get('depth_gamma', 1.0))
+        if round(depth_gamma_val, 2) != 1.0:
+            # Math: 1.0 - (1.0 - depth)^gamma
+            depth_normalized = 1.0 - np.power(1.0 - np.clip(depth_normalized, 0, 1), depth_gamma_val)
+            depth_normalized = np.clip(depth_normalized, 0, 1)
+
+        logger.debug(
+            f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]"
+        )
 
         # --- Perform Splatting ---
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
@@ -3658,58 +4324,93 @@ class SplatterGUI(ThemedTk):
         actual_max_disp_pixels = (params['max_disp'] / 20.0 / 100.0) * W_target
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
+
+        # Preview-only depth/pop separation metrics (percent of screen width)
+        # Uses a lightweight sampled scan of the current normalized depth map.
+        try:
+            if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_metrics"):
+                show_metrics = bool(self.depth_pop_enabled_var.get()) and preview_source in ("Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph")
+                if show_metrics:
+                    _stride = 8  # sample stride for speed (1/64 pixels)
+                    _sample = depth_normalized[::_stride, ::_stride]
+                    _valid = (_sample > 0.001) & (_sample < 0.999)
+                    if _valid.any():
+                        _ds = _sample[_valid]
+                        # Disparity percent of screen width (W cancels out):
+                        # disp_pct = (depth - conv) * 2 * (max_disp / 20)
+                        _disp_pct = (_ds - params['convergence_point']) * 2.0 * (params['max_disp'] / 20.0)
+                        _min_pct = float(_disp_pct.min())
+                        _max_pct = float(_disp_pct.max())
+                        _depth_pct = max(0.0, -_min_pct)  # screen-behind
+                        _pop_pct = float(_max_pct)       # screen-out (can be negative if all behind)
+                    else:
+                        _depth_pct, _pop_pct = 0.0, 0.0
+                    self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
+                else:
+                    self.previewer.set_depth_pop_metrics(None, None)
+        except Exception:
+            pass
+
         with torch.no_grad():
             # Use the potentially resized Left Eye
             right_eye_tensor_raw, occlusion_mask = stereo_projector(left_eye_tensor_resized, disp_map_tensor)
             
             # Apply low-res specific post-processing
-            if is_low_res_preview:
-                # 1. Fill Left Edge Occlusions
-                right_eye_tensor_left_filled = self._fill_left_edge_occlusions(right_eye_tensor_raw, occlusion_mask, boundary_width_pixels=3)
-                
-                # 2. Fill Right Edge Occlusions (New Call)
-                right_eye_tensor = self._fill_right_edge_occlusions(right_eye_tensor_left_filled, occlusion_mask, boundary_width_pixels=3)
-            else:
-                right_eye_tensor = right_eye_tensor_raw
+            right_eye_tensor = right_eye_tensor_raw
 
-        # --- NEW: Update Info Frame for Preview (using Target resolution) ---
-        current_source_dict = getattr(self.previewer, 'current_source', {})
-        current_video_path = current_source_dict.get('source_video')
-            
-        video_filename = os.path.basename(current_video_path) if current_video_path else "N/A"
         
-        # 2. Frames: Get total frames from metadata (assuming key 'total_frames' or similar)
-        preview_metadata = getattr(self.previewer, 'metadata', {})
-        total_frames = preview_metadata.get('total_frames')
-        frames_display = f"1/{total_frames}" if total_frames else "1 (Preview)"
-
-        self.processing_filename_var.set(video_filename)
-        self.processing_task_name_var.set("Preview" + (" (Low-Res)" if is_low_res_preview else ""))
-        self.processing_resolution_var.set(f"{W_target}x{H_target}")
-        self.processing_frames_var.set(frames_display) 
-        # --- END NEW: Update Info Frame for Preview ---
-
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor.cpu()
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
             final_tensor = occlusion_mask.repeat(1, 3, 1, 1).cpu()
+
         elif preview_source == "Depth Map":
-            # --- MODIFIED FOR GRAYSCALE OUTPUT ---
-            # 1. Take the single-channel normalized array (0-1 float)
-            depth_vis_normalized = depth_normalized
-            
-            # 2. Convert to 3-channel grayscale (by repeating the channel)
-            # This is necessary because the previewer expects a 3-channel RGB image.
-            depth_vis_uint8 = (depth_vis_normalized * 255).astype(np.uint8)
-            
-            # Create a 3-channel image by stacking the grayscale channel
-            depth_vis_rgb_grayscale = np.stack([depth_vis_uint8] * 3, axis=-1)
-            
-            # 3. Convert back to PyTorch tensor
-            final_tensor = torch.from_numpy(depth_vis_rgb_grayscale).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-            # depth_vis_colored = cv2.applyColorMap((depth_normalized * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-            # depth_vis_rgb = cv2.cvtColor(depth_vis_colored, cv2.COLOR_BGR2RGB)
-            # final_tensor = torch.from_numpy(depth_vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0            
+            # Direct grayscale view (visualization-only TV-range expansion for 10-bit depth, when tagged 'tv')
+            depth_vis = depth_normalized
+            try:
+                if DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT and getattr(self, "previewer", None) is not None:
+                    bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    dpath = getattr(self.previewer, "_depth_path", None)
+                    if bd >= 10 and isinstance(dpath, str) and dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        rng = self._depth_color_range_cache.get(dpath)
+                        if rng is None:
+                            info = get_video_stream_info(dpath)
+                            rng = str((info or {}).get("color_range") or (info or {}).get("range") or "").lower()
+                            self._depth_color_range_cache[dpath] = rng
+                        if rng == "tv":
+                            depth_vis = (depth_vis - DEPTH_VIS_TV10_BLACK_NORM) / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                pass
+            depth_vis_uint8 = (np.clip(depth_vis, 0, 1) * 255).astype(np.uint8)
+            depth_vis_3ch = np.stack([depth_vis_uint8] * 3, axis=-1)
+            final_tensor = torch.from_numpy(depth_vis_3ch).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
+        elif preview_source == "Depth Map (Color)":
+            # Diagnostic color view (visualization-only TV-range expansion for 10-bit depth, when tagged 'tv')
+            depth_vis = depth_normalized
+            try:
+                if DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT and getattr(self, "previewer", None) is not None:
+                    bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    dpath = getattr(self.previewer, "_depth_path", None)
+                    if bd >= 10 and isinstance(dpath, str) and dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        rng = self._depth_color_range_cache.get(dpath)
+                        if rng is None:
+                            info = get_video_stream_info(dpath)
+                            rng = str((info or {}).get("color_range") or (info or {}).get("range") or "").lower()
+                            self._depth_color_range_cache[dpath] = rng
+                        if rng == "tv":
+                            depth_vis = (depth_vis - DEPTH_VIS_TV10_BLACK_NORM) / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                pass
+            depth_vis_uint8 = (np.clip(depth_vis, 0, 1) * 255).astype(np.uint8)
+            vis_color = cv2.applyColorMap(depth_vis_uint8, cv2.COLORMAP_VIRIDIS)
+            vis_rgb = cv2.cvtColor(vis_color, cv2.COLOR_BGR2RGB)
+            final_tensor = torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+       
         elif preview_source == "Original (Left Eye)":
             # Use the resized or original left eye depending on the low-res flag
             final_tensor = left_eye_tensor_resized.cpu()
@@ -3763,7 +4464,9 @@ class SplatterGUI(ThemedTk):
         self.dual_output_var.set(False)
         self.enable_global_norm_var.set(False)
         self.zero_disparity_anchor_var.set("0.5")
-        self.output_crf_var.set("23")        
+        self.output_crf_var.set("23")
+        self.output_crf_full_var.set("23")
+        self.output_crf_low_var.set("23")
         self.move_to_finished_var.set(True)
         
         self.toggle_processing_settings_fields()
@@ -4103,7 +4806,7 @@ class SplatterGUI(ThemedTk):
         self.auto_converge_thread.start()
     
     def _save_current_settings_and_notify(self):
-        """Saves current GUI settings to config_splat.json and notifies the user."""
+        """Saves current GUI settings to default config file and notifies the user."""
         config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
         try:
             self._save_config()
@@ -4151,6 +4854,9 @@ class SplatterGUI(ThemedTk):
                 "depth_dilate_size_y": float(self.depth_dilate_size_y_var.get()),
                 "depth_blur_size_x": float(self.depth_blur_size_x_var.get()),
                 "depth_blur_size_y": float(self.depth_blur_size_y_var.get()),
+                "depth_dilate_left": float(self.depth_dilate_left_var.get()),
+                "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
+                "depth_blur_left_mix": float(self.depth_blur_left_mix_var.get()),
                 "selected_depth_map": self.selected_depth_map_var.get(),
             }
         except ValueError:
@@ -4341,7 +5047,6 @@ class SplatterGUI(ThemedTk):
             current_height = calculated_height
         else:
             current_height = saved_height
-        # --- END MODIFIED ---
 
         # Fallback if saved width is invalid or too small
         if current_width < 200: # Minimum sensible width
@@ -4514,7 +5219,7 @@ class SplatterGUI(ThemedTk):
         self.start_single_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.status_label.config(text="Starting processing...")
-        # --- NEW: Disable all inputs at start ---
+        # --- Disable all inputs at start ---
         self._set_input_state('disabled')
         
         # --- CRITICAL FIX: Explicitly disable slider widgets ---
@@ -4560,16 +5265,25 @@ class SplatterGUI(ThemedTk):
                 raise ValueError("Depth Gamma must be positive.")
             
             # Validate Dilate X/Y
-            depth_dilate_size_x_val = int(float(self.depth_dilate_size_x_var.get()))
-            depth_dilate_size_y_val = int(float(self.depth_dilate_size_y_var.get()))
-            if depth_dilate_size_x_val < 0 or depth_dilate_size_y_val < 0:
-                raise ValueError("Depth Dilate Sizes (X/Y) must be non-negative.")
+            depth_dilate_size_x_val = float(self.depth_dilate_size_x_var.get())
+            depth_dilate_size_y_val = float(self.depth_dilate_size_y_var.get())
+            if (depth_dilate_size_x_val < -10.0 or depth_dilate_size_x_val > 30.0 or
+                depth_dilate_size_y_val < -10.0 or depth_dilate_size_y_val > 30.0):
+                raise ValueError("Depth Dilate Sizes (X/Y) must be between -10 and 30.")
             
             # Validate Blur X/Y
             depth_blur_size_x_val = int(float(self.depth_blur_size_x_var.get()))
             depth_blur_size_y_val = int(float(self.depth_blur_size_y_var.get()))
             if depth_blur_size_x_val < 0 or depth_blur_size_y_val < 0:
                 raise ValueError("Depth Blur Sizes (X/Y) must be non-negative.")
+            # Validate Dilate/Blur Left
+            depth_dilate_left_val = float(self.depth_dilate_left_var.get())
+            depth_blur_left_val = int(float(self.depth_blur_left_var.get()))
+            if depth_dilate_left_val < 0.0 or depth_dilate_left_val > 20.0:
+                raise ValueError("Dilate Left must be between 0 and 20.")
+            if depth_blur_left_val < 0 or depth_blur_left_val > 20:
+                raise ValueError("Blur Left must be between 0 and 20.")
+
 
         except ValueError as e:
             self.status_label.config(text=f"Error: {e}")
@@ -4594,13 +5308,17 @@ class SplatterGUI(ThemedTk):
             "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "match_depth_res": True,
             "move_to_finished": self.move_to_finished_var.get(),
-            "output_crf": int(self.output_crf_var.get()),
+            "output_crf": int(self.output_crf_full_var.get()),  # legacy
+            "output_crf_full": int(self.output_crf_full_var.get()),
+            "output_crf_low": int(self.output_crf_low_var.get()),
             # --- Depth Pre-processing & Auto-Convergence Settings ---
             "depth_gamma": depth_gamma_val,
             "depth_dilate_size_x": depth_dilate_size_x_val,
             "depth_dilate_size_y": depth_dilate_size_y_val,
             "depth_blur_size_x": depth_blur_size_x_val,
             "depth_blur_size_y": depth_blur_size_y_val,
+            "depth_dilate_left": float(self.depth_dilate_left_var.get()),
+            "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
             "auto_convergence_mode": self.auto_convergence_mode_var.get(),
             "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
             "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
@@ -4634,6 +5352,23 @@ class SplatterGUI(ThemedTk):
         current_source_dict = self.previewer.video_list[current_index]
         single_video_path = current_source_dict.get('source_video')
         single_depth_path = current_source_dict.get('depth_map')
+        # In Multi-Map mode, ensure Single/Test processing uses the clip's sidecar-selected map file.
+        if self.multi_map_var.get() and single_video_path:
+            try:
+                _mm_sidecar_map = self._get_sidecar_selected_map_for_video(single_video_path)
+                if _mm_sidecar_map:
+                    _mm_base = self.input_depth_maps_var.get()
+                    _mm_video_name = os.path.splitext(os.path.basename(single_video_path))[0]
+                    _mm_folder = os.path.join(_mm_base, _mm_sidecar_map)
+                    _mm_mp4 = os.path.join(_mm_folder, f"{_mm_video_name}_depth.mp4")
+                    _mm_npz = os.path.join(_mm_folder, f"{_mm_video_name}_depth.npz")
+                    if os.path.exists(_mm_mp4):
+                        single_depth_path = _mm_mp4
+                    elif os.path.exists(_mm_npz):
+                        single_depth_path = _mm_npz
+            except Exception as _e:
+                logger.debug(f"[MM] Failed resolving sidecar-selected map for Single/Test: {_e}")
+
 
         if not single_video_path or not single_depth_path:
             messagebox.showerror("Process Single Clip Error", "Could not get both video and depth map paths from previewer.")
@@ -4653,8 +5388,46 @@ class SplatterGUI(ThemedTk):
             messagebox.showerror("Validation Error", str(e))
             return
         
-        if hasattr(self, 'previewer'):
-            self.previewer.cleanup()
+        # --- MODIFIED: Delayed cleanup for diagnostic parity ---
+        is_test_active = self.enable_full_res_var.get() or self.enable_low_res_var.get()
+        
+        # --- MODIFIED: Auto-Switch Preview for Tests ---
+        if self.map_test_var.get() or self.splat_test_var.get():
+            # If a test is active, sync GUI controls from sidecar once before capture/run (keeps parity without freezing live slider changes).
+            try:
+                self.update_gui_from_sidecar(single_depth_path)
+                # Sidecar restore may switch the map for this clip; re-read the effective depth path.
+                _cur_entry = self.previewer.video_list[current_index]
+                single_depth_path = _cur_entry.get('depth_map') or single_depth_path
+            except Exception:
+                pass
+
+            # Auto-switch preview mode for tests:
+            # - Map Test: always show Depth Map
+            # - Splat Test: if Full is enabled (even with Low), show Full splat preview; if only Low is enabled, show Low splat preview
+            if self.map_test_var.get():
+                target_mode = "Depth Map"
+            else:
+                full_enabled = bool(getattr(self, 'enable_full_res_var', None).get()) if getattr(self, 'enable_full_res_var', None) else False
+                low_enabled  = bool(getattr(self, 'enable_low_res_var', None).get()) if getattr(self, 'enable_low_res_var', None) else False
+                if full_enabled or (full_enabled and low_enabled) or (not low_enabled and full_enabled):
+                    target_mode = "Splat Result"
+                elif low_enabled and not full_enabled:
+                    target_mode = "Splat Result(Low)"
+                else:
+                    # Fallback (shouldn't happen in normal usage)
+                    target_mode = "Splat Result"
+            self.preview_source_var.set(target_mode)
+            self.preview_size_var.set("100%") # Ensure 1:1 scale for capture parity
+            logger.info(f"Test Active: Auto-switching preview to {target_mode} at 100% scale.")
+            self.previewer.update_preview()
+            # Give the previewer a moment to actually render the new mode
+            self.update()
+        else:
+            # Standard cleanup only if NOT in test mode
+            if hasattr(self, 'previewer'):
+                self.previewer.cleanup()
+        # --- END AUTO-SWITCH ---
             
         # 3. Compile settings dictionary
         # We explicitly set the input paths to the single files, which forces batch logic 
@@ -4692,7 +5465,9 @@ class SplatterGUI(ThemedTk):
             "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
             "enable_global_norm": self.enable_global_norm_var.get(), # Renamed
             "match_depth_res": True,
-            "output_crf": int(self.output_crf_var.get()),
+            "output_crf": int(self.output_crf_full_var.get()),  # legacy
+            "output_crf_full": int(self.output_crf_full_var.get()),
+            "output_crf_low": int(self.output_crf_low_var.get()),
             
             # --- Depth Pre-processing Settings ---
             "depth_gamma": float(self.depth_gamma_var.get()),
@@ -4700,6 +5475,9 @@ class SplatterGUI(ThemedTk):
             "depth_dilate_size_y": int(float(self.depth_dilate_size_y_var.get())),
             "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
             "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
+            "depth_dilate_left": float(self.depth_dilate_left_var.get()),
+            "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
+            "depth_blur_left_mix": float(self.depth_blur_left_mix_var.get()),
             "auto_convergence_mode": self.auto_convergence_mode_var.get(),
             "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
             "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
@@ -4726,7 +5504,7 @@ class SplatterGUI(ThemedTk):
         self.status_label.config(text="Stopping...")
         self.stop_button.config(state="disabled")
         self.start_single_button.config(state="normal")
-        # --- NEW: Re-enable previewer widgets on stop ---
+        # --- Re-enable previewer widgets on stop ---
         if hasattr(self, 'previewer'):
             self.previewer.set_ui_processing_state(False)
 
@@ -4778,6 +5556,26 @@ class SplatterGUI(ThemedTk):
         else:
             self.start_button.config(state="disabled")
 
+
+    def _apply_preview_overlay_toggles(self):
+        """Apply preview-only overlay toggles to the previewer (Crosshair + D/P)."""
+        if not getattr(self, 'previewer', None):
+            return
+
+        try:
+            self.previewer.set_crosshair_settings(
+                self.crosshair_enabled_var.get(),
+                self.crosshair_white_var.get(),
+                self.crosshair_multi_var.get()
+            )
+        except Exception:
+            pass
+
+        try:
+            getattr(self.previewer, "set_depth_pop_enabled", lambda *_: None)(self.depth_pop_enabled_var.get())
+        except Exception:
+            pass
+
     def _toggle_sidecar_update_button_state(self):
         """
         Controls the Update Sidecar button state based on the Override Sidecar checkbox.
@@ -4810,6 +5608,66 @@ class SplatterGUI(ThemedTk):
         # 2. Update the button state (Normal vs Disabled by Override)
         if hasattr(self, '_toggle_sidecar_update_button_state'):
             self._toggle_sidecar_update_button_state()
+
+
+        # 3. Update the info panel to reflect the currently loaded preview clip
+        self._update_processing_info_for_preview_clip()
+
+    def _update_processing_info_for_preview_clip(self):
+        """Updates the 'Current Processing Information' panel to reflect the currently loaded preview clip."""
+        try:
+            if not getattr(self, 'previewer', None):
+                return
+
+            idx = getattr(self.previewer, 'current_video_index', -1)
+            video_list = getattr(self.previewer, 'video_list', []) or []
+            if not (0 <= idx < len(video_list)):
+                return
+
+            source_dict = video_list[idx] if isinstance(video_list[idx], dict) else {}
+
+            # Filename (the main thing you care about in practice)
+            src_path = source_dict.get('source_video')
+            if src_path:
+                new_name = os.path.basename(src_path)
+                if self.processing_filename_var.get() != new_name:
+                    self.processing_filename_var.set(new_name)
+            # Map display during preview:
+            # - Normal mode: keep blank (map is already implied by the UI and filename prefix).
+            # - Multi-Map mode: show the currently selected map label (same text as the selector),
+            #   because the radio dot can be hard to see (e.g., with 3D glasses).
+            try:
+                if self.multi_map_var.get():
+                    sel_map = (self.selected_depth_map_var.get() or "").strip()
+                    if sel_map and self.processing_map_var.get() != sel_map:
+                        self.processing_map_var.set(sel_map)
+                else:
+                    if self.processing_map_var.get() != "":
+                        self.processing_map_var.set("")
+            except Exception:
+                # Fail closed: don't spam logs; leave whatever is currently displayed.
+                pass
+
+            # Task name: keep stable during preview
+            new_task = "Preview"
+            if self.processing_task_name_var.get() != new_task:
+                self.processing_task_name_var.set(new_task)
+
+            # Frames display: keep stable during preview; show total frames only
+            try:
+                to_val = self.previewer.frame_scrubber.cget('to')
+                total_frames = int(float(to_val)) + 1 if to_val is not None else None
+
+                if total_frames is not None:
+                    new_frames = f"{total_frames}"
+                    if self.processing_frames_var.get() != new_frames:
+                        self.processing_frames_var.set(new_frames)
+            except Exception:
+                pass
+
+
+        except Exception as e:
+            logger.debug(f"Preview info update skipped due to error: {e}")
 
     def update_gui_from_sidecar(self, depth_map_path: str):
         """
@@ -4884,25 +5742,45 @@ class SplatterGUI(ThemedTk):
         # Blur Y
         blur_y_val = sidecar_config.get("depth_blur_size_y", self.depth_blur_size_y_var.get())
         self.depth_blur_size_y_var.set(blur_y_val)
+
+        # Dilate Left
+        dilate_left_val = sidecar_config.get("depth_dilate_left", self.depth_dilate_left_var.get())
+        self.depth_dilate_left_var.set(dilate_left_val)
+
+        # Blur Left (stored as integer steps; accept older float values)
+        blur_left_val = sidecar_config.get("depth_blur_left", self.depth_blur_left_var.get())
+        try:
+            self.depth_blur_left_var.set(int(round(float(blur_left_val))))
+        except Exception:
+            self.depth_blur_left_var.set(0)
         
+        # Blur Left H↔V balance (defaults to 0.5 for older sidecars)
+        mix_val = sidecar_config.get("depth_blur_left_mix", self.depth_blur_left_mix_var.get())
+        try:
+            mix_f = float(mix_val)
+            if mix_f < 0.0: mix_f = 0.0
+            if mix_f > 1.0: mix_f = 1.0
+            # store as one decimal string to match UI selector
+            self.depth_blur_left_mix_var.set(f"{mix_f:.1f}")
+        except Exception:
+            self.depth_blur_left_mix_var.set("0.5")
+
         # Selected Depth Map (for Multi-Map mode)
-        # Check if Multi-Map is enabled
-        logger.info(f"Multi-Map enabled: {self.multi_map_var.get()}")
         if self.multi_map_var.get():
             selected_map_val = sidecar_config.get("selected_depth_map", "")
             if selected_map_val:
-                # Update the radio button selection
-                logger.info(f"selected_map_val from sidecar: '{selected_map_val}'")
-                logger.info(f"BEFORE SET: selected_depth_map_var = {self.selected_depth_map_var.get()}")
-                self.selected_depth_map_var.set(selected_map_val)
-                logger.info(f"AFTER SET: selected_depth_map_var = {self.selected_depth_map_var.get()}")
-                
-                # Just call the handler once, marking it as from_sidecar
+                # Only log when we actually switch maps (reduces redundant messages).
+                _current_sel = self.selected_depth_map_var.get()
+                if selected_map_val != _current_sel:
+                    logger.info(f"Restoring depth map selection from sidecar: {selected_map_val}")
+                    self.selected_depth_map_var.set(selected_map_val)
+
+                # Ensure the current preview entry uses the sidecar-selected map (even if unchanged).
                 try:
                     self._on_map_selection_changed(from_sidecar=True)
-                    logger.info(f"Depth map selection restored from sidecar: {selected_map_val}")
                 except Exception as e:
                     logger.error(f"Failed to apply sidecar map '{selected_map_val}': {e}")
+
                 # Do not allow sidecar to override manual click after this point
                 self._suppress_sidecar_map_update = True
 
@@ -5058,37 +5936,328 @@ def read_video_frames(
 
     return video_reader, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info, total_frames_to_process
 
+
+# -----------------------------
+# 10-bit+ depth decode helpers
+# -----------------------------
+class _NumpyBatch:
+    """Minimal wrapper to match Decord's get_batch(...).asnumpy() API."""
+    def __init__(self, arr: np.ndarray):
+        self._arr = arr
+    def asnumpy(self) -> np.ndarray:
+        return self._arr
+
+def _infer_depth_bit_depth(depth_stream_info: Optional[dict]) -> int:
+    """Best-effort bit-depth inference from ffprobe info."""
+    if not depth_stream_info:
+        return 8
+    pix_fmt = str(depth_stream_info.get("pix_fmt", "")).lower()
+    profile = str(depth_stream_info.get("profile", "")).lower()
+
+    # Common patterns: yuv420p10le, yuv444p12le, gray16le, etc.
+    m = re.search(r"(?:p|gray)(\d+)", pix_fmt)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    if "main10" in profile or "10" in profile:
+        return 10
+    return 8
+
+def _build_depth_vf(pix_fmt: str, out_w: int, out_h: int) -> str:
+    pix_fmt = (pix_fmt or "").lower()
+    # If it's already gray*, don't try to extract planes.
+    if pix_fmt.startswith("gray"):
+        return f"scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
+    # Otherwise, extract luma plane (Y) and convert to gray16.
+    return f"extractplanes=y,scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
+
+class FFmpegDepthPipeReader:
+    """
+    Sequential ffmpeg-backed depth reader that preserves 10-bit+ values.
+    Implements a small subset of Decord's VideoReader API used by the splatter:
+      - __len__()
+      - seek(idx)
+      - get_batch([idx0, idx1, ...]).asnumpy()
+    NOTE: This reader is optimized for sequential access (render path).
+    """
+    def __init__(self, path: str, out_w: int, out_h: int, bit_depth: int, num_frames: int, pix_fmt: str = ""):
+        self.path = path
+        self.out_w = int(out_w)
+        self.out_h = int(out_h)
+        self.bit_depth = int(bit_depth) if bit_depth else 16
+        self._num_frames = int(num_frames) if num_frames is not None else 0
+        self._pix_fmt = pix_fmt or ""
+        self._proc: Optional[subprocess.Popen] = None
+        self._next_index = 0
+        self._frame_bytes = self.out_w * self.out_h * 2  # gray16le
+        self._msb_shift: Optional[int] = None
+        self._use_16_to_n_scale: bool = False
+        self._start_process()
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def _start_process(self):
+        self.close()
+        vf = _build_depth_vf(self._pix_fmt, self.out_w, self.out_h)
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-i", self.path,
+            "-an", "-sn", "-dn",
+            "-vframes", str(self._num_frames) if self._num_frames and self._num_frames > 0 else "999999999",
+            "-vf", vf,
+            "-f", "rawvideo",
+            "pipe:1",
+        ]
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._next_index = 0
+        self._msb_shift = None
+
+    def close(self):
+        try:
+            if self._proc is not None:
+                if self._proc.stdout:
+                    try:
+                        self._proc.stdout.close()
+                    except Exception:
+                        pass
+                if self._proc.stderr:
+                    try:
+                        self._proc.stderr.close()
+                    except Exception:
+                        pass
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+        finally:
+            self._proc = None
+
+    def __del__(self):
+        self.close()
+
+    def seek(self, idx: int):
+        """Best-effort seek. Efficient only if seeking forward sequentially."""
+        idx = int(idx)
+        if idx == self._next_index:
+            return
+        if idx < self._next_index:
+            # Restart and fast-forward by discarding frames (rare in render path).
+            self._start_process()
+        # Discard until we reach idx
+        to_skip = idx - self._next_index
+        if to_skip <= 0:
+            self._next_index = idx
+            return
+        if self._proc is None or self._proc.stdout is None:
+            self._start_process()
+        discard_bytes = to_skip * self._frame_bytes
+        _ = self._proc.stdout.read(discard_bytes)
+        self._next_index = idx
+
+    def _read_exact(self, nbytes: int) -> bytes:
+        if self._proc is None or self._proc.stdout is None:
+            self._start_process()
+        buf = b""
+        while len(buf) < nbytes:
+            chunk = self._proc.stdout.read(nbytes - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def _maybe_apply_shift(self, arr_u16: np.ndarray) -> np.ndarray:
+        """Normalize decoded gray16 values back into the native bit-depth range (e.g., 0..1023 for 10-bit).
+
+        ffmpeg's format conversion to gray16le may either:
+          1) left-shift the original N-bit values into the MSBs (exact multiples of 2^(16-N)), or
+          2) scale values to the full 16-bit range (0..65535).
+
+        We detect the likely behavior once and then apply either a right-shift or a scale-down so the
+        output values land back in 0..(2^bit_depth-1).
+        """
+        if self._msb_shift is None:
+            expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
+            if expected_max is None:
+                self._msb_shift = 0
+                self._use_16_to_n_scale = False
+            else:
+                # Sample to avoid full-frame scans on large batches
+                flat = arr_u16.reshape(-1)
+                step = max(1, flat.size // 50000)
+                sample = flat[::step]
+                max_val = int(sample.max(initial=0))
+
+                if max_val <= expected_max:
+                    self._msb_shift = 0
+                    self._use_16_to_n_scale = False
+                else:
+                    shift = 16 - self.bit_depth
+                    if shift <= 0:
+                        self._msb_shift = 0
+                        self._use_16_to_n_scale = False
+                    else:
+                        low_mask = (1 << shift) - 1
+                        # If the sample's low bits are consistently zero, it's very likely MSB-aligned (pure left shift).
+                        low_bits_max = int((sample & low_mask).max(initial=0))
+                        if low_bits_max == 0:
+                            self._msb_shift = shift
+                            self._use_16_to_n_scale = False
+                        else:
+                            # Otherwise assume scaled-to-16bit; scale back down into expected range.
+                            self._msb_shift = 0
+                            self._use_16_to_n_scale = True
+
+        expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
+        if expected_max is None:
+            return arr_u16
+
+        if self._msb_shift and self._msb_shift > 0:
+            return (arr_u16 >> self._msb_shift).astype(np.uint16)
+
+        if self._use_16_to_n_scale:
+            # Map 0..65535 -> 0..expected_max with rounding.
+            arr32 = arr_u16.astype(np.uint32)
+            return ((arr32 * expected_max + 32767) // 65535).astype(np.uint16)
+
+        return arr_u16
+
+    def get_batch(self, indices):
+        indices = list(indices)
+        if not indices:
+            return _NumpyBatch(np.zeros((0, self.out_h, self.out_w, 1), dtype=np.uint16))
+
+        # Render path calls are contiguous and increasing. Enforce best-effort alignment.
+        first = int(indices[0])
+        if first != self._next_index:
+            self.seek(first)
+
+        n = len(indices)
+        expected = self._frame_bytes * n
+        buf = self._read_exact(expected)
+        if len(buf) != expected:
+            raise EOFError(f"FFmpegDepthPipeReader: expected {expected} bytes, got {len(buf)}")
+
+        arr = np.frombuffer(buf, dtype=np.uint16).reshape(n, self.out_h, self.out_w, 1)
+        arr = self._maybe_apply_shift(arr)
+        self._next_index = first + n
+        return _NumpyBatch(arr.copy())
+
 def load_pre_rendered_depth(
         depth_map_path: str,
         process_length: int,
         target_height: int,
         target_width: int,
-        match_resolution_to_target: bool) -> Tuple[VideoReader, int, int, int, Optional[dict]]:
+        match_resolution_to_target: bool) -> Tuple[Any, int, int, int, Optional[dict]]:
     """
-    Initializes a VideoReader for chunked depth map reading.
+    Initializes a reader for chunked depth map reading.
+    Preserves 10-bit+ depth maps by using an ffmpeg-backed reader when needed.
     No normalization or autogain is applied here.
-    Returns: (depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width)
+    Returns:
+        (depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width, depth_stream_info)
     """
-    logger.debug(f"==> Initializing VideoReader for depth maps from: {depth_map_path}")
+    logger.debug(f"==> Initializing depth reader from: {depth_map_path}")
 
-    # NEW: Get stream info for the depth map video
-    depth_stream_info = get_video_stream_info(depth_map_path) 
+    depth_stream_info = get_video_stream_info(depth_map_path)
+    bit_depth = _infer_depth_bit_depth(depth_stream_info)
+    pix_fmt = str((depth_stream_info or {}).get("pix_fmt", ""))
+
+    logger.info(f"==> Depth map stream: pix_fmt='{pix_fmt}', profile='{str((depth_stream_info or {}).get('profile',''))}', inferred_bit_depth={bit_depth}")
 
     if depth_map_path.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        depth_reader = VideoReader(depth_map_path, ctx=cpu(0), width=target_width, height=target_height)
-        
-        first_depth_frame_shape = depth_reader.get_batch([0]).shape
-        actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
-        
-        total_depth_frames_available = len(depth_reader)
+        # Determine total frames available (for mismatch checks) without relying on the ffmpeg pipe.
+        total_depth_frames_available = 0
+        try:
+            _tmp = VideoReader(depth_map_path, ctx=cpu(0))
+            total_depth_frames_available = len(_tmp)
+            del _tmp
+        except Exception as e:
+            logger.warning(f"Could not determine depth frame count via Decord for '{depth_map_path}': {e}")
+
         total_depth_frames_to_process = total_depth_frames_available
         if process_length != -1 and process_length < total_depth_frames_available:
             total_depth_frames_to_process = process_length
 
-        logger.debug(f"==> DepthReader initialized. Final depth dimensions: {actual_depth_width}x{actual_depth_height}. Total frames for processing: {total_depth_frames_to_process}")
-        
+        # Choose reader implementation
+        if bit_depth > 8:
+            depth_reader = FFmpegDepthPipeReader(
+                depth_map_path,
+                out_w=target_width,
+                out_h=target_height,
+                bit_depth=bit_depth,
+                num_frames=total_depth_frames_available,
+                pix_fmt=pix_fmt
+            )
+        else:
+            # 8-bit: decode at native res with Decord, then (optionally) resize with OpenCV for parity.
+            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))  # decode at native res; resize with OpenCV later for parity
+
+            # --- NEW: When match_resolution_to_target=True, wrap the reader so it *outputs* frames at (target_width,target_height)
+            # using OpenCV resizing (NOT Decord scaling). This keeps 8-bit preview/render parity and also enables the low-res
+            # pipeline to preprocess at clip resolution (depth_target_w/h are set to original clip res for low-res tasks).
+            class _NumpyBatch:
+                def __init__(self, arr):
+                    self._arr = arr
+                def asnumpy(self):
+                    return self._arr
+
+            class _ResizingDepthReader:
+                def __init__(self, inner_reader, out_w, out_h):
+                    self._inner = inner_reader
+                    self._out_w = int(out_w)
+                    self._out_h = int(out_h)
+
+                def __len__(self):
+                    return len(self._inner)
+
+                def seek(self, *args, **kwargs):
+                    return self._inner.seek(*args, **kwargs)
+
+                def get_batch(self, indices):
+                    arr = self._inner.get_batch(indices).asnumpy()
+                    # arr is typically (N,H,W,C) from Decord
+                    in_h = int(arr.shape[1])
+                    in_w = int(arr.shape[2])
+                    if in_w == self._out_w and in_h == self._out_h:
+                        return _NumpyBatch(arr)
+
+                    interp = cv2.INTER_LINEAR if (self._out_w > in_w or self._out_h > in_h) else cv2.INTER_AREA
+
+                    if arr.ndim == 4:
+                        out = np.empty((arr.shape[0], self._out_h, self._out_w, arr.shape[3]), dtype=arr.dtype)
+                        for i in range(arr.shape[0]):
+                            out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+                    else:
+                        out = np.empty((arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype)
+                        for i in range(arr.shape[0]):
+                            out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+
+                    return _NumpyBatch(out)
+
+            first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
+            actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
+
+            if match_resolution_to_target and (actual_depth_width != target_width or actual_depth_height != target_height):
+                depth_reader = _ResizingDepthReader(depth_reader, out_w=target_width, out_h=target_height)
+                actual_depth_height, actual_depth_width = int(target_height), int(target_width)
+
+
+        first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
+        actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
+
+        logger.debug(
+            f"==> Depth reader ready. Final depth resolution: {actual_depth_width}x{actual_depth_height}. "
+            f"Frames available: {total_depth_frames_available}. Frames to process: {total_depth_frames_to_process}. "
+            f"bit_depth={bit_depth}, pix_fmt='{pix_fmt}'."
+        )
+
         return depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width, depth_stream_info
-    
+
     elif depth_map_path.lower().endswith('.npz'):
         logger.error("NPZ support is temporarily disabled with disk chunking refactor. Please convert NPZ to MP4 depth video.")
         raise NotImplementedError("NPZ depth map loading is not yet supported with disk chunking.")
