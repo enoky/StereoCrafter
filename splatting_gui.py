@@ -85,7 +85,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-01-17_Tru10"
+GUI_VERSION = "26-01-18.01"
 
 
 class FusionSidecarGenerator:
@@ -421,7 +421,7 @@ class FusionSidecarGenerator:
             else:
                 # Append index if multiple markers (5-digit zero-padded)
                 base, ext = os.path.splitext(custom_save_path)
-                target_filename = f"{base}_{i + 1:05d}{ext}"
+                target_filename = f"{base}_{i + 1:04d}{ext}"
 
             if not self.sidecar_manager.save_sidecar_data(
                 target_filename, sidecar_data
