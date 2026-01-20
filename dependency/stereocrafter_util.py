@@ -1,24 +1,21 @@
 import os
-import glob
 import json
 import shutil
 import threading
 import tkinter as tk  # Required for Tooltip class
 from tkinter import Toplevel, Label, ttk
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 import logging
-import math
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from decord import VideoReader, cpu
 import subprocess
 import cv2
 import gc
 import time
 
-VERSION = "26-01-17.1"
+VERSION = "26-01-20.3"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -114,7 +111,9 @@ class SidecarConfigManager:
         "selected_depth_map": (str, ""),
         "left_border": (float, 0.0),
         "right_border": (float, 0.0),
-        "manual_border": (bool, False),
+        "border_mode": (str, None),
+        "auto_border_L": (float, None),
+        "auto_border_R": (float, None),
         # Add future keys here
     }
 
@@ -147,9 +146,9 @@ class SidecarConfigManager:
                 # Attempt to cast the GUI value to the expected type
                 try:
                     val = gui_config[key]
-                    if expected_type == float:
+                    if expected_type is float:
                         merged_config[key] = float(val)
-                    elif expected_type == int:
+                    elif expected_type is int:
                         merged_config[key] = int(val)
                     else:
                         merged_config[key] = val
@@ -180,9 +179,9 @@ class SidecarConfigManager:
                     val = sidecar_json[key]
                     try:
                         # Attempt to cast the value to the expected type
-                        if expected_type == int:
+                        if expected_type is int:
                             data[key] = int(val)
-                        elif expected_type == float:
+                        elif expected_type is float:
                             data[key] = float(val)
                         else:
                             data[key] = val
@@ -190,6 +189,11 @@ class SidecarConfigManager:
                         logger.warning(
                             f"Sidecar key '{key}' has invalid value/type. Using default."
                         )
+
+            # Preserve unknown keys for legacy migration (e.g., manual_border)
+            for key, val in sidecar_json.items():
+                if key not in data:
+                    data[key] = val
 
         except Exception as e:
             logger.error(f"Failed to read/parse sidecar at {file_path}: {e}")
@@ -368,15 +372,6 @@ def apply_optimized_anaglyph(
     anaglyph_rgb = anaglyph_flat.reshape(H, W, 3)
 
     return (anaglyph_rgb * 255.0).astype(np.uint8)
-
-
-from typing import (
-    Optional,
-    Tuple,
-    Callable,
-)  # Ensure Callable is in your imports at the top
-
-from typing import Optional, Tuple, Callable  # Add Callable to your imports at the top
 
 
 def create_single_slider_with_label_updater(
@@ -864,7 +859,6 @@ def custom_blur(
     if k_x <= 0 and k_y <= 0:
         return tensor
 
-    k_x_orig, k_y_orig = k_x, k_y
     k_x = k_x if k_x % 2 == 1 else k_x + 1
     k_y = k_y if k_y % 2 == 1 else k_y + 1
 
@@ -1497,7 +1491,7 @@ def read_video_frames_decord(
 
     if not frames_idx:
         logger.warning(
-            f"No frames selected for processing after stride and process_length filters."
+            "No frames selected for processing after stride and process_length filters."
         )
         return (
             np.empty((0, 0, 0, 0), dtype=np.float32),
