@@ -2099,7 +2099,7 @@ class SplatterGUI(ThemedTk):
         # Slider Implementation for dilate and blur
         # --- MODIFIED: Dilation Slider with Expanded Erosion Range (Slider goes to 40) ---
         row_inner = 0
-        create_dual_slider_layout(
+        _, _, _ = create_dual_slider_layout(
             self,
             self.depth_prep_frame,
             "Dilate X:",
@@ -2119,7 +2119,7 @@ class SplatterGUI(ThemedTk):
             default_y=0.0,
         )
         row_inner += 1
-        create_dual_slider_layout(
+        _, _, _ = create_dual_slider_layout(
             self,
             self.depth_prep_frame,
             "   Blur X:",
@@ -2141,49 +2141,23 @@ class SplatterGUI(ThemedTk):
         row_inner += 1
 
         # Dilate Left (0.5 steps) + Blur Left (integer steps)
-        # NOTE: We avoid create_dual_slider_layout here because Dilate Left needs fractional steps
-        # while Blur Left should be integer-only (kernel sizing is effectively integer).
-        left_xy_frame = ttk.Frame(self.depth_prep_frame)
-        left_xy_frame.grid(
-            row=row_inner, column=0, columnspan=2, sticky="ew", padx=5, pady=0
-        )
-        left_xy_frame.grid_columnconfigure(0, weight=1)
-        left_xy_frame.grid_columnconfigure(1, weight=1)
-
-        left_dilate_frame = ttk.Frame(left_xy_frame)
-        left_dilate_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        left_dilate_frame.grid_columnconfigure(1, weight=1)
-        create_single_slider_with_label_updater(
+        _, _, (_, left_blur_frame) = create_dual_slider_layout(
             self,
-            left_dilate_frame,
+            self.depth_prep_frame,
             "Dilate Left:",
-            self.depth_dilate_left_var,
-            0.0,
-            20.0,
-            0,
-            decimals=1,
-            tooltip_key="depth_dilate_left",
-            trough_increment=0.5,
-            display_next_odd_integer=False,
-            default_value=0.0,
-        )
-
-        left_blur_frame = ttk.Frame(left_xy_frame)
-        left_blur_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        left_blur_frame.grid_columnconfigure(1, weight=1)
-        create_single_slider_with_label_updater(
-            self,
-            left_blur_frame,
             "Blur Left:",
+            self.depth_dilate_left_var,
             self.depth_blur_left_var,
             0.0,
             20.0,
-            0,
-            decimals=0,
-            tooltip_key="depth_blur_left",
-            trough_increment=1.0,
-            display_next_odd_integer=False,
-            default_value=0.0,
+            row_inner,
+            decimals=1,
+            decimals_y=0,
+            tooltip_key_x="depth_dilate_left",
+            tooltip_key_y="depth_blur_left",
+            trough_increment=0.5,
+            default_x=0.0,
+            default_y=0.0,
         )
 
         # Blur Left H↔V balance (0.0 = all horizontal, 1.0 = all vertical; 0.5 = 50/50)
@@ -2303,52 +2277,44 @@ class SplatterGUI(ThemedTk):
         all_settings_row += 1
 
         # Border Width & Bias Sliders
-        border_sliders_row_frame = ttk.Frame(self.depth_all_settings_frame)
-        self.border_sliders_row_frame = border_sliders_row_frame
-        border_sliders_row_frame.grid(
-            row=all_settings_row, column=0, columnspan=3, sticky="ew"
-        )
-        border_sliders_row_frame.grid_columnconfigure(0, weight=1)
-        border_sliders_row_frame.grid_columnconfigure(1, weight=1)
-
-        border_width_subframe = ttk.Frame(border_sliders_row_frame)
-        border_width_subframe.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        border_width_subframe.grid_columnconfigure(1, weight=1)
-
-        border_bias_subframe = ttk.Frame(border_sliders_row_frame)
-        border_bias_subframe.grid(row=0, column=1, sticky="ew")
-        border_bias_subframe.grid_columnconfigure(1, weight=1)
-
-        self.set_border_width_programmatically = (
-            create_single_slider_with_label_updater(
-                self,
-                border_width_subframe,
-                "Border Width:",
-                self.border_width_var,
-                0.0,
-                5.0,
-                0,
-                decimals=2,
-                tooltip_key="border_width",
-                trough_increment=0.1,
-                step_size=0.01,
-                default_value=0.0,
-            )
-        )
-        self.set_border_bias_programmatically = create_single_slider_with_label_updater(
+        # The improved create_dual_slider_layout returns the frame, setters, and subframes.
+        (
+            self.border_sliders_row_frame,
+            (
+                self.set_border_width_programmatically,
+                self.set_border_bias_programmatically,
+            ),
+            _,
+        ) = create_dual_slider_layout(
             self,
-            border_bias_subframe,
+            self.depth_all_settings_frame,
+            "Border Width:",
             "Bias:",
+            self.border_width_var,
             self.border_bias_var,
-            -1.0,
-            1.0,
-            0,
+            0.0,
+            5.0,
+            all_settings_row,
             decimals=2,
-            tooltip_key="border_bias",
+            tooltip_key_x="border_width",
+            tooltip_key_y="border_bias",
             trough_increment=0.1,
-            step_size=0.01,
-            default_value=0.0,
+            step_size_x=0.01,
+            step_size_y=0.01,
+            default_x=0.0,
+            default_y=0.0,
+            from_y=-1.0,
+            to_y=1.0,
         )
+        # Store the frame containing the sliders for the manual toggle logic
+        # Since create_dual_slider_layout now returns the frame directly,
+        # the lookup loop is no longer needed.
+        # for child in self.depth_all_settings_frame.winfo_children():
+        #     info = child.grid_info()
+        #     if info.get("row") == str(all_settings_row):
+        #         self.border_sliders_row_frame = child
+        #         break
+
         all_settings_row += 1
         # --- Global Normalization + Resume (packed in a sub-frame so slider columns stay aligned) ---
         checkbox_row = ttk.Frame(self.depth_all_settings_frame)
