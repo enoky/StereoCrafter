@@ -136,6 +136,30 @@ class FusionSidecarGenerator:
             "sidecar_key": "input_bias",
             "decimals": 2,
         },
+        "left_border": {
+            "label": "Left Border",
+            "type": float,
+            "default": 0.0,
+            "fusion_key": "LeftBorder",
+            "sidecar_key": "left_border",
+            "decimals": 3,
+        },
+        "right_border": {
+            "label": "Right Border",
+            "type": float,
+            "default": 0.0,
+            "fusion_key": "RightBorder",
+            "sidecar_key": "right_border",
+            "decimals": 3,
+        },
+        "manual_border": {
+            "label": "Manual Border",
+            "type": bool,
+            "default": False,
+            "fusion_key": "ManualBorder",
+            "sidecar_key": "manual_border",
+            "decimals": 0,
+        },
     }
 
     def __init__(self, master_gui, sidecar_manager):
@@ -320,8 +344,13 @@ class FusionSidecarGenerator:
             sidecar_data = {}
             for key, config in self.FUSION_PARAMETER_CONFIG.items():
                 value = current_param_vals[key]
-                # Round to configured decimals for clean sidecar output
-                sidecar_data[config["sidecar_key"]] = round(value, config["decimals"])
+                if config["type"] is bool:
+                    sidecar_data[config["sidecar_key"]] = bool(value)
+                else:
+                    # Round to configured decimals for clean sidecar output
+                    sidecar_data[config["sidecar_key"]] = round(
+                        float(value), config["decimals"]
+                    )
 
             base_name_without_ext = os.path.splitext(file_data["full_path"])[0]
             json_filename = (
@@ -413,7 +442,12 @@ class FusionSidecarGenerator:
             sidecar_data = {}
             for key, config in self.FUSION_PARAMETER_CONFIG.items():
                 value = current_param_vals[key]
-                sidecar_data[config["sidecar_key"]] = round(value, config["decimals"])
+                if config["type"] is bool:
+                    sidecar_data[config["sidecar_key"]] = bool(value)
+                else:
+                    sidecar_data[config["sidecar_key"]] = round(
+                        float(value), config["decimals"]
+                    )
 
             # Determine filename
             if len(markers) == 1:

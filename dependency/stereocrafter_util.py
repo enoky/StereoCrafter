@@ -112,6 +112,9 @@ class SidecarConfigManager:
         "depth_blur_left": (float, 0.0),
         "depth_blur_left_mix": (float, 0.5),
         "selected_depth_map": (str, ""),
+        "left_border": (float, 0.0),
+        "right_border": (float, 0.0),
+        "manual_border": (bool, False),
         # Add future keys here
     }
 
