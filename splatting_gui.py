@@ -502,6 +502,11 @@ class SplatterGUI(ThemedTk):
         "DEPTH_DILATE_LEFT": "0",
         "DEPTH_BLUR_LEFT": "0",
         "DEPTH_BLUR_LEFT_MIX": "0.5",
+        "BORDER_WIDTH": "0.0",
+        "BORDER_BIAS": "0.0",
+        "BORDER_LEFT": "0.0",
+        "BORDER_RIGHT": "0.0",
+        "BORDER_MANUAL": False,
     }
     # ---------------------------------------
     # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
@@ -519,6 +524,9 @@ class SplatterGUI(ThemedTk):
         "frame_overlap": "FRAME_OVERLAP",
         "input_bias": "INPUT_BIAS",
         "selected_depth_map": "SELECTED_DEPTH_MAP",
+        "left_border": "BORDER_LEFT",
+        "right_border": "BORDER_RIGHT",
+        "manual_border": "BORDER_MANUAL",
     }
     MOVE_TO_FINISHED_ENABLED = True
     # ---------------------------------------
@@ -728,6 +736,20 @@ class SplatterGUI(ThemedTk):
         self.auto_save_sidecar_var = tk.BooleanVar(
             value=self.app_config.get("auto_save_sidecar", False)
         )
+        self.border_width_var = tk.StringVar(
+            value=self.app_config.get("border_width", defaults["BORDER_WIDTH"])
+        )
+        self.border_bias_var = tk.StringVar(
+            value=self.app_config.get("border_bias", defaults["BORDER_BIAS"])
+        )
+        self.border_manual_var = tk.BooleanVar(
+            value=bool(self.app_config.get("border_manual", defaults["BORDER_MANUAL"]))
+        )
+        # Add traces for automatic border calculation
+        self.zero_disparity_anchor_var.trace_add(
+            "write", self._on_convergence_or_disparity_changed
+        )
+        self.max_disp_var.trace_add("write", self._on_convergence_or_disparity_changed)
 
         # --- NEW: Previewer Variables ---
         self.preview_source_var = tk.StringVar(
@@ -1075,6 +1097,62 @@ class SplatterGUI(ThemedTk):
         if self.multi_map_var.get():
             # Re-scan if Multi-Map is enabled
             self._scan_depth_map_folders()
+
+    def _on_convergence_or_disparity_changed(self, *args):
+        """Web of traces: Update border width when convergence or disparity changes, if not in manual mode."""
+        if not hasattr(self, "border_manual_var") or self.border_manual_var.get():
+            return
+
+        try:
+            # width = (1.0 - convergence) * 2.0 * (max_disp / 20.0)
+            c_val = self.zero_disparity_anchor_var.get()
+            d_val = self.max_disp_var.get()
+            if not c_val or not d_val:
+                return
+            c = float(c_val)
+            d = float(d_val)
+
+            width = max(0.0, (1.0 - c) * 2.0 * (d / 20.0))
+            width = min(5.0, width)
+
+            self.border_width_var.set(f"{width:.2f}")
+            self.border_bias_var.set("0.0")
+
+            if (
+                hasattr(self, "set_border_width_programmatically")
+                and self.set_border_width_programmatically
+            ):
+                self.set_border_width_programmatically(width)
+            if (
+                hasattr(self, "set_border_bias_programmatically")
+                and self.set_border_bias_programmatically
+            ):
+                self.set_border_bias_programmatically(0.0)
+        except (ValueError, TypeError):
+            pass
+
+    def _on_border_manual_toggle(self):
+        """Called when the 'Border' manual control checkbox is toggled."""
+        is_manual = self.border_manual_var.get()
+        state = "normal" if is_manual else "disabled"
+
+        # Find and disable/enable the slider widgets within our custom frame
+        if hasattr(self, "border_sliders_row_frame"):
+            for subframe in self.border_sliders_row_frame.winfo_children():
+                for child in subframe.winfo_children():
+                    # Both tk.Scale and ttk.Scale are possible depending on theme
+                    if isinstance(child, (tk.Scale, ttk.Scale)):
+                        try:
+                            child.configure(state=state)
+                        except Exception:
+                            pass
+
+        if not is_manual:
+            # Re-apply calculated values immediately
+            self._on_convergence_or_disparity_changed()
+
+        # Update preview
+        self.on_slider_release()
 
     def _scan_depth_map_folders(self):
         """Scans the Input Depth Maps folder for subfolders containing *_depth.mp4 files."""
@@ -2223,6 +2301,55 @@ class SplatterGUI(ThemedTk):
         )
         self.set_convergence_value_programmatically = setter_func_conv
         all_settings_row += 1
+
+        # Border Width & Bias Sliders
+        border_sliders_row_frame = ttk.Frame(self.depth_all_settings_frame)
+        self.border_sliders_row_frame = border_sliders_row_frame
+        border_sliders_row_frame.grid(
+            row=all_settings_row, column=0, columnspan=3, sticky="ew"
+        )
+        border_sliders_row_frame.grid_columnconfigure(0, weight=1)
+        border_sliders_row_frame.grid_columnconfigure(1, weight=1)
+
+        border_width_subframe = ttk.Frame(border_sliders_row_frame)
+        border_width_subframe.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        border_width_subframe.grid_columnconfigure(1, weight=1)
+
+        border_bias_subframe = ttk.Frame(border_sliders_row_frame)
+        border_bias_subframe.grid(row=0, column=1, sticky="ew")
+        border_bias_subframe.grid_columnconfigure(1, weight=1)
+
+        self.set_border_width_programmatically = (
+            create_single_slider_with_label_updater(
+                self,
+                border_width_subframe,
+                "Border Width:",
+                self.border_width_var,
+                0.0,
+                5.0,
+                0,
+                decimals=2,
+                tooltip_key="border_width",
+                trough_increment=0.1,
+                step_size=0.01,
+                default_value=0.0,
+            )
+        )
+        self.set_border_bias_programmatically = create_single_slider_with_label_updater(
+            self,
+            border_bias_subframe,
+            "Bias:",
+            self.border_bias_var,
+            -1.0,
+            1.0,
+            0,
+            decimals=2,
+            tooltip_key="border_bias",
+            trough_increment=0.1,
+            step_size=0.01,
+            default_value=0.0,
+        )
+        all_settings_row += 1
         # --- Global Normalization + Resume (packed in a sub-frame so slider columns stay aligned) ---
         checkbox_row = ttk.Frame(self.depth_all_settings_frame)
         checkbox_row.grid(
@@ -2320,6 +2447,16 @@ class SplatterGUI(ThemedTk):
         )
         self.depth_pop_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.depth_pop_checkbox, "depth_pop_readout")
+
+        self.border_manual_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="Border",
+            variable=self.border_manual_var,
+            takefocus=False,
+            command=self._on_border_manual_toggle,
+        )
+        self.border_manual_checkbox.pack(side="left", padx=(24, 0))
+        self._create_hover_tooltip(self.border_manual_checkbox, "border_manual")
         all_settings_row += 1
 
         current_row = 0  # Reset for next frame
@@ -3984,6 +4121,12 @@ class SplatterGUI(ThemedTk):
                 "depth_blur_size_y": safe_float_conversion(self.depth_blur_size_y_var),
                 "depth_dilate_left": safe_float_conversion(self.depth_dilate_left_var),
                 "depth_blur_left": safe_float_conversion(self.depth_blur_left_var),
+                "depth_blur_left_mix": safe_float_conversion(
+                    self.depth_blur_left_mix_var
+                ),
+                "border_width": safe_float_conversion(self.border_width_var),
+                "border_bias": safe_float_conversion(self.border_bias_var),
+                "border_manual": self.border_manual_var.get(),
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 "enable_global_norm": self.enable_global_norm_var.get(),
@@ -6037,6 +6180,35 @@ class SplatterGUI(ThemedTk):
             # Apply low-res specific post-processing
             right_eye_tensor = right_eye_tensor_raw
 
+        # --- Apply black borders for Anaglyph and Wigglegram ---
+        if preview_source in [
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Wigglegram",
+        ]:
+            bw = params.get("border_width", 0.0)
+            bb = params.get("border_bias", 0.0)
+
+            if bb <= 0:
+                l_pct = bw
+                r_pct = bw * (1.0 + bb)
+            else:
+                r_pct = bw
+                l_pct = bw * (1.0 - bb)
+
+            l_px = int(round(l_pct * W_target / 100.0))
+            r_px = int(round(r_pct * W_target / 100.0))
+
+            if l_px > 0:
+                # Left eye: Opaque black border on the left side
+                # left_eye_tensor_resized is (1, 3, H, W)
+                left_eye_tensor_resized[:, :, :, :l_px] = 0.0
+            if r_px > 0:
+                # Right eye: Opaque black border on the right side
+                # right_eye_tensor is (1, 3, H, W)
+                right_eye_tensor[:, :, :, -r_px:] = 0.0
+
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor.cpu()
         elif (
@@ -6193,12 +6365,22 @@ class SplatterGUI(ThemedTk):
         self.dual_output_var.set(False)
         self.enable_global_norm_var.set(False)
         self.zero_disparity_anchor_var.set("0.5")
+        self.enable_sidecar_gamma_var.set(True)
+        self.enable_sidecar_blur_dilate_var.set(True)
+
+        self.border_manual_var.set(False)
+        self.border_width_var.set("0.0")
+        self.border_bias_var.set("0.0")
+
         self.output_crf_var.set("23")
         self.output_crf_full_var.set("23")
         self.output_crf_low_var.set("23")
         self.move_to_finished_var.set(True)
 
+        # Ensure UI/Toggles match the new reset states
         self.toggle_processing_settings_fields()
+        self._on_border_manual_toggle()
+        self.on_slider_release()
         self._save_config()
         self.clear_processing_info()
         self.status_label.config(text="Settings reset to defaults.")
@@ -6681,6 +6863,24 @@ class SplatterGUI(ThemedTk):
                 "depth_blur_left_mix": float(self.depth_blur_left_mix_var.get()),
                 "selected_depth_map": self.selected_depth_map_var.get(),
             }
+
+            # Convert Border Width/Bias to Left/Right for storage
+            w = float(self.border_width_var.get())
+            b = float(self.border_bias_var.get())
+            if b <= 0:
+                left_b = w
+                right_b = w * (1.0 + b)
+            else:
+                right_b = w
+                left_b = w * (1.0 - b)
+
+            gui_save_data.update(
+                {
+                    "left_border": round(left_b, 3),
+                    "right_border": round(right_b, 3),
+                    "manual_border": self.border_manual_var.get(),
+                }
+            )
         except ValueError:
             logger.error("Sidecar Save: Invalid input value in GUI. Skipping save.")
             if not is_auto_save:
@@ -7769,6 +7969,34 @@ class SplatterGUI(ThemedTk):
                 # Do not allow sidecar to override manual click after this point
                 self._suppress_sidecar_map_update = True
 
+        # --- Border Settings ---
+        self.border_manual_var.set(sidecar_config.get("manual_border", False))
+        left_b = sidecar_config.get("left_border", 0.0)
+        right_b = sidecar_config.get("right_border", 0.0)
+
+        # Convert back to width/bias
+        w = max(left_b, right_b)
+        if w > 0:
+            if left_b > right_b:
+                b = (right_b / left_b) - 1.0
+            elif right_b > left_b:
+                b = 1.0 - (left_b / right_b)
+            else:
+                b = 0.0
+        else:
+            b = 0.0
+
+        self.border_width_var.set(f"{w:.2f}")
+        self.border_bias_var.set(f"{b:.2f}")
+
+        if self.set_border_width_programmatically:
+            self.set_border_width_programmatically(w)
+        if self.set_border_bias_programmatically:
+            self.set_border_bias_programmatically(b)
+
+        # Ensure UI state matches restored manual flag
+        self._on_border_manual_toggle()
+
         # --- FIX: Refresh slider labels after restoring sidecar values ---
         if hasattr(self, "slider_label_updaters"):
             for updater in self.slider_label_updaters:
@@ -7831,7 +8059,7 @@ class SplatterGUI(ThemedTk):
         if is_sidecar_present:
             title = "Overwrite Sidecar File?"
             message = (
-                f"This will overwrite parameters (Convergence, Disparity, Gamma) "
+                f"This will overwrite parameters (Convergence, Disparity, Gamma, Borders) "
                 f"in the existing sidecar file:\n\n{os.path.basename(json_sidecar_path)}\n\n"
                 f"Do you want to continue?"
             )
