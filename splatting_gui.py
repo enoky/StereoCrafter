@@ -471,7 +471,7 @@ class FusionSidecarGenerator:
             else:
                 # Append index if multiple markers (5-digit zero-padded)
                 base, ext = os.path.splitext(custom_save_path)
-                target_filename = f"{base}_{i + 1:05d}{ext}"
+                target_filename = f"{base}_{i + 1:04d}{ext}"
 
             if not self.sidecar_manager.save_sidecar_data(
                 target_filename, sidecar_data
