@@ -1259,9 +1259,17 @@ class SplatterGUI(ThemedTk):
                     self._sync_sliders_to_auto_borders(l_val, r_val)
                 else:
                     # No data, perform scan
-                    self._scan_borders_for_current_clip()
+                    scan_result = self._scan_borders_for_current_clip()
+                    if scan_result:
+                        l_val, r_val = scan_result
+                        self._sync_sliders_to_auto_borders(l_val, r_val)
+                        self._save_current_sidecar_data(is_auto_save=True)
             else:
-                self._scan_borders_for_current_clip()
+                scan_result = self._scan_borders_for_current_clip()
+                if scan_result:
+                    l_val, r_val = scan_result
+                    self._sync_sliders_to_auto_borders(l_val, r_val)
+                    self._save_current_sidecar_data(is_auto_save=True)
         elif mode == "Off":
             self.border_width_var.set("0.0")
             self.border_bias_var.set("0.0")
