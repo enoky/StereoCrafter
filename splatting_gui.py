@@ -1013,12 +1013,13 @@ class SplatterGUI(ThemedTk):
         #     self._adjust_window_height_for_content()
 
     def _auto_converge_worker(
-        self, depth_map_path, process_length, batch_size, fallback_value, mode
+        self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, mode
     ):
         """Worker thread for running the Auto-Convergence calculation."""
 
-        # Run the existing auto-convergence logic (no mode parameter needed now)
+        # Run the NEW auto-convergence logic using Neural Estimator
         new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
+            rgb_path,
             depth_map_path,
             process_length,
             batch_size,
@@ -1035,6 +1036,115 @@ class SplatterGUI(ThemedTk):
                 mode,  # Still pass the current mode to know which value to select immediately
             ),
         )
+
+    def _determine_auto_convergence(
+        self,
+        rgb_path: str,
+        depth_map_path: str,
+        process_length: int,
+        batch_size: int,
+        fallback_value: float = 0.5,
+    ) -> Tuple[float, float]:
+        """
+        Uses the ConvergenceEstimator (U2NETP) to recommend a zero-parallax plane.
+        Returns: (average_convergence, peak_convergence)
+        """
+        if hasattr(self, "stop_event") and not self.stop_event:
+            self.stop_event = threading.Event()
+        
+        # Initialize Estimator
+        try:
+            # Lazy import to avoid circular dependency issues
+            from dependency.convergence_estimator import ConvergenceEstimator
+            estimator = ConvergenceEstimator()
+            if estimator.model is None:
+                 logger.error("ConvergenceEstimator model failed to load. Using fallback.")
+                 return fallback_value, fallback_value
+        except ImportError as e:
+            logger.error(f"Could not import ConvergenceEstimator: {e}")
+            return fallback_value, fallback_value
+            
+        try:
+            # Initialize Readers
+            # Use CPU context for safety and simplicity in this thread
+            vr_rgb = VideoReader(rgb_path, ctx=cpu(0))
+            vr_depth = VideoReader(depth_map_path, ctx=cpu(0))
+            
+            len_rgb = len(vr_rgb)
+            len_depth = len(vr_depth)
+            
+            # Sanity check
+            if len_rgb == 0 or len_depth == 0:
+                logger.warning("Empty video or depth map found.")
+                return fallback_value, fallback_value
+                
+            total_frames = min(len_rgb, len_depth)
+            
+            # Respect process_length if set > 0
+            if process_length > 0:
+                total_frames = min(total_frames, process_length)
+
+            # Sample frames (e.g., every 6 frames, 4 times per second at 24fps)
+            # This provides better coverage than a fixed small number
+            sample_stride = 6
+            indices = list(range(0, total_frames, sample_stride))
+            
+            # Ensure at least one frame is sampled
+            if not indices:
+                indices = [0]
+            
+            estimates = []
+            
+            logger.info(f"Auto-Converge: Sampling {len(indices)} frames from {os.path.basename(rgb_path)}...")
+
+            for idx in indices:
+                if self.stop_event.is_set():
+                    logger.info("Auto-Converge scan cancelled.")
+                    break
+                    
+                # Read RGB
+                rgb_frame = vr_rgb[idx].asnumpy() # H, W, 3 (uint8)
+                # Read Depth
+                depth_frame = vr_depth[idx].asnumpy() # H, W, C or H, W
+                
+                # Preprocess for Torch
+                # RGB: 0-255 -> 0-1, Permute to C, H, W
+                # ToTensor handles /255 but here we do manual for clarity/control over numpy
+                rgb_t = torch.from_numpy(rgb_frame).float().permute(2, 0, 1) / 255.0
+                
+                # Depth: Handle various formats (Gray8, Gray16, RGB-encoding)
+                if depth_frame.ndim == 3:
+                     # If it looks like RGB depth (grayscale repeated), take mean
+                     depth_mono = depth_frame.mean(axis=2)
+                else:
+                     depth_mono = depth_frame
+                
+                depth_t = torch.from_numpy(depth_mono).float()
+                # Normalize if not 0-1
+                if depth_t.max() > 1.0:
+                    depth_t = depth_t / 255.0
+                
+                # Format: 1, C, H, W
+                depth_t = depth_t.unsqueeze(0).unsqueeze(0) 
+                rgb_b = rgb_t.unsqueeze(0) 
+                
+                # Predict
+                res = estimator.predict(rgb_b, depth_t)
+                estimates.extend(res)
+                
+            if not estimates:
+                return fallback_value, fallback_value
+                
+            avg_val = sum(estimates) / len(estimates)
+            # Using Max as 'Peak' estimate
+            peak_val = max(estimates)
+            
+            logger.info(f"Auto-Converge Result: Avg={avg_val:.3f}, Peak={peak_val:.3f}")
+            return avg_val, peak_val
+
+        except Exception as e:
+            logger.error(f"Auto convergence determination failed: {e}", exc_info=True)
+            return fallback_value, fallback_value
 
     def _auto_save_current_sidecar(self):
         """
@@ -3926,179 +4036,7 @@ class SplatterGUI(ThemedTk):
 
         return True
 
-    def _determine_auto_convergence(
-        self,
-        depth_map_path: str,
-        total_frames_to_process: int,
-        batch_size: int,
-        fallback_value: float,
-    ) -> Tuple[float, float]:
-        """
-        Calculates the Auto Convergence points for the entire video (Average and Peak)
-        in a single pass.
-
-        Args:
-            fallback_value (float): The current GUI/Sidecar value to return if auto-convergence fails.
-
-        Returns:
-            Tuple[float, float]: (new_anchor_avg: 0.0-1.0, new_anchor_peak: 0.0-1.0).
-                                 Returns (fallback_value, fallback_value) if the process fails.
-        """
-        logger.info(
-            "==> Starting Auto-Convergence pre-pass to determine global average and peak depth."
-        )
-
-        # --- Constants for Auto-Convergence Logic ---
-        BLUR_KERNEL_SIZE = 9
-        CENTER_CROP_PERCENT = 0.75
-        MIN_VALID_PIXELS = 5
-        # The offset is only applied at the end for the 'Average' mode.
-        INTERNAL_ANCHOR_OFFSET = 0.1
-        # -------------------------------------------
-
-        all_valid_frame_values = []
-        fallback_tuple = (fallback_value, fallback_value)  # Value to return on failure
-
-        try:
-            # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
-            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
-            if len(depth_reader) == 0:
-                logger.error(
-                    "Depth map reader has no frames. Cannot calculate Auto-Convergence."
-                )
-                return fallback_tuple
-        except Exception as e:
-            logger.error(
-                f"Error initializing depth map reader for Auto-Convergence: {e}"
-            )
-            return fallback_tuple
-
-        # 2. Iterate and Collect Data
-
-        video_length = len(depth_reader)
-        if total_frames_to_process <= 0 or total_frames_to_process > video_length:
-            num_frames = video_length
-        else:
-            num_frames = total_frames_to_process
-
-        logger.debug(
-            f"  AutoConv determined actual frames to process: {num_frames} (from input length {total_frames_to_process})."
-        )
-
-        for i in range(0, num_frames, batch_size):
-            if self.stop_event.is_set():
-                logger.warning("Auto-Convergence pre-pass stopped by user.")
-                return fallback_tuple
-
-            current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
-            if not current_frame_indices:
-                break
-
-            # CRITICAL FIX: Ensure seeking/reading works
-            try:
-                depth_reader.seek(current_frame_indices[0])
-                batch_depth_numpy_raw = depth_reader.get_batch(
-                    current_frame_indices
-                ).asnumpy()
-            except Exception as e:
-                logger.error(
-                    f"Error seeking/reading depth map batch starting at index {i}: {e}. Skipping batch."
-                )
-                continue
-
-            # Process depth frames (Grayscale, Float conversion)
-            if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
-                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
-            elif (
-                batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1
-            ):
-                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
-            else:
-                batch_depth_numpy = batch_depth_numpy_raw
-
-            batch_depth_float = batch_depth_numpy.astype(np.float32)
-
-            # Get chunk min/max for normalization (using the chunk's range)
-            min_val = batch_depth_float.min()
-            max_val = batch_depth_float.max()
-
-            if max_val - min_val > 1e-5:
-                batch_depth_normalized = (batch_depth_float - min_val) / (
-                    max_val - min_val
-                )
-            else:
-                batch_depth_normalized = np.full_like(
-                    batch_depth_float, fill_value=0.5, dtype=np.float32
-                )
-
-            # Frame-by-Frame Processing (Blur & Crop)
-            for j, frame in enumerate(batch_depth_normalized):
-                current_frame_idx = current_frame_indices[j]
-                H, W = frame.shape
-
-                # a) Blur
-                frame_blurred = cv2.GaussianBlur(
-                    frame, (BLUR_KERNEL_SIZE, BLUR_KERNEL_SIZE), 0
-                )
-
-                # b) Center Crop (75% of H and W)
-                margin_h = int(H * (1 - CENTER_CROP_PERCENT) / 2)
-                margin_w = int(W * (1 - CENTER_CROP_PERCENT) / 2)
-
-                cropped_frame = frame_blurred[
-                    margin_h : H - margin_h, margin_w : W - margin_w
-                ]
-
-                # c) Average (Exclude true black/white pixels (0.0 or 1.0) which may be background/edges)
-                valid_pixels = cropped_frame[
-                    (cropped_frame > 0.001) & (cropped_frame < 0.999)
-                ]
-
-                if valid_pixels.size > MIN_VALID_PIXELS:
-                    # Append the mean of the valid pixels for this frame
-                    all_valid_frame_values.append(valid_pixels.mean())
-                else:
-                    # FALLBACK FOR THE FRAME: Use the mean of the WHOLE cropped, blurred frame
-                    all_valid_frame_values.append(cropped_frame.mean())
-                    logger.warning(
-                        f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}). Forcing mean from full cropped frame."
-                    )
-
-            draw_progress_bar(
-                i + len(current_frame_indices),
-                num_frames,
-                prefix="  Auto-Conv Pre-Pass:",
-            )
-
-        # 3. Final Temporal Calculations
-        if all_valid_frame_values:
-            valid_values_np = np.array(all_valid_frame_values)
-
-            # Calculate final RAW values (Temporal Mean and Temporal Max)
-            raw_anchor_avg = np.mean(valid_values_np)
-            raw_anchor_peak = np.max(valid_values_np)
-
-            # Apply Offset only for Average mode
-            final_anchor_avg_offset = raw_anchor_avg + INTERNAL_ANCHOR_OFFSET
-
-            # Clamp to the valid range [0.0, 1.0]
-            final_anchor_avg = np.clip(final_anchor_avg_offset, 0.0, 1.0)
-            final_anchor_peak = np.clip(raw_anchor_peak, 0.0, 1.0)
-
-            logger.info(
-                f"\n==> Auto-Convergence Calculated: Avg={raw_anchor_avg:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Avg {final_anchor_avg:.4f}"
-            )
-            logger.info(
-                f"==> Auto-Convergence Calculated: Peak={raw_anchor_peak:.4f} = Final Peak {final_anchor_peak:.4f}"
-            )
-
-            # Return both calculated values
-            return float(final_anchor_avg), float(final_anchor_peak)
-        else:
-            logger.warning(
-                "\n==> Auto-Convergence failed: No valid frames found. Using fallback value."
-            )
-            return fallback_tuple
+    # _determine_auto_convergence definition removed (moved to earlier in file)
 
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
@@ -5566,6 +5504,7 @@ class SplatterGUI(ThemedTk):
                 anchor_float = 0.5
 
             new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
+                video_path,
                 actual_depth_map_path,
                 settings["process_length"],
                 settings["full_res_batch_size"],
@@ -7002,10 +6941,16 @@ class SplatterGUI(ThemedTk):
             self._auto_conv_cache = {"Average": None, "Peak": None}
             self._auto_conv_cached_path = None
 
-        if not single_video_path or not single_depth_path:
+        # Validate paths
+        if (
+            not isinstance(single_video_path, str)
+            or not os.path.exists(single_video_path)
+            or not isinstance(single_depth_path, str)
+            or not os.path.exists(single_depth_path)
+        ):
             messagebox.showerror(
                 "Auto-Converge Preview Error",
-                "Could not get both video and depth map paths from previewer.",
+                f"Invalid video or depth map path.\nVideo: {single_video_path}\nDepth: {single_depth_path}",
             )
             if force_run:
                 self.auto_convergence_combo.set("Off")
@@ -7036,7 +6981,9 @@ class SplatterGUI(ThemedTk):
         )
 
         # Start the calculation in a new thread
+        # Start the calculation in a new thread
         worker_args = (
+            single_video_path,
             single_depth_path,
             process_length,
             batch_size,
