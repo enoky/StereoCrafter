@@ -1882,7 +1882,14 @@ class SplatterGUI(ThemedTk):
                 self._auto_conv_cached_path = depth_map_path
 
             # 2. Determine which value to apply immediately (based on the current 'mode' selection)
-            anchor_to_apply = new_anchor_avg if mode == "Average" else new_anchor_peak
+            if mode == "Average":
+                anchor_to_apply = new_anchor_avg
+            elif mode == "Peak":
+                anchor_to_apply = new_anchor_peak
+            elif mode == "Hybrid":
+                anchor_to_apply = (new_anchor_avg + new_anchor_peak) / 2.0
+            else:
+                anchor_to_apply = fallback_value
 
             # 3. Update the Tkinter variable and refresh the slider/label
 
@@ -2371,7 +2378,7 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo = ttk.Combobox(
             self.auto_conv_frame,
             textvariable=self.auto_convergence_mode_var,
-            values=["Off", "Average", "Peak"],
+            values=["Off", "Average", "Peak", "Hybrid"],
             state="readonly",
             width=10,
         )
@@ -5128,10 +5135,17 @@ class SplatterGUI(ThemedTk):
             logger.warning("Auto-Converge calculation is already running. Please wait.")
             return
 
-        if self._auto_conv_cache[mode] is not None:
-            # Value is cached, apply it immediately
-            cached_value = self._auto_conv_cache[mode]
+        # Check cache logic
+        cached_value = None
+        if mode == "Hybrid":
+             if self._auto_conv_cache.get("Average") is not None and self._auto_conv_cache.get("Peak") is not None:
+                 cached_value = (self._auto_conv_cache["Average"] + self._auto_conv_cache["Peak"]) / 2.0
+        elif self._auto_conv_cache.get(mode) is not None:
+             cached_value = self._auto_conv_cache[mode]
 
+        if cached_value is not None:
+            # Value is cached, apply it immediately
+            
             # 1. Set the Tkinter variable to the cached value (needed for the setter)
             self.zero_disparity_anchor_var.set(f"{cached_value:.2f}")
 
@@ -5510,9 +5524,14 @@ class SplatterGUI(ThemedTk):
                 settings["full_res_batch_size"],
                 anchor_float,
             )
-            new_anchor_val = (
-                new_anchor_avg if auto_conv_mode == "Average" else new_anchor_peak
-            )
+            if auto_conv_mode == "Average":
+                new_anchor_val = new_anchor_avg
+            elif auto_conv_mode == "Peak":
+                new_anchor_val = new_anchor_peak
+            elif auto_conv_mode == "Hybrid":
+                new_anchor_val = (new_anchor_avg + new_anchor_peak) / 2.0
+            else:
+                new_anchor_val = float(current_zero_disparity_anchor)
 
             if new_anchor_val != current_zero_disparity_anchor:
                 current_zero_disparity_anchor = new_anchor_val
@@ -6920,7 +6939,7 @@ class SplatterGUI(ThemedTk):
                 return
             messagebox.showwarning(
                 "Auto-Converge Preview",
-                "Auto-Convergence Mode must be set to 'Average' or 'Peak'.",
+                "Auto-Convergence Mode must be set to 'Average', 'Peak', or 'Hybrid'.",
             )
             return
 
