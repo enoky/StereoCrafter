@@ -82,7 +82,7 @@ cython_debug/
 outputs/
 weights/
 old/
-
+temp/
 
 
 config.json
