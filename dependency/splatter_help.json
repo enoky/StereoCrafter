@@ -19,6 +19,7 @@
     "dual_output": "If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.",
     "splat_test": "Saves an SBS PNG image and separate render/preview splat images. For testing Preview/Render Parity.",
     "map_test": "Saves an SBS PNG image and separate render/preview depthmap images. For testing Preview/Render Parity.",
+    "track_dp_total_true_on_render": "When enabled, rendering tracks the true max disparity across all frames and saves it to sidecar + auto_pass_export.csv. Turn off to test baseline render speed.",
     "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
     "color_tags_mode": "Writes color metadata tags into output file headers (primaries/transfer/matrix/range). Auto uses detected tags when available; otherwise falls back to BT.709. This changes metadata only. Increases compatability.",
@@ -32,6 +33,7 @@
     "depth_blur_left_mix": "Controls the balance between horizontal and vertical Blur Left. 0.0 = all horizontal, 0.5 = 50/50, 1.0 = all vertical. Recommend .5",
     "depth_gamma": "Applies a non-linear adjustment to the depth map before normalization. above 1.0 moves the midground towards the camera. Below 1.0 move further away. Set to 1.0 to disable.",
     "max_disp": "Maximum disparity value as a percentage of the video's width x 20. Higher values result in more extreme parallax effects (depth shift). Example: '30.0' means a maximum of 1.5% shift horizontally at the forground. Shortcut: 4(-) and 6(+)",
+    "estimate_dp_total": "Estimate this clip’s actual Max Disparity by sampling 10 evenly spaced depth frames using current Convergence, Disparity, and Gamma settings. Seeds the Max readout; preview can still raise it if it finds higher.",
     "convergence_point": "Set to 1.0 will place depth inside the screen. 0.0 will give 100% pop out. StereoCrafter Default = 0.5, Recommend 0.8. Shortcut: 1(-) and 3(+)",
     "border_mode": "Select border calculation strategy. Manual: uses sliders. Auto Basic: calculates based on Disparity/Convergence. Auto Adv.: uses depth map sampling for independent borders. Shortcut: 2(Cycle).",
     "border_rescan": "Trigger a quick scan of the depth map edges to calculate clip-specific borders (every 5th frame). Auto-switches modes (Off -> Manual, Auto Basic -> Auto Adv).",
@@ -50,6 +52,7 @@
     "process_to": "Optional: Enter an ending video number (1-based) to stop processing at that point in the list. Leave empty to process to the end.",
     "stop_button": "Stops the currently running processing task cleanly.",
     "preview_auto_converge": "Runs the Auto-Convergence pre-pass on the current preview clip. The calculated value overrides the Convergence Point slider. Requires Auto-Convergence Mode to be 'Average' or 'Peak'.",
+    "auto_pass_button": "Runs through the Preview list (or From/To range), per clip: (1) Auto-Converge (Average/Peak/Hybrid unless Off), then (2) Auto-Border if Auto Basic or Auto Adv, then (3) saves sidecar with the computed convergence and borders plus your current slider settings. Auto-Border results are written into left_border/right_border (saved as Manual) so you can tweak them afterward. Takes map gamma into account. Best run once BEFORE specific scene edits.",
     "update_sidecar_button": "Saves/Edit the current depth setting to the to the sidecar file for inpainting_gui to process. Shortcut: Enter",
     "skip_lowres_preproc": "EXPERIMENTAL: Skip depthmap dilation/erosion/blur for low-res splatting. Also skips the resize to clip-resolution parity path for the low-res pass."
 }

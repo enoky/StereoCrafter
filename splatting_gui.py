@@ -1,6 +1,7 @@
 import gc
 import os
 import re
+import csv
 import cv2
 import glob
 import shutil
@@ -22,7 +23,7 @@ import time
 import logging
 from typing import Optional, Tuple, Any
 from PIL import Image
-import math  # <--- ADD THIS
+import math
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
@@ -85,7 +86,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-01-23.0"
+GUI_VERSION = "26-01-30.0"
 
 
 class FusionSidecarGenerator:
@@ -592,6 +593,18 @@ class SplatterGUI(ThemedTk):
         self.app_config = {}
         self.help_texts = {}
         self.sidecar_manager = SidecarConfigManager()
+        # Cache: estimated per-clip max Total(D+P) keyed by signature
+        self._dp_total_est_cache = {}
+
+        # Cache: measured (render-time) per-clip max Total(D+P) keyed by signature
+        self._dp_total_true_cache = {}
+        self._dp_total_true_active_sig = None
+        self._dp_total_true_active_val = None
+
+        # Cache: AUTO-PASS CSV rows (optional) keyed by depth_map basename
+        self._auto_pass_csv_cache = None
+        self._auto_pass_csv_path = None
+
 
         # --- NEW CACHE AND STATE ---
         self._auto_conv_cache = {"Average": None, "Peak": None}
@@ -706,6 +719,9 @@ class SplatterGUI(ThemedTk):
         self.skip_lowres_preproc_var = tk.BooleanVar(
             value=bool(self.app_config.get("skip_lowres_preproc", False))
         )
+
+        # Dev Tools: Render-time exact Max Total(D+P) tracking (toggle for perf testing; not saved)
+        self.track_dp_total_true_on_render_var = tk.BooleanVar(value=False)
 
         self.move_to_finished_var = tk.BooleanVar(
             value=self.app_config.get("move_to_finished", True)
@@ -1013,7 +1029,7 @@ class SplatterGUI(ThemedTk):
         #     self._adjust_window_height_for_content()
 
     def _auto_converge_worker(
-        self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, mode
+        self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode
     ):
         """Worker thread for running the Auto-Convergence calculation."""
 
@@ -1024,6 +1040,7 @@ class SplatterGUI(ThemedTk):
             process_length,
             batch_size,
             fallback_value,
+            gamma=gamma,
         )
 
         # Use self.after to safely update the GUI from the worker thread
@@ -1044,6 +1061,7 @@ class SplatterGUI(ThemedTk):
         process_length: int,
         batch_size: int,
         fallback_value: float = 0.5,
+        gamma: float = 1.0,
     ) -> Tuple[float, float]:
         """
         Uses the ConvergenceEstimator (U2NETP) to recommend a zero-parallax plane.
@@ -1124,6 +1142,17 @@ class SplatterGUI(ThemedTk):
                 if depth_t.max() > 1.0:
                     depth_t = depth_t / 255.0
                 
+
+                # Clamp and apply the same gamma curve used by the render path:
+                # 1 - (1 - depth) ** gamma
+                try:
+                    gamma_f = float(gamma)
+                except Exception:
+                    gamma_f = 1.0
+                depth_t = torch.clamp(depth_t, 0.0, 1.0)
+                if gamma_f != 1.0:
+                    depth_t = 1.0 - torch.pow((1.0 - depth_t), gamma_f)
+
                 # Format: 1, C, H, W
                 depth_t = depth_t.unsqueeze(0).unsqueeze(0) 
                 rgb_b = rgb_t.unsqueeze(0) 
@@ -1293,7 +1322,25 @@ class SplatterGUI(ThemedTk):
             c = float(c_val)
             d = float(d_val)
 
-            width = max(0.0, (1.0 - c) * 2.0 * (d / 20.0))
+
+            # TV-range 10-bit depth maps preserve the 64–940 code window; compensate so set_disparity feels the same as full-range.
+            tv_disp_comp = 1.0
+            try:
+                if getattr(self, "previewer", None) is not None:
+                    _bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    _dpath = getattr(self.previewer, "_depth_path", None)
+                    if _bd > 8 and _dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        if _dpath not in self._depth_color_range_cache:
+                            _info = get_video_stream_info(_dpath)
+                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                        if self._depth_color_range_cache.get(_dpath) == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+            width = max(0.0, (1.0 - c) * 2.0 * (d / 20.0) * tv_disp_comp)
             width = min(5.0, width)
 
             self.border_width_var.set(f"{width:.2f}")
@@ -1455,6 +1502,17 @@ class SplatterGUI(ThemedTk):
             conv = self._safe_float(self.zero_disparity_anchor_var, 0.5)
             max_disp = self._safe_float(self.max_disp_var, 20.0)
 
+            gamma = self._safe_float(self.depth_gamma_var, 1.0)
+
+            tv_disp_comp = 1.0
+            try:
+                _info = get_video_stream_info(depth_path)
+                if _infer_depth_bit_depth(_info) > 8 and str((_info or {}).get("color_range", "unknown")).lower() == "tv":
+                    tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+
             for i in range(0, total_frames, step):
                 if self.stop_event.is_set():
                     break
@@ -1474,9 +1532,16 @@ class SplatterGUI(ThemedTk):
                 d_L = np.percentile(L_sample, 99) / 255.0
                 d_R = np.percentile(R_sample, 99) / 255.0
 
+                # Apply the same gamma curve used by the render path
+                if gamma and float(gamma) != 1.0:
+                    d_L = float(np.clip(d_L, 0.0, 1.0))
+                    d_R = float(np.clip(d_R, 0.0, 1.0))
+                    d_L = 1.0 - (1.0 - d_L) ** float(gamma)
+                    d_R = 1.0 - (1.0 - d_R) ** float(gamma)
+
                 # Scaling matches Auto Basic but localized to depth
-                b_L = max(0.0, (d_L - conv) * 2.0 * (max_disp / 20.0))
-                b_R = max(0.0, (d_R - conv) * 2.0 * (max_disp / 20.0))
+                b_L = max(0.0, (d_L - conv) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+                b_R = max(0.0, (d_R - conv) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
 
                 max_L = max(max_L, b_L)
                 max_R = max(max_R, b_R)
@@ -1500,6 +1565,76 @@ class SplatterGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Border scan failed: {e}")
             self.status_label.config(text="Border scan failed.")
+            return None
+
+
+    def _scan_borders_for_depth_path(
+        self,
+        depth_map_path: str,
+        conv: float,
+        max_disp: float,
+        gamma: float = 1.0,
+    ) -> Optional[Tuple[float, float]]:
+        """Thread-safe helper for AUTO-PASS: scans a depth-map video and returns (L, R) border %."""
+        try:
+            vr_depth = VideoReader(depth_map_path, ctx=cpu(0))
+            total_frames = len(vr_depth)
+            if total_frames <= 0:
+                return None
+
+            step = 5
+            max_L = 0.0
+            max_R = 0.0
+
+            gamma_f = 1.0
+            try:
+                gamma_f = float(gamma)
+            except Exception:
+                gamma_f = 1.0
+
+
+            tv_disp_comp = 1.0
+            try:
+                _info = get_video_stream_info(depth_map_path)
+                if _infer_depth_bit_depth(_info) > 8 and str((_info or {}).get("color_range", "unknown")).lower() == "tv":
+                    tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+            for i in range(0, total_frames, step):
+                if hasattr(self, "stop_event") and self.stop_event and self.stop_event.is_set():
+                    break
+
+                frame_raw = vr_depth[i].asnumpy()
+                if frame_raw.ndim == 3:
+                    frame = frame_raw.mean(axis=2)
+                else:
+                    frame = frame_raw
+
+                L_sample = frame[:, :5]
+                R_sample = frame[:, -5:]
+
+                d_L = np.percentile(L_sample, 99) / 255.0
+                d_R = np.percentile(R_sample, 99) / 255.0
+
+                if gamma_f != 1.0:
+                    d_L = float(np.clip(d_L, 0.0, 1.0))
+                    d_R = float(np.clip(d_R, 0.0, 1.0))
+                    d_L = 1.0 - (1.0 - d_L) ** gamma_f
+                    d_R = 1.0 - (1.0 - d_R) ** gamma_f
+
+                b_L = max(0.0, (d_L - conv) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+                b_R = max(0.0, (d_R - conv) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+
+                max_L = max(max_L, b_L)
+                max_R = max(max_R, b_R)
+
+            max_L = min(5.0, round(float(max_L), 3))
+            max_R = min(5.0, round(float(max_R), 3))
+            return max_L, max_R
+
+        except Exception as e:
+            logger.error(f"Border scan failed: {e}")
             return None
 
     def _scan_depth_map_folders(self):
@@ -1947,8 +2082,22 @@ class SplatterGUI(ThemedTk):
 
     def _create_hover_tooltip(self, widget, key):
         """Creates a tooltip for a given widget based on a key from help_texts."""
-        if key in self.help_texts:
-            Tooltip(widget, self.help_texts[key])
+        if not key:
+            return
+        try:
+            # Try the provided key first, then a few common variants (no file writes).
+            candidates = [
+                key,
+                f"{key}_button" if not str(key).endswith("_button") else str(key).replace("_button", ""),
+                str(key).replace("btn_", ""),
+                str(key).replace("button_", ""),
+            ]
+            for k in candidates:
+                if k in self.help_texts:
+                    Tooltip(widget, self.help_texts[k])
+                    return
+        except Exception:
+            pass
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
@@ -2444,6 +2593,7 @@ class SplatterGUI(ThemedTk):
             values=["Manual", "Auto Basic", "Auto Adv.", "Off"],
             state="readonly",
             width=10,
+            takefocus=False,
         )
         self.combo_border_mode.pack(side="left")
 
@@ -2453,6 +2603,7 @@ class SplatterGUI(ThemedTk):
             text="⟳",  # Unicode rescan-like symbol
             width=2,
             command=self._on_border_rescan_click,
+            takefocus=False,
         )
         self.btn_border_rescan.pack(side="left", padx=(3, 0))
 
@@ -2644,6 +2795,21 @@ class SplatterGUI(ThemedTk):
                 default_value=30.0,
             )
         )
+
+        # --- Estimate Max Total(D+P) (quick sampled scan) ---
+        try:
+            self.btn_est_dp_total = ttk.Button(
+                disp_subframe,
+                text="≈",
+                width=2,
+                command=self.run_estimate_dp_total_max,
+                takefocus=False,
+            )
+            self.btn_est_dp_total.grid(row=0, column=3, sticky="w", padx=(6, 0))
+            if hasattr(self, "_create_hover_tooltip"):
+                self._create_hover_tooltip(self.btn_est_dp_total, "estimate_dp_total")
+        except Exception:
+            pass
         all_settings_row += 1
 
         # Convergence Point Slider
@@ -2963,6 +3129,14 @@ class SplatterGUI(ThemedTk):
         self.chk_skip_lowres_preproc.grid(row=0, column=0, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.chk_skip_lowres_preproc, "skip_lowres_preproc")
 
+
+        self.chk_track_dp_total_true = ttk.Checkbutton(
+            self.dev_tools_frame,
+            text="True Max",
+            variable=self.track_dp_total_true_on_render_var,
+        )
+        self.chk_track_dp_total_true.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=0)
+        self._create_hover_tooltip(self.chk_track_dp_total_true, "track_dp_total_true_on_render")
         self.chk_map_test = ttk.Checkbutton(
             self.dev_tools_frame,
             text="Map Test",
@@ -3040,11 +3214,22 @@ class SplatterGUI(ThemedTk):
             button_frame,
             text="Preview Auto-Converge",
             command=self.run_preview_auto_converge,
+            takefocus=False,
         )
         self.btn_auto_converge_preview.pack(side="left", padx=5)
         self._create_hover_tooltip(
             self.btn_auto_converge_preview, "preview_auto_converge"
         )
+
+        # --- AUTO-PASS Button ---
+        self.btn_auto_pass = ttk.Button(
+            button_frame,
+            text="AUTO-PASS",
+            command=self.run_auto_pass,
+            takefocus=False,
+        )
+        self.btn_auto_pass.pack(side="left", padx=(9, 9))
+        self._create_hover_tooltip(self.btn_auto_pass, "auto_pass_button")
 
         # --- Update Sidecar Button ---
         self.update_sidecar_button = ttk.Button(
@@ -3645,6 +3830,41 @@ class SplatterGUI(ThemedTk):
                 for d_frame in batch_depth_normalized:
                     # We keep this as float32 for the assembly to prevent 8-bit quantization
                     vis_gray_3ch = np.stack([d_frame] * 3, axis=-1)
+                    # Render-time: track measured per-clip max Total(D+P) (percent of width)
+                    # (Uses the same depth frames already being processed; no extra decode pass.)
+                    try:
+                        sig = getattr(self, "_dp_total_true_active_sig", None)
+                        _track_true = (
+                            getattr(self, "track_dp_total_true_on_render_var", None) is not None
+                            and self.track_dp_total_true_on_render_var.get()
+                        )
+                        if sig and _track_true:
+                            # Exclude hard holes (0 and 1) from min/max to avoid bogus extremes
+                            _min_arr = d_frame[d_frame > 0.001]
+                            _max_arr = d_frame[d_frame < 0.999]
+                            if _min_arr.size and _max_arr.size:
+                                dmin = float(_min_arr.min())
+                                dmax = float(_max_arr.max())
+                                # True max Total(D+P) (percent of width) for this frame
+                                # Uses full-frame min/max (holes excluded) with the same math as the preview overlay.
+                                _scale = 2.0 * float(max_disp) * 100.0 / float(d_frame.shape[1])
+                                _min_pct = (dmin - float(zero_disparity_anchor_val)) * _scale
+                                _max_pct = (dmax - float(zero_disparity_anchor_val)) * _scale
+                                _depth_pct = max(0.0, -_min_pct)
+                                _pop_pct = _max_pct
+                                total_pct = float(_depth_pct) + float(_pop_pct)
+
+                                cur = getattr(self, "_dp_total_true_active_val", None)
+                                if cur is None or total_pct > cur:
+                                    self._dp_total_true_active_val = float(total_pct)
+                                    try:
+                                        self._dp_total_true_cache[sig] = float(
+                                            self._dp_total_true_active_val
+                                        )
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
                     batch_depth_vis_list.append(vis_gray_3ch.astype("float32"))
 
                 batch_depth_vis = np.stack(batch_depth_vis_list, axis=0)
@@ -5417,6 +5637,8 @@ class SplatterGUI(ThemedTk):
         )
 
         processing_tasks = self._get_defined_tasks(settings)
+        has_low_res_task = any(t.get("is_low_res") for t in processing_tasks)
+        has_full_res_task = any(not t.get("is_low_res") for t in processing_tasks)
         expected_task_count = len(processing_tasks)
         processed_tasks_count = 0
         any_task_completed_successfully_for_this_video = False
@@ -5523,6 +5745,7 @@ class SplatterGUI(ThemedTk):
                 settings["process_length"],
                 settings["full_res_batch_size"],
                 anchor_float,
+                gamma=settings.get("depth_gamma", 1.0),
             )
             if auto_conv_mode == "Average":
                 new_anchor_val = new_anchor_avg
@@ -5818,7 +6041,15 @@ class SplatterGUI(ThemedTk):
                             f"This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned."
                         )
 
-            actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
+            tv_disp_comp = 1.0
+            if assume_raw_input_mode:
+                try:
+                    if _infer_depth_bit_depth(depth_stream_info) > 8 and str((depth_stream_info or {}).get("color_range", "unknown")).lower() == "tv":
+                        tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                except Exception:
+                    tv_disp_comp = 1.0
+
+            actual_percentage_for_calculation = (current_max_disparity_percentage / 20.0) * tv_disp_comp
             actual_max_disp_pixels = (
                 actual_percentage_for_calculation / 100.0
             ) * current_processed_width
@@ -5843,6 +6074,26 @@ class SplatterGUI(ThemedTk):
                 current_output_subdir, f"{video_name}.mp4"
             )
 
+            # Prepare signature for render-time Total(D+P) capture (for CSV/sidecar exact max update)
+            try:
+                _track_true = (
+                    getattr(self, "track_dp_total_true_on_render_var", None) is not None
+                    and self.track_dp_total_true_on_render_var.get()
+                )
+                if _track_true and ((has_full_res_task and (not task.get("is_low_res"))) or ((not has_full_res_task) and task.get("is_low_res"))):
+                    self._dp_total_true_active_sig = self._dp_total_signature(
+                        actual_depth_map_path,
+                        float(current_zero_disparity_anchor),
+                        float(current_max_disparity_percentage),
+                        float(current_depth_gamma),
+                    )
+                    self._dp_total_true_active_val = None
+                else:
+                    self._dp_total_true_active_sig = None
+                    self._dp_total_true_active_val = None
+            except Exception:
+                self._dp_total_true_active_sig = None
+                self._dp_total_true_active_val = None
             completed_splatting_task = self.depthSplatting(
                 input_video_reader=video_reader_input,
                 depth_map_reader=depth_reader_input,
@@ -5936,6 +6187,118 @@ class SplatterGUI(ThemedTk):
                     f"==> Splatted {task['name']} video saved for {video_name}."
                 )
                 any_task_completed_successfully_for_this_video = True
+
+                # Persist per-clip settings/metadata + (optional) render-time True Max into sidecar/CSV
+                try:
+                    # Capture any render-measured True Max Total(D+P)
+                    sig = getattr(self, "_dp_total_true_active_sig", None)
+                    dp_true = getattr(self, "_dp_total_true_active_val", None)
+                    if sig and dp_true is not None:
+                        self._dp_total_true_cache[sig] = float(dp_true)
+
+                    sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+                    depth_bn_noext = os.path.splitext(os.path.basename(actual_depth_map_path))[0]
+                    sidecar_folder = self._get_sidecar_base_folder()
+                    json_sidecar_path = os.path.join(sidecar_folder, f"{depth_bn_noext}{sidecar_ext}")
+
+                    sidecar_data = {}
+                    try:
+                        sidecar_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path) or {}
+                    except Exception:
+                        sidecar_data = {}
+
+                    # Always overwrite with the EFFECTIVE values used for THIS clip (avoid defaults leaking in)
+                    sidecar_data["convergence_plane"] = float(current_zero_disparity_anchor)
+                    sidecar_data["max_disparity"] = float(current_max_disparity_percentage)
+                    sidecar_data["gamma"] = float(f"{float(current_depth_gamma):.2f}")
+
+                    sidecar_data["depth_dilate_size_x"] = float(current_depth_dilate_size_x)
+                    sidecar_data["depth_dilate_size_y"] = float(current_depth_dilate_size_y)
+                    sidecar_data["depth_blur_size_x"] = float(current_depth_blur_size_x)
+                    sidecar_data["depth_blur_size_y"] = float(current_depth_blur_size_y)
+                    sidecar_data["depth_dilate_left"] = float(current_depth_dilate_left)
+                    sidecar_data["depth_blur_left"] = float(current_depth_blur_left)
+
+                    # Selected depth map (Multi-Map mode)
+                    try:
+                        if self.multi_map_var.get():
+                            base_depth = os.path.normpath(settings.get("input_depth_maps", "") or "")
+                            if base_depth:
+                                rel = os.path.relpath(os.path.normpath(actual_depth_map_path), base_depth)
+                                parts = rel.split(os.sep)
+                                if len(parts) > 1 and parts[0] not in (".", ""):
+                                    sidecar_data["selected_depth_map"] = parts[0]
+                    except Exception:
+                        pass
+
+                    # Auto Border: only compute/save when Auto is selected; otherwise preserve any existing per-clip borders.
+                    try:
+                        border_mode = self.border_mode_var.get()
+                    except Exception:
+                        border_mode = "Off"
+
+                    if border_mode in ("Auto Basic", "Auto Adv."):
+                        try:
+                            if border_mode == "Auto Basic":
+                                width = max(
+                                    0.0,
+                                    (1.0 - float(current_zero_disparity_anchor))
+                                    * 2.0
+                                    * (float(current_max_disparity_percentage) / 20.0) * tv_disp_comp,
+                                )
+                                sidecar_data["left_border"] = round(width, 3)
+                                sidecar_data["right_border"] = round(width, 3)
+                                sidecar_data["auto_border_L"] = sidecar_data["left_border"]
+                                sidecar_data["auto_border_R"] = sidecar_data["right_border"]
+                                sidecar_data["border_mode"] = border_mode
+                                logger.info(
+                                    f"Auto Border (Basic): left_border={sidecar_data['left_border']}, right_border={sidecar_data['right_border']}"
+                                )
+                            else:
+                                l_val, r_val = self._scan_borders_for_depth_path(
+                                    actual_depth_map_path,
+                                    float(current_zero_disparity_anchor),
+                                    float(current_max_disparity_percentage),
+                                    float(current_depth_gamma),
+                                )
+                                if l_val is not None and r_val is not None:
+                                    sidecar_data["left_border"] = round(float(l_val), 3)
+                                    sidecar_data["right_border"] = round(float(r_val), 3)
+                                    sidecar_data["auto_border_L"] = sidecar_data["left_border"]
+                                    sidecar_data["auto_border_R"] = sidecar_data["right_border"]
+                                    sidecar_data["border_mode"] = border_mode
+                                    logger.info(
+                                        f"Auto Border (Adv.): left_border={sidecar_data['left_border']}, right_border={sidecar_data['right_border']}"
+                                    )
+                        except Exception:
+                            pass
+
+                    # Persist render-measured True Max Total(D+P) into sidecar (and log the value) if available
+                    if dp_true is not None:
+                        try:
+                            sidecar_data["dp_total_max_true"] = round(float(dp_true), 3)
+                            logger.info(
+                                f"True Max Total(D+P): dp_total_max_true={sidecar_data['dp_total_max_true']:.3f}"
+                            )
+                        except Exception:
+                            pass
+
+                    # Save sidecar (create if missing)
+                    try:
+                        if not self.sidecar_manager.save_sidecar_data(json_sidecar_path, sidecar_data):
+                            logger.error(f"Failed to save sidecar: {os.path.basename(json_sidecar_path)}")
+                    except Exception:
+                        pass
+
+                    # Update CSV row (creates file on demand)
+                    self._auto_pass_csv_update_row_for_paths(
+                        source_video_path=video_path,
+                        depth_map_path=actual_depth_map_path,
+                        current_data=sidecar_data,
+                        dp_total_max_true=(float(dp_true) if dp_true is not None else None),
+                    )
+                except Exception:
+                    pass
 
                 if video_reader_input is not None:
                     del video_reader_input
@@ -6338,8 +6701,26 @@ class SplatterGUI(ThemedTk):
 
         disp_map_tensor = (disp_map_tensor - params["convergence_point"]) * 2.0
 
+        tv_disp_comp = 1.0
+        if not enable_global_norm:
+            try:
+                if getattr(self, "previewer", None) is not None:
+                    _bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    _dpath = getattr(self.previewer, "_depth_path", None)
+                    if _bd > 8 and _dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        if _dpath not in self._depth_color_range_cache:
+                            _info = get_video_stream_info(_dpath)
+                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                        if self._depth_color_range_cache.get(_dpath) == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+
         # Calculate disparity in pixels based on the TARGET width (W_target)
-        actual_max_disp_pixels = (params["max_disp"] / 20.0 / 100.0) * W_target
+        actual_max_disp_pixels = (params["max_disp"] / 20.0 / 100.0) * W_target * tv_disp_comp
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
         # Preview-only depth/pop separation metrics (percent of screen width)
@@ -6366,7 +6747,7 @@ class SplatterGUI(ThemedTk):
                         _disp_pct = (
                             (_ds - params["convergence_point"])
                             * 2.0
-                            * (params["max_disp"] / 20.0)
+                            * (params["max_disp"] / 20.0) * tv_disp_comp
                         )
                         _min_pct = float(_disp_pct.min())
                         _max_pct = float(_disp_pct.max())
@@ -6376,9 +6757,21 @@ class SplatterGUI(ThemedTk):
                         )  # screen-out (can be negative if all behind)
                     else:
                         _depth_pct, _pop_pct = 0.0, 0.0
-                    self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
+                    sig = None
+                    try:
+                        _dp_path = getattr(self.previewer, "_depth_path", "")
+                        sig = self._dp_total_signature(_dp_path, params.get("convergence_point", 0.0), params.get("max_disp", 0.0), params.get("depth_gamma", 1.0))
+                    except Exception:
+                        sig = None
+                    try:
+                        self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct, sig)
+                    except TypeError:
+                        self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
                 else:
-                    self.previewer.set_depth_pop_metrics(None, None)
+                    try:
+                        self.previewer.set_depth_pop_metrics(None, None, None)
+                    except TypeError:
+                        self.previewer.set_depth_pop_metrics(None, None)
         except Exception:
             pass
 
@@ -6979,6 +7372,7 @@ class SplatterGUI(ThemedTk):
             current_anchor = float(self.zero_disparity_anchor_var.get())
             process_length = int(self.process_length_var.get())
             batch_size = int(self.batch_size_var.get())
+            gamma = self._safe_float(self.depth_gamma_var, 1.0)
         except ValueError as e:
             messagebox.showerror(
                 "Auto-Converge Preview Error",
@@ -7007,12 +7401,689 @@ class SplatterGUI(ThemedTk):
             process_length,
             batch_size,
             current_anchor,
+            gamma,
             mode,
         )
         self.auto_converge_thread = threading.Thread(
             target=self._auto_converge_worker, args=worker_args
         )
         self.auto_converge_thread.start()
+
+    def _dp_total_signature(self, depth_path: str, conv: float, max_disp: float, gamma: float) -> str:
+        """Signature for caching Total(D+P) metrics.
+
+        IMPORTANT: Convergence changes should NOT invalidate the cached display/estimate.
+        Also tolerate older call sites that might accidentally swap (conv, max_disp).
+        """
+        try:
+            a = float(conv)
+            b = float(max_disp)
+
+            # If args look swapped (conv should be ~0..1, max_disp usually > 1), swap them.
+            if 0.0 <= a <= 1.0 and b > 1.0:
+                conv_val = a
+                max_disp_val = b
+            elif 0.0 <= b <= 1.0 and a > 1.0:
+                conv_val = b
+                max_disp_val = a
+            else:
+                conv_val = a
+                max_disp_val = b
+
+            # NOTE: conv_val intentionally excluded to prevent cache resets when convergence changes.
+            return f"{depth_path}|{float(max_disp_val):.4f}|{float(gamma):.4f}"
+        except Exception:
+            return str(depth_path)
+
+    def _estimate_dp_total_max_for_depth_video(
+        self,
+        depth_path: str,
+        convergence_point: float,
+        max_disp: float,
+        depth_gamma: float,
+        sample_frames: int = 10,
+        pixel_stride: int = 8,
+        total_frames_override: Optional[int] = None,
+        *,
+        params: Optional[dict] = None,
+    ) -> Optional[float]:
+        """
+        Estimates the maximum Total(D+P) for a clip by sampling frames.
+
+        IMPORTANT: This aims to match the preview/render math as closely as possible:
+          - Reads depth in RAW code values (10-bit stays 0..1023-ish, not RGB-expanded)
+          - Runs the same depth pre-processing (dilate/blur) used by preview/render
+          - Applies the same normalization policy and gamma curve:
+                depth = clip(depth, 0..1)
+                depth = 1 - (1 - depth) ** gamma
+        """
+        if not depth_path or not os.path.exists(depth_path):
+            return None
+
+        # Grab the same pre-proc knobs the preview pipeline uses (fallback to GUI vars if not provided).
+        p = params or {}
+
+        def _pfloat(key: str, default: float) -> float:
+            try:
+                v = p.get(key, default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        # NOTE: sidecars store these keys (depth_*) via _save_current_sidecar_data.
+        depth_dilate_size_x = _pfloat("depth_dilate_size_x", self._safe_float(self.depth_dilate_size_x_var))
+        depth_dilate_size_y = _pfloat("depth_dilate_size_y", self._safe_float(self.depth_dilate_size_y_var))
+        depth_blur_size_x = _pfloat("depth_blur_size_x", self._safe_float(self.depth_blur_size_x_var))
+        depth_blur_size_y = _pfloat("depth_blur_size_y", self._safe_float(self.depth_blur_size_y_var))
+        depth_dilate_left = _pfloat("depth_dilate_left", self._safe_float(self.depth_dilate_left_var))
+        depth_blur_left = _pfloat("depth_blur_left", self._safe_float(self.depth_blur_left_var))
+
+        # Gamma used for the estimator math (prefer explicit param dict if present).
+        try:
+            depth_gamma = float(p.get("depth_gamma", depth_gamma))
+        except Exception:
+            depth_gamma = float(depth_gamma)
+
+        # Build sample indices (evenly spaced, clamped)
+        total_frames = 0
+        try:
+            if total_frames_override is not None:
+                total_frames = int(total_frames_override)
+        except Exception:
+            total_frames = 0
+
+        if total_frames <= 0:
+            try:
+                tmp = VideoReader(depth_path, ctx=cpu(0))
+                total_frames = len(tmp)
+                del tmp
+            except Exception:
+                total_frames = 0
+
+        if total_frames <= 0:
+            return None
+
+        sample_frames = int(max(1, sample_frames))
+        if sample_frames >= total_frames:
+            indices = list(range(total_frames))
+        else:
+            indices = [int(round(i * (total_frames - 1) / (sample_frames - 1))) for i in range(sample_frames)]
+        # Ensure strictly increasing (helps the sequential reader)
+        indices = sorted(set(max(0, min(total_frames - 1, i)) for i in indices))
+
+        # Try to preserve RAW depth values (10-bit+) by using the same ffmpeg-backed reader used by render.
+        depth_stream_info = None
+        bit_depth = 8
+        pix_fmt = ""
+        try:
+            depth_stream_info = get_video_stream_info(depth_path)
+            bit_depth = _infer_depth_bit_depth(depth_stream_info)
+            pix_fmt = str((depth_stream_info or {}).get("pix_fmt", ""))
+        except Exception:
+            depth_stream_info = None
+            bit_depth = 8
+            pix_fmt = ""
+
+        # Determine an output size for sampling. If the previewer is active, match its current depth native size.
+        out_w = None
+        out_h = None
+        try:
+            if self.previewer is not None and getattr(self.previewer, "_depth_path", None) == depth_path:
+                out_w = int(getattr(self.previewer, "_depth_native_w", 0) or 0)
+                out_h = int(getattr(self.previewer, "_depth_native_h", 0) or 0)
+        except Exception:
+            out_w, out_h = None, None
+
+        # Fallback: take from ffprobe stream info
+        if not out_w or not out_h:
+            try:
+                out_w = int((depth_stream_info or {}).get("width", 0) or 0)
+                out_h = int((depth_stream_info or {}).get("height", 0) or 0)
+            except Exception:
+                out_w, out_h = 0, 0
+
+        if not out_w or not out_h:
+            return None
+
+        # We only need sampled frames; no need to match clip resolution here (keeps it fast).
+        # This still matches parity better than RGB-expanded reads.
+        try:
+            depth_reader, _, _, _, _ = load_pre_rendered_depth(
+                depth_map_path=depth_path,
+                process_length=-1,
+                target_height=out_h,
+                target_width=out_w,
+                match_resolution_to_target=False,
+            )
+        except Exception:
+            # Fallback to Decord if the ffmpeg-backed reader cannot be created.
+            try:
+                depth_reader = VideoReader(depth_path, ctx=cpu(0))
+            except Exception:
+                return None
+
+        max_total = None
+
+        # Optional: adopt the same "sidecar forces GN off" behavior used in preview.
+        enable_global_norm = bool(p.get("enable_global_norm", False))
+        try:
+            sidecar_folder = self._get_sidecar_base_folder()
+            depth_map_basename = os.path.splitext(os.path.basename(depth_path))[0]
+            sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+            json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
+            if os.path.exists(json_sidecar_path):
+                enable_global_norm = False
+        except Exception:
+            pass
+
+        # Fetch cached global min/max if GN is enabled (rare for estimator because sidecar usually exists).
+        global_min, global_max = 0.0, 1.0
+        if enable_global_norm:
+            try:
+                c = self._clip_norm_cache.get(depth_path)
+                if c:
+                    global_min = float(c.get("min", 0.0))
+                    global_max = float(c.get("max", 1.0))
+            except Exception:
+                global_min, global_max = 0.0, 1.0
+
+        for idx in indices:
+            try:
+                # Read raw frame as (1,H,W,1)
+                if hasattr(depth_reader, "seek"):
+                    depth_reader.seek(int(idx))
+                frame_np = depth_reader.get_batch([int(idx)]).asnumpy()
+
+                # Ensure numeric + channel-last gray
+                if frame_np.ndim == 3:
+                    # (1,H,W) -> (1,H,W,1)
+                    frame_np = frame_np[..., None]
+                elif frame_np.ndim == 4 and frame_np.shape[-1] >= 1:
+                    # If somehow RGB, take the first channel (depth stored as gray replicated)
+                    if frame_np.shape[-1] != 1:
+                        frame_np = frame_np[..., :1]
+                else:
+                    continue
+
+                frame_raw = frame_np.astype(np.float32, copy=False)
+
+                # Mirror preview: determine per-frame max content value (used in processing + normalization)
+                max_raw_content_value = float(np.max(frame_raw))
+                if max_raw_content_value < 1.0:
+                    max_raw_content_value = 1.0
+
+                # Pre-process (dilate/blur, left-edge ops) exactly like preview
+                try:
+                    processed = self._process_depth_batch(
+                        batch_depth_numpy_raw=frame_raw,
+                        depth_stream_info=depth_stream_info,
+                        depth_gamma=depth_gamma,
+                        depth_dilate_size_x=depth_dilate_size_x,
+                        depth_dilate_size_y=depth_dilate_size_y,
+                        depth_blur_size_x=depth_blur_size_x,
+                        depth_blur_size_y=depth_blur_size_y,
+                        is_low_res_task=False,
+                        max_raw_value=max_raw_content_value,
+                        global_depth_min=global_min,
+                        global_depth_max=global_max,
+                        depth_dilate_left=depth_dilate_left,
+                        depth_blur_left=depth_blur_left,
+                        debug_batch_index=0,
+                        debug_frame_index=int(idx),
+                        debug_task_name="EstimateMaxTotal",
+                    )
+                except Exception:
+                    processed = frame_raw  # fallback
+
+                # _process_depth_batch already returns normalized + gamma-applied depth in 0..1 (preview/render parity).
+                # Only fall back to manual scaling+gamma if the processor failed and returned raw code values.
+                try:
+                    if hasattr(processed, "ndim") and processed.ndim == 4:
+                        depth_norm = processed[0, ..., 0]
+                    elif hasattr(processed, "ndim") and processed.ndim == 3:
+                        depth_norm = processed[0, ...]
+                    else:
+                        depth_norm = processed
+                except Exception:
+                    depth_norm = processed[0, ..., 0]
+
+                try:
+                    maxv = float(np.max(depth_norm))
+                except Exception:
+                    maxv = 1.0
+
+                # If we're still in raw code space (e.g., 10-bit TV-range values ~64..940), scale using fixed ranges (NOT observed max).
+                if maxv > 1.5:
+                    if maxv <= 256.0:
+                        depth_norm = depth_norm / 255.0
+                    elif maxv <= 1024.0:
+                        depth_norm = depth_norm / 1023.0
+                    elif maxv <= 4096.0:
+                        depth_norm = depth_norm / 4095.0
+                    elif maxv <= 65536.0:
+                        depth_norm = depth_norm / 65535.0
+                    else:
+                        depth_norm = depth_norm / float(maxv)
+                    depth_norm = np.clip(depth_norm, 0.0, 1.0)
+                    if depth_gamma and abs(depth_gamma - 1.0) > 1e-6:
+                        inv = 1.0 - depth_norm
+                        inv = np.clip(inv, 0.0, 1.0)
+                        depth_norm = 1.0 - np.power(inv, float(depth_gamma))
+
+                depth_norm = np.clip(depth_norm, 0.0, 1.0)
+
+                # Compute Total(D+P) for this frame (match preview: stride sample + ignore holes)
+                ds = depth_norm[::max(1, int(pixel_stride)), ::max(1, int(pixel_stride))].astype(np.float32, copy=False)
+                valid = (ds > 0.001) & (ds < 0.999)
+                if not np.any(valid):
+                    continue
+                dmin = float(np.min(ds[valid]))
+                dmax = float(np.max(ds[valid]))
+
+                tv_disp_comp = 1.0
+                if not enable_global_norm:
+                    try:
+                        if _infer_depth_bit_depth(depth_stream_info) > 8 and str((depth_stream_info or {}).get("color_range", "unknown")).lower() == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                    except Exception:
+                        tv_disp_comp = 1.0
+
+                scale = 2.0 * (float(max_disp) / 20.0) * tv_disp_comp
+                min_pct = (dmin - float(convergence_point)) * scale
+                max_pct = (dmax - float(convergence_point)) * scale
+
+                depth_pct = abs(min_pct) if min_pct < 0 else 0.0
+                pop_pct = max_pct if max_pct > 0 else 0.0
+                total = float(depth_pct + pop_pct)
+
+                if max_total is None or total > max_total:
+                    max_total = total
+
+            except Exception:
+                continue
+
+        try:
+            if hasattr(depth_reader, "close"):
+                depth_reader.close()
+        except Exception:
+            pass
+
+        return max_total
+
+
+    def run_estimate_dp_total_max(self):
+        """Compute a quick sampled estimate of this clip's Max Total(D+P) and seed the overlay."""
+        try:
+            if getattr(self, "previewer", None) is None:
+                return
+            depth_path = getattr(self.previewer, "_depth_path", None)
+            if not depth_path:
+                return
+
+            try:
+                logger.info(f"Estimate Max Total(D+P): sampling clip depth map: {os.path.basename(depth_path)}")
+            except Exception:
+                pass
+
+            params = None
+            try:
+                # Use the same parameters the preview processing uses (includes sidecar overrides)
+                if getattr(self.previewer, "get_params_callback", None):
+                    params = self.previewer.get_params_callback()
+            except Exception:
+                params = None
+
+            if isinstance(params, dict):
+                conv = float(params.get("zero_disparity_anchor", self.zero_disparity_anchor_var.get()))
+                max_disp = float(params.get("max_disp", self.max_disp_var.get()))
+                gamma = float(params.get("depth_gamma", self.depth_gamma_var.get()))
+            else:
+                conv = float(self.zero_disparity_anchor_var.get())
+                max_disp = float(self.max_disp_var.get())
+                gamma = float(self.depth_gamma_var.get())
+
+            total_frames_override = None
+            try:
+                # Reuse already-known frame count from the active preview (avoids re-probing/decord hangs)
+                if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "frame_scrubber"):
+                    total_frames_override = int(self.previewer.frame_scrubber.cget("to")) + 1
+            except Exception:
+                total_frames_override = None
+
+            sig = self._dp_total_signature(depth_path, conv, max_disp, gamma)
+
+            try:
+                if hasattr(self, "btn_est_dp_total"):
+                    self.btn_est_dp_total.config(state="disabled")
+            except Exception:
+                pass
+
+            est_start_ts = time.time()
+
+            def _worker():
+                try:
+                    est = self._estimate_dp_total_max_for_depth_video(
+                    depth_path, conv, max_disp, gamma, sample_frames=10, pixel_stride=8, total_frames_override=total_frames_override, params=params
+                )
+                except Exception as e:
+                    try:
+                        logger.exception(f"Estimate Max Total(D+P) failed: {e}")
+                    except Exception:
+                        pass
+                    est = None
+
+                def _apply():
+                    try:
+                        if est is not None:
+                            try:
+                                logger.info(f"Estimate Max Total(D+P): {float(est):.2f}%")
+                            except Exception:
+                                pass
+                            self._dp_total_est_cache[sig] = float(est)
+                            if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
+                                ui_sig = None
+                            try:
+                                ui_sig = getattr(self.previewer, "_dp_signature", None)
+                            except Exception:
+                                ui_sig = None
+                            if not ui_sig:
+                                ui_sig = sig
+                            self.previewer.set_depth_pop_max_estimate(float(est), ui_sig)
+                    finally:
+                        try:
+                            if est is None:
+                                elapsed = None
+                                try:
+                                    elapsed = time.time() - est_start_ts
+                                except Exception:
+                                    pass
+                                if elapsed is not None:
+                                    logger.info(f"Estimate Max Total(D+P): (no result)  (took {elapsed:.2f}s)")
+                                else:
+                                    logger.info("Estimate Max Total(D+P): (no result)")
+                        except Exception:
+                            pass
+
+                        try:
+                            if hasattr(self, "btn_est_dp_total"):
+                                self.btn_est_dp_total.config(state="normal")
+                        except Exception:
+                            pass
+
+                self.after(0, _apply)
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            try:
+                if hasattr(self, "btn_est_dp_total"):
+                    self.btn_est_dp_total.config(state="normal")
+            except Exception:
+                pass
+
+    def _get_cached_dp_total_est_for_current(self) -> Optional[float]:
+        try:
+            if getattr(self, "previewer", None) is None:
+                return None
+            depth_path = getattr(self.previewer, "_depth_path", None)
+            if not depth_path:
+                return None
+            conv = float(self.zero_disparity_anchor_var.get())
+            max_disp = float(self.max_disp_var.get())
+            gamma = float(self.depth_gamma_var.get())
+            sig = self._dp_total_signature(depth_path, conv, max_disp, gamma)
+            v = self._dp_total_est_cache.get(sig, None)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _auto_pass_csv_get_path(self) -> str:
+        try:
+            return os.path.join(self._get_sidecar_base_folder(), "auto_pass_export.csv")
+        except Exception:
+            return "auto_pass_export.csv"
+
+    def _auto_pass_csv_load_cache(self, csv_path: str) -> None:
+        """Load CSV rows into memory (keyed by source_video basename)."""
+        try:
+            self._auto_pass_csv_path = csv_path
+            rows = {}
+            if os.path.exists(csv_path):
+                with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        # Prefer source_video as the stable key; fall back to depth_map for older exports.
+                        key = str(row.get("source_video", "")).strip()
+                        if not key:
+                            key = str(row.get("depth_map", "")).strip()
+                        if key:
+                            rows[key] = dict(row)
+            self._auto_pass_csv_cache = rows
+        except Exception:
+            self._auto_pass_csv_cache = {}
+
+    def _auto_pass_csv_flush_cache(self, fieldnames: list) -> None:
+        try:
+            if not self._auto_pass_csv_path or self._auto_pass_csv_cache is None:
+                return
+
+            # Always write the CSV (for Resolve / general interoperability)
+            with open(self._auto_pass_csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for key in sorted(self._auto_pass_csv_cache.keys()):
+                    w.writerow(self._auto_pass_csv_cache[key])
+
+            # TSV export removed (CSV import works fine in LibreOffice after clicking OK).
+        except Exception:
+            pass
+
+    def _auto_pass_csv_update_row_from_current(self) -> None:
+        """If auto_pass_export.csv exists, update this clip's row when sidecar changes."""
+        try:
+            csv_path = self._auto_pass_csv_get_path()
+            if not os.path.exists(csv_path):
+                return
+
+            if self._auto_pass_csv_cache is None or self._auto_pass_csv_path != csv_path:
+                self._auto_pass_csv_load_cache(csv_path)
+
+            if getattr(self, "previewer", None) is None:
+                return
+            idx = getattr(self.previewer, "current_video_index", -1)
+            if idx is None or idx < 0:
+                return
+            src = self.previewer.video_list[idx].get("source_video", "")
+            depth = self.previewer.video_list[idx].get("depth_map", "")
+            depth_bn = os.path.basename(depth) if depth else ""
+            src_bn = os.path.basename(src) if src else ""
+
+            # Frame token: last underscore + digits at end of source basename (before extension).
+            frame_num = ""
+            try:
+                stem = os.path.splitext(src_bn)[0]
+                mfr = re.search(r"_([0-9]+)$", stem)
+                frame_num = mfr.group(1) if mfr else ""
+            except Exception:
+                frame_num = ""
+            if not frame_num:
+                # Fallback: try depth basename pattern "..._<digits>_depth"
+                try:
+                    stem = os.path.splitext(depth_bn)[0]
+                    if stem.endswith("_depth"):
+                        stem = stem[:-6]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+
+            res = self._get_current_sidecar_paths_and_data()
+            if not res:
+                return
+            _, _, current_data = res
+
+            dp_est = self._get_cached_dp_total_est_for_current()
+            if dp_est is None:
+                try:
+                    dp_est = current_data.get("dp_total_max_est", None)
+                except Exception:
+                    dp_est = None
+
+            # Best-effort: measured (render-time) max Total(D+P), if available
+            dp_true = None
+            try:
+                sig = self._dp_total_signature(
+                    depth,
+                    float(current_data.get("convergence_plane", 0.5)),
+                    float(current_data.get("max_disparity", 0.0)),
+                    float(current_data.get("gamma", 1.0)),
+                )
+                dp_true = self._dp_total_true_cache.get(sig, None)
+            except Exception:
+                dp_true = None
+            if dp_true is None:
+                try:
+                    dp_true = current_data.get("dp_total_max_true", None)
+                except Exception:
+                    dp_true = None
+
+            row = {
+                "frame": frame_num,
+                "source_video": src_bn,
+                "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                "border_mode": str(current_data.get("border_mode", "")),
+                "set_disparity": round(float(current_data.get("max_disparity", 0.0)), 3),
+                "true_max_disp": round(float(dp_true), 3) if dp_true is not None else "",
+                "est_max_disp": round(float(dp_est), 3) if dp_est is not None else "",
+                "gamma": round(float(current_data.get("gamma", 1.0)), 3),
+            }
+
+            # Key by source basename (stable + avoids collisions across multi-map folders).
+            self._auto_pass_csv_cache[src_bn] = row
+
+            fieldnames = [
+                "frame",
+                "source_video",
+                "selected_depth_map",
+                "convergence_plane",
+                "left_border",
+                "right_border",
+                "border_mode",
+                "set_disparity",
+                "true_max_disp",
+                "est_max_disp",
+                "gamma",
+            ]
+            self._auto_pass_csv_flush_cache(fieldnames)
+        except Exception:
+            pass
+
+    def _auto_pass_csv_update_row_for_paths(
+        self,
+        source_video_path: str,
+        depth_map_path: str,
+        current_data: dict,
+        dp_total_max_true: Optional[float] = None,
+    ) -> None:
+        """Best-effort: update/merge a single row in the AUTO-PASS CSV (if it exists).
+
+        This is used by non-preview code paths (e.g. render) where we already know the
+        source/depth paths and a dict of the most relevant settings.
+        """
+        try:
+            csv_path = self._auto_pass_csv_get_path()
+            if not csv_path:
+                return
+            # Ensure destination folder exists (CSV may be created on-demand)
+            try:
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            return
+
+        try:
+            self._auto_pass_csv_load_cache(csv_path)
+        except Exception:
+            return
+
+        try:
+            depth_bn = os.path.basename(depth_map_path)
+            src_bn = os.path.basename(source_video_path)
+
+            # Frame token: last underscore + digits at end of source basename (before extension).
+            frame_num = ""
+            try:
+                stem = os.path.splitext(src_bn)[0]
+                mfr = re.search(r"_([0-9]+)$", stem)
+                frame_num = mfr.group(1) if mfr else ""
+            except Exception:
+                frame_num = ""
+            if not frame_num:
+                # Fallback: try depth basename pattern "..._<digits>_depth"
+                try:
+                    stem = os.path.splitext(depth_bn)[0]
+                    if stem.endswith("_depth"):
+                        stem = stem[:-6]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+
+            # Preserve anything already present for this clip unless we are explicitly overwriting it.
+            existing = dict(self._auto_pass_csv_cache.get(src_bn, {}))
+            row = dict(existing)
+
+            row.update(
+                {
+                    "frame": frame_num,
+                    "source_video": src_bn,
+                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "border_mode": str(current_data.get("border_mode", "")),
+                    "set_disparity": round(
+                        float(current_data.get("max_disparity", current_data.get("set_disparity", 0.0))),
+                        3,
+                    ),
+                    "gamma": round(float(current_data.get("gamma", 1.0)), 3),
+                }
+            )
+
+            # Optional columns (keep internal names, change only CSV keys)
+            try:
+                if current_data.get("dp_total_max_est", None) not in ("", None):
+                    row["est_max_disp"] = round(float(current_data.get("dp_total_max_est")), 3)
+            except Exception:
+                pass
+
+            if dp_total_max_true is not None:
+                try:
+                    row["true_max_disp"] = round(float(dp_total_max_true), 3)
+                except Exception:
+                    row["true_max_disp"] = dp_total_max_true
+
+            self._auto_pass_csv_cache[src_bn] = row
+
+            fieldnames = [
+                "frame",
+                "source_video",
+                "selected_depth_map",
+                "convergence_plane",
+                "left_border",
+                "right_border",
+                "border_mode",
+                "set_disparity",
+                "true_max_disp",
+                "est_max_disp",
+                "gamma",
+            ]
+            self._auto_pass_csv_flush_cache(fieldnames=fieldnames)
+        except Exception:
+            return
 
     def _save_current_settings_and_notify(self):
         """Saves current GUI settings to default config file and notifies the user."""
@@ -7032,6 +8103,386 @@ class SplatterGUI(ThemedTk):
             messagebox.showerror(
                 "Save Error", f"Failed to save settings to {config_filename}:\n{e}"
             )
+
+
+    def run_auto_pass(self) -> None:
+        """Run AUTO-PASS over the preview list (or From/To range) without rendering."""
+        if not getattr(self, "previewer", None) or not getattr(self.previewer, "video_list", None):
+            messagebox.showwarning("AUTO-PASS", "Load/Refresh the Preview list first.")
+            return
+
+        available_entries = self.previewer.video_list
+        total_videos = len(available_entries)
+        if total_videos == 0:
+            messagebox.showwarning("AUTO-PASS", "No clips found in the preview list.")
+            return
+
+        # Range selection (1-based in UI, 0-based internally)
+        start_index_0 = 0
+        end_index_0 = total_videos
+
+        try:
+            from_str = self.process_from_var.get().strip()
+            to_str = self.process_to_var.get().strip()
+
+            from_ui = int(from_str) if from_str else 1
+            to_ui = int(to_str) if to_str else total_videos
+
+            from_ui = max(1, min(from_ui, total_videos))
+            to_ui = max(1, min(to_ui, total_videos))
+
+            start_index_0 = from_ui - 1
+            end_index_0 = to_ui
+            if start_index_0 >= end_index_0:
+                raise ValueError("From must be <= To.")
+
+        except Exception:
+            messagebox.showerror(
+                "Invalid Range",
+                f"Please enter a valid From/To range between 1 and {total_videos}.",
+            )
+            return
+
+        # Snapshot the current GUI settings ONCE (thread-safe)
+        try:
+            base_sidecar_data = {
+                "convergence_plane": self._safe_float(self.zero_disparity_anchor_var, 0.5),
+                "max_disparity": self._safe_float(self.max_disp_var, 20.0),
+                "gamma": float(f"{self._safe_float(self.depth_gamma_var, 1.0):.2f}"),
+                "depth_dilate_size_x": self._safe_float(self.depth_dilate_size_x_var),
+                "depth_dilate_size_y": self._safe_float(self.depth_dilate_size_y_var),
+                "depth_blur_size_x": self._safe_float(self.depth_blur_size_x_var),
+                "depth_blur_size_y": self._safe_float(self.depth_blur_size_y_var),
+                "depth_dilate_left": self._safe_float(self.depth_dilate_left_var),
+                "depth_blur_left": int(round(self._safe_float(self.depth_blur_left_var))),
+                "depth_blur_left_mix": self._safe_float(self.depth_blur_left_mix_var, 0.5),
+                "selected_depth_map": self.selected_depth_map_var.get(),
+            }
+
+            auto_conv_mode = self.auto_convergence_mode_var.get()
+            border_mode = self.border_mode_var.get()
+            process_length = int(self.process_length_var.get())
+            batch_size = int(self.batch_size_var.get())
+
+            border_w = self._safe_float(self.border_width_var)
+            border_b = self._safe_float(self.border_bias_var)
+
+        except Exception as e:
+            messagebox.showerror("AUTO-PASS", f"Could not read current settings: {e}")
+            return
+
+        # Disable interactive controls while AUTO-PASS runs
+        self.stop_event.clear()
+        try:
+            self.stop_button.config(state="normal")
+        except Exception:
+            pass
+        try:
+            self.start_button.config(state="disabled")
+            self.start_single_button.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.update_sidecar_button.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.btn_auto_converge_preview.config(state="disabled")
+            self.btn_auto_pass.config(state="disabled")
+        except Exception:
+            pass
+
+        self.status_label.config(
+            text=f"AUTO-PASS running… ({start_index_0 + 1}–{end_index_0} of {total_videos})"
+        )
+
+        worker_args = (
+            available_entries,
+            start_index_0,
+            end_index_0,
+            base_sidecar_data,
+            auto_conv_mode,
+            border_mode,
+            process_length,
+            batch_size,
+            border_w,
+            border_b,
+        )
+
+        t = threading.Thread(target=self._auto_pass_worker, args=worker_args, daemon=True)
+        t.start()
+
+    def _auto_pass_worker(
+        self,
+        available_entries,
+        start_index_0,
+        end_index_0,
+        base_sidecar_data,
+        auto_conv_mode,
+        border_mode,
+        process_length,
+        batch_size,
+        border_w,
+        border_b,
+    ) -> None:
+        total = max(0, end_index_0 - start_index_0)
+        completed = 0
+
+
+        # AUTO-PASS export (CSV) - optional helper output for timeline/Resolve workflows
+        rows_for_csv = []
+        csv_out_path = None
+        try:
+            csv_out_path = os.path.join(self._get_sidecar_base_folder(), "auto_pass_export.csv")
+        except Exception:
+            csv_out_path = "auto_pass_export.csv"
+        # Pre-compute manual borders from the current Width/Bias (used when mode is Off/Manual)
+        try:
+            w = float(border_w)
+            b = float(border_b)
+        except Exception:
+            w = 0.0
+            b = 0.0
+
+        if b >= 0:
+            manual_right = w
+            manual_left = w * (1.0 - b)
+        else:
+            manual_left = w
+            manual_right = w * (1.0 + b)
+
+        manual_left = min(5.0, max(0.0, manual_left))
+        manual_right = min(5.0, max(0.0, manual_right))
+
+        sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+        sidecar_base_folder = self._get_sidecar_base_folder()
+        os.makedirs(sidecar_base_folder, exist_ok=True)
+
+        gamma = float(base_sidecar_data.get("gamma", 1.0))
+        max_disp = float(base_sidecar_data.get("max_disparity", 20.0))
+        fallback_anchor = float(base_sidecar_data.get("convergence_plane", 0.5))
+
+        for idx in range(start_index_0, end_index_0):
+            if self.stop_event.is_set():
+                break
+
+            entry = available_entries[idx]
+            rgb_path = entry.get("source_video")
+            depth_path = entry.get("depth_map")
+            if not rgb_path or not depth_path:
+                continue
+
+            depth_basename = os.path.splitext(os.path.basename(depth_path))[0]
+            json_sidecar_path = os.path.join(sidecar_base_folder, f"{depth_basename}{sidecar_ext}")
+
+            current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
+
+            # Apply current GUI settings snapshot (preserves overlap/bias from existing sidecar)
+            current_data.update(base_sidecar_data)
+
+            # 1) AUTO-CONVERGE (optional)
+            conv_val = fallback_anchor
+            if auto_conv_mode and auto_conv_mode != "Off":
+                avg_val, peak_val = self._determine_auto_convergence(
+                    rgb_path,
+                    depth_path,
+                    process_length,
+                    batch_size,
+                    fallback_anchor,
+                    gamma=gamma,
+                )
+                if auto_conv_mode == "Average":
+                    conv_val = avg_val
+                elif auto_conv_mode == "Peak":
+                    conv_val = peak_val
+                elif auto_conv_mode == "Hybrid":
+                    conv_val = 0.5 * (avg_val + peak_val)
+                else:
+                    conv_val = avg_val
+
+            current_data["convergence_plane"] = float(conv_val)
+
+            # 2) AUTO-BORDER (optional) – runs AFTER convergence (conv_val affects borders)
+            if border_mode == "Auto Basic":
+                tv_disp_comp = 1.0
+                try:
+                    _info = get_video_stream_info(depth_path)
+                    if _infer_depth_bit_depth(_info) > 8 and str((_info or {}).get("color_range", "unknown")).lower() == "tv":
+                        tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                except Exception:
+                    tv_disp_comp = 1.0
+
+                width = max(0.0, (1.0 - conv_val) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+                width = min(5.0, width)
+                current_data["left_border"] = round(float(width), 3)
+                current_data["right_border"] = round(float(width), 3)
+                # Freeze borders into manual left/right so it's easy to tweak later
+                current_data["border_mode"] = "Manual"
+
+            elif border_mode == "Auto Adv.":
+                scan = self._scan_borders_for_depth_path(depth_path, float(conv_val), max_disp, gamma)
+                if scan:
+                    l_val, r_val = scan
+                else:
+                    l_val, r_val = 0.0, 0.0
+                current_data["left_border"] = float(l_val)
+                current_data["right_border"] = float(r_val)
+                current_data["border_mode"] = "Manual"
+
+            else:
+                # Off or Manual – do not touch borders (preserve existing per-clip values)
+                pass
+
+            # Save sidecar
+            # Optional: estimate per-clip Max Total(D+P) (sampled) for CSV + later review
+            try:
+                dp_est = self._estimate_dp_total_max_for_depth_video(
+                    depth_path,
+                    float(current_data.get("convergence_plane", conv_val)),
+                    float(current_data.get("max_disparity", max_disp)),
+                    float(current_data.get("gamma", gamma)),
+                    sample_frames=10,
+                    pixel_stride=8,
+                    params=current_data,
+                )
+                if dp_est is not None:
+                    current_data["dp_total_max_est"] = round(float(dp_est), 3)
+            except Exception:
+                pass
+
+            self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data)
+
+
+            # Collect row for optional CSV export
+            try:
+                depth_bn = os.path.basename(depth_path)
+                src_bn = os.path.basename(rgb_path)
+                # Frame token: last underscore + digits at end of source basename (before extension).
+                frame_num = ""
+                try:
+                    stem = os.path.splitext(src_bn)[0]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+                if not frame_num:
+                    try:
+                        stem = os.path.splitext(depth_bn)[0]
+                        if stem.endswith("_depth"):
+                            stem = stem[:-6]
+                        mfr = re.search(r"_([0-9]+)$", stem)
+                        frame_num = mfr.group(1) if mfr else ""
+                    except Exception:
+                        frame_num = ""
+                rows_for_csv.append({
+                    "frame": frame_num,
+                    "source_video": src_bn,
+                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "border_mode": str(current_data.get("border_mode", "")),
+                    "set_disparity": round(float(current_data.get("max_disparity", max_disp)), 3),
+                    "true_max_disp": current_data.get("dp_total_max_true", ""),
+                    "est_max_disp": current_data.get("dp_total_max_est", ""),
+                    "gamma": round(float(current_data.get("gamma", gamma)), 3),
+                })
+            except Exception:
+                pass
+            completed += 1
+            self.after(
+                0,
+                lambda c=completed, t=total: self.status_label.config(
+                    text=f"AUTO-PASS… {c}/{t}"
+                ),
+            )
+        # Write optional CSV export (best-effort; never blocks completion)
+        try:
+            if rows_for_csv and csv_out_path:
+                fieldnames = [
+                    "frame",
+                    "source_video",
+                    "selected_depth_map",
+                    "convergence_plane",
+                    "left_border",
+                    "right_border",
+                    "border_mode",
+                    "set_disparity",
+                    "true_max_disp",
+                    "est_max_disp",
+                    "gamma",
+                ]
+
+                # Merge/update existing CSV instead of overwriting (source_video basename is the key)
+                existing_rows = {}
+                try:
+                    if os.path.exists(csv_out_path):
+                        with open(csv_out_path, "r", newline="", encoding="utf-8") as rf:
+                            rcsv = csv.DictReader(rf)
+                            for rrow in rcsv:
+                                k = str(rrow.get("source_video", "")).strip()
+                                if k:
+                                    existing_rows[k] = dict(rrow)
+                except Exception:
+                    existing_rows = {}
+
+                for row in rows_for_csv:
+                    try:
+                        k = str(row.get("source_video", "")).strip()
+                        if k:
+                            existing_rows[k] = row
+                    except Exception:
+                        pass
+
+                with open(csv_out_path, "w", newline="", encoding="utf-8") as f:
+                    wcsv = csv.DictWriter(f, fieldnames=fieldnames)
+                    wcsv.writeheader()
+                    for k in sorted(existing_rows.keys()):
+                        wcsv.writerow(existing_rows[k])
+        except Exception:
+            pass
+
+        was_stopped = self.stop_event.is_set()
+        self.after(0, lambda: self._complete_auto_pass(completed, total, was_stopped))
+
+    def _complete_auto_pass(self, completed: int, total: int, was_stopped: bool) -> None:
+        try:
+            self.stop_button.config(state="disabled")
+        except Exception:
+            pass
+
+        # Re-enable controls
+        try:
+            self.start_button.config(state="normal")
+            self.start_single_button.config(state="normal")
+        except Exception:
+            pass
+        try:
+            self.btn_auto_converge_preview.config(state="normal")
+            self.btn_auto_pass.config(state="normal")
+        except Exception:
+            pass
+
+        self.stop_event.clear()
+        self._toggle_sidecar_update_button_state()
+
+        if was_stopped:
+            self.status_label.config(text=f"AUTO-PASS stopped ({completed}/{total}).")
+        else:
+            self.status_label.config(text=f"AUTO-PASS complete ({completed}/{total}).")
+
+        # Refresh current clip UI (convergence/border) so the results are immediately visible
+        try:
+            if getattr(self, "previewer", None) and 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
+                _depth_map = self.previewer.video_list[self.previewer.current_video_index].get("depth_map")
+                if _depth_map:
+                    self.update_gui_from_sidecar(_depth_map)
+                    try:
+                        self.previewer.update_preview()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _save_config(self):
         """Saves current GUI settings to the default file."""
@@ -7074,7 +8525,7 @@ class SplatterGUI(ThemedTk):
                     self.zero_disparity_anchor_var, 0.5
                 ),
                 "max_disparity": self._safe_float(self.max_disp_var, 20.0),
-                "gamma": self._safe_float(self.depth_gamma_var, 1.0),
+                "gamma": float(f"{self._safe_float(self.depth_gamma_var, 1.0):.2f}"),
                 "depth_dilate_size_x": self._safe_float(self.depth_dilate_size_x_var),
                 "depth_dilate_size_y": self._safe_float(self.depth_dilate_size_y_var),
                 "depth_blur_size_x": self._safe_float(self.depth_blur_size_x_var),
@@ -7118,15 +8569,24 @@ class SplatterGUI(ThemedTk):
                 final_auto_L = current_data.get("auto_border_L", 0.0)
                 final_auto_R = current_data.get("auto_border_R", 0.0)
 
-            gui_save_data.update(
-                {
-                    "left_border": round(left_b, 3),
-                    "right_border": round(right_b, 3),
-                    "border_mode": mode,
-                    "auto_border_L": round(final_auto_L, 3),
-                    "auto_border_R": round(final_auto_R, 3),
-                }
-            )
+            if final_auto_L is None:
+                final_auto_L = 0.0
+            if final_auto_R is None:
+                final_auto_R = 0.0
+
+            if mode == "Off":
+                # Preserve any existing per-clip borders; do not overwrite or clear.
+                pass
+            else:
+                gui_save_data.update(
+                    {
+                        "left_border": round(left_b, 3),
+                        "right_border": round(right_b, 3),
+                        "border_mode": mode,
+                        "auto_border_L": round(final_auto_L, 3),
+                        "auto_border_R": round(final_auto_R, 3),
+                    }
+                )
         except ValueError:
             logger.error("Sidecar Save: Invalid input value in GUI. Skipping save.")
             if not is_auto_save:
@@ -8139,6 +9599,19 @@ class SplatterGUI(ThemedTk):
         gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
         self.depth_gamma_var.set(gamma_val)
 
+        # Seed preview overlay "Max Total" from sidecar (most-accurate available):
+        # prefer dp_total_max_true (render-measured) else dp_total_max_est (sampled).
+        try:
+            dp_seed = sidecar_config.get("dp_total_max_true", None)
+            if dp_seed is None:
+                dp_seed = sidecar_config.get("dp_total_max_est", None)
+            if dp_seed is not None and getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
+                sig = self._dp_total_signature(depth_map_path, conv_val, disp_val, gamma_val)
+                self.previewer.set_depth_pop_max_estimate(float(dp_seed), sig)
+        except Exception:
+            pass
+
+
         # Dilate X
         dilate_x_val = sidecar_config.get(
             "depth_dilate_size_x", self.depth_dilate_size_x_var.get()
@@ -8331,6 +9804,11 @@ class SplatterGUI(ThemedTk):
         if self._save_current_sidecar_data(is_auto_save=False):
             # Immediately refresh the preview to show the *effect* of the newly saved sidecar
             self.on_slider_release(None)
+            # If an AUTO-PASS CSV exists, keep its row in sync with sidecar edits
+            try:
+                self._auto_pass_csv_update_row_from_current()
+            except Exception:
+                pass
 
 
 def compute_global_depth_stats(
@@ -8724,12 +10202,21 @@ def load_pre_rendered_depth(
         # Determine total frames available (for mismatch checks) without relying on the ffmpeg pipe.
         total_depth_frames_available = 0
         try:
-            _tmp = VideoReader(depth_map_path, ctx=cpu(0))
-            total_depth_frames_available = len(_tmp)
-            del _tmp
+            # Prefer ffprobe-derived frame count when available; Decord can be slow on some files.
+            nb = None
+            if isinstance(depth_stream_info, dict):
+                nb = depth_stream_info.get("nb_frames")
+                if nb in (None, "", "N/A"):
+                    nb = depth_stream_info.get("num_frames") or depth_stream_info.get("nb_read_frames")
+            if nb not in (None, "", "N/A"):
+                total_depth_frames_available = int(float(nb))
+            else:
+                _tmp = VideoReader(depth_map_path, ctx=cpu(0))
+                total_depth_frames_available = len(_tmp)
+                del _tmp
         except Exception as e:
             logger.warning(
-                f"Could not determine depth frame count via Decord for '{depth_map_path}': {e}"
+                f"Could not determine depth frame count for '{depth_map_path}': {e}"
             )
 
         total_depth_frames_to_process = total_depth_frames_available
