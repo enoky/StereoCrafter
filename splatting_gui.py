@@ -3859,7 +3859,10 @@ class SplatterGUI(ThemedTk):
             # --- Finalize FFmpeg process ---
             if ffmpeg_process is not None:
                 if ffmpeg_process.stdin:
-                    ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
+                    try:
+                        ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
+                    finally:
+                        ffmpeg_process.stdin = None   # <-- IMPORTANT: prevent communicate() flushing closed stdin
 
                 # Wait for the process to finish and get output
                 stdout, stderr = ffmpeg_process.communicate(timeout=120)

@@ -1375,7 +1375,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.debug(f"Raw ffprobe stdout: {result.stdout}")        
+        logger.error(f"Raw ffprobe stdout: {result.stdout}")        
         return None
     except Exception as e:
         logger.error(
