@@ -7,3 +7,4 @@ set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%PATH%"
 
 call venv\scripts\activate.bat
 python splatting_gui.py
+pause

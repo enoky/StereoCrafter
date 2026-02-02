@@ -14,6 +14,7 @@ import subprocess
 import cv2
 import gc
 import time
+import re
 
 VERSION = "26-01-30.0"
 
@@ -965,7 +966,7 @@ def draw_progress_bar(current, total, bar_length=50, prefix="Progress:", suffix=
     # Format the suffix for completion
     actual_suffix = suffix
     if current == total:
-        actual_suffix = "Complete"
+        actual_suffix = "Complete      "
 
     print(f"\r{prefix} |{bar}| {percent:.1f}% {actual_suffix}", end="", flush=True)
 
@@ -1311,7 +1312,14 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             encoding="utf-8",
             timeout=500,
         )
-        data = json.loads(result.stdout)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
+            # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
+            # "Expecting ',' delimiter: line 13 column 40 (char 229)"
+            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r'\1,\2\3', result.stdout)
+            data = json.loads(repaired)
 
         stream_info = {}
         if "streams" in data and len(data["streams"]) > 0:
@@ -1375,7 +1383,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.debug(f"Raw ffprobe stdout: {result.stdout}")
+        logger.error(f"Raw ffprobe stdout: {result.stdout}")
         return None
     except Exception as e:
         logger.error(
@@ -1761,7 +1769,7 @@ def start_ffmpeg_pipe_process(
     }
 
     if debug_label:
-        logger.info(
+        logger.debug(
             f"[COLOR_META][{debug_label}] src(pix_fmt={src_pix_fmt}, range={src_range}, primaries={src_prim}, trc={src_trc}, matrix={src_matrix}) "
             f"-> enc(codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, primaries={color_primaries}, trc={transfer_characteristics}, matrix={color_space}, {quality_mode}={quality_value})"
         )
