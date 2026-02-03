@@ -513,6 +513,23 @@ class SplatterGUI(ThemedTk):
         if folder:
             var.set(folder)
 
+    def _open_folder_in_explorer(self, var):
+        """Opens the folder path from StringVar in Windows Explorer."""
+        folder_path = var.get()
+        if os.path.isdir(folder_path):
+            try:
+                os.startfile(folder_path)
+            except Exception as e:
+                logger.error(f"Failed to open folder in explorer: {e}")
+        elif os.path.exists(folder_path):
+            # If it's a file, open its parent directory
+            parent_dir = os.path.dirname(folder_path)
+            if os.path.isdir(parent_dir):
+                try:
+                    os.startfile(parent_dir)
+                except Exception as e:
+                    logger.error(f"Failed to open folder in explorer: {e}")
+
     def _browse_file(self, var, filetypes_list):
         """Opens a file dialog and updates a StringVar."""
         current_path = var.get()
@@ -1447,6 +1464,10 @@ class SplatterGUI(ThemedTk):
         self.btn_browse_source_clips_folder.grid(
             row=current_row, column=2, padx=2, pady=0
         )
+        self.btn_browse_source_clips_folder.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.input_source_clips_var),
+        )
         self.btn_select_source_clips_file = ttk.Button(
             self.folder_frame,
             text="Select File",
@@ -1489,6 +1510,10 @@ class SplatterGUI(ThemedTk):
         self.btn_browse_input_depth_maps_folder.grid(
             row=current_row, column=2, padx=2, pady=0
         )
+        self.btn_browse_input_depth_maps_folder.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.input_depth_maps_var),
+        )
         self.btn_select_input_depth_maps_file = ttk.Button(
             self.folder_frame,
             text="Select File",
@@ -1527,6 +1552,10 @@ class SplatterGUI(ThemedTk):
             command=lambda: self._browse_folder(self.output_splatted_var),
         )
         self.btn_browse_output_splatted.grid(row=current_row, column=2, padx=5, pady=0)
+        self.btn_browse_output_splatted.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.output_splatted_var),
+        )
         self.chk_multi_map = ttk.Checkbutton(
             self.folder_frame,
             text="Multi-Map",
