@@ -1,6 +1,7 @@
 import os
 import json
 import gc
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Optional, Callable, Dict, Any, Union
@@ -13,7 +14,7 @@ from decord import VideoReader, cpu
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory, get_video_stream_info
 
-VERSION = "26-01-17.1"
+VERSION = "26-01-30.0"
 
 class VideoPreviewer(ttk.Frame):
     """
@@ -118,6 +119,9 @@ class VideoPreviewer(ttk.Frame):
         self.depth_pop_depth_pct = None  # background separation (% of width)
         self.depth_pop_pop_pct = None    # foreground separation (% of width)
         self.depth_pop_enabled = False    # show Depth/Pop readout (preview only)
+        self._dp_total_max_seen = None
+        self._dp_total_max_video_index = None
+        self._dp_signature = None
 
         self._create_widgets()
 
@@ -271,16 +275,16 @@ class VideoPreviewer(ttk.Frame):
         self._create_hover_tooltip(lbl_preview_source, "preview_source", tip_preview_source)
         self._create_hover_tooltip(self.preview_source_combo, "preview_source", tip_preview_source)
 
-        self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._handle_load_refresh, width=20)
+        self.load_preview_button = ttk.Button(preview_button_frame, text="Load/Refresh List", command=self._handle_load_refresh, width=20, takefocus=False)
         self.load_preview_button.pack(side="left", padx=5)
         tip_load_refresh_list = "Scans the 'Inpainted Video Folder' for valid files and loads the first one for preview."
         self._create_hover_tooltip(self.load_preview_button, "load_refresh_list", tip_load_refresh_list)
 
-        self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1))
+        self.prev_video_button = ttk.Button(preview_button_frame, text="< Prev", command=lambda: self._nav_preview_video(-1), takefocus=False)
         self.prev_video_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.prev_video_button, "prev_video", "Load the previous video in the list for preview.")
 
-        self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1))
+        self.next_video_button = ttk.Button(preview_button_frame, text="Next >", command=lambda: self._nav_preview_video(1), takefocus=False)
         self.next_video_button.pack(side="left", padx=5)
         self._create_hover_tooltip(self.next_video_button, "next_video", "Load the next video in the list for preview.")
 
@@ -340,7 +344,8 @@ class VideoPreviewer(ttk.Frame):
             textvariable=self.preview_size_var, 
             values=PERCENTAGE_VALUES, 
             state="readonly", # Make it selection-only
-            width=5
+            width=5,
+            takefocus=False
         )
         self.preview_size_combo.pack(side="left")
         self._create_hover_tooltip(self.preview_size_combo, "preview_scale", tip_preview_scale)
@@ -499,6 +504,13 @@ class VideoPreviewer(ttk.Frame):
 
     def _key_jump_frames(self, event):
         """Handler for left/right arrow keys to jump frames. Shift key is for large jumps."""
+        # Don't hijack arrow keys inside text/entry/combobox widgets (let cursor move)
+        try:
+            wclass = event.widget.winfo_class() if event else ""
+        except Exception:
+            wclass = ""
+        if wclass in ("TEntry", "Entry", "TCombobox", "Combobox", "TSpinbox", "Spinbox", "Text"):
+            return
         if not self.source_readers:
             return
 
@@ -859,16 +871,103 @@ class VideoPreviewer(ttk.Frame):
             self.load_preview_button.config(text="Load/Refresh List", style="TButton")
 
     def _nav_preview_video(self, direction: int):
-        """Navigate to the previous or next video in the preview list."""
+        """Navigate to the previous or next video in the preview list.
+
+        Coalesces rapid presses (buttons/keys) so skipping over many clips only triggers one load,
+        but updates the UI counter immediately so it doesn't feel like nothing happened.
+        """
+        try:
+            if not self.video_list:
+                return
+
+            # Base index is the index at the start of a nav burst (before the delayed load happens)
+            after_id = getattr(self, "_nav_pending_after_id", None)
+            if after_id is None:
+                self._nav_base_index = int(getattr(self, "current_video_index", 0))
+
+            # Accumulate delta during the burst
+            self._nav_pending_delta = int(getattr(self, "_nav_pending_delta", 0)) + int(direction)
+
+            # Compute the *pending* target index for immediate UI feedback (no load yet)
+            total_videos = len(self.video_list)
+            base_index = int(getattr(self, "_nav_base_index", getattr(self, "current_video_index", 0)))
+            pending_target = base_index + int(getattr(self, "_nav_pending_delta", 0))
+            if pending_target < 0:
+                pending_target = 0
+            elif pending_target >= total_videos:
+                pending_target = total_videos - 1
+
+            try:
+                self.video_status_label_var.set(f"Video: {pending_target + 1} / {total_videos}" if total_videos > 0 else "Video: 0 / 0")
+                self.video_jump_to_var.set(str(pending_target + 1) if total_videos > 0 else "1")
+                # Update button enabled state based on pending target (so it feels responsive)
+                self.prev_video_button.config(state="normal" if pending_target > 0 else "disabled")
+                self.next_video_button.config(state="normal" if pending_target < total_videos - 1 else "disabled")
+            except Exception:
+                pass
+
+            # Cancel any queued nav flush so we only execute once after user stops spamming input
+            if after_id is not None:
+                try:
+                    self.root_window.after_cancel(after_id)
+                except Exception:
+                    pass
+
+            # Flush a bit after the last press
+            self._nav_pending_after_id = self.root_window.after(120, self._nav_preview_video_flush)
+            return
+        except Exception:
+            # If anything goes wrong, fall back to immediate nav
+            pass
+
+        self._nav_preview_video_apply(direction)
+
+    def _nav_preview_video_flush(self):
+        try:
+            delta = int(getattr(self, "_nav_pending_delta", 0))
+        except Exception:
+            delta = 0
+        try:
+            base_index = int(getattr(self, "_nav_base_index", getattr(self, "current_video_index", 0)))
+        except Exception:
+            base_index = int(getattr(self, "current_video_index", 0))
+
+        # Clear pending state
+        try:
+            self._nav_pending_delta = 0
+            self._nav_pending_after_id = None
+            self._nav_base_index = None
+        except Exception:
+            pass
+
+        if delta == 0:
+            return
+
+        self._nav_preview_video_apply(base_index + delta, absolute=True)
+
+    def _nav_preview_video_apply(self, direction: int, absolute: bool = False):
+        """Apply the actual navigation immediately (single load).
+
+        If absolute=True, `direction` is treated as the target index.
+        """
         self._stop_playback()
         if not self.video_list:
             return
-        
+
         # --- Auto-Save Current Sidecar before navigating ---
         if self.on_clip_navigate_callback:
             self.on_clip_navigate_callback()
 
-        new_index = self.current_video_index + direction
+        if absolute:
+            new_index = int(direction)
+        else:
+            new_index = self.current_video_index + int(direction)
+
+        if new_index < 0:
+            new_index = 0
+        elif new_index >= len(self.video_list):
+            new_index = len(self.video_list) - 1
+
         if 0 <= new_index < len(self.video_list):
             self._load_preview_by_index(new_index)
 
@@ -1156,8 +1255,16 @@ class VideoPreviewer(ttk.Frame):
                         cx = w_img // 2
                         color = (255, 255, 255) if getattr(self, "crosshair_white", False) else (0, 0, 0)
 
-                        # Keep a dash separator, but avoid a confusing "double minus" when pop is negative
-                        txt = f"{float(d_pct):.1f}/{float(p_pct):.1f}%"
+                        # Depth/Pop readout + Total (Total = behind + out)
+                        total_pct = float(d_pct) + float(p_pct)
+                        # Per-frame Total (D+P) shown in parentheses; purely informational (not saved)
+                        txt = f"{float(d_pct):.1f}/{float(p_pct):.1f}% ({total_pct:.1f})"
+
+                        # Per-clip running max (updates as frames are previewed)
+                        max_total = getattr(self, "_dp_total_max_seen", None)
+                        if max_total is None:
+                            max_total = total_pct
+                        max_txt = f"Max:{float(max_total):.1f}%"
 
                         # Slightly larger font (fallbacks safely if TTF isn't available)
                         try:
@@ -1179,6 +1286,15 @@ class VideoPreviewer(ttk.Frame):
                         x_txt = cx - (tw // 2)
                         y_txt = h_img - th - 10
                         draw.text((x_txt, y_txt), txt, fill=color, font=font)
+
+                        # Draw max total at bottom-right (same baseline)
+                        try:
+                            bbox2 = draw.textbbox((0, 0), max_txt, font=font)
+                            tw2, th2 = (bbox2[2] - bbox2[0]), (bbox2[3] - bbox2[1])
+                        except Exception:
+                            tw2, th2 = draw.textsize(max_txt, font=font)
+                        x2 = w_img - tw2 - 10
+                        draw.text((x2, y_txt), max_txt, fill=color, font=font)
                 except Exception:
                     pass
 
@@ -1436,18 +1552,115 @@ class VideoPreviewer(ttk.Frame):
     def set_depth_pop_enabled(self, enabled: bool):
         """Enable/disable the Depth/Pop readout overlay. Preview-only (never exported)."""
         self.depth_pop_enabled = bool(enabled)
+        # Reset running max when toggled
+        if not self.depth_pop_enabled:
+            self._dp_total_max_seen = None
+            self._dp_total_max_video_index = None
+            self._dp_signature = None
+        else:
+            self._dp_total_max_seen = None
+            self._dp_total_max_video_index = getattr(self, 'current_video_index', None)
         # Redraw so toggling this checkbox updates immediately
         try:
             self.update_preview()
         except Exception:
             pass
 
-    def set_depth_pop_metrics(self, depth_pct: Optional[float], pop_pct: Optional[float]):
+    def set_depth_pop_max_estimate(self, max_total_pct: Optional[float], signature: Optional[str] = None):
+        """Set an estimated per-clip max total disparity (Total = depth + pop).
+
+        This seeds the on-screen Max readout so you can see a good estimate without playing through.
+        """
+        try:
+            if signature is not None:
+                self._dp_est_signature = signature
+            self._dp_total_max_est = float(max_total_pct) if max_total_pct is not None else None
+
+            # Seed current running max immediately so the on-screen Max updates right away.
+            # If the preview hasn't produced a signature yet, adopt this one.
+            current_sig = getattr(self, "_dp_signature", None)
+            if signature is not None and current_sig != signature:
+                # If settings changed but a new preview frame hasn't been processed yet,
+                # let this estimate take over (and avoid mixing max values across different settings).
+                self._dp_signature = signature
+                current_sig = signature
+                self._dp_total_max_seen = None
+
+            if signature is None or signature == current_sig:
+                self._dp_total_max_seen = self._dp_total_max_est
+                self._dp_total_max_video_index = getattr(self, "current_video_index", None)
+        except Exception:
+            pass
+
+        try:
+            self.update_preview()
+        except Exception:
+            pass
+
+    def set_depth_pop_metrics(
+        self,
+        depth_pct: Optional[float],
+        pop_pct: Optional[float],
+        signature: Optional[str] = None,
+    ):
         """Store preview-only depth/pop separation metrics (percent of screen width).
 
         - depth_pct: positive percentage for far/background separation (screen-behind)
         - pop_pct:   positive percentage for near/foreground separation (screen-out)
         Pass None to clear.
+
+        signature (optional): a small string that changes when the relevant parameters/map change.
+        If it changes, the per-clip running max is reset.
         """
+        # Reset running max if signature changes (e.g., map/disp/gamma/conv changed)
+        try:
+            if signature is not None and signature != getattr(self, "_dp_signature", None):
+                self._dp_signature = signature
+
+                # Drop estimate if it doesn't match this signature
+                try:
+                    if getattr(self, "_dp_est_signature", None) != signature:
+                        self._dp_total_max_est = None
+                except Exception:
+                    pass
+
+                # Seed running max from an estimate (if present) so you don't have to play through
+                try:
+                    est = getattr(self, "_dp_total_max_est", None)
+                    self._dp_total_max_seen = float(est) if est is not None else None
+                except Exception:
+                    self._dp_total_max_seen = None
+
+                self._dp_total_max_video_index = getattr(self, "current_video_index", None)
+        except Exception:
+            pass
+
+
         self.depth_pop_depth_pct = depth_pct
         self.depth_pop_pop_pct = pop_pct
+
+        # Update per-clip running max (cheap; uses already-computed per-frame values)
+        try:
+            if self._dp_total_max_video_index != getattr(self, "current_video_index", None):
+                self._dp_total_max_video_index = getattr(self, "current_video_index", None)
+                try:
+                    est = getattr(self, "_dp_total_max_est", None)
+                    self._dp_total_max_seen = float(est) if est is not None else None
+                except Exception:
+                    self._dp_total_max_seen = None
+
+            if depth_pct is not None and pop_pct is not None:
+                total = float(depth_pct) + float(pop_pct)
+                if self._dp_total_max_seen is None or total > self._dp_total_max_seen:
+                    self._dp_total_max_seen = total
+        except Exception:
+            pass
+
+
+
+            if depth_pct is not None and pop_pct is not None:
+                total = float(depth_pct) + float(pop_pct)
+                if self._dp_total_max_seen is None or total > self._dp_total_max_seen:
+                    self._dp_total_max_seen = total
+        except Exception:
+            pass
