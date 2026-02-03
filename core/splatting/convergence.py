@@ -79,12 +79,14 @@ class ConvergenceEstimatorWrapper:
         gamma: float = 1.0,
         fallback_value: float = 0.5,
         stop_event: Optional[threading.Event] = None,
-    ) -> Tuple[float, float]:
-        """Estimate optimal convergence plane from video and depth map.
+        scan_borders: bool = False,
+    ) -> Tuple[float, float, Optional[float], Optional[float]]:
+        """Estimate optimal convergence plane and optionally scan borders.
 
         Samples frames uniformly from the video, analyzes them using the
         U2NETP model to detect salient objects, and returns both average
-        and peak convergence values.
+        and peak convergence values. If scan_borders is True, also returns
+        the maximum depth values found at the left and right 5px edges.
 
         Args:
             rgb_path: Path to RGB source video
@@ -94,13 +96,14 @@ class ConvergenceEstimatorWrapper:
             gamma: Gamma correction for depth (default: 1.0)
             fallback_value: Value to return on failure (default: 0.5)
             stop_event: Optional threading.Event for cancellation
+            scan_borders: Whether to also scan left/right edges for max depth
 
         Returns:
-            Tuple of (average_convergence, peak_convergence)
+            Tuple of (average_convergence, peak_convergence, max_edge_l, max_edge_r)
         """
         if not self.is_model_loaded():
             self.logger.warning("Model not loaded, returning fallback values")
-            return fallback_value, fallback_value
+            return fallback_value, fallback_value, None, None
 
         try:
             # Initialize Readers
@@ -113,7 +116,7 @@ class ConvergenceEstimatorWrapper:
             # Sanity check
             if len_rgb == 0 or len_depth == 0:
                 self.logger.warning("Empty video or depth map found.")
-                return fallback_value, fallback_value
+                return fallback_value, fallback_value, None, None
 
             total_frames = min(len_rgb, len_depth)
 
@@ -129,9 +132,11 @@ class ConvergenceEstimatorWrapper:
                 indices = [0]
 
             estimates = []
+            max_edge_l = 0.0 if scan_borders else None
+            max_edge_r = 0.0 if scan_borders else None
 
             self.logger.info(
-                f"Auto-Converge: Sampling {len(indices)} frames from {os.path.basename(rgb_path)}..."
+                f"Auto-Converge{' + Border Scan' if scan_borders else ''}: Sampling {len(indices)} frames from {os.path.basename(rgb_path)}..."
             )
 
             for idx in indices:
@@ -144,16 +149,35 @@ class ConvergenceEstimatorWrapper:
                 # Read Depth
                 depth_frame = vr_depth[idx].asnumpy()  # H, W, C or H, W
 
-                # Preprocess for Torch
-                rgb_t = (
-                    torch.from_numpy(rgb_frame).float().permute(2, 0, 1) / 255.0
-                )
-
                 # Depth: Handle various formats (Gray8, Gray16, RGB-encoding)
                 if depth_frame.ndim == 3:
                     depth_mono = depth_frame.mean(axis=2)
                 else:
                     depth_mono = depth_frame
+
+                # --- Optional Border Scan (Lightweight) ---
+                if scan_borders:
+                    # Sample 5px wide at each edge
+                    # We use numpy here as it's already a numpy array from decord
+                    L_sample = depth_mono[:, :5]
+                    R_sample = depth_mono[:, -5:]
+
+                    # 99th percentile to ignore noise
+                    d_L = float(np.percentile(L_sample, 99))
+                    d_R = float(np.percentile(R_sample, 99))
+
+                    # Normalize if uint8
+                    if depth_mono.dtype == np.uint8 or d_L > 1.0 or d_R > 1.0:
+                        d_L /= 255.0
+                        d_R /= 255.0
+
+                    max_edge_l = max(max_edge_l, d_L)
+                    max_edge_r = max(max_edge_r, d_R)
+
+                # Preprocess for Torch (NN inference)
+                rgb_t = (
+                    torch.from_numpy(rgb_frame).float().permute(2, 0, 1) / 255.0
+                )
 
                 depth_t = torch.from_numpy(depth_mono).float()
                 # Normalize if not 0-1
@@ -175,7 +199,7 @@ class ConvergenceEstimatorWrapper:
                 estimates.extend(res)
 
             if not estimates:
-                return fallback_value, fallback_value
+                return fallback_value, fallback_value, max_edge_l, max_edge_r
 
             avg_val = sum(estimates) / len(estimates)
             # Using Max as 'Peak' estimate
@@ -184,7 +208,10 @@ class ConvergenceEstimatorWrapper:
             self.logger.info(
                 f"Auto-Converge Result: Avg={avg_val:.3f}, Peak={peak_val:.3f}"
             )
-            return avg_val, peak_val
+            if scan_borders:
+                self.logger.info(f"Edge Depth Result: L={max_edge_l:.3f}, R={max_edge_r:.3f}")
+
+            return avg_val, peak_val, max_edge_l, max_edge_r
 
         except Exception as e:
             self.logger.error(

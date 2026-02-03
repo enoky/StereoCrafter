@@ -21,6 +21,7 @@ import queue
 import subprocess
 import time
 import logging
+import platform
 from typing import Optional, Tuple, Any
 from PIL import Image
 import math
@@ -102,6 +103,11 @@ from core.splatting import (
     ProcessingSettings,
     ProcessingTask,
     BatchSetupResult,
+)
+from core.splatting.depth_processing import (
+    DEPTH_VIS_TV10_BLACK_NORM,
+    DEPTH_VIS_TV10_WHITE_NORM,
+    _infer_depth_bit_depth,
 )
 from core.splatting.config_manager import ConfigManager
 
@@ -446,14 +452,28 @@ class SplatterGUI(ThemedTk):
         """Worker thread for running the Auto-Convergence calculation."""
 
         # Use the extracted ConvergenceEstimatorWrapper
-        new_anchor_avg, new_anchor_peak = self.convergence_estimator.estimate_convergence(
+        # Now returns average, peak, and (NEW) max_edge_l, max_edge_r
+        res = self.convergence_estimator.estimate_convergence(
             rgb_path=rgb_path,
             depth_path=depth_map_path,
             process_length=int(process_length),
             gamma=float(gamma),
             fallback_value=float(fallback_value),
-            stop_event=self.stop_event
+            stop_event=self.stop_event,
+            scan_borders=True, # Enable combined scan
         )
+        
+        new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r = res
+
+        # Determine TV range compensation for border calculation
+        # This is fast if called here (usually cached or metadata-only)
+        tv_disp_comp = 1.0
+        if hasattr(self, "border_scanner"):
+            # We don't have a VideoReader here, so we'll let BorderScanner handle it or calculate it later.
+            # For simplicity, we can pass the path and let BorderScanner handle it if we modify it, 
+            # but actually BorderScanner._get_tv_compensation uses VideoReader.
+            # We'll just pass the depth_map_path and do it in the UI thread or use a helper.
+            pass
 
         # Use self.after to safely update the GUI from the worker thread
         self.after(
@@ -461,8 +481,11 @@ class SplatterGUI(ThemedTk):
             lambda: self._complete_auto_converge_update(
                 new_anchor_avg,
                 new_anchor_peak,
+                max_edge_l,
+                max_edge_r,
                 fallback_value,
-                mode,  # Still pass the current mode to know which value to select immediately
+                mode,
+                depth_map_path,
             ),
         )
 
@@ -1160,8 +1183,11 @@ class SplatterGUI(ThemedTk):
         self,
         new_anchor_avg: float,
         new_anchor_peak: float,
+        max_edge_l: Optional[float],
+        max_edge_r: Optional[float],
         fallback_value: float,
         mode: str,
+        depth_map_path: str = None,
     ):
         """
         Safely updates the GUI and preview after Auto-Convergence worker is done.
@@ -1219,8 +1245,48 @@ class SplatterGUI(ThemedTk):
             if not is_setter_successful:
                 self.zero_disparity_anchor_var.set(f"{anchor_to_apply:.2f}")
 
+            # 5. Calculate and apply Auto Borders (Combined Scan Result)
+            border_info_text = ""
+            if max_edge_l is not None and max_edge_r is not None:
+                try:
+                    # Determine TV compensation (fast meta lookup)
+                    tv_disp_comp = 1.0
+                    if depth_map_path:
+                        info = get_video_stream_info(depth_map_path)
+                        if info and _infer_depth_bit_depth(info) > 8:
+                            if str(info.get("color_range")).lower() == "tv":
+                                tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                    
+                    max_disp = self._safe_float(self.max_disp_var, 20.0)
+                    
+                    # Use the same logic as BorderScanner: b = (d - conv) * scale
+                    # Result is percentage (e.g. 1.5 for 1.5%)
+                    scale = 2.0 * (max_disp / 20.0) * tv_disp_comp
+                    newL = max(0.0, (max_edge_l - anchor_to_apply) * scale)
+                    newR = max(0.0, (max_edge_r - anchor_to_apply) * scale)
+                    
+                    # Cap at 5.0% as per app standard
+                    newL = min(5.0, round(float(newL), 3))
+                    newR = min(5.0, round(float(newR), 3))
+                    
+                    self.auto_border_L_var.set(str(newL))
+                    self.auto_border_R_var.set(str(newR))
+                    
+                    # Update sliders if relevant mode
+                    mode_border = self.border_mode_var.get()
+                    if mode_border in ("Auto Adv.", "Auto Basic"):
+                        self._sync_sliders_to_auto_borders(newL, newR)
+                    elif mode_border == "Manual":
+                        # If in Manual, we don't force sliders, but we've updated the auto values
+                        pass
+                    
+                    border_info_text = f", Borders: L={newL}%, R={newR}%"
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating auto-borders in combined scan: {e}")
+
             self.status_label.config(
-                text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f})"
+                text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f}){border_info_text}"
             )
 
             # 4. Immediately trigger a preview update to show the change
