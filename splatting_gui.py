@@ -2847,14 +2847,7 @@ class SplatterGUI(ThemedTk):
             settings["left_border_pct"] = l_pct
             settings["right_border_pct"] = r_pct
 
-            # --- Finalize FFmpeg process ---
-            if ffmpeg_process is not None:
-                if ffmpeg_process.stdin:
-                    try:
-                        ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
-                    finally:
-                        ffmpeg_process.stdin = None   # <-- IMPORTANT: prevent communicate() flushing closed stdin
-
+            return settings
         except (ValueError, tk.TclError) as e:
             logger.error(f"Invalid preview setting value: {e}")
             return None
