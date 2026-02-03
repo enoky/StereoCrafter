@@ -6,6 +6,7 @@ import tkinter as tk  # Required for Tooltip class
 from tkinter import Toplevel, Label, ttk
 from typing import Optional, Tuple, Callable
 import logging
+import re
 
 import numpy as np
 import torch
@@ -1303,7 +1304,14 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             encoding="utf-8",
             timeout=500,
         )
-        data = json.loads(result.stdout)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
+            # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
+            # "Expecting ',' delimiter: line 13 column 40 (char 229)"
+            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r'\1,\2\3', result.stdout)
+            data = json.loads(repaired)
 
         stream_info = {}
         if "streams" in data and len(data["streams"]) > 0:
@@ -1367,7 +1375,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.debug(f"Raw ffprobe stdout: {result.stdout}")
+        logger.error(f"Raw ffprobe stdout: {result.stdout}")        
         return None
     except Exception as e:
         logger.error(
