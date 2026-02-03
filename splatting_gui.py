@@ -1,6 +1,7 @@
 import gc
 import os
 import re
+import csv
 import cv2
 import glob
 import shutil
@@ -22,7 +23,7 @@ import time
 import logging
 from typing import Optional, Tuple, Any
 from PIL import Image
-import math  # <--- ADD THIS
+import math
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
@@ -85,443 +86,28 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-01-23.0"
+GUI_VERSION = "26-02-02.Big Refactoring"
 
 
-class FusionSidecarGenerator:
-    """Handles parsing Fusion Export files, matching them to depth maps,
-    and generating/saving FSSIDECAR files using carry-forward logic."""
 
-    FUSION_PARAMETER_CONFIG = {
-        # Key: {Label, Type, Default, FusionKey(fsexport), SidecarKey(fssidecar), Decimals}
-        "convergence": {
-            "label": "Convergence Plane",
-            "type": float,
-            "default": 0.5,
-            "fusion_key": "Convergence",
-            "sidecar_key": "convergence_plane",
-            "decimals": 3,
-        },
-        "max_disparity": {
-            "label": "Max Disparity",
-            "type": float,
-            "default": 35.0,
-            "fusion_key": "MaxDisparity",
-            "sidecar_key": "max_disparity",
-            "decimals": 1,
-        },
-        "gamma": {
-            "label": "Gamma Correction",
-            "type": float,
-            "default": 1.0,
-            "fusion_key": "FrontGamma",
-            "sidecar_key": "gamma",
-            "decimals": 2,
-        },
-        # These keys exist in the sidecar manager but are usually set in the source tool
-        # We include them here for completeness if Fusion ever exported them
-        "frame_overlap": {
-            "label": "Frame Overlap",
-            "type": float,
-            "default": 3,
-            "fusion_key": "Overlap",
-            "sidecar_key": "frame_overlap",
-            "decimals": 0,
-        },
-        "input_bias": {
-            "label": "Input Bias",
-            "type": float,
-            "default": 0.0,
-            "fusion_key": "Bias",
-            "sidecar_key": "input_bias",
-            "decimals": 2,
-        },
-        "left_border": {
-            "label": "Left Border",
-            "type": float,
-            "default": 0.0,
-            "fusion_key": "LeftBorder",
-            "sidecar_key": "left_border",
-            "decimals": 3,
-        },
-        "right_border": {
-            "label": "Right Border",
-            "type": float,
-            "default": 0.0,
-            "fusion_key": "RightBorder",
-            "sidecar_key": "right_border",
-            "decimals": 3,
-        },
-        "manual_border": {
-            "label": "Border Mode",
-            "type": str,
-            "default": "Off",
-            "fusion_key": "BorderMode",
-            "sidecar_key": "border_mode",
-            "decimals": 0,
-        },
-        "auto_border_l": {
-            "label": "Auto Border L",
-            "type": float,
-            "default": 0.0,
-            "fusion_key": "AutoBorderL",
-            "sidecar_key": "auto_border_L",
-            "decimals": 3,
-        },
-        "auto_border_r": {
-            "label": "Auto Border R",
-            "type": float,
-            "default": 0.0,
-            "fusion_key": "AutoBorderR",
-            "sidecar_key": "auto_border_R",
-            "decimals": 3,
-        },
-    }
+# [REFACTORED] FusionSidecarGenerator class replaced with core import
+from core.splatting import FusionSidecarGenerator
 
-    def __init__(self, master_gui, sidecar_manager):
-        self.master_gui = master_gui
-        self.sidecar_manager = sidecar_manager
-        self.logger = logging.getLogger(__name__)
+# [REFACTORED] ForwardWarpStereo class replaced with core import
+from core.splatting import (
+    ForwardWarpStereo,
+    ConvergenceEstimatorWrapper,
+    BorderScanner,
+    BatchProcessor,
+    ProcessingSettings,
+    ProcessingTask,
+    BatchSetupResult,
+)
+from core.splatting.config_manager import ConfigManager
 
-    def _get_video_frame_count(self, file_path):
-        """Safely gets the frame count of a video file using moviepy."""
-        try:
-            clip = VideoFileClip(file_path)
-            fps = clip.fps
-            duration = clip.duration
-            if fps is None or duration is None:
-                # If moviepy failed to get reliable info, fall back
-                fps = 24
-                if duration is None:
-                    return 0
-
-            frames = math.ceil(duration * fps)
-            clip.close()
-            return frames
-        except Exception as e:
-            self.logger.warning(
-                f"Error getting frame count for {os.path.basename(file_path)}: {e}"
-            )
-            return 0
-
-    def _load_and_validate_fsexport(self, file_path):
-        """Loads, parses, and validates marker data from a Fusion Export file."""
-        try:
-            with open(file_path, "r") as f:
-                export_data = json.load(f)
-        except json.JSONDecodeError as e:
-            messagebox.showerror(
-                "File Error",
-                f"Failed to parse JSON in {os.path.basename(file_path)}: {e}",
-            )
-            return None
-        except Exception as e:
-            messagebox.showerror(
-                "File Error", f"Failed to read {os.path.basename(file_path)}: {e}"
-            )
-            return None
-
-        markers = export_data.get("markers", [])
-        if not markers:
-            messagebox.showwarning(
-                "Data Warning", "No 'markers' found in the export file."
-            )
-            return None
-
-        # Sort markers by frame number (critical for carry-forward logic)
-        markers.sort(key=lambda m: m["frame"])
-        self.logger.info(
-            f"Loaded {len(markers)} markers from {os.path.basename(file_path)}."
-        )
-        return markers
-
-    def _scan_target_videos(self, folder):
-        """Scans the target folder for video files and computes their frame counts."""
-        video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
-        found_files_paths = []
-        for ext in video_extensions:
-            found_files_paths.extend(glob.glob(os.path.join(folder, ext)))
-        sorted_files_paths = sorted(found_files_paths)
-
-        if not sorted_files_paths:
-            messagebox.showwarning(
-                "No Files", f"No video depth map files found in: {folder}"
-            )
-            return None
-
-        target_video_data = []
-        cumulative_frames = 0
-
-        for full_path in sorted_files_paths:
-            total_frames = self._get_video_frame_count(full_path)
-
-            if total_frames == 0:
-                self.logger.warning(
-                    f"Skipping {os.path.basename(full_path)} due to zero frame count."
-                )
-                continue
-
-            target_video_data.append(
-                {
-                    "full_path": full_path,
-                    "basename": os.path.basename(full_path),
-                    "total_frames": total_frames,
-                    "timeline_start_frame": cumulative_frames,
-                    "timeline_end_frame": cumulative_frames + total_frames - 1,
-                }
-            )
-            cumulative_frames += total_frames
-
-        self.logger.info(
-            f"Scanned {len(target_video_data)} video files. Total timeline frames: {cumulative_frames}."
-        )
-        return target_video_data
-
-    def generate_sidecars(self):
-        """Main entry point for the Fusion Export to Sidecar generation workflow."""
-
-        # 1. Select Fusion Export File
-        export_file_path = filedialog.askopenfilename(
-            defaultextension=".fsexport",
-            filetypes=[
-                ("Fusion Export Files", "*.fsexport.txt;*.fsexport"),
-                ("All Files", "*.*"),
-            ],
-            title="Select Fusion Export (.fsexport) File",
-        )
-        if not export_file_path:
-            self.master_gui.status_label.config(
-                text="Fusion export selection cancelled."
-            )
-            return
-
-        markers = self._load_and_validate_fsexport(export_file_path)
-        if markers is None:
-            self.master_gui.status_label.config(text="Fusion export loading failed.")
-            return
-
-        # 2. Select Target Depth Map Folder
-        target_folder = filedialog.askdirectory(title="Select Target Depth Map Folder")
-        if not target_folder:
-            self.master_gui.status_label.config(
-                text="Depth map folder selection cancelled."
-            )
-            return
-
-        target_videos = self._scan_target_videos(target_folder)
-        if target_videos is None or not target_videos:
-            self.master_gui.status_label.config(text="No valid depth map videos found.")
-            return
-
-        # 3. Apply Parameters (Carry-Forward Logic)
-        applied_count = 0
-
-        # Initialize last known values with the config defaults
-        last_param_vals = {}
-        for key, config in self.FUSION_PARAMETER_CONFIG.items():
-            last_param_vals[key] = config["default"]
-
-        for file_data in target_videos:
-            file_start_frame = file_data["timeline_start_frame"]
-
-            # Find the most relevant marker (latest marker frame <= file_start_frame)
-            relevant_marker = None
-            for marker in markers:
-                if marker["frame"] <= file_start_frame:
-                    relevant_marker = marker
-                else:
-                    break
-
-            current_param_vals = last_param_vals.copy()
-
-            if relevant_marker and relevant_marker.get("values"):
-                marker_values = relevant_marker["values"]
-                updated_from_marker = False
-
-                for key, config in self.FUSION_PARAMETER_CONFIG.items():
-                    fusion_key = config["fusion_key"]
-                    default_val = config["default"]
-
-                    if fusion_key in marker_values:
-                        # Attempt to cast the value from the marker to the expected type
-                        val = marker_values.get(fusion_key, default_val)
-                        try:
-                            current_param_vals[key] = config["type"](val)
-                            updated_from_marker = True
-                        except (ValueError, TypeError):
-                            self.logger.warning(
-                                f"Marker value for '{fusion_key}' is invalid ({val}). Using previous/default value."
-                            )
-
-                if updated_from_marker:
-                    applied_count += 1
-
-            # 4. Save Sidecar JSON
-            sidecar_data = {}
-            for key, config in self.FUSION_PARAMETER_CONFIG.items():
-                value = current_param_vals[key]
-                if config["type"] is bool:
-                    sidecar_data[config["sidecar_key"]] = bool(value)
-                else:
-                    # Round to configured decimals for clean sidecar output
-                    sidecar_data[config["sidecar_key"]] = round(
-                        float(value), config["decimals"]
-                    )
-
-            base_name_without_ext = os.path.splitext(file_data["full_path"])[0]
-            json_filename = (
-                base_name_without_ext + ".fssidecar"
-            )  # Target sidecar extension
-
-            if not self.sidecar_manager.save_sidecar_data(json_filename, sidecar_data):
-                self.logger.error(
-                    f"Failed to save sidecar for {file_data['basename']}."
-                )
-
-            # Update last values for carry-forward to the next file
-            last_param_vals = current_param_vals.copy()
-
-        # 5. Final Status
-        if applied_count == 0:
-            self.master_gui.status_label.config(
-                text="Finished: No parameters were applied from the export file."
-            )
-        else:
-            self.master_gui.status_label.config(
-                text=f"Finished: Applied markers to {applied_count} files, generated {len(target_videos)} FSSIDECARs."
-            )
-        messagebox.showinfo(
-            "Sidecar Generation Complete",
-            f"Successfully processed {os.path.basename(export_file_path)} and generated {len(target_videos)} FSSIDECAR files.",
-        )
-
-    def generate_custom_sidecars(self):
-        """Generates sidecars with a custom name without requiring existing video files."""
-
-        # 1. Select Fusion Export File
-        export_file_path = filedialog.askopenfilename(
-            defaultextension=".fsexport",
-            filetypes=[
-                ("Fusion Export Files", "*.fsexport.txt;*.fsexport"),
-                ("All Files", "*.*"),
-            ],
-            title="Select Fusion Export (.fsexport) File",
-        )
-        if not export_file_path:
-            self.master_gui.status_label.config(
-                text="Fusion export selection cancelled."
-            )
-            return
-
-        markers = self._load_and_validate_fsexport(export_file_path)
-        if markers is None:
-            self.master_gui.status_label.config(text="Fusion export loading failed.")
-            return
-
-        # 2. Select Output Sidecar Path and Name
-        custom_save_path = filedialog.asksaveasfilename(
-            defaultextension=".fssidecar",
-            filetypes=[("Sidecar Files", "*.fssidecar")],
-            title="Save Sidecar As",
-            initialfile=os.path.splitext(os.path.basename(export_file_path))[0],
-        )
-        if not custom_save_path:
-            self.master_gui.status_label.config(text="Custom sidecar export cancelled.")
-            return
-
-        # 3. Process markers
-        applied_count = 0
-        last_param_vals = {
-            key: config["default"]
-            for key, config in self.FUSION_PARAMETER_CONFIG.items()
-        }
-
-        for i, marker in enumerate(markers):
-            current_param_vals = last_param_vals.copy()
-            if marker.get("values"):
-                marker_values = marker["values"]
-                updated_from_marker = False
-                for key, config in self.FUSION_PARAMETER_CONFIG.items():
-                    fusion_key = config["fusion_key"]
-                    if fusion_key in marker_values:
-                        try:
-                            current_param_vals[key] = config["type"](
-                                marker_values[fusion_key]
-                            )
-                            updated_from_marker = True
-                        except (ValueError, TypeError):
-                            pass
-                if updated_from_marker:
-                    applied_count += 1
-
-            # Prepare sidecar data
-            sidecar_data = {}
-            for key, config in self.FUSION_PARAMETER_CONFIG.items():
-                value = current_param_vals[key]
-                if config["type"] is bool:
-                    sidecar_data[config["sidecar_key"]] = bool(value)
-                else:
-                    sidecar_data[config["sidecar_key"]] = round(
-                        float(value), config["decimals"]
-                    )
-
-            # Determine filename
-            if len(markers) == 1:
-                target_filename = custom_save_path
-            else:
-                # Append index if multiple markers (5-digit zero-padded)
-                base, ext = os.path.splitext(custom_save_path)
-                target_filename = f"{base}_{i + 1:04d}{ext}"
-
-            if not self.sidecar_manager.save_sidecar_data(
-                target_filename, sidecar_data
-            ):
-                self.logger.error(f"Failed to save custom sidecar: {target_filename}")
-
-            last_param_vals = current_param_vals.copy()
-
-        # 4. Final Status
-        self.master_gui.status_label.config(
-            text=f"Finished: Generated {len(markers)} custom FSSIDECARs."
-        )
-        messagebox.showinfo(
-            "Custom Export Complete",
-            f"Successfully generated {len(markers)} custom FSSIDECAR files.",
-        )
-
-
-class ForwardWarpStereo(nn.Module):
-    """
-    PyTorch module for forward warping an image based on a disparity map.
-    """
-
-    def __init__(self, eps=1e-6, occlu_map=False):
-        super(ForwardWarpStereo, self).__init__()
-        self.eps = eps
-        self.occlu_map = occlu_map
-        self.fw = forward_warp()
-
-    def forward(self, im, disp):
-        im = im.contiguous()
-        disp = disp.contiguous()
-        weights_map = disp - disp.min()
-        weights_map = (1.414) ** weights_map
-        flow = -disp.squeeze(1)
-        dummy_flow = torch.zeros_like(flow, requires_grad=False)
-        flow = torch.stack((flow, dummy_flow), dim=-1)
-        res_accum = self.fw(im * weights_map, flow)
-        mask = self.fw(weights_map, flow)
-        mask.clamp_(min=self.eps)
-        res = res_accum / mask
-        if not self.occlu_map:
-            return res
-        else:
-            ones = torch.ones_like(disp, requires_grad=False)
-            occlu_map = self.fw(ones, flow)
-            occlu_map.clamp_(0.0, 1.0)
-            occlu_map = 1.0 - occlu_map
-            return res, occlu_map
-
+# [REFACTORED] Video I/O and Theme functions replaced with core imports
+from core.common import ThemeManager
+from core.common.video_io import read_video_frames, _NumpyBatch
 
 class SplatterGUI(ThemedTk):
     # --- UI MINIMUM WIDTHS (tweak these numbers) ---
@@ -589,9 +175,24 @@ class SplatterGUI(ThemedTk):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
 
+        self.config_manager = ConfigManager()
         self.app_config = {}
         self.help_texts = {}
         self.sidecar_manager = SidecarConfigManager()
+        self.convergence_estimator = ConvergenceEstimatorWrapper()
+        self.border_scanner = BorderScanner(gui_context=self)
+        # Cache: estimated per-clip max Total(D+P) keyed by signature
+        self._dp_total_est_cache = {}
+
+        # Cache: measured (render-time) per-clip max Total(D+P) keyed by signature
+        self._dp_total_true_cache = {}
+        self._dp_total_true_active_sig = None
+        self._dp_total_true_active_val = None
+
+        # Cache: AUTO-PASS CSV rows (optional) keyed by depth_map basename
+        self._auto_pass_csv_cache = None
+        self._auto_pass_csv_path = None
+
 
         # --- NEW CACHE AND STATE ---
         self._auto_conv_cache = {"Average": None, "Peak": None}
@@ -620,205 +221,88 @@ class SplatterGUI(ThemedTk):
         # --- Variables with defaults ---
         defaults = self.APP_CONFIG_DEFAULTS  # Convenience variable
 
-        self.dark_mode_var = tk.BooleanVar(
-            value=self.app_config.get("dark_mode_enabled", False)
-        )
-        self.input_source_clips_var = tk.StringVar(
-            value=self.app_config.get("input_source_clips", "./input_source_clips")
-        )
-        self.input_depth_maps_var = tk.StringVar(
-            value=self.app_config.get("input_depth_maps", "./input_depth_maps")
-        )
-        self.multi_map_var = tk.BooleanVar(
-            value=bool(self.app_config.get("multi_map_enabled", False))
-        )
+        self.dark_mode_var = tk.BooleanVar(value=False)
+        self.input_source_clips_var = tk.StringVar(value="./input_source_clips")
+        self.input_depth_maps_var = tk.StringVar(value="./input_depth_maps")
+        self.multi_map_var = tk.BooleanVar(value=False)
         self.selected_depth_map_var = tk.StringVar(value="")
-        self.depth_map_subfolders = []  # List of valid subfolders
-        self.depth_map_radio_buttons = []  # keep list for UI management
-        self.depth_map_radio_dict = {}  # NEW: map text->widget
-        self._current_video_sidecar_map = None  # Track sidecar's selected map
-        self._suppress_sidecar_map_update = (
-            False  # Prevent overwriting manual selections
-        )
-        self._last_loaded_source_video = (
-            None  # Track source video for NEW video detection
-        )
+        self.depth_map_subfolders = []
+        self.depth_map_radio_buttons = []
+        self.depth_map_radio_dict = {}
+        self._current_video_sidecar_map = None
+        self._suppress_sidecar_map_update = False
+        self._last_loaded_source_video = None
+        
         self.input_depth_maps_var.trace_add(
             "write", lambda *args: self._on_depth_map_folder_changed()
         )
-        self.output_splatted_var = tk.StringVar(
-            value=self.app_config.get("output_splatted", "./output_splatted")
-        )
-
-        self.max_disp_var = tk.StringVar(
-            value=self.app_config.get("max_disp", defaults["MAX_DISP"])
-        )
-        self.process_length_var = tk.StringVar(
-            value=self.app_config.get("process_length", defaults["PROC_LENGTH"])
-        )
+        self.output_splatted_var = tk.StringVar(value="./output_splatted")
+        self.max_disp_var = tk.StringVar(value=defaults["MAX_DISP"])
+        self.process_length_var = tk.StringVar(value=defaults["PROC_LENGTH"])
         self.process_from_var = tk.StringVar(value="")
         self.process_to_var = tk.StringVar(value="")
-        self.batch_size_var = tk.StringVar(
-            value=self.app_config.get("batch_size", defaults["BATCH_SIZE_FULL"])
-        )
+        self.batch_size_var = tk.StringVar(value=defaults["BATCH_SIZE_FULL"])
+        self.dual_output_var = tk.BooleanVar(value=False)
+        self.enable_global_norm_var = tk.BooleanVar(value=False)
+        self.enable_full_res_var = tk.BooleanVar(value=True)
+        self.enable_low_res_var = tk.BooleanVar(value=False)
+        self.pre_res_width_var = tk.StringVar(value="1920")
+        self.pre_res_height_var = tk.StringVar(value="1080")
+        self.low_res_batch_size_var = tk.StringVar(value=defaults["BATCH_SIZE_LOW"])
+        self.zero_disparity_anchor_var = tk.StringVar(value=defaults["CONV_POINT"])
+        self.output_crf_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
+        self.output_crf_full_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
+        self.output_crf_low_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
+        self.color_tags_mode_var = tk.StringVar(value="Auto")
+        self.skip_lowres_preproc_var = tk.BooleanVar(value=False)
+        self.track_dp_total_true_on_render_var = tk.BooleanVar(value=False)
+        self.move_to_finished_var = tk.BooleanVar(value=True)
+        self.crosshair_enabled_var = tk.BooleanVar(value=False)
+        self.crosshair_white_var = tk.BooleanVar(value=False)
+        self.crosshair_multi_var = tk.BooleanVar(value=False)
+        self.depth_pop_enabled_var = tk.BooleanVar(value=False)
+        self.auto_convergence_mode_var = tk.StringVar(value="Off")
+        self.depth_gamma_var = tk.StringVar(value=defaults["DEPTH_GAMMA"])
+        self.depth_dilate_size_x_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_X"])
+        self.depth_dilate_size_y_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_Y"])
+        self.depth_blur_size_x_var = tk.StringVar(value=defaults["DEPTH_BLUR_SIZE_X"])
+        self.depth_blur_size_y_var = tk.StringVar(value=defaults["DEPTH_BLUR_SIZE_Y"])
+        self.depth_dilate_left_var = tk.StringVar(value=defaults["DEPTH_DILATE_LEFT"])
+        self.depth_blur_left_var = tk.StringVar(value=defaults["DEPTH_BLUR_LEFT"])
+        self.depth_blur_left_mix_var = tk.StringVar(value=defaults["DEPTH_BLUR_LEFT_MIX"])
+        self.enable_sidecar_gamma_var = tk.BooleanVar(value=True)
+        self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=True)
+        self.update_slider_from_sidecar_var = tk.BooleanVar(value=True)
+        self.auto_save_sidecar_var = tk.BooleanVar(value=False)
+        self.border_width_var = tk.StringVar(value=defaults["BORDER_WIDTH"])
+        self.border_bias_var = tk.StringVar(value=defaults["BORDER_BIAS"])
+        self.border_mode_var = tk.StringVar(value=defaults["BORDER_MODE"])
+        self.auto_border_L_var = tk.StringVar(value=defaults["AUTO_BORDER_L"])
+        self.auto_border_R_var = tk.StringVar(value=defaults["AUTO_BORDER_R"])
+        self.preview_source_var = tk.StringVar(value="Splat Result")
+        self.preview_size_var = tk.StringVar(value="75%")
+        
+        # --- NEW Sync from ConfigManager ---
+        self.config_manager.sync_to_tk_vars(self.__dict__)
+        
+        # Manual sync for non-standard mappings
+        if "convergence_point" in self.app_config:
+            self.zero_disparity_anchor_var.set(str(self.app_config["convergence_point"]))
+        if "multi_map_enabled" in self.app_config:
+            self.multi_map_var.set(bool(self.app_config["multi_map_enabled"]))
+        if "dark_mode_enabled" in self.app_config:
+            self.dark_mode_var.set(bool(self.app_config["dark_mode_enabled"]))
+        if "enable_full_resolution" in self.app_config:
+            self.enable_full_res_var.set(bool(self.app_config["enable_full_resolution"]))
+        if "enable_low_resolution" in self.app_config:
+            self.enable_low_res_var.set(bool(self.app_config["enable_low_resolution"]))
 
-        self.dual_output_var = tk.BooleanVar(
-            value=self.app_config.get("dual_output", False)
-        )
-        self.enable_global_norm_var = tk.BooleanVar(
-            value=self.app_config.get("enable_global_norm", False)
-        )
-        self.enable_full_res_var = tk.BooleanVar(
-            value=self.app_config.get("enable_full_resolution", True)
-        )
-        self.enable_low_res_var = tk.BooleanVar(
-            value=self.app_config.get("enable_low_resolution", True)
-        )
-        self.pre_res_width_var = tk.StringVar(
-            value=self.app_config.get("pre_res_width", "1024")
-        )
-        self.pre_res_height_var = tk.StringVar(
-            value=self.app_config.get("pre_res_height", "512")
-        )
-        self.low_res_batch_size_var = tk.StringVar(
-            value=self.app_config.get("low_res_batch_size", defaults["BATCH_SIZE_LOW"])
-        )
-        self.zero_disparity_anchor_var = tk.StringVar(
-            value=self.app_config.get("convergence_point", defaults["CONV_POINT"])
-        )
-        self.output_crf_var = tk.StringVar(
-            value=self.app_config.get("output_crf", defaults["CRF_OUTPUT"])
-        )
-        # Separate CRF values for Full vs Low output (fallback to legacy "output_crf")
-        _legacy_crf = self.app_config.get("output_crf", defaults["CRF_OUTPUT"])
-        self.output_crf_full_var = tk.StringVar(
-            value=self.app_config.get("output_crf_full", _legacy_crf)
-        )
-        self.output_crf_low_var = tk.StringVar(
-            value=self.app_config.get("output_crf_low", _legacy_crf)
-        )
-        # Output color metadata tags (metadata-only; does not affect splat math)
-        self.color_tags_mode_var = tk.StringVar(
-            value=self.app_config.get("color_tags_mode", "Auto")
-        )
-
-        # Dev Tools (not saved to config)
-        self.skip_lowres_preproc_var = tk.BooleanVar(
-            value=bool(self.app_config.get("skip_lowres_preproc", False))
-        )
-
-        self.move_to_finished_var = tk.BooleanVar(
-            value=self.app_config.get("move_to_finished", True)
-        )
-
-        # Crosshair overlay for convergence checking (preview-only; not exported)
-        self.crosshair_enabled_var = tk.BooleanVar(
-            value=bool(self.app_config.get("crosshair_enabled", False))
-        )
-        self.crosshair_white_var = tk.BooleanVar(
-            value=bool(self.app_config.get("crosshair_white", False))
-        )
-        self.crosshair_multi_var = tk.BooleanVar(
-            value=bool(self.app_config.get("crosshair_multi", False))
-        )
-        self.depth_pop_enabled_var = tk.BooleanVar(
-            value=bool(self.app_config.get("depth_pop_enabled", False))
-        )
-
-        self.auto_convergence_mode_var = tk.StringVar(
-            value=self.app_config.get("auto_convergence_mode", "Off")
-        )
-
-        # --- Depth Pre-processing Variables ---
-        self.depth_gamma_var = tk.StringVar(
-            value=self.app_config.get("depth_gamma", defaults["DEPTH_GAMMA"])
-        )
-        _ddx = self.app_config.get(
-            "depth_dilate_size_x", defaults["DEPTH_DILATE_SIZE_X"]
-        )
-        _ddy = self.app_config.get(
-            "depth_dilate_size_y", defaults["DEPTH_DILATE_SIZE_Y"]
-        )
-        # Backward compatibility: older configs used 30..40 to represent erosion (-0..-10)
-        try:
-            _ddx_f = float(_ddx)
-            if 30.0 < _ddx_f <= 40.0:
-                _ddx = -(_ddx_f - 30.0)
-        except Exception:
-            pass
-        try:
-            _ddy_f = float(_ddy)
-            if 30.0 < _ddy_f <= 40.0:
-                _ddy = -(_ddy_f - 30.0)
-        except Exception:
-            pass
-        self.depth_dilate_size_x_var = tk.StringVar(value=str(_ddx))
-        self.depth_dilate_size_y_var = tk.StringVar(value=str(_ddy))
-        self.depth_blur_size_x_var = tk.StringVar(
-            value=self.app_config.get(
-                "depth_blur_size_x", defaults["DEPTH_BLUR_SIZE_X"]
-            )
-        )
-        self.depth_blur_size_y_var = tk.StringVar(
-            value=self.app_config.get(
-                "depth_blur_size_y", defaults["DEPTH_BLUR_SIZE_Y"]
-            )
-        )
-        self.depth_dilate_left_var = tk.StringVar(
-            value=self.app_config.get(
-                "depth_dilate_left", defaults["DEPTH_DILATE_LEFT"]
-            )
-        )
-        self.depth_blur_left_var = tk.StringVar(
-            value=self.app_config.get("depth_blur_left", defaults["DEPTH_BLUR_LEFT"])
-        )
-        self.depth_blur_left_mix_var = tk.StringVar(
-            value=self.app_config.get(
-                "depth_blur_left_mix", defaults["DEPTH_BLUR_LEFT_MIX"]
-            )
-        )
-        # --- NEW: Sidecar Control Toggle Variables ---
-        self.enable_sidecar_gamma_var = tk.BooleanVar(
-            value=self.app_config.get("enable_sidecar_gamma", True)
-        )
-        self.enable_sidecar_blur_dilate_var = tk.BooleanVar(
-            value=self.app_config.get("enable_sidecar_blur_dilate", True)
-        )
-        self.update_slider_from_sidecar_var = tk.BooleanVar(
-            value=self.app_config.get("update_slider_from_sidecar", True)
-        )
-        self.auto_save_sidecar_var = tk.BooleanVar(
-            value=self.app_config.get("auto_save_sidecar", False)
-        )
-        self.border_width_var = tk.StringVar(
-            value=self.app_config.get("border_width", defaults["BORDER_WIDTH"])
-        )
-        self.border_bias_var = tk.StringVar(
-            value=self.app_config.get("border_bias", defaults["BORDER_BIAS"])
-        )
-        self.border_mode_var = tk.StringVar(
-            value=self.app_config.get("border_mode", defaults["BORDER_MODE"])
-        )
-        self.auto_border_L_var = tk.StringVar(
-            value=self.app_config.get("auto_border_L", defaults["AUTO_BORDER_L"])
-        )
-        self.auto_border_R_var = tk.StringVar(
-            value=self.app_config.get("auto_border_R", defaults["AUTO_BORDER_R"])
-        )
         # Add traces for automatic border calculation (Auto Basic mode)
         self.zero_disparity_anchor_var.trace_add(
             "write", self._on_convergence_or_disparity_changed
         )
         self.max_disp_var.trace_add("write", self._on_convergence_or_disparity_changed)
         self.border_mode_var.trace_add("write", self._on_border_mode_change)
-
-        # --- NEW: Previewer Variables ---
-        self.preview_source_var = tk.StringVar(
-            value=self.app_config.get("preview_source", "Splat Result")
-        )
-        self.preview_size_var = tk.StringVar(
-            value=self.app_config.get("preview_size", "75%")
-        )
 
         # --- Variables for "Current Processing Information" display ---
         self.processing_filename_var = tk.StringVar(value="N/A")
@@ -837,11 +321,17 @@ class SplatterGUI(ThemedTk):
         # --- Processing control variables ---
         self.stop_event = threading.Event()
         self.progress_queue = queue.Queue()
+        self.batch_processor = BatchProcessor(
+            progress_queue=self.progress_queue,
+            stop_event=self.stop_event,
+            sidecar_manager=self.sidecar_manager,
+        )
         self.processing_thread = None
 
         self._create_widgets()
         self._setup_keyboard_shortcuts()
         self.style = ttk.Style()
+        self.theme_manager = ThemeManager(dark_mode_var=self.dark_mode_var)
 
         self.update_idletasks()  # Ensure widgets are rendered for correct reqheight
         self._apply_theme(is_startup=True)  # Pass is_startup=True here
@@ -923,106 +413,46 @@ class SplatterGUI(ThemedTk):
         self.window_width = current_actual_width  # Update stored width
 
     def _apply_theme(self, is_startup: bool = False):
-        """Applies the selected theme (dark or light) to the GUI."""
-        # 1. Define color palettes
-        dark_colors = {
-            "bg": "#2b2b2b",
-            "fg": "white",
-            "entry_bg": "#3c3c3c",
-            "menu_bg": "#3c3c3c",
-            "menu_fg": "white",
-            "active_bg": "#555555",
-            "active_fg": "white",
-            "theme": "black",
-        }
-        light_colors = {
-            "bg": "#d9d9d9",
-            "fg": "black",
-            "entry_bg": "#ffffff",
-            "menu_bg": "#f0f0f0",
-            "menu_fg": "black",
-            "active_bg": "#dddddd",
-            "active_fg": "black",
-            "theme": "default",
-        }
+        """Applies the selected theme (dark or light) to the GUI using ThemeManager."""
+        if not hasattr(self, "theme_manager"):
+            return
 
-        # 2. Select the current palette and theme
-        if self.dark_mode_var.get():
-            colors = dark_colors
-        else:
-            colors = light_colors
+        # 1. Apply styles to ttk widgets and root window
+        self.theme_manager.apply_theme_to_style(self.style, root_window=self)
 
-        self.style.theme_use(colors["theme"])
-        self.configure(bg=colors["bg"])
+        # 2. Apply theme to non-ttk widgets (Menu, Canvas, Labels)
+        colors = self.theme_manager.get_colors()
 
-        # 3. Apply styles to ttk widgets
-        self.style.configure("TFrame", background=colors["bg"], foreground=colors["fg"])
-        self.style.configure(
-            "TLabelframe", background=colors["bg"], foreground=colors["fg"]
-        )
-        self.style.configure(
-            "TLabelframe.Label", background=colors["bg"], foreground=colors["fg"]
-        )
-        self.style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
-        self.style.configure(
-            "TCheckbutton", background=colors["bg"], foreground=colors["fg"]
-        )
-        self.style.map(
-            "TCheckbutton",
-            foreground=[("active", colors["fg"])],
-            background=[("active", colors["bg"])],
-        )
-
-        # 4. Configure Entry and Combobox widgets using style.map for robust background override
-        self.style.map(
-            "TEntry",
-            fieldbackground=[("", colors["entry_bg"])],
-            foreground=[("", colors["fg"])],
-        )
-        self.style.configure("TEntry", insertcolor=colors["fg"])
-        self.style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", colors["entry_bg"])],
-            foreground=[("readonly", colors["fg"])],
-            selectbackground=[("readonly", colors["entry_bg"])],
-            selectforeground=[("readonly", colors["fg"])],
-        )
-
-        # Manually set the background for the previewer's canvas widget
-        if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
-            self.previewer.preview_canvas.config(bg=colors["bg"], highlightthickness=0)
-
-        # 5. Manually configure non-ttk widgets (Menu, tk.Label)
+        # Menus
         if hasattr(self, "menubar"):
-            for menu in [self.menubar, self.file_menu, self.help_menu]:
-                menu.config(
-                    bg=colors["menu_bg"],
-                    fg=colors["menu_fg"],
-                    activebackground=colors["active_bg"],
-                    activeforeground=colors["active_fg"],
-                )
-        if hasattr(self, "info_frame"):
-            for label in self.info_labels:
-                label.config(bg=colors["bg"], fg=colors["fg"])
+            self.theme_manager.apply_theme_to_menus(
+                menus=[self.file_menu, self.help_menu], menubar=self.menubar
+            )
 
-        # 6. Handle window geometry adjustment (only after startup)
-        self.update_idletasks()  # Ensure all theme changes are rendered for accurate reqheight
+        # Previewer Canvas
+        if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
+            self.theme_manager.apply_theme_to_canvas(self.previewer.preview_canvas)
 
-        # --- Apply geometry only if not during startup (NEW conditional block) ---
-        # if not is_startup:
-        #     self._adjust_window_height_for_content()
+        # Info Labels
+        if hasattr(self, "info_frame") and hasattr(self, "info_labels"):
+            self.theme_manager.apply_theme_to_labels(self.info_labels)
+
+        # 3. Handle window geometry adjustment
+        self.update_idletasks()
 
     def _auto_converge_worker(
-        self, depth_map_path, process_length, batch_size, fallback_value, mode
+        self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode
     ):
         """Worker thread for running the Auto-Convergence calculation."""
 
-        # Run the existing auto-convergence logic (no mode parameter needed now)
-        new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
-            depth_map_path,
-            process_length,
-            batch_size,
-            fallback_value,
+        # Use the extracted ConvergenceEstimatorWrapper
+        new_anchor_avg, new_anchor_peak = self.convergence_estimator.estimate_convergence(
+            rgb_path=rgb_path,
+            depth_path=depth_map_path,
+            process_length=int(process_length),
+            gamma=float(gamma),
+            fallback_value=float(fallback_value),
+            stop_event=self.stop_event
         )
 
         # Use self.after to safely update the GUI from the worker thread
@@ -1183,7 +613,25 @@ class SplatterGUI(ThemedTk):
             c = float(c_val)
             d = float(d_val)
 
-            width = max(0.0, (1.0 - c) * 2.0 * (d / 20.0))
+
+            # TV-range 10-bit depth maps preserve the 64–940 code window; compensate so set_disparity feels the same as full-range.
+            tv_disp_comp = 1.0
+            try:
+                if getattr(self, "previewer", None) is not None:
+                    _bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    _dpath = getattr(self.previewer, "_depth_path", None)
+                    if _bd > 8 and _dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        if _dpath not in self._depth_color_range_cache:
+                            _info = get_video_stream_info(_dpath)
+                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                        if self._depth_color_range_cache.get(_dpath) == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+            width = max(0.0, (1.0 - c) * 2.0 * (d / 20.0) * tv_disp_comp)
             width = min(5.0, width)
 
             self.border_width_var.set(f"{width:.2f}")
@@ -1209,14 +657,7 @@ class SplatterGUI(ThemedTk):
         if r_val is None:
             r_val = self._safe_float(self.auto_border_R_var)
 
-        w = max(l_val, r_val)
-        if w > 0:
-            if l_val >= r_val:
-                b = (r_val / l_val) - 1.0
-            else:
-                b = 1.0 - (l_val / r_val)
-        else:
-            b = 0.0
+        w, b = BorderScanner.sync_sliders_to_auto_borders(l_val, r_val)
 
         self.border_width_var.set(f"{w:.2f}")
         self.border_bias_var.set(f"{b:.2f}")
@@ -1325,72 +766,54 @@ class SplatterGUI(ThemedTk):
         if not depth_path or not os.path.exists(depth_path):
             return
 
-        try:
-            vr = VideoReader(depth_path, ctx=cpu(0))
-            total_frames = len(vr)
-            if total_frames == 0:
-                return
+        # Determine current settings
+        conv = self._safe_float(self.zero_disparity_anchor_var, 0.5)
+        max_disp = self._safe_float(self.max_disp_var, 20.0)
+        gamma = self._safe_float(self.depth_gamma_var, 1.0)
 
-            # Show scanning status
-            old_status = self.status_label.cget("text")
-            self.status_label.config(
-                text=f"Scanning borders for {os.path.basename(depth_path)}..."
-            )
+        # Show scanning status and keep track of old status to revert later
+        old_status = self.status_label.cget("text")
+
+        def status_update(text):
+            self.status_label.config(text=text)
             self.update_idletasks()
 
-            step = 5
-            max_L = 0.0
-            max_R = 0.0
+        # Call the core scanner
+        scan_result = self.border_scanner.scan_current_clip(
+            depth_path=depth_path,
+            conv=conv,
+            max_disp=max_disp,
+            gamma=gamma,
+            stop_event=self.stop_event,
+            status_callback=status_update,
+        )
 
-            conv = self._safe_float(self.zero_disparity_anchor_var, 0.5)
-            max_disp = self._safe_float(self.max_disp_var, 20.0)
-
-            for i in range(0, total_frames, step):
-                if self.stop_event.is_set():
-                    break
-
-                frame_raw = vr[i].asnumpy()
-                if frame_raw.ndim == 3:
-                    # Simple average for grayscale
-                    frame = frame_raw.mean(axis=2)
-                else:
-                    frame = frame_raw
-
-                # Sample 5px wide at each edge
-                L_sample = frame[:, :5]
-                R_sample = frame[:, -5:]
-
-                # 99th percentile to ignore noise
-                d_L = np.percentile(L_sample, 99) / 255.0
-                d_R = np.percentile(R_sample, 99) / 255.0
-
-                # Scaling matches Auto Basic but localized to depth
-                b_L = max(0.0, (d_L - conv) * 2.0 * (max_disp / 20.0))
-                b_R = max(0.0, (d_R - conv) * 2.0 * (max_disp / 20.0))
-
-                max_L = max(max_L, b_L)
-                max_R = max(max_R, b_R)
-
-            max_L = min(5.0, round(float(max_L), 3))
-            max_R = min(5.0, round(float(max_R), 3))
-
+        if scan_result:
+            max_L, max_R = scan_result
             self.auto_border_L_var.set(str(max_L))
             self.auto_border_R_var.set(str(max_R))
 
-            logger.info(
-                f"Border scan complete: L={max_L}, R={max_R} (Conv={conv:.2f}, Disp={max_disp:.1f})"
-            )
-
-            self.status_label.config(text=f"Scan complete: L={max_L}%, R={max_R}%")
-            # Wait a bit so user can see the result before status might be clobbered
+            # Briefly show "Scan complete" then revert
             self.after(2000, lambda: self.status_label.config(text=old_status))
-
             return max_L, max_R
 
-        except Exception as e:
-            logger.error(f"Border scan failed: {e}")
-            self.status_label.config(text="Border scan failed.")
-            return None
+        return None
+
+    def _scan_borders_for_depth_path(
+        self,
+        depth_map_path: str,
+        conv: float,
+        max_disp: float,
+        gamma: float = 1.0,
+    ) -> Optional[Tuple[float, float]]:
+        """Thread-safe helper for AUTO-PASS: scans a depth-map video and returns (L, R) border %."""
+        return self.border_scanner.scan_depth_path(
+            depth_map_path=depth_map_path,
+            conv=conv,
+            max_disp=max_disp,
+            gamma=gamma,
+            stop_event=getattr(self, "stop_event", None),
+        )
 
     def _scan_depth_map_folders(self):
         """Scans the Input Depth Maps folder for subfolders containing *_depth.mp4 files."""
@@ -1772,7 +1195,14 @@ class SplatterGUI(ThemedTk):
                 self._auto_conv_cached_path = depth_map_path
 
             # 2. Determine which value to apply immediately (based on the current 'mode' selection)
-            anchor_to_apply = new_anchor_avg if mode == "Average" else new_anchor_peak
+            if mode == "Average":
+                anchor_to_apply = new_anchor_avg
+            elif mode == "Peak":
+                anchor_to_apply = new_anchor_peak
+            elif mode == "Hybrid":
+                anchor_to_apply = (new_anchor_avg + new_anchor_peak) / 2.0
+            else:
+                anchor_to_apply = fallback_value
 
             # 3. Update the Tkinter variable and refresh the slider/label
 
@@ -1830,8 +1260,22 @@ class SplatterGUI(ThemedTk):
 
     def _create_hover_tooltip(self, widget, key):
         """Creates a tooltip for a given widget based on a key from help_texts."""
-        if key in self.help_texts:
-            Tooltip(widget, self.help_texts[key])
+        if not key:
+            return
+        try:
+            # Try the provided key first, then a few common variants (no file writes).
+            candidates = [
+                key,
+                f"{key}_button" if not str(key).endswith("_button") else str(key).replace("_button", ""),
+                str(key).replace("btn_", ""),
+                str(key).replace("button_", ""),
+            ]
+            for k in candidates:
+                if k in self.help_texts:
+                    Tooltip(widget, self.help_texts[k])
+                    return
+        except Exception:
+            pass
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
@@ -2261,7 +1705,7 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo = ttk.Combobox(
             self.auto_conv_frame,
             textvariable=self.auto_convergence_mode_var,
-            values=["Off", "Average", "Peak"],
+            values=["Off", "Average", "Peak", "Hybrid"],
             state="readonly",
             width=10,
         )
@@ -2327,6 +1771,7 @@ class SplatterGUI(ThemedTk):
             values=["Manual", "Auto Basic", "Auto Adv.", "Off"],
             state="readonly",
             width=10,
+            takefocus=False,
         )
         self.combo_border_mode.pack(side="left")
 
@@ -2336,6 +1781,7 @@ class SplatterGUI(ThemedTk):
             text="⟳",  # Unicode rescan-like symbol
             width=2,
             command=self._on_border_rescan_click,
+            takefocus=False,
         )
         self.btn_border_rescan.pack(side="left", padx=(3, 0))
 
@@ -2527,6 +1973,21 @@ class SplatterGUI(ThemedTk):
                 default_value=30.0,
             )
         )
+
+        # --- Estimate Max Total(D+P) (quick sampled scan) ---
+        try:
+            self.btn_est_dp_total = ttk.Button(
+                disp_subframe,
+                text="≈",
+                width=2,
+                command=self.run_estimate_dp_total_max,
+                takefocus=False,
+            )
+            self.btn_est_dp_total.grid(row=0, column=3, sticky="w", padx=(6, 0))
+            if hasattr(self, "_create_hover_tooltip"):
+                self._create_hover_tooltip(self.btn_est_dp_total, "estimate_dp_total")
+        except Exception:
+            pass
         all_settings_row += 1
 
         # Convergence Point Slider
@@ -2846,6 +2307,14 @@ class SplatterGUI(ThemedTk):
         self.chk_skip_lowres_preproc.grid(row=0, column=0, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.chk_skip_lowres_preproc, "skip_lowres_preproc")
 
+
+        self.chk_track_dp_total_true = ttk.Checkbutton(
+            self.dev_tools_frame,
+            text="True Max",
+            variable=self.track_dp_total_true_on_render_var,
+        )
+        self.chk_track_dp_total_true.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=0)
+        self._create_hover_tooltip(self.chk_track_dp_total_true, "track_dp_total_true_on_render")
         self.chk_map_test = ttk.Checkbutton(
             self.dev_tools_frame,
             text="Map Test",
@@ -2923,11 +2392,22 @@ class SplatterGUI(ThemedTk):
             button_frame,
             text="Preview Auto-Converge",
             command=self.run_preview_auto_converge,
+            takefocus=False,
         )
         self.btn_auto_converge_preview.pack(side="left", padx=5)
         self._create_hover_tooltip(
             self.btn_auto_converge_preview, "preview_auto_converge"
         )
+
+        # --- AUTO-PASS Button ---
+        self.btn_auto_pass = ttk.Button(
+            button_frame,
+            text="AUTO-PASS",
+            command=self.run_auto_pass,
+            takefocus=False,
+        )
+        self.btn_auto_pass.pack(side="left", padx=(9, 9))
+        self._create_hover_tooltip(self.btn_auto_pass, "auto_pass_button")
 
         # --- Update Sidecar Button ---
         self.update_sidecar_button = ttk.Button(
@@ -3066,1042 +2546,7 @@ class SplatterGUI(ThemedTk):
         except ValueError:
             pass  # Invalid current value
 
-    def depthSplatting(
-        self: "SplatterGUI",
-        input_video_reader: VideoReader,
-        depth_map_reader: VideoReader,
-        total_frames_to_process: int,
-        processed_fps: float,
-        output_video_path_base: str,
-        target_output_height: int,
-        target_output_width: int,
-        max_disp: float,
-        process_length: int,
-        batch_size: int,
-        dual_output: bool,
-        zero_disparity_anchor_val: float,
-        video_stream_info: Optional[dict],
-        input_bias: Optional[float],
-        assume_raw_input: bool,
-        global_depth_min: float,
-        global_depth_max: float,
-        depth_stream_info: Optional[dict],
-        user_output_crf: Optional[int] = None,
-        is_low_res_task: bool = False,
-        depth_gamma: float = 1.0,
-        depth_dilate_size_x: float = 0.0,
-        depth_dilate_size_y: float = 0.0,
-        depth_blur_size_x: float = 0.0,
-        depth_blur_size_y: float = 0.0,
-        depth_dilate_left: float = 0.0,
-        depth_blur_left: float = 0.0,
-    ):
-        logger.debug("==> Initializing ForwardWarpStereo module")
-        stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-
-        num_frames = total_frames_to_process
-        height, width = target_output_height, target_output_width
-        os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
-
-        # --- Determine output grid dimensions and final path ---
-        grid_height, grid_width = (
-            (height, width * 2) if dual_output else (height * 2, width * 2)
-        )
-        suffix = "_splatted2" if dual_output else "_splatted4"
-        res_suffix = f"_{width}"
-        final_output_video_path = (
-            f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
-        )
-
-        # --- DEBUG: Log ffprobe-derived color metadata for this pass (Hi/Lo parity checks) ---
-        task_name = "LowRes" if is_low_res_task else "HiRes"
-        try:
-            logger.info(
-                f"[COLOR_META][{task_name}] input ffprobe: "
-                f"pix_fmt={video_stream_info.get('pix_fmt') if video_stream_info else None}, "
-                f"range={video_stream_info.get('color_range') if video_stream_info else None}, "
-                f"primaries={video_stream_info.get('color_primaries') if video_stream_info else None}, "
-                f"trc={video_stream_info.get('transfer_characteristics') if video_stream_info else None}, "
-                f"matrix={video_stream_info.get('color_space') if video_stream_info else None}"
-            )
-        except Exception:
-            pass
-        # --- END DEBUG ---
-
-        # --- Start FFmpeg pipe process ---
-        is_test_mode = bool(
-            (getattr(self, "map_test_var", None) and self.map_test_var.get())
-            or (getattr(self, "splat_test_var", None) and self.splat_test_var.get())
-        )
-        ffmpeg_process = None
-        if is_test_mode:
-            # In test mode we don't want to create/overwrite any output video files.
-            logger.debug(
-                "Test mode active: skipping FFmpeg encoding (no output video will be written)."
-            )
-        else:
-            # --- Start FFmpeg pipe process ---
-            # Apply output color tag mode (metadata-only; does not change splat math)
-            encode_stream_info = (
-                dict(video_stream_info) if isinstance(video_stream_info, dict) else {}
-            )
-            try:
-                _ct_mode = (
-                    self.color_tags_mode_var.get()
-                    if hasattr(self, "color_tags_mode_var")
-                    else "Auto"
-                )
-            except Exception:
-                _ct_mode = "Auto"
-
-            def _ct_defaults(d: dict) -> dict:
-                d.setdefault("color_primaries", "bt709")
-                d.setdefault("transfer_characteristics", "bt709")
-                d.setdefault("color_space", "bt709")
-                # Only metadata; used for tagging if missing. Preserve source if present.
-                d.setdefault("color_range", "tv")
-                return d
-
-            if _ct_mode == "Auto":
-                encode_stream_info = _ct_defaults(encode_stream_info)
-            elif _ct_mode == "BT.709 L":
-                encode_stream_info.update(
-                    {
-                        "color_primaries": "bt709",
-                        "transfer_characteristics": "bt709",
-                        "color_space": "bt709",
-                        "color_range": "tv",
-                    }
-                )
-            elif _ct_mode == "BT.709 F":
-                encode_stream_info.update(
-                    {
-                        "color_primaries": "bt709",
-                        "transfer_characteristics": "bt709",
-                        "color_space": "bt709",
-                        "color_range": "pc",
-                    }
-                )
-            elif _ct_mode == "BT.2020 PQ":
-                encode_stream_info.update(
-                    {
-                        "color_primaries": "bt2020",
-                        "transfer_characteristics": "smpte2084",
-                        "color_space": "bt2020nc",
-                        "color_range": "tv",
-                    }
-                )
-            elif _ct_mode == "BT.2020 HLG":
-                encode_stream_info.update(
-                    {
-                        "color_primaries": "bt2020",
-                        "transfer_characteristics": "arib-std-b67",
-                        "color_space": "bt2020nc",
-                        "color_range": "tv",
-                    }
-                )
-            else:
-                # Unknown/legacy value; keep current behavior
-                encode_stream_info = _ct_defaults(encode_stream_info)
-
-            ffmpeg_process = start_ffmpeg_pipe_process(
-                content_width=grid_width,
-                content_height=grid_height,
-                final_output_mp4_path=final_output_video_path,
-                fps=processed_fps,
-                video_stream_info=encode_stream_info,
-                user_output_crf=user_output_crf,
-                output_format_str="splatted_grid",  # Pass a placeholder for the new argument
-                debug_label=task_name,
-            )
-            if ffmpeg_process is None:
-                logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
-                return False
-
-        # --- DEBUG: Capture and compare encoding flags between HiRes and LowRes passes ---
-        try:
-            flags = getattr(ffmpeg_process, "sc_encode_flags", None)
-            if flags:
-                if not hasattr(self, "_sc_color_encode_flags"):
-                    self._sc_color_encode_flags = {}
-                subset_keys = [
-                    "enc_codec",
-                    "enc_pix_fmt",
-                    "enc_profile",
-                    "enc_color_primaries",
-                    "enc_color_trc",
-                    "enc_colorspace",
-                    "quality_mode",
-                    "quality_value",
-                ]
-                subset = {k: flags.get(k) for k in subset_keys}
-                self._sc_color_encode_flags[task_name] = subset
-
-                other_name = "HiRes" if task_name == "LowRes" else "LowRes"
-                if other_name in self._sc_color_encode_flags:
-                    other = self._sc_color_encode_flags[other_name]
-                    diffs = {
-                        k: (other.get(k), subset.get(k))
-                        for k in subset_keys
-                        if other.get(k) != subset.get(k)
-                    }
-                    if diffs:
-                        logger.warning(
-                            f"[COLOR_META] Encoding flags differ ({other_name} vs {task_name}): {diffs}"
-                        )
-                    else:
-                        logger.info(
-                            f"[COLOR_META] Encoding flags match between {other_name} and {task_name}."
-                        )
-        except Exception:
-            pass
-        # --- END DEBUG ---
-
-        # --- Determine max_expected_raw_value for consistent Gamma ---
-        max_expected_raw_value = 1.0
-        depth_pix_fmt = depth_stream_info.get("pix_fmt") if depth_stream_info else None
-        depth_profile = depth_stream_info.get("profile") if depth_stream_info else None
-        is_source_10bit = False
-        if depth_pix_fmt:
-            if (
-                "10" in depth_pix_fmt
-                or "gray10" in depth_pix_fmt
-                or "12" in depth_pix_fmt
-                or (depth_profile and "main10" in depth_profile)
-            ):
-                is_source_10bit = True
-        if is_source_10bit:
-            max_expected_raw_value = 1023.0
-        elif depth_pix_fmt and (
-            "8" in depth_pix_fmt or depth_pix_fmt in ["yuv420p", "yuv422p", "yuv444p"]
-        ):
-            max_expected_raw_value = 255.0
-        elif isinstance(depth_pix_fmt, str) and "float" in depth_pix_fmt:
-            max_expected_raw_value = 1.0
-        logger.debug(
-            f"Determined max_expected_raw_value: {max_expected_raw_value:.1f} (Source: {depth_pix_fmt}/{depth_profile})"
-        )
-
-        frame_count = 0
-        encoding_successful = True  # Assume success unless an error occurs
-
-        try:
-            # Map/Splat Test: render the *same frame* the preview is showing.
-            test_target_frame_idx = None
-            try:
-                if (
-                    getattr(self, "map_test_var", None) and self.map_test_var.get()
-                ) or (
-                    getattr(self, "splat_test_var", None) and self.splat_test_var.get()
-                ):
-                    if (
-                        hasattr(self, "previewer")
-                        and getattr(self.previewer, "last_loaded_frame_index", None)
-                        is not None
-                    ):
-                        test_target_frame_idx = int(
-                            self.previewer.last_loaded_frame_index
-                        )
-                        test_target_frame_idx = max(
-                            0, min(int(num_frames) - 1, test_target_frame_idx)
-                        )
-            except Exception:
-                test_target_frame_idx = None
-
-            frame_index_iter = (
-                [test_target_frame_idx]
-                if test_target_frame_idx is not None
-                else range(0, num_frames, batch_size)
-            )
-            for i in frame_index_iter:
-                t_start_batch = time.perf_counter()  # <--- TIMER START: Total Batch
-                if self.stop_event.is_set() or (
-                    ffmpeg_process is not None and ffmpeg_process.poll() is not None
-                ):
-                    if ffmpeg_process is not None and ffmpeg_process.poll() is not None:
-                        logger.error(
-                            "FFmpeg process terminated unexpectedly. Stopping frame processing."
-                        )
-                    else:
-                        logger.warning(
-                            "Stop event received. Terminating FFmpeg process."
-                        )
-                    encoding_successful = False
-                    break
-
-                # --- TIMER 1: Video/Depth I/O (Disk/Decode/Resize) ---
-                t_start_io = time.perf_counter()
-
-                current_frame_indices = (
-                    [i]
-                    if test_target_frame_idx is not None
-                    else list(range(i, min(i + batch_size, num_frames)))
-                )
-                if not current_frame_indices:
-                    break
-
-                batch_frames_numpy = input_video_reader.get_batch(
-                    current_frame_indices
-                ).asnumpy()
-                # This often resolves issues where Decord/FFmpeg loses the internal stream position
-                try:
-                    # Seek to the first frame of the current batch
-                    depth_map_reader.seek(current_frame_indices[0])
-                    # Then read the full batch from that position
-                    batch_depth_numpy_raw = depth_map_reader.get_batch(
-                        current_frame_indices
-                    ).asnumpy()
-                except Exception as e:
-                    logger.error(
-                        f"Error seeking/reading depth map batch starting at index {i}: {e}. Falling back to a potentially blank read."
-                    )
-                    batch_depth_numpy_raw = depth_map_reader.get_batch(
-                        current_frame_indices
-                    ).asnumpy()
-                t_end_io = time.perf_counter()
-
-                file_frame_idx = current_frame_indices[0]
-                task_name = "LowRes" if is_low_res_task else "HiRes"
-
-                if batch_depth_numpy_raw.min() == batch_depth_numpy_raw.max() == 0:
-                    logger.warning(
-                        f"Depth map batch starting at index {i} is entirely blank/zero after read. **Seeking failed to resolve.**"
-                    )
-
-                if batch_depth_numpy_raw.min() == batch_depth_numpy_raw.max():
-                    logger.warning(
-                        f"Depth map batch starting at index {i} is entirely uniform/flat after read. Min/Max: {batch_depth_numpy_raw.min():.2f}"
-                    )
-
-                # Use the FIRST frame index for the file name (e.g., 00000.png)
-                file_frame_idx = current_frame_indices[0]
-
-                # self._save_debug_numpy(batch_depth_numpy_raw, "01_RAW_INPUT", i, file_frame_idx, task_name)
-                # --- TIMER 2: CPU Pre-processing (Dilate, Blur, Grayscale, Gamma, Min/Max Calc) ---
-                # --- 8-bit resize parity (Map Test Preview vs Render) ---
-                # For 8-bit depth videos, Decord's decode-time scaling can differ by ~1-2 code values vs OpenCV.
-                # To match the Preview path, decode at native res (see load_pre_rendered_depth) and resize here
-                # BEFORE preprocessing using the same OpenCV interpolation policy.
-                _bd = (
-                    _infer_depth_bit_depth(depth_stream_info)
-                    if depth_stream_info
-                    else 8
-                )
-                if _bd <= 8:
-                    # Determine pre-processing resolution (matches preview/render ordering).
-                    _target_w = int(batch_frames_numpy.shape[2])
-                    _target_h = int(batch_frames_numpy.shape[1])
-                    if is_low_res_task:
-                        _skip_lr = bool(
-                            getattr(self, "skip_lowres_preproc_var", None) is not None
-                            and self.skip_lowres_preproc_var.get()
-                        )
-                        if not _skip_lr:
-                            # For Low-Res tasks we want to apply preprocessing at the incoming depth-reader resolution
-                            # (typically clip-sized when match_resolution_to_target is enabled), then downscale after preprocessing.
-                            _target_w = int(batch_depth_numpy_raw.shape[2])
-                            _target_h = int(batch_depth_numpy_raw.shape[1])
-
-                    # Reduce to a single channel (depth maps are grayscale-encoded).
-                    if batch_depth_numpy_raw.ndim == 4:
-                        if batch_depth_numpy_raw.shape[-1] == 3:
-                            _depth_1c = batch_depth_numpy_raw[..., 0]
-                        elif batch_depth_numpy_raw.shape[-1] == 1:
-                            _depth_1c = batch_depth_numpy_raw[..., 0]
-                        else:
-                            _depth_1c = batch_depth_numpy_raw.squeeze(-1)
-                    else:
-                        _depth_1c = batch_depth_numpy_raw
-
-                    if (_depth_1c.shape[1] != _target_h) or (
-                        _depth_1c.shape[2] != _target_w
-                    ):
-                        _interp = (
-                            cv2.INTER_LINEAR
-                            if (
-                                _target_w > _depth_1c.shape[2]
-                                or _target_h > _depth_1c.shape[1]
-                            )
-                            else cv2.INTER_AREA
-                        )
-                        _resized = np.empty(
-                            (_depth_1c.shape[0], _target_h, _target_w),
-                            dtype=_depth_1c.dtype,
-                        )
-                        for _di in range(_depth_1c.shape[0]):
-                            _resized[_di] = cv2.resize(
-                                _depth_1c[_di],
-                                (_target_w, _target_h),
-                                interpolation=_interp,
-                            )
-                        batch_depth_numpy_raw = _resized[..., None]
-                    else:
-                        batch_depth_numpy_raw = _depth_1c[..., None]
-
-                t_start_preproc = time.perf_counter()
-
-                batch_depth_numpy = self._process_depth_batch(
-                    batch_depth_numpy_raw=batch_depth_numpy_raw,
-                    depth_stream_info=depth_stream_info,
-                    depth_gamma=depth_gamma,
-                    depth_dilate_size_x=depth_dilate_size_x,
-                    depth_dilate_size_y=depth_dilate_size_y,
-                    depth_blur_size_x=depth_blur_size_x,
-                    depth_blur_size_y=depth_blur_size_y,
-                    depth_dilate_left=depth_dilate_left,
-                    depth_blur_left=depth_blur_left,
-                    is_low_res_task=is_low_res_task,
-                    max_raw_value=max_expected_raw_value,
-                    global_depth_min=global_depth_min,
-                    global_depth_max=global_depth_max,
-                    debug_batch_index=i,
-                    debug_frame_index=file_frame_idx,
-                    debug_task_name=task_name,
-                )
-
-                # If the depth batch resolution differs from the source frames,
-                # resize AFTER preprocessing so dilation/erosion/blur parity is preserved.
-                if (batch_depth_numpy.shape[1] != batch_frames_numpy.shape[1]) or (
-                    batch_depth_numpy.shape[2] != batch_frames_numpy.shape[2]
-                ):
-                    target_h = batch_frames_numpy.shape[1]
-                    target_w = batch_frames_numpy.shape[2]
-                    # INTER_AREA seems best for downscaling depth maps (minimizes aliasing/jaggies-cv2.INTER_LANCZOS4 works too).
-                    if (
-                        target_w < batch_depth_numpy.shape[2]
-                        and target_h < batch_depth_numpy.shape[1]
-                    ):
-                        interp = cv2.INTER_AREA
-                    else:
-                        interp = cv2.INTER_LINEAR
-                    resized_depth = np.empty(
-                        (batch_depth_numpy.shape[0], target_h, target_w),
-                        dtype=batch_depth_numpy.dtype,
-                    )
-                    for _di in range(batch_depth_numpy.shape[0]):
-                        resized_depth[_di] = cv2.resize(
-                            batch_depth_numpy[_di],
-                            (target_w, target_h),
-                            interpolation=interp,
-                        )
-                    batch_depth_numpy = resized_depth
-
-                # self._save_debug_numpy(batch_depth_numpy, "02_PROCESSED_PRE_NORM", i, file_frame_idx, task_name)
-
-                batch_frames_float = batch_frames_numpy.astype("float32") / 255.0
-
-                # 1. Normalize based on mode
-                if assume_raw_input:
-                    if global_depth_max > 1.0:
-                        batch_depth_normalized = batch_depth_numpy / global_depth_max
-                    else:
-                        batch_depth_normalized = batch_depth_numpy.copy()
-                else:
-                    depth_range = global_depth_max - global_depth_min
-                    if depth_range > 1e-5:
-                        batch_depth_normalized = (
-                            batch_depth_numpy - global_depth_min
-                        ) / depth_range
-                    else:
-                        batch_depth_normalized = np.full_like(
-                            batch_depth_numpy,
-                            fill_value=zero_disparity_anchor_val,
-                            dtype=np.float32,
-                        )
-                        logger.warning(
-                            f"Normalization collapsed to zero range ({global_depth_min:.4f} - {global_depth_max:.4f})."
-                        )
-
-                # 2. Unified Inverted Gamma (Matches Preview Math exactly)
-                if round(float(depth_gamma), 2) != 1.0:
-                    # Math: 1.0 - (1.0 - depth)^gamma
-                    batch_depth_normalized = 1.0 - np.power(
-                        1.0 - np.clip(batch_depth_normalized, 0, 1), depth_gamma
-                    )
-                    # (Normal) Depth gamma applied in normalized space; no warning log.
-
-                batch_depth_normalized = np.clip(batch_depth_normalized, 0, 1)
-
-                # --- START OF DIAGNOSTIC SYNC BLOCK ---
-                # Keeps depth visualization at 16-bit to prevent banding in the Render output
-                batch_depth_vis_list = []
-                for d_frame in batch_depth_normalized:
-                    # We keep this as float32 for the assembly to prevent 8-bit quantization
-                    vis_gray_3ch = np.stack([d_frame] * 3, axis=-1)
-                    batch_depth_vis_list.append(vis_gray_3ch.astype("float32"))
-
-                batch_depth_vis = np.stack(batch_depth_vis_list, axis=0)
-                # --- END OF DIAGNOSTIC SYNC BLOCK ---
-
-                t_end_preproc = time.perf_counter()
-                # --- END TIMER 2 ---
-
-                # --- TIMER 3: HtoD Transfer (CPU to GPU) ---
-                t_start_transfer_HtoD = time.perf_counter()
-
-                left_video_tensor = (
-                    torch.from_numpy(batch_frames_numpy)
-                    .permute(0, 3, 1, 2)
-                    .float()
-                    .cuda()
-                    / 255.0
-                )
-                disp_map_tensor = (
-                    torch.from_numpy(batch_depth_normalized).unsqueeze(1).float().cuda()
-                )
-                disp_map_tensor = (disp_map_tensor - zero_disparity_anchor_val) * 2.0
-                disp_map_tensor = disp_map_tensor * max_disp
-
-                torch.cuda.synchronize()  # Force synchronization before compute
-                t_end_transfer_HtoD = time.perf_counter()
-                # --- END TIMER 3 ---
-
-                # --- TIMER 4: GPU Compute (Core Splatting) ---
-                t_start_compute = time.perf_counter()
-
-                with torch.no_grad():
-                    right_video_tensor_raw, occlusion_mask_tensor = stereo_projector(
-                        left_video_tensor, disp_map_tensor
-                    )
-                    right_video_tensor = right_video_tensor_raw
-
-                right_video_numpy = right_video_tensor.cpu().permute(0, 2, 3, 1).numpy()
-                occlusion_mask_numpy = (
-                    occlusion_mask_tensor.cpu()
-                    .permute(0, 2, 3, 1)
-                    .numpy()
-                    .repeat(3, axis=-1)
-                )
-
-                t_end_transfer_DtoH = time.perf_counter()
-                # --- END TIMER 5 ---
-
-                # --- TIMER 6: FFmpeg Write (Blocking I/O) ---
-                t_start_write = time.perf_counter()
-
-                # --- START OF DIAGNOSTIC TEST ASSEMBLY ---
-                test_generated_this_task = False
-                if self.map_test_var.get() or self.splat_test_var.get():
-                    for j in range(len(batch_frames_numpy)):
-                        # Capture logic
-                        clean_base = (
-                            os.path.splitext(output_video_path_base)[0]
-                            .replace("_splatted2", "")
-                            .replace("_splatted4", "")
-                        )
-                        base_img_path = f"{clean_base}_{width}"
-
-                        # Emergency pump to ensure the 100% scale update_preview finished
-                        for _ in range(25):
-                            self.update_idletasks()
-                            self.update()
-                            if self.previewer.pil_image_for_preview is not None:
-                                break
-                            time.sleep(0.1)
-
-                        if self.previewer.pil_image_for_preview is None:
-                            logger.error(
-                                "Diagnostic Capture Failed: Preview image is missing."
-                            )
-                            return False
-
-                        preview_pil = self.previewer.pil_image_for_preview.convert(
-                            "RGB"
-                        )
-                        # Resize preview to match RENDER resolution for SBS parity
-                        preview_pil = preview_pil.resize(
-                            (width, height), Image.Resampling.LANCZOS
-                        )
-                        preview_side = np.array(preview_pil).astype(np.float32) / 255.0
-
-                        if self.map_test_var.get():
-                            # Render depth visualization (apply the same visualization-only TV->full expansion for 10-bit, when tagged 'tv')
-                            render_map_vis = batch_depth_vis[j]
-                            try:
-                                if DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT:
-                                    bd = (
-                                        int(_infer_depth_bit_depth(depth_stream_info))
-                                        if depth_stream_info
-                                        else 8
-                                    )
-                                    rng = str(
-                                        (depth_stream_info or {}).get("color_range")
-                                        or (depth_stream_info or {}).get("range")
-                                        or ""
-                                    ).lower()
-                                    if bd >= 10 and rng == "tv":
-                                        render_map_vis = (
-                                            render_map_vis - DEPTH_VIS_TV10_BLACK_NORM
-                                        ) / (
-                                            DEPTH_VIS_TV10_WHITE_NORM
-                                            - DEPTH_VIS_TV10_BLACK_NORM
-                                        )
-                            except Exception:
-                                pass
-
-                            # Save labeled PREVIEW / RENDER single images
-                            try:
-                                prev_u8 = (np.clip(preview_side, 0, 1) * 255).astype(
-                                    np.uint8
-                                )
-                                prev_bgr = cv2.cvtColor(prev_u8, cv2.COLOR_RGB2BGR)
-                                cv2.putText(
-                                    prev_bgr,
-                                    "PREVIEW",
-                                    (10, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.2,
-                                    (0, 0, 255),
-                                    2,
-                                )
-                                cv2.imwrite(
-                                    f"{base_img_path}_map_test_preview.png", prev_bgr
-                                )
-
-                                rend_u8 = (np.clip(render_map_vis, 0, 1) * 255).astype(
-                                    np.uint8
-                                )
-                                rend_bgr = cv2.cvtColor(rend_u8, cv2.COLOR_RGB2BGR)
-                                cv2.putText(
-                                    rend_bgr,
-                                    "RENDER",
-                                    (10, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.2,
-                                    (0, 0, 255),
-                                    2,
-                                )
-                                cv2.imwrite(
-                                    f"{base_img_path}_map_test_render.png", rend_bgr
-                                )
-                            except Exception:
-                                pass
-
-                            # SBS (kept for convenience)
-                            sbs_map = np.concatenate(
-                                [preview_side, render_map_vis], axis=1
-                            )
-                            sbs_map_uint8 = (np.clip(sbs_map, 0, 1) * 255).astype(
-                                np.uint8
-                            )
-                            sbs_map_bgr = cv2.cvtColor(sbs_map_uint8, cv2.COLOR_RGB2BGR)
-                            cv2.putText(
-                                sbs_map_bgr,
-                                "PREVIEW",
-                                (10, 35),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2,
-                                (0, 0, 255),
-                                2,
-                            )
-                            cv2.putText(
-                                sbs_map_bgr,
-                                "RENDER",
-                                (width + 10, 35),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2,
-                                (0, 0, 255),
-                                2,
-                            )
-                            cv2.imwrite(f"{base_img_path}_map_test.png", sbs_map_bgr)
-                            logger.info(
-                                f"Saved Map Test: {os.path.basename(base_img_path)}_map_test.png"
-                            )
-
-                        if self.splat_test_var.get():
-                            # Save labeled PREVIEW / RENDER single images
-                            try:
-                                prev_u8 = (np.clip(preview_side, 0, 1) * 255).astype(
-                                    np.uint8
-                                )
-                                prev_bgr = cv2.cvtColor(prev_u8, cv2.COLOR_RGB2BGR)
-                                cv2.putText(
-                                    prev_bgr,
-                                    "PREVIEW",
-                                    (10, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.2,
-                                    (0, 0, 255),
-                                    2,
-                                )
-                                cv2.imwrite(
-                                    f"{base_img_path}_splat_test_preview.png", prev_bgr
-                                )
-
-                                rend_u8 = (
-                                    np.clip(right_video_numpy[j], 0, 1) * 255
-                                ).astype(np.uint8)
-                                rend_bgr = cv2.cvtColor(rend_u8, cv2.COLOR_RGB2BGR)
-                                cv2.putText(
-                                    rend_bgr,
-                                    "RENDER",
-                                    (10, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    1.2,
-                                    (0, 0, 255),
-                                    2,
-                                )
-                                cv2.imwrite(
-                                    f"{base_img_path}_splat_test_render.png", rend_bgr
-                                )
-                            except Exception:
-                                pass
-
-                            # SBS (kept for convenience)
-                            sbs_splat = np.concatenate(
-                                [preview_side, right_video_numpy[j]], axis=1
-                            )
-                            sbs_splat_uint8 = (np.clip(sbs_splat, 0, 1) * 255).astype(
-                                np.uint8
-                            )
-                            sbs_splat_bgr = cv2.cvtColor(
-                                sbs_splat_uint8, cv2.COLOR_RGB2BGR
-                            )
-                            cv2.putText(
-                                sbs_splat_bgr,
-                                "PREVIEW",
-                                (10, 35),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2,
-                                (0, 0, 255),
-                                2,
-                            )
-                            cv2.putText(
-                                sbs_splat_bgr,
-                                "RENDER",
-                                (width + 10, 35),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                1.2,
-                                (0, 0, 255),
-                                2,
-                            )
-                            cv2.imwrite(
-                                f"{base_img_path}_splat_test.png", sbs_splat_bgr
-                            )
-                            logger.info(
-                                f"Saved Splat Test: {os.path.basename(base_img_path)}_splat_test.png"
-                            )
-
-                        test_generated_this_task = True
-                        break  # Only process one frame for images
-
-                    if test_generated_this_task:
-                        return True  # Exit early: NO VIDEO encoding occurs
-
-                # --- STANDARD VIDEO ENCODING (Only reached if NO tests enabled) ---
-                for j in range(len(batch_frames_numpy)):
-                    if dual_output:
-                        video_grid = np.concatenate(
-                            [occlusion_mask_numpy[j], right_video_numpy[j]], axis=1
-                        )
-                    else:
-                        video_grid_top = np.concatenate(
-                            [batch_frames_float[j], batch_depth_vis[j]], axis=1
-                        )
-                        video_grid_bottom = np.concatenate(
-                            [occlusion_mask_numpy[j], right_video_numpy[j]], axis=1
-                        )
-                        video_grid = np.concatenate(
-                            [video_grid_top, video_grid_bottom], axis=0
-                        )
-
-                    video_grid_uint16 = (
-                        np.clip(video_grid, 0.0, 1.0) * 65535.0
-                    ).astype(np.uint16)
-                    ffmpeg_process.stdin.write(
-                        cv2.cvtColor(video_grid_uint16, cv2.COLOR_RGB2BGR).tobytes()
-                    )
-                    frame_count += 1
-                # --- END OF FRAME ASSEMBLY ---
-
-                t_end_write = time.perf_counter()
-                # --- END TIMER 6 ---
-
-                del (
-                    left_video_tensor,
-                    disp_map_tensor,
-                    right_video_tensor,
-                    occlusion_mask_tensor,
-                )
-                torch.cuda.empty_cache()
-                draw_progress_bar(frame_count, num_frames, prefix=f"  Encoding:")
-
-                t_end_batch = time.perf_counter()  # <--- TIMER END: Total Batch
-
-                # --- LOG RESULTS: Conditionally log at DEBUG level ---
-                if logger.isEnabledFor(logging.DEBUG):
-                    batch_size_actual = len(current_frame_indices)
-                    task_tag = "LowRes" if is_low_res_task else "HiRes"
-
-                    io_time = t_end_io - t_start_io
-                    preproc_time = t_end_preproc - t_start_preproc
-                    htod_time = t_end_transfer_HtoD - t_start_transfer_HtoD
-                    compute_time = t_end_compute - t_start_compute
-                    dtoh_time = t_end_transfer_DtoH - t_start_transfer_DtoH
-                    write_time = t_end_write - t_start_write
-                    total_batch_time = t_end_batch - t_start_batch
-
-                    logger.info(
-                        f"[{task_tag} Batch {i // batch_size_actual + 1}] Frames={batch_size_actual} Total={total_batch_time * 1000:.0f}ms | "
-                        f"IO={io_time * 1000:.0f}ms | CPU_Proc={preproc_time * 1000:.0f}ms | HtoD={htod_time * 1000:.0f}ms | "
-                        f"GPU_Comp={compute_time * 1000:.0f}ms | DtoH={dtoh_time * 1000:.0f}ms | FFmpeg_Write={write_time * 1000:.0f}ms"
-                    )
-                # --- END LOG RESULTS ---
-
-        except (IOError, BrokenPipeError) as e:
-            logger.error(f"FFmpeg pipe error: {e}. Encoding may have failed.")
-            encoding_successful = False
-        finally:
-            del stereo_projector
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            # --- Finalize FFmpeg process ---
-            if ffmpeg_process is not None:
-                if ffmpeg_process.stdin:
-                    try:
-                        ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
-                    finally:
-                        ffmpeg_process.stdin = None   # <-- IMPORTANT: prevent communicate() flushing closed stdin
-
-                # Wait for the process to finish and get output
-                stdout, stderr = ffmpeg_process.communicate(timeout=120)
-
-                if self.stop_event.is_set():
-                    ffmpeg_process.terminate()
-                    logger.warning(
-                        f"FFmpeg encoding stopped by user for {os.path.basename(final_output_video_path)}."
-                    )
-                    encoding_successful = False
-                elif ffmpeg_process.returncode != 0:
-                    logger.error(
-                        f"FFmpeg encoding failed for {os.path.basename(final_output_video_path)} (return code {ffmpeg_process.returncode}):\n{stderr.decode()}"
-                    )
-                    encoding_successful = False
-                else:
-                    logger.info(
-                        f"Successfully encoded video to {final_output_video_path}"
-                    )
-                    logger.debug(f"FFmpeg stderr log:\n{stderr.decode()}")
-            else:
-                # Test mode: no encoding step was started, so nothing to finalize.
-                pass
-
-        if not encoding_successful:
-            return False
-
-        # --- Check for Low-Res Task BEFORE writing sidecar ---
-        if is_low_res_task:
-            # --- Write sidecar JSON after successful encoding ---
-            output_sidecar_data = {}
-
-            # Check and include frame_overlap and input_bias
-            has_non_zero_setting = False
-
-            if input_bias is not None and input_bias != 0.0:
-                output_sidecar_data["input_bias"] = input_bias
-                has_non_zero_setting = True
-
-            # Use the combined condition: non-zero setting AND is low-res
-            if has_non_zero_setting:
-                sidecar_ext = self.APP_CONFIG_DEFAULTS.get(
-                    "OUTPUT_SIDECAR_EXT", ".spsidecar"
-                )
-                output_sidecar_path = (
-                    f"{os.path.splitext(final_output_video_path)[0]}{sidecar_ext}"
-                )
-                try:
-                    with open(output_sidecar_path, "w", encoding="utf-8") as f:
-                        json.dump(output_sidecar_data, f, indent=4)
-                    logger.info(f"Created output sidecar file: {output_sidecar_path}")
-                except Exception as e:
-                    logger.error(
-                        f"Error creating output sidecar file '{output_sidecar_path}': {e}"
-                    )
-            else:
-                logger.debug(
-                    "Skipping output sidecar creation: frame_overlap and input_bias are zero."
-                )
-        else:
-            logger.debug(
-                "Skipping output sidecar creation: High-resolution output does not require spsidecar."
-            )
-
-        return True
-
-    def _determine_auto_convergence(
-        self,
-        depth_map_path: str,
-        total_frames_to_process: int,
-        batch_size: int,
-        fallback_value: float,
-    ) -> Tuple[float, float]:
-        """
-        Calculates the Auto Convergence points for the entire video (Average and Peak)
-        in a single pass.
-
-        Args:
-            fallback_value (float): The current GUI/Sidecar value to return if auto-convergence fails.
-
-        Returns:
-            Tuple[float, float]: (new_anchor_avg: 0.0-1.0, new_anchor_peak: 0.0-1.0).
-                                 Returns (fallback_value, fallback_value) if the process fails.
-        """
-        logger.info(
-            "==> Starting Auto-Convergence pre-pass to determine global average and peak depth."
-        )
-
-        # --- Constants for Auto-Convergence Logic ---
-        BLUR_KERNEL_SIZE = 9
-        CENTER_CROP_PERCENT = 0.75
-        MIN_VALID_PIXELS = 5
-        # The offset is only applied at the end for the 'Average' mode.
-        INTERNAL_ANCHOR_OFFSET = 0.1
-        # -------------------------------------------
-
-        all_valid_frame_values = []
-        fallback_tuple = (fallback_value, fallback_value)  # Value to return on failure
-
-        try:
-            # 1. Initialize Decord Reader (No target height/width needed, raw is fine)
-            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))
-            if len(depth_reader) == 0:
-                logger.error(
-                    "Depth map reader has no frames. Cannot calculate Auto-Convergence."
-                )
-                return fallback_tuple
-        except Exception as e:
-            logger.error(
-                f"Error initializing depth map reader for Auto-Convergence: {e}"
-            )
-            return fallback_tuple
-
-        # 2. Iterate and Collect Data
-
-        video_length = len(depth_reader)
-        if total_frames_to_process <= 0 or total_frames_to_process > video_length:
-            num_frames = video_length
-        else:
-            num_frames = total_frames_to_process
-
-        logger.debug(
-            f"  AutoConv determined actual frames to process: {num_frames} (from input length {total_frames_to_process})."
-        )
-
-        for i in range(0, num_frames, batch_size):
-            if self.stop_event.is_set():
-                logger.warning("Auto-Convergence pre-pass stopped by user.")
-                return fallback_tuple
-
-            current_frame_indices = list(range(i, min(i + batch_size, num_frames)))
-            if not current_frame_indices:
-                break
-
-            # CRITICAL FIX: Ensure seeking/reading works
-            try:
-                depth_reader.seek(current_frame_indices[0])
-                batch_depth_numpy_raw = depth_reader.get_batch(
-                    current_frame_indices
-                ).asnumpy()
-            except Exception as e:
-                logger.error(
-                    f"Error seeking/reading depth map batch starting at index {i}: {e}. Skipping batch."
-                )
-                continue
-
-            # Process depth frames (Grayscale, Float conversion)
-            if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
-                batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
-            elif (
-                batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1
-            ):
-                batch_depth_numpy = batch_depth_numpy_raw.squeeze(-1)
-            else:
-                batch_depth_numpy = batch_depth_numpy_raw
-
-            batch_depth_float = batch_depth_numpy.astype(np.float32)
-
-            # Get chunk min/max for normalization (using the chunk's range)
-            min_val = batch_depth_float.min()
-            max_val = batch_depth_float.max()
-
-            if max_val - min_val > 1e-5:
-                batch_depth_normalized = (batch_depth_float - min_val) / (
-                    max_val - min_val
-                )
-            else:
-                batch_depth_normalized = np.full_like(
-                    batch_depth_float, fill_value=0.5, dtype=np.float32
-                )
-
-            # Frame-by-Frame Processing (Blur & Crop)
-            for j, frame in enumerate(batch_depth_normalized):
-                current_frame_idx = current_frame_indices[j]
-                H, W = frame.shape
-
-                # a) Blur
-                frame_blurred = cv2.GaussianBlur(
-                    frame, (BLUR_KERNEL_SIZE, BLUR_KERNEL_SIZE), 0
-                )
-
-                # b) Center Crop (75% of H and W)
-                margin_h = int(H * (1 - CENTER_CROP_PERCENT) / 2)
-                margin_w = int(W * (1 - CENTER_CROP_PERCENT) / 2)
-
-                cropped_frame = frame_blurred[
-                    margin_h : H - margin_h, margin_w : W - margin_w
-                ]
-
-                # c) Average (Exclude true black/white pixels (0.0 or 1.0) which may be background/edges)
-                valid_pixels = cropped_frame[
-                    (cropped_frame > 0.001) & (cropped_frame < 0.999)
-                ]
-
-                if valid_pixels.size > MIN_VALID_PIXELS:
-                    # Append the mean of the valid pixels for this frame
-                    all_valid_frame_values.append(valid_pixels.mean())
-                else:
-                    # FALLBACK FOR THE FRAME: Use the mean of the WHOLE cropped, blurred frame
-                    all_valid_frame_values.append(cropped_frame.mean())
-                    logger.warning(
-                        f"  [AutoConv Frame {current_frame_idx:03d}] SKIPPED: Valid pixel count ({valid_pixels.size}) below threshold ({MIN_VALID_PIXELS}). Forcing mean from full cropped frame."
-                    )
-
-            draw_progress_bar(
-                i + len(current_frame_indices),
-                num_frames,
-                prefix="  Auto-Conv Pre-Pass:",
-            )
-
-        # 3. Final Temporal Calculations
-        if all_valid_frame_values:
-            valid_values_np = np.array(all_valid_frame_values)
-
-            # Calculate final RAW values (Temporal Mean and Temporal Max)
-            raw_anchor_avg = np.mean(valid_values_np)
-            raw_anchor_peak = np.max(valid_values_np)
-
-            # Apply Offset only for Average mode
-            final_anchor_avg_offset = raw_anchor_avg + INTERNAL_ANCHOR_OFFSET
-
-            # Clamp to the valid range [0.0, 1.0]
-            final_anchor_avg = np.clip(final_anchor_avg_offset, 0.0, 1.0)
-            final_anchor_peak = np.clip(raw_anchor_peak, 0.0, 1.0)
-
-            logger.info(
-                f"\n==> Auto-Convergence Calculated: Avg={raw_anchor_avg:.4f} + Offset ({INTERNAL_ANCHOR_OFFSET:.2f}) = Final Avg {final_anchor_avg:.4f}"
-            )
-            logger.info(
-                f"==> Auto-Convergence Calculated: Peak={raw_anchor_peak:.4f} = Final Peak {final_anchor_peak:.4f}"
-            )
-
-            # Return both calculated values
-            return float(final_anchor_avg), float(final_anchor_peak)
-        else:
-            logger.warning(
-                "\n==> Auto-Convergence failed: No valid frames found. Using fallback value."
-            )
-            return fallback_tuple
+    # _determine_auto_convergence definition removed (moved to earlier in file)
 
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
@@ -4270,63 +2715,34 @@ class SplatterGUI(ThemedTk):
         return video_source_list
 
     def _get_current_config(self):
-        """Collects all current GUI variable values into a single dictionary."""
-        config = {
-            # Folder Configurations
-            "input_source_clips": self.input_source_clips_var.get(),
-            "input_depth_maps": self.input_depth_maps_var.get(),
-            "output_splatted": self.output_splatted_var.get(),
-            "dark_mode_enabled": self.dark_mode_var.get(),
-            "window_width": self.winfo_width(),
-            "window_height": self.winfo_height(),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "update_slider_from_sidecar": self.update_slider_from_sidecar_var.get(),
-            "auto_save_sidecar": self.auto_save_sidecar_var.get(),
-            "multi_map_enabled": self.multi_map_var.get(),
-            "skip_lowres_preproc": self.skip_lowres_preproc_var.get(),
-            "crosshair_enabled": self.crosshair_enabled_var.get(),
-            "crosshair_white": self.crosshair_white_var.get(),
-            "crosshair_multi": self.crosshair_multi_var.get(),
-            "depth_pop_enabled": self.depth_pop_enabled_var.get(),
-            "debug_logging_enabled": self.debug_logging_var.get(),
-            "loop_playback": bool(
-                getattr(
-                    getattr(self, "previewer", None),
-                    "loop_playback_var",
-                    tk.BooleanVar(value=False),
-                ).get()
-            ),
-            "enable_full_resolution": self.enable_full_res_var.get(),
-            "batch_size": self.batch_size_var.get(),
-            "enable_low_resolution": self.enable_low_res_var.get(),
-            "pre_res_width": self.pre_res_width_var.get(),
-            "pre_res_height": self.pre_res_height_var.get(),
-            "low_res_batch_size": self.low_res_batch_size_var.get(),
-            "depth_dilate_size_x": self.depth_dilate_size_x_var.get(),
-            "depth_dilate_size_y": self.depth_dilate_size_y_var.get(),
-            "depth_blur_size_x": self.depth_blur_size_x_var.get(),
-            "depth_blur_size_y": self.depth_blur_size_y_var.get(),
-            "depth_dilate_left": self.depth_dilate_left_var.get(),
-            "depth_blur_left": self.depth_blur_left_var.get(),
-            "depth_blur_left_mix": self.depth_blur_left_mix_var.get(),
-            "preview_size": self.preview_size_var.get(),
-            "preview_source": self.preview_source_var.get(),
-            "process_length": self.process_length_var.get(),
-            "output_crf": self.output_crf_full_var.get(),  # legacy
-            "output_crf_full": self.output_crf_full_var.get(),
-            "output_crf_low": self.output_crf_low_var.get(),
-            "color_tags_mode": getattr(
-                self, "color_tags_mode_var", tk.StringVar(value="Auto")
-            ).get(),
-            "dual_output": self.dual_output_var.get(),
-            "auto_convergence_mode": self.auto_convergence_mode_var.get(),
-            "depth_gamma": self.depth_gamma_var.get(),
-            "max_disp": self.max_disp_var.get(),
-            "convergence_point": self.zero_disparity_anchor_var.get(),
-            "enable_global_norm": self.enable_global_norm_var.get(),  # Renamed
-            "move_to_finished": self.move_to_finished_var.get(),
-        }
+        """Collects all current GUI variable values into a single dictionary using ConfigManager."""
+        from core.splatting.config_manager import get_current_config
+        config = get_current_config(self.__dict__, self.config_manager.defaults)
+
+        # Map non-standard variable names to expected config keys
+        config["convergence_point"] = self.zero_disparity_anchor_var.get()
+        config["multi_map_enabled"] = self.multi_map_var.get()
+        config["dark_mode_enabled"] = self.dark_mode_var.get()
+        config["enable_full_resolution"] = self.enable_full_res_var.get()
+        config["enable_low_resolution"] = self.enable_low_res_var.get()
+
+        # Add special cases not directly mapped to _var
+        config["window_width"] = self.winfo_width()
+        config["window_height"] = self.winfo_height()
+        config["window_x"] = self.winfo_x()
+        config["window_y"] = self.winfo_y()
+
+        config["loop_playback"] = bool(
+            getattr(
+                getattr(self, "previewer", None),
+                "loop_playback_var",
+                tk.BooleanVar(value=False),
+            ).get()
+        )
+
+        # Legacy CRF mapping
+        config["output_crf"] = self.output_crf_full_var.get()
+
         # Avoid persisting test-forced preview settings
         try:
             test_active = bool(self.splat_test_var.get()) or bool(
@@ -4341,6 +2757,50 @@ class SplatterGUI(ThemedTk):
             config["preview_size"] = self.app_config.get("preview_size", "75%")
 
         return config
+
+    def _get_processing_settings(self):
+        """Converts current GUI configuration to BatchProcessor settings object."""
+        config = self._get_current_config()
+        return ProcessingSettings(
+            input_source_clips=config["input_source_clips"],
+            input_depth_maps=config["input_depth_maps"],
+            output_splatted=config["output_splatted"],
+            max_disp=float(config["max_disp"]),
+            process_length=int(config["process_length"]),
+            enable_full_resolution=config["enable_full_resolution"],
+            full_res_batch_size=int(config["batch_size"]),
+            enable_low_resolution=config["enable_low_resolution"],
+            low_res_width=int(config["pre_res_width"]),
+            low_res_height=int(config["pre_res_height"]),
+            low_res_batch_size=int(config["low_res_batch_size"]),
+            dual_output=config["dual_output"],
+            zero_disparity_anchor=float(config["convergence_point"]),
+            enable_global_norm=config["enable_global_norm"],
+            move_to_finished=config["move_to_finished"],
+            output_crf_full=int(config["output_crf_full"]),
+            output_crf_low=int(config["output_crf_low"]),
+            depth_gamma=float(config["depth_gamma"]),
+            depth_dilate_size_x=float(config["depth_dilate_size_x"]),
+            depth_dilate_size_y=float(config["depth_dilate_size_y"]),
+            depth_blur_size_x=float(config["depth_blur_size_x"]),
+            depth_blur_size_y=float(config["depth_blur_size_y"]),
+            depth_dilate_left=float(config["depth_dilate_left"]),
+            depth_blur_left=float(config["depth_blur_left"]),
+            depth_blur_left_mix=float(config["depth_blur_left_mix"]),
+            auto_convergence_mode=config["auto_convergence_mode"],
+            enable_sidecar_gamma=self.enable_sidecar_gamma_var.get(),
+            enable_sidecar_blur_dilate=self.enable_sidecar_blur_dilate_var.get(),
+            # NEW fields
+            multi_map=self.multi_map_var.get(),
+            selected_depth_map=self.selected_depth_map_var.get().strip(),
+            color_tags_mode=self.color_tags_mode_var.get() if hasattr(self, "color_tags_mode_var") else "Auto",
+            is_test_mode=False, # Standard batch mode
+            test_target_frame_idx=None,
+            skip_lowres_preproc=bool(getattr(self, "skip_lowres_preproc_var", None) and self.skip_lowres_preproc_var.get()),
+            sidecar_ext=self.APP_CONFIG_DEFAULTS["SIDECAR_EXT"],
+            sidecar_folder=self._get_sidecar_base_folder(),
+            track_dp_total_true_on_render=bool(getattr(self, "track_dp_total_true_on_render_var", None) and self.track_dp_total_true_on_render_var.get()),
+        )
 
     def get_current_preview_settings(self) -> dict:
         """Gathers settings from the GUI needed for the preview callback."""
@@ -4387,7 +2847,13 @@ class SplatterGUI(ThemedTk):
             settings["left_border_pct"] = l_pct
             settings["right_border_pct"] = r_pct
 
-            return settings
+            # --- Finalize FFmpeg process ---
+            if ffmpeg_process is not None:
+                if ffmpeg_process.stdin:
+                    try:
+                        ffmpeg_process.stdin.close()  # Close the pipe to signal end of input
+                    finally:
+                        ffmpeg_process.stdin = None   # <-- IMPORTANT: prevent communicate() flushing closed stdin
 
         except (ValueError, tk.TclError) as e:
             logger.error(f"Invalid preview setting value: {e}")
@@ -4421,34 +2887,9 @@ class SplatterGUI(ThemedTk):
 
         return json_sidecar_path, depth_map_path, current_data
 
-    def _get_defined_tasks(self, settings):
-        """Helper to return a list of processing tasks based on GUI settings."""
-        processing_tasks = []
-        if settings["enable_full_resolution"]:
-            processing_tasks.append(
-                {
-                    "name": "Full-Resolution",
-                    "output_subdir": "hires",
-                    "set_pre_res": False,
-                    "target_width": -1,
-                    "target_height": -1,
-                    "batch_size": settings["full_res_batch_size"],
-                    "is_low_res": False,
-                }
-            )
-        if settings["enable_low_resolution"]:
-            processing_tasks.append(
-                {
-                    "name": "Low-Resolution",
-                    "output_subdir": "lowres",
-                    "set_pre_res": True,
-                    "target_width": settings["low_res_width"],
-                    "target_height": settings["low_res_height"],
-                    "batch_size": settings["low_res_batch_size"],
-                    "is_low_res": True,
-                }
-            )
-        return processing_tasks
+    def _get_defined_tasks(self, settings: ProcessingSettings) -> list[ProcessingTask]:
+        """Helper to return a list of processing tasks based on settings."""
+        return self.batch_processor.get_defined_tasks(settings)
 
     def _get_video_specific_settings(
         self,
@@ -4805,13 +3246,13 @@ class SplatterGUI(ThemedTk):
             ) = read_video_frames(
                 video_path,
                 process_length,
-                set_pre_res=task_settings["set_pre_res"],
-                pre_res_width=task_settings["target_width"],
-                pre_res_height=task_settings["target_height"],
+                set_pre_res=task_settings.set_pre_res,
+                pre_res_width=task_settings.target_width,
+                pre_res_height=task_settings.target_height,
             )
         except Exception as e:
             logger.error(
-                f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings['name']} pass: {e}. Skipping this pass."
+                f"==> Error initializing input video reader for {os.path.basename(video_path)} {task_settings.name} pass: {e}. Skipping this pass."
             )
             return (
                 None,
@@ -4853,7 +3294,7 @@ class SplatterGUI(ThemedTk):
             depth_target_h = current_processed_height
             depth_target_w = current_processed_width
             depth_match = match_depth_res
-            if task_settings.get("is_low_res"):
+            if task_settings.is_low_res:
                 if (
                     getattr(self, "skip_lowres_preproc_var", None) is not None
                     and self.skip_lowres_preproc_var.get()
@@ -4945,25 +3386,8 @@ class SplatterGUI(ThemedTk):
         )
 
     def _load_config(self):
-        """Loads configuration from default config file."""
-        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
-        # --- MODIFIED: Use the new dictionary constant ---
-        if os.path.exists(config_filename):
-            try:
-                with open(config_filename, "r") as f:
-                    self.app_config = json.load(f)
-
-                # --- BACKWARD COMPATIBILITY FIX: Handle the old 'enable_autogain' key ---
-                # Old meaning: True = Raw Input / Disable Normalization (GN OFF)
-                # New meaning: True = Enable Global Normalization (GN ON)
-                if "enable_autogain" in self.app_config:
-                    old_value = self.app_config.pop("enable_autogain")  # Remove old key
-                    # New value is the inverse of the old value
-                    self.app_config["enable_global_norm"] = not bool(old_value)
-                # --- END FIX ---
-            except Exception as e:
-                logger.error(f"Failed to load config file: {e}. Using defaults.")
-                self.app_config = {}
+        """Loads configuration using the ConfigManager."""
+        self.app_config = self.config_manager.load()
 
     def _load_help_texts(self):
         """Loads help texts from a JSON file."""
@@ -4984,47 +3408,18 @@ class SplatterGUI(ThemedTk):
             self.help_texts = {}
 
     def load_settings(self):
-        """Loads settings from a user-selected JSON file."""
+        """Loads settings from a user-selected JSON file using ConfigManager."""
         filename = filedialog.askopenfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
+            defaultextension=".splatcfg",
+            filetypes=[("Splat Config", "*.splatcfg"), ("JSON files", "*.json")],
             title="Load Settings from File",
         )
         if not filename:
             return
 
         try:
-            with open(filename, "r") as f:
-                loaded_config = json.load(f)
-            # Apply loaded config values to the variables
-            for (
-                config_key,
-                config_value,
-            ) in loaded_config.items():  # Iterate over loaded keys
-                # --- NEW MAPPING LOGIC ---
-                # Construct the expected name of the Tkinter variable
-                tk_var_attr_name = config_key + "_var"
-
-                if hasattr(self, tk_var_attr_name):
-                    tk_var_object = getattr(self, tk_var_attr_name)
-
-                    if isinstance(tk_var_object, tk.BooleanVar):
-                        # Ensure value is converted to a proper boolean/int before setting BooleanVar
-                        tk_var_object.set(bool(config_value))
-                    elif isinstance(tk_var_object, tk.StringVar):
-                        # Set StringVar directly
-                        tk_var_object.set(str(config_value))
-
-            # Apply loaded config values to the variables
-            for key, var in self.__dict__.items():
-                if key.endswith("_var") and key in loaded_config:
-                    # Logic to safely set values:
-                    # For tk.StringVar, set()
-                    # For tk.BooleanVar, use set() with the bool/int value
-                    if isinstance(var, tk.BooleanVar):
-                        var.set(bool(loaded_config[key]))
-                    elif isinstance(var, tk.StringVar):
-                        var.set(str(loaded_config[key]))
+            from core.splatting.config_manager import load_settings_from_file
+            load_settings_from_file(filename, tk_vars=self.__dict__)
 
             self._apply_theme()  # Re-apply theme in case dark mode setting was loaded
             self.toggle_processing_settings_fields()  # Update state of dependent fields
@@ -5193,10 +3588,17 @@ class SplatterGUI(ThemedTk):
             logger.warning("Auto-Converge calculation is already running. Please wait.")
             return
 
-        if self._auto_conv_cache[mode] is not None:
-            # Value is cached, apply it immediately
-            cached_value = self._auto_conv_cache[mode]
+        # Check cache logic
+        cached_value = None
+        if mode == "Hybrid":
+             if self._auto_conv_cache.get("Average") is not None and self._auto_conv_cache.get("Peak") is not None:
+                 cached_value = (self._auto_conv_cache["Average"] + self._auto_conv_cache["Peak"]) / 2.0
+        elif self._auto_conv_cache.get(mode) is not None:
+             cached_value = self._auto_conv_cache[mode]
 
+        if cached_value is not None:
+            # Value is cached, apply it immediately
+            
             # 1. Set the Tkinter variable to the cached value (needed for the setter)
             self.zero_disparity_anchor_var.set(f"{cached_value:.2f}")
 
@@ -5427,634 +3829,6 @@ class SplatterGUI(ThemedTk):
             release_cuda_memory()
 
         return batch_depth_numpy_float
-
-    def _process_single_video_tasks(
-        self,
-        video_path,
-        settings,
-        initial_overall_task_counter,
-        is_single_file_mode,
-        finished_source_folder=None,
-        finished_depth_folder=None,
-    ):
-        """
-        Handles the full processing lifecycle (sidecar, auto-conv, task loop, move-to-finished)
-        for a single video and its depth map.
-
-        Returns: (tasks_processed_count: int, any_task_completed_successfully: bool)
-        """
-        # Initialize task-local variables (some of these were local in the old _run_batch_process loop)
-        current_depth_dilate_size_x = 0
-        current_depth_dilate_size_y = 0
-        current_depth_blur_size_x = 0
-        current_depth_blur_size_y = 0
-        current_depth_dilate_left = 0.0
-        current_depth_blur_left = 0.0
-        current_depth_blur_left_mix = 0.0
-
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        logger.info(f"==> Processing Video: {video_name}")
-        self.progress_queue.put(("update_info", {"filename": video_name}))
-
-        # Keep a local counter for tasks processed in this function
-        local_task_counter = initial_overall_task_counter
-
-        video_specific_settings = self._get_video_specific_settings(
-            video_path,
-            settings["input_depth_maps"],
-            settings["zero_disparity_anchor"],
-            settings["max_disp"],
-            is_single_file_mode,
-        )
-
-        processing_tasks = self._get_defined_tasks(settings)
-        expected_task_count = len(processing_tasks)
-        processed_tasks_count = 0
-        any_task_completed_successfully_for_this_video = False
-
-        if video_specific_settings.get("error"):
-            logger.error(
-                f"Error getting video specific settings for {video_name}: {video_specific_settings['error']}. Skipping."
-            )
-            # Skip the expected task count in the progress bar
-            local_task_counter += expected_task_count
-            self.progress_queue.put(("processed", local_task_counter))
-            return expected_task_count, False
-
-        actual_depth_map_path = video_specific_settings["actual_depth_map_path"]
-        current_zero_disparity_anchor = video_specific_settings["convergence_plane"]
-        current_max_disparity_percentage = video_specific_settings[
-            "max_disparity_percentage"
-        ]
-        current_input_bias = video_specific_settings["input_bias"]
-        anchor_source = video_specific_settings["anchor_source"]
-        max_disp_source = video_specific_settings["max_disp_source"]
-        gamma_source = video_specific_settings["gamma_source"]
-        map_source = video_specific_settings.get("map_source", "N/A")
-        current_depth_gamma = video_specific_settings["depth_gamma"]
-        current_depth_dilate_size_x = video_specific_settings["depth_dilate_size_x"]
-        current_depth_dilate_size_y = video_specific_settings["depth_dilate_size_y"]
-        current_depth_blur_size_x = video_specific_settings["depth_blur_size_x"]
-        current_depth_blur_size_y = video_specific_settings["depth_blur_size_y"]
-        current_depth_dilate_left = float(
-            video_specific_settings.get(
-                "depth_dilate_left", settings.get("depth_dilate_left", 0.0)
-            )
-        )
-        current_depth_blur_left = float(
-            video_specific_settings.get(
-                "depth_blur_left", settings.get("depth_blur_left", 0.0)
-            )
-        )
-        current_depth_blur_left_mix = float(
-            video_specific_settings.get(
-                "depth_blur_left_mix",
-                getattr(self, "depth_blur_left_mix_var", None).get()
-                if getattr(self, "depth_blur_left_mix_var", None)
-                else 0.0,
-            )
-        )
-
-        if not processing_tasks:
-            logger.debug(
-                f"==> No processing tasks configured for {video_name}. Skipping."
-            )
-            return 0, False
-
-        # --- Auto-Convergence Logic (BEFORE initializing readers) ---
-        auto_conv_mode = settings["auto_convergence_mode"]
-
-        # --- NEW: Global Normalization Policy variables ---
-        enable_global_norm_policy = video_specific_settings["enable_global_norm"]
-        gn_source = video_specific_settings["gn_source"]
-
-        if (
-            video_specific_settings["sidecar_found"]
-            and self.enable_global_norm_var.get()
-        ):
-            # Policy: Sidecar exists AND GUI toggle is ON. Policy forces GN OFF.
-            if not self._gn_warning_shown:
-                messagebox.showwarning(
-                    "GN Policy Warning",
-                    f"Sidecar found for '{video_name}'.\n"
-                    f"Global Normalization is DISABLED for this clip, overriding the GUI setting.\n"
-                    f"Further warnings will be logged to console only.",
-                )
-                self._gn_warning_shown = (
-                    True  # Set flag to log to console only next time
-                )
-            else:
-                logger.warning(
-                    f"GN Policy: Sidecar found for {video_name}. GN forced OFF (console log only)."
-                )
-
-        # --- NEW LOGIC: Sidecar overrides Auto-Convergence ---
-        if anchor_source == "Sidecar" and auto_conv_mode != "Off":
-            logger.info(
-                f"Sidecar found for {video_name}. Convergence Point locked to Sidecar value ({current_zero_disparity_anchor:.4f}). Auto-Convergence SKIPPED."
-            )
-            auto_conv_mode = "Off"
-
-        if auto_conv_mode != "Off":
-            logger.info(
-                f"Auto-Convergence is ENABLED (Mode: {auto_conv_mode}). Running pre-pass..."
-            )
-
-            try:
-                anchor_float = float(current_zero_disparity_anchor)
-            except (ValueError, TypeError):
-                logger.error(
-                    f"Invalid convergence anchor value found: {current_zero_disparity_anchor}. Defaulting to 0.5."
-                )
-                anchor_float = 0.5
-
-            new_anchor_avg, new_anchor_peak = self._determine_auto_convergence(
-                actual_depth_map_path,
-                settings["process_length"],
-                settings["full_res_batch_size"],
-                anchor_float,
-            )
-            new_anchor_val = (
-                new_anchor_avg if auto_conv_mode == "Average" else new_anchor_peak
-            )
-
-            if new_anchor_val != current_zero_disparity_anchor:
-                current_zero_disparity_anchor = new_anchor_val
-                anchor_source = "Auto"
-
-            logger.info(
-                f"Using Convergence Point: {current_zero_disparity_anchor:.4f} (Source: {anchor_source})"
-            )
-
-        for task in processing_tasks:
-            if self.stop_event.is_set():
-                logger.info(
-                    f"==> Stopping {task['name']} processing for {video_name} due to user request"
-                )
-                # Increment the global counter for all remaining, skipped tasks
-                remaining_tasks_to_increment = (
-                    expected_task_count - processed_tasks_count
-                )
-                local_task_counter += remaining_tasks_to_increment
-                self.progress_queue.put(("processed", local_task_counter))
-                return (
-                    expected_task_count,
-                    any_task_completed_successfully_for_this_video,
-                )
-
-            logger.debug(f"\n==> Starting {task['name']} pass for {video_name}")
-            self.progress_queue.put(
-                ("status", f"Processing {task['name']} for {video_name}")
-            )
-
-            # Decide what to show in the Map field
-            if self.multi_map_var.get():
-                # Multi-Map mode
-                if actual_depth_map_path and map_source not in ("", "N/A"):
-                    map_folder = os.path.basename(
-                        os.path.dirname(actual_depth_map_path)
-                    ).strip()
-                    map_label = f"{map_folder} ({map_source})"
-                else:
-                    map_label = "N/A"
-            else:
-                # Normal mode
-                map_label = "Direct file" if is_single_file_mode else "Direct folder"
-
-            self.progress_queue.put(
-                (
-                    "update_info",
-                    {
-                        "task_name": task["name"],
-                        "convergence": f"{current_zero_disparity_anchor:.2f} ({anchor_source})",
-                        "disparity": f"{current_max_disparity_percentage:.1f}% ({max_disp_source})",
-                        "gamma": f"{current_depth_gamma:.2f} ({gamma_source})",
-                        "map": map_label,
-                    },
-                )
-            )
-
-            (
-                video_reader_input,
-                depth_reader_input,
-                processed_fps,
-                original_vid_h,
-                original_vid_w,
-                current_processed_height,
-                current_processed_width,
-                video_stream_info,
-                total_frames_input,
-                total_frames_depth,
-                actual_depth_height,
-                actual_depth_width,
-                depth_stream_info,
-            ) = self._initialize_video_and_depth_readers(
-                video_path,
-                actual_depth_map_path,
-                settings["process_length"],
-                task,
-                settings["match_depth_res"],
-            )
-
-            # Explicitly check for None for critical components before proceeding
-            if (
-                video_reader_input is None
-                or depth_reader_input is None
-                or video_stream_info is None
-            ):
-                logger.error(
-                    f"Skipping {task['name']} pass for {video_name} due to reader initialization error, frame count mismatch, or missing stream info."
-                )
-                local_task_counter += 1
-                processed_tasks_count += 1
-                self.progress_queue.put(("processed", local_task_counter))
-                release_cuda_memory()
-                continue
-
-            # --- MODIFIED: Use the policy to determine the mode ---
-            assume_raw_input_mode = (
-                not enable_global_norm_policy
-            )  # If GN is OFF, assume RAW Input
-            global_depth_min = 0.0
-            global_depth_max = 1.0
-
-            # --- UNCONDITIONAL Max Content Value Scan for RAW/Normalization Modes ---
-            max_content_value = 1.0
-            raw_depth_reader_temp = None
-            try:
-                depth_info_tmp = get_video_stream_info(actual_depth_map_path)
-
-                bit_depth_tmp = _infer_depth_bit_depth(depth_info_tmp)
-
-                pix_fmt_tmp = str((depth_info_tmp or {}).get("pix_fmt", ""))
-
-                # Use source/processing dimensions for the content scan (avoids NameError and keeps preview/render parity)
-                scan_w = original_vid_w or current_processed_width or actual_depth_width
-                scan_h = (
-                    original_vid_h or current_processed_height or actual_depth_height
-                )
-
-                if bit_depth_tmp > 8:
-                    raw_depth_reader_temp = FFmpegDepthPipeReader(
-                        actual_depth_map_path,
-                        out_w=scan_w,
-                        out_h=scan_h,
-                        bit_depth=bit_depth_tmp,
-                        num_frames=total_frames_depth,
-                        pix_fmt=pix_fmt_tmp,
-                    )
-
-                else:
-                    raw_depth_reader_temp = VideoReader(
-                        actual_depth_map_path, ctx=cpu(0), width=scan_w, height=scan_h
-                    )
-
-                if len(raw_depth_reader_temp) > 0:
-                    _, max_content_value = compute_global_depth_stats(
-                        depth_map_reader=raw_depth_reader_temp,
-                        total_frames=total_frames_depth,
-                        chunk_size=task["batch_size"],
-                    )
-                    logger.debug(f"Max content depth scanned: {max_content_value:.3f}.")
-                else:
-                    logger.error("RAW depth reader has no frames for content scan.")
-            except Exception as e:
-                logger.error(f"Failed to scan max content depth: {e}")
-            finally:
-                if raw_depth_reader_temp:
-                    if hasattr(raw_depth_reader_temp, "close"):
-                        try:
-                            raw_depth_reader_temp.close()
-                        except Exception:
-                            pass
-                    del raw_depth_reader_temp
-                    gc.collect()
-            # --- END UNCONDITIONAL SCAN ---
-
-            if not assume_raw_input_mode:
-                logger.info(
-                    "==> Global Depth Normalization selected. Starting global depth stats pre-pass with RAW reader."
-                )
-
-                raw_depth_reader_temp = None
-                try:
-                    depth_info_tmp = get_video_stream_info(actual_depth_map_path)
-
-                    bit_depth_tmp = _infer_depth_bit_depth(depth_info_tmp)
-
-                    pix_fmt_tmp = str((depth_info_tmp or {}).get("pix_fmt", ""))
-
-                    if bit_depth_tmp > 8:
-                        raw_depth_reader_temp = FFmpegDepthPipeReader(
-                            actual_depth_map_path,
-                            out_w=actual_depth_width,
-                            out_h=actual_depth_height,
-                            bit_depth=bit_depth_tmp,
-                            num_frames=total_frames_depth,
-                            pix_fmt=pix_fmt_tmp,
-                        )
-
-                    else:
-                        raw_depth_reader_temp = VideoReader(
-                            actual_depth_map_path,
-                            ctx=cpu(0),
-                            width=actual_depth_width,
-                            height=actual_depth_height,
-                        )
-
-                    if len(raw_depth_reader_temp) > 0:
-                        global_depth_min, global_depth_max = compute_global_depth_stats(
-                            depth_map_reader=raw_depth_reader_temp,
-                            total_frames=total_frames_depth,
-                            chunk_size=task["batch_size"],
-                        )
-                        logger.debug(
-                            "Successfully computed global stats from RAW reader."
-                        )
-                    else:
-                        logger.error("RAW depth reader has no frames.")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to initialize/read RAW depth reader for global stats: {e}"
-                    )
-                    global_depth_min = 0.0
-                    global_depth_max = 1.0
-                finally:
-                    if raw_depth_reader_temp:
-                        if hasattr(raw_depth_reader_temp, "close"):
-                            try:
-                                raw_depth_reader_temp.close()
-                            except Exception:
-                                pass
-                        del raw_depth_reader_temp
-                        gc.collect()
-            else:
-                logger.debug(
-                    "==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass."
-                )
-
-                # --- RAW INPUT MODE SCALING ---
-                final_scaling_factor = 1.0
-
-                if max_content_value <= 256.0 and max_content_value > 1.0:
-                    final_scaling_factor = 255.0
-                    logger.debug(
-                        f"Content Max {max_content_value:.2f} <= 8-bit. SCALING BY 255.0."
-                    )
-                elif max_content_value > 256.0 and max_content_value <= 1024.0:
-                    final_scaling_factor = 1023.0
-                    logger.debug(
-                        f"Content Max {max_content_value:.2f} (9-10bit). SCALING BY 1023.0 (expected 10-bit max) for preview parity."
-                    )
-                else:
-                    final_scaling_factor = 1023.0
-                    logger.warning(
-                        f"Max content value is too high/low ({max_content_value:.2f}). Using fallback 1023.0."
-                    )
-
-                global_depth_max = final_scaling_factor
-                global_depth_min = 0.0
-
-                logger.debug(
-                    f"Raw Input Final Scaling Factor set to: {global_depth_max:.3f}"
-                )
-
-            if not (
-                actual_depth_height == current_processed_height
-                and actual_depth_width == current_processed_width
-            ):
-                # Low-res parity path intentionally loads depth at clip resolution so dilation/blur happens pre-resize.
-                # The depth frames are resized to match the (possibly low-res) video frames *after* preprocessing inside depthSplatting().
-                if task.get("is_low_res"):
-                    skip_lr_preproc = bool(
-                        getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    if (not skip_lr_preproc) and (
-                        actual_depth_width == original_vid_w
-                        and actual_depth_height == original_vid_h
-                    ):
-                        logger.info(
-                            f"==> Low-Resolution pass: Upscaling depthmap to clip resolution ({actual_depth_width}x{actual_depth_height}) "
-                            f"before preprocessing for parity; it will be resized to ({current_processed_width}x{current_processed_height}) after preprocessing."
-                        )
-                    else:
-                        _bd_warn = (
-                            _infer_depth_bit_depth(depth_stream_info)
-                            if depth_stream_info
-                            else 8
-                        )
-                        if _bd_warn > 8:
-                            logger.warning(
-                                f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed "
-                                f"video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. "
-                                f"This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned."
-                            )
-                else:
-                    _bd_warn = (
-                        _infer_depth_bit_depth(depth_stream_info)
-                        if depth_stream_info
-                        else 8
-                    )
-                    if _bd_warn > 8:
-                        logger.warning(
-                            f"==> Warning: Depth map reader output resolution ({actual_depth_width}x{actual_depth_height}) does not match processed "
-                            f"video resolution ({current_processed_width}x{current_processed_height}) for {task['name']} pass. "
-                            f"This indicates an issue with `load_pre_rendered_depth`'s `width`/`height` parameters. Processing may proceed but results might be misaligned."
-                        )
-
-            actual_percentage_for_calculation = current_max_disparity_percentage / 20.0
-            actual_max_disp_pixels = (
-                actual_percentage_for_calculation / 100.0
-            ) * current_processed_width
-            logger.debug(
-                f"==> Max Disparity Input: {current_max_disparity_percentage:.1f}% -> Calculated Max Disparity for splatting ({task['name']}): {actual_max_disp_pixels:.2f} pixels"
-            )
-
-            self.progress_queue.put(
-                (
-                    "update_info",
-                    {
-                        "disparity": f"{current_max_disparity_percentage:.1f}% ({actual_max_disp_pixels:.2f} pixels)"
-                    },
-                )
-            )
-
-            current_output_subdir = os.path.join(
-                settings["output_splatted"], task["output_subdir"]
-            )
-            os.makedirs(current_output_subdir, exist_ok=True)
-            output_video_path_base = os.path.join(
-                current_output_subdir, f"{video_name}.mp4"
-            )
-
-            completed_splatting_task = self.depthSplatting(
-                input_video_reader=video_reader_input,
-                depth_map_reader=depth_reader_input,
-                total_frames_to_process=total_frames_input,
-                processed_fps=processed_fps,
-                output_video_path_base=output_video_path_base,
-                target_output_height=current_processed_height,
-                target_output_width=current_processed_width,
-                max_disp=actual_max_disp_pixels,
-                process_length=settings["process_length"],
-                batch_size=task["batch_size"],
-                dual_output=settings["dual_output"],
-                zero_disparity_anchor_val=current_zero_disparity_anchor,
-                video_stream_info=video_stream_info,
-                input_bias=current_input_bias,
-                assume_raw_input=assume_raw_input_mode,
-                global_depth_min=global_depth_min,
-                global_depth_max=global_depth_max,
-                depth_stream_info=depth_stream_info,
-                user_output_crf=(
-                    settings.get("output_crf_low")
-                    if task["is_low_res"]
-                    else settings.get("output_crf_full", settings.get("output_crf"))
-                ),
-                is_low_res_task=task["is_low_res"],
-                depth_gamma=current_depth_gamma,
-                depth_dilate_size_x=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else current_depth_dilate_size_x
-                ),
-                depth_dilate_size_y=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else current_depth_dilate_size_y
-                ),
-                depth_blur_size_x=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else current_depth_blur_size_x
-                ),
-                depth_blur_size_y=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else current_depth_blur_size_y
-                ),
-                depth_dilate_left=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else float(current_depth_dilate_left)
-                ),
-                depth_blur_left=(
-                    0.0
-                    if (
-                        task["is_low_res"]
-                        and getattr(self, "skip_lowres_preproc_var", None) is not None
-                        and self.skip_lowres_preproc_var.get()
-                    )
-                    else float(current_depth_blur_left)
-                ),
-            )
-
-            if self.stop_event.is_set():
-                logger.info(
-                    f"==> Stopping {task['name']} pass for {video_name} due to user request"
-                )
-                break
-
-            if completed_splatting_task:
-                logger.debug(
-                    f"==> Splatted {task['name']} video saved for {video_name}."
-                )
-                any_task_completed_successfully_for_this_video = True
-
-                if video_reader_input is not None:
-                    del video_reader_input
-                if depth_reader_input is not None:
-                    del depth_reader_input
-                torch.cuda.empty_cache()
-                gc.collect()
-                logger.debug(
-                    "Explicitly deleted VideoReader objects and forced garbage collection to release file handles."
-                )
-            else:
-                logger.info(
-                    f"==> Splatting task '{task['name']}' for '{video_name}' was skipped or failed. Files will NOT be moved."
-                )
-                if video_reader_input:
-                    del video_reader_input
-                if depth_reader_input:
-                    del depth_reader_input
-                torch.cuda.empty_cache()
-                gc.collect()
-
-            local_task_counter += 1
-            processed_tasks_count += 1
-            self.progress_queue.put(("processed", local_task_counter))
-            logger.debug(f"==> Completed {task['name']} pass for {video_name}.")
-
-        # After all tasks for the current video are processed or stopped
-        if self.stop_event.is_set():
-            return expected_task_count, any_task_completed_successfully_for_this_video
-
-        # Move to finished logic
-        move_enabled = settings[
-            "move_to_finished"
-        ]  # Use the setting from the dictionary
-
-        if is_single_file_mode:
-            # CRITICAL FIX: Get the finished folders directly from settings (set in start_single_processing)
-            single_finished_src = settings.get("single_finished_source_folder")
-            single_finished_depth = settings.get("single_finished_depth_folder")
-
-            # --- Check move_enabled setting ---
-            if (
-                single_finished_src
-                and single_finished_depth
-                and move_enabled
-                and any_task_completed_successfully_for_this_video
-            ):
-                self._move_processed_files(
-                    video_path,
-                    actual_depth_map_path,
-                    single_finished_src,
-                    single_finished_depth,
-                )
-            else:
-                logger.debug(
-                    f"Single file move skipped. Enabled={move_enabled}, Success={any_task_completed_successfully_for_this_video}, PathsValid={bool(single_finished_src)}"
-                )
-
-        elif (
-            any_task_completed_successfully_for_this_video
-            and finished_source_folder
-            and finished_depth_folder
-            and move_enabled
-        ):
-            # Batch mode move (uses the arguments passed from _run_batch_process)
-            self._move_processed_files(
-                video_path,
-                actual_depth_map_path,
-                finished_source_folder,
-                finished_depth_folder,
-            )
-
-        # Return the number of tasks actually processed for the global counter update
-        return processed_tasks_count, any_task_completed_successfully_for_this_video
 
     def _preview_processing_callback(
         self, source_frames: dict, params: dict
@@ -6383,8 +4157,26 @@ class SplatterGUI(ThemedTk):
 
         disp_map_tensor = (disp_map_tensor - params["convergence_point"]) * 2.0
 
+        tv_disp_comp = 1.0
+        if not enable_global_norm:
+            try:
+                if getattr(self, "previewer", None) is not None:
+                    _bd = int(getattr(self.previewer, "_depth_bit_depth", 8) or 8)
+                    _dpath = getattr(self.previewer, "_depth_path", None)
+                    if _bd > 8 and _dpath:
+                        if not hasattr(self, "_depth_color_range_cache"):
+                            self._depth_color_range_cache = {}
+                        if _dpath not in self._depth_color_range_cache:
+                            _info = get_video_stream_info(_dpath)
+                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                        if self._depth_color_range_cache.get(_dpath) == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+            except Exception:
+                tv_disp_comp = 1.0
+
+
         # Calculate disparity in pixels based on the TARGET width (W_target)
-        actual_max_disp_pixels = (params["max_disp"] / 20.0 / 100.0) * W_target
+        actual_max_disp_pixels = (params["max_disp"] / 20.0 / 100.0) * W_target * tv_disp_comp
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
         # Preview-only depth/pop separation metrics (percent of screen width)
@@ -6411,7 +4203,7 @@ class SplatterGUI(ThemedTk):
                         _disp_pct = (
                             (_ds - params["convergence_point"])
                             * 2.0
-                            * (params["max_disp"] / 20.0)
+                            * (params["max_disp"] / 20.0) * tv_disp_comp
                         )
                         _min_pct = float(_disp_pct.min())
                         _max_pct = float(_disp_pct.max())
@@ -6421,9 +4213,21 @@ class SplatterGUI(ThemedTk):
                         )  # screen-out (can be negative if all behind)
                     else:
                         _depth_pct, _pop_pct = 0.0, 0.0
-                    self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
+                    sig = None
+                    try:
+                        _dp_path = getattr(self.previewer, "_depth_path", "")
+                        sig = self._dp_total_signature(_dp_path, params.get("convergence_point", 0.0), params.get("max_disp", 0.0), params.get("depth_gamma", 1.0))
+                    except Exception:
+                        sig = None
+                    try:
+                        self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct, sig)
+                    except TypeError:
+                        self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
                 else:
-                    self.previewer.set_depth_pop_metrics(None, None)
+                    try:
+                        self.previewer.set_depth_pop_metrics(None, None, None)
+                    except TypeError:
+                        self.previewer.set_depth_pop_metrics(None, None)
         except Exception:
             pass
 
@@ -6593,38 +4397,15 @@ class SplatterGUI(ThemedTk):
         return pil_img
 
     def reset_to_defaults(self):
-        """Resets all GUI parameters to their default hardcoded values."""
+        """Resets all GUI parameters to their default values using ConfigManager."""
         if not messagebox.askyesno(
             "Reset Settings",
             "Are you sure you want to reset all settings to their default values?",
         ):
             return
 
-        self.input_source_clips_var.set("./input_source_clips")
-        self.input_depth_maps_var.set("./input_depth_maps")
-        self.output_splatted_var.set("./output_splatted")
-        self.max_disp_var.set("20.0")
-        self.process_length_var.set("-1")
-        self.enable_full_res_var.set(True)
-        self.batch_size_var.set("10")
-        self.enable_low_res_var.set(False)
-        self.pre_res_width_var.set("1920")
-        self.pre_res_height_var.set("1080")
-        self.low_res_batch_size_var.set("50")
-        self.dual_output_var.set(False)
-        self.enable_global_norm_var.set(False)
-        self.zero_disparity_anchor_var.set("0.5")
-        self.enable_sidecar_gamma_var.set(True)
-        self.enable_sidecar_blur_dilate_var.set(True)
-
-        self.border_manual_var.set(False)
-        self.border_width_var.set("0.0")
-        self.border_bias_var.set("0.0")
-
-        self.output_crf_var.set("23")
-        self.output_crf_full_var.set("23")
-        self.output_crf_low_var.set("23")
-        self.move_to_finished_var.set(True)
+        from core.splatting.config_manager import reset_to_defaults
+        reset_to_defaults(self.__dict__, self.config_manager.defaults)
 
         # Ensure UI/Toggles match the new reset states
         self.toggle_processing_settings_fields()
@@ -6729,204 +4510,40 @@ class SplatterGUI(ThemedTk):
         except ValueError:
             pass
 
-    def _run_batch_process(self, settings):
+    def _run_batch_process(self, settings: ProcessingSettings):
         """
-        Batch processing entry point.
-
-        In multi-file mode:
-          - 'From' and 'To' are treated as 1-based indices into the *GUI list*
-            (self.previewer.video_list), i.e. the same numbers you see when
-            jumping between clips.
-        In single-file mode:
-          - The From/To fields are ignored and the single video is processed.
+        Batch processing entry point. Delegates to core BatchProcessor.
         """
-        try:
-            # --- 1. Basic setup (folder paths, discovered videos, etc.) ---
-            setup_result = self._setup_batch_processing(settings)
-            if "error" in setup_result:
-                logger.error(setup_result["error"])
-                messagebox.showerror("Batch Processing Error", setup_result["error"])
-                return
+        # Parse From/To range
+        from_idx = 0
+        to_idx = None
+        
+        from_str = self.process_from_var.get().strip()
+        if from_str:
+            try:
+                from_idx = int(from_str) - 1
+            except ValueError:
+                pass
 
-            input_videos = setup_result["input_videos"]
-            is_single_file_mode = setup_result["is_single_file_mode"]
-            finished_source_folder = setup_result["finished_source_folder"]
-            finished_depth_folder = setup_result["finished_depth_folder"]
+        to_str = self.process_to_var.get().strip()
+        if to_str:
+            try:
+                to_idx = int(to_str)
+            except ValueError:
+                pass
 
-            if not input_videos:
-                logger.error("No input videos found for processing.")
-                messagebox.showerror(
-                    "Processing Error", "No input videos found for processing."
-                )
-                return
+        video_list = None
+        if hasattr(self, "previewer") and getattr(self.previewer, "video_list", None):
+            video_list = self.previewer.video_list
 
-            # --- 2. Apply From/To range on the *preview list* when available ---
-            # In single-file mode, we always process the one file and ignore From/To.
-            if (
-                not is_single_file_mode
-                and hasattr(self, "previewer")
-                and getattr(self.previewer, "video_list", None)
-            ):
-                # The previewer list is what you see in the GUI (1/XXXX, 2/XXXX, ...).
-                available_entries = self.previewer.video_list
-                total_videos = len(available_entries)
+        self.batch_processor.run_batch_process(
+            settings=settings,
+            from_index=from_idx,
+            to_index=to_idx,
+            video_list=video_list,
+        )
 
-                # Defaults: full range
-                start_index_0 = 0  # 0-based
-                end_index_0 = total_videos  # exclusive
-
-                # Parse "From" (1-based in UI)
-                from_str = self.process_from_var.get().strip()
-                if from_str:
-                    try:
-                        from_val = int(from_str)
-                        if from_val > 0:
-                            # convert to 0-based, clamp to bounds
-                            start_index_0 = max(0, min(total_videos, from_val - 1))
-                    except ValueError:
-                        logger.warning(f"Invalid 'From' value '{from_str}', ignoring.")
-
-                # Parse "To" (1-based in UI, inclusive)
-                to_str = self.process_to_var.get().strip()
-                if to_str:
-                    try:
-                        to_val = int(to_str)
-                        if to_val > 0:
-                            # convert to exclusive end index, clamp, and ensure at least 1 video
-                            end_index_0 = max(
-                                start_index_0 + 1, min(total_videos, to_val)
-                            )
-                    except ValueError:
-                        logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
-
-                # Log the range in GUI-style indices if we're not using the full list
-                if start_index_0 > 0 or end_index_0 < total_videos:
-                    logger.info(
-                        f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
-                        f"(out of {total_videos} total)"
-                    )
-
-                # Slice the preview list and build the actual video path list
-                selected_entries = available_entries[start_index_0:end_index_0]
-                sliced_videos = [
-                    entry.get("source_video")
-                    for entry in selected_entries
-                    if entry.get("source_video")
-                ]
-
-                input_videos = sliced_videos
-
-            else:
-                # Multi-file mode with no previewer/video_list: treat From/To as simple
-                # 1-based indices over the discovered input_videos list (old behavior).
-                # In *single-file* mode, we intentionally ignore From/To and leave
-                # input_videos unchanged so the current preview clip always runs.
-                if not is_single_file_mode:
-                    total_videos = len(input_videos)
-                    start_index_0 = 0
-                    end_index_0 = total_videos
-
-                    from_str = self.process_from_var.get().strip()
-                    if from_str:
-                        try:
-                            from_val = int(from_str)
-                            if from_val > 0:
-                                start_index_0 = max(0, min(total_videos, from_val - 1))
-                        except ValueError:
-                            logger.warning(
-                                f"Invalid 'From' value '{from_str}', ignoring."
-                            )
-
-                    to_str = self.process_to_var.get().strip()
-                    if to_str:
-                        try:
-                            to_val = int(to_str)
-                            if to_val > 0:
-                                end_index_0 = max(
-                                    start_index_0 + 1, min(total_videos, to_val)
-                                )
-                        except ValueError:
-                            logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
-
-                    if start_index_0 > 0 or end_index_0 < total_videos:
-                        logger.info(
-                            f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
-                            f"(out of {total_videos} total)"
-                        )
-                    input_videos = input_videos[start_index_0:end_index_0]
-                # else: single-file mode -> From/To boxes are ignored on purpose
-
-            # After applying the range, make sure we still have something to do
-            if not input_videos:
-                logger.error(
-                    "No input videos left to process after applying From/To range."
-                )
-                messagebox.showerror(
-                    "Processing Error",
-                    "No input videos left to process after applying the From/To range.",
-                )
-                return
-
-            # --- 3. Determine total tasks for the progress bar ---
-            processing_tasks = self._get_defined_tasks(settings)
-            if not processing_tasks:
-                logger.error(
-                    "No processing tasks defined. Please enable at least one output resolution."
-                )
-                messagebox.showerror(
-                    "Processing Error",
-                    "No processing tasks defined. Please enable at least one output resolution.",
-                )
-                return
-
-            tasks_per_video = len(processing_tasks)
-            total_tasks = len(input_videos) * tasks_per_video
-            logger.info(
-                f"Total tasks to process: {total_tasks} "
-                f"({len(input_videos)} videos × {tasks_per_video} tasks each)"
-            )
-            self.progress_queue.put(("total", total_tasks))
-
-            overall_task_counter = 0
-
-            # --- 4. Main processing loop ---
-            for idx, video_path in enumerate(input_videos):
-                if self.stop_event.is_set():
-                    logger.info("==> Stopping processing due to user request")
-                    break
-
-                # Delegates all per-video work to the helper
-                tasks_processed, _ = self._process_single_video_tasks(
-                    video_path=video_path,
-                    settings=settings,
-                    initial_overall_task_counter=overall_task_counter,
-                    is_single_file_mode=is_single_file_mode,
-                    finished_source_folder=finished_source_folder,
-                    finished_depth_folder=finished_depth_folder,
-                )
-
-                overall_task_counter += tasks_processed
-
-        except Exception as e:
-            logger.error(
-                f"An unexpected error occurred during batch processing: {e}",
-                exc_info=True,
-            )
-            self.progress_queue.put(("status", f"Error: {e}"))
-            error_message = str(e)
-            self.after(
-                0,
-                lambda msg=error_message: messagebox.showerror(
-                    "Processing Error",
-                    f"An unexpected error occurred during batch processing: {msg}",
-                ),
-            )
-        finally:
-            release_cuda_memory()
-            self.progress_queue.put("finished")
-            self.after(0, self.clear_processing_info)
-
-    def run_fusion_sidecar_generator(self):
+    def run_fusion_sidecar_generator(self) -> None:
         """Initializes and runs the FusionSidecarGenerator tool."""
 
         # Use an external thread to prevent the GUI from freezing during the file scan
@@ -6984,7 +4601,7 @@ class SplatterGUI(ThemedTk):
                 return
             messagebox.showwarning(
                 "Auto-Converge Preview",
-                "Auto-Convergence Mode must be set to 'Average' or 'Peak'.",
+                "Auto-Convergence Mode must be set to 'Average', 'Peak', or 'Hybrid'.",
             )
             return
 
@@ -7005,10 +4622,16 @@ class SplatterGUI(ThemedTk):
             self._auto_conv_cache = {"Average": None, "Peak": None}
             self._auto_conv_cached_path = None
 
-        if not single_video_path or not single_depth_path:
+        # Validate paths
+        if (
+            not isinstance(single_video_path, str)
+            or not os.path.exists(single_video_path)
+            or not isinstance(single_depth_path, str)
+            or not os.path.exists(single_depth_path)
+        ):
             messagebox.showerror(
                 "Auto-Converge Preview Error",
-                "Could not get both video and depth map paths from previewer.",
+                f"Invalid video or depth map path.\nVideo: {single_video_path}\nDepth: {single_depth_path}",
             )
             if force_run:
                 self.auto_convergence_combo.set("Off")
@@ -7018,6 +4641,7 @@ class SplatterGUI(ThemedTk):
             current_anchor = float(self.zero_disparity_anchor_var.get())
             process_length = int(self.process_length_var.get())
             batch_size = int(self.batch_size_var.get())
+            gamma = self._safe_float(self.depth_gamma_var, 1.0)
         except ValueError as e:
             messagebox.showerror(
                 "Auto-Converge Preview Error",
@@ -7039,17 +4663,695 @@ class SplatterGUI(ThemedTk):
         )
 
         # Start the calculation in a new thread
+        # Start the calculation in a new thread
         worker_args = (
+            single_video_path,
             single_depth_path,
             process_length,
             batch_size,
             current_anchor,
+            gamma,
             mode,
         )
         self.auto_converge_thread = threading.Thread(
             target=self._auto_converge_worker, args=worker_args
         )
         self.auto_converge_thread.start()
+
+    def _dp_total_signature(self, depth_path: str, conv: float, max_disp: float, gamma: float) -> str:
+        """Signature for caching Total(D+P) metrics.
+
+        IMPORTANT: Convergence changes should NOT invalidate the cached display/estimate.
+        Also tolerate older call sites that might accidentally swap (conv, max_disp).
+        """
+        try:
+            a = float(conv)
+            b = float(max_disp)
+
+            # If args look swapped (conv should be ~0..1, max_disp usually > 1), swap them.
+            if 0.0 <= a <= 1.0 and b > 1.0:
+                conv_val = a
+                max_disp_val = b
+            elif 0.0 <= b <= 1.0 and a > 1.0:
+                conv_val = b
+                max_disp_val = a
+            else:
+                conv_val = a
+                max_disp_val = b
+
+            # NOTE: conv_val intentionally excluded to prevent cache resets when convergence changes.
+            return f"{depth_path}|{float(max_disp_val):.4f}|{float(gamma):.4f}"
+        except Exception:
+            return str(depth_path)
+
+    def _estimate_dp_total_max_for_depth_video(
+        self,
+        depth_path: str,
+        convergence_point: float,
+        max_disp: float,
+        depth_gamma: float,
+        sample_frames: int = 10,
+        pixel_stride: int = 8,
+        total_frames_override: Optional[int] = None,
+        *,
+        params: Optional[dict] = None,
+    ) -> Optional[float]:
+        """
+        Estimates the maximum Total(D+P) for a clip by sampling frames.
+
+        IMPORTANT: This aims to match the preview/render math as closely as possible:
+          - Reads depth in RAW code values (10-bit stays 0..1023-ish, not RGB-expanded)
+          - Runs the same depth pre-processing (dilate/blur) used by preview/render
+          - Applies the same normalization policy and gamma curve:
+                depth = clip(depth, 0..1)
+                depth = 1 - (1 - depth) ** gamma
+        """
+        if not depth_path or not os.path.exists(depth_path):
+            return None
+
+        # Grab the same pre-proc knobs the preview pipeline uses (fallback to GUI vars if not provided).
+        p = params or {}
+
+        def _pfloat(key: str, default: float) -> float:
+            try:
+                v = p.get(key, default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        # NOTE: sidecars store these keys (depth_*) via _save_current_sidecar_data.
+        depth_dilate_size_x = _pfloat("depth_dilate_size_x", self._safe_float(self.depth_dilate_size_x_var))
+        depth_dilate_size_y = _pfloat("depth_dilate_size_y", self._safe_float(self.depth_dilate_size_y_var))
+        depth_blur_size_x = _pfloat("depth_blur_size_x", self._safe_float(self.depth_blur_size_x_var))
+        depth_blur_size_y = _pfloat("depth_blur_size_y", self._safe_float(self.depth_blur_size_y_var))
+        depth_dilate_left = _pfloat("depth_dilate_left", self._safe_float(self.depth_dilate_left_var))
+        depth_blur_left = _pfloat("depth_blur_left", self._safe_float(self.depth_blur_left_var))
+
+        # Gamma used for the estimator math (prefer explicit param dict if present).
+        try:
+            depth_gamma = float(p.get("depth_gamma", depth_gamma))
+        except Exception:
+            depth_gamma = float(depth_gamma)
+
+        # Build sample indices (evenly spaced, clamped)
+        total_frames = 0
+        try:
+            if total_frames_override is not None:
+                total_frames = int(total_frames_override)
+        except Exception:
+            total_frames = 0
+
+        if total_frames <= 0:
+            try:
+                tmp = VideoReader(depth_path, ctx=cpu(0))
+                total_frames = len(tmp)
+                del tmp
+            except Exception:
+                total_frames = 0
+
+        if total_frames <= 0:
+            return None
+
+        sample_frames = int(max(1, sample_frames))
+        if sample_frames >= total_frames:
+            indices = list(range(total_frames))
+        else:
+            indices = [int(round(i * (total_frames - 1) / (sample_frames - 1))) for i in range(sample_frames)]
+        # Ensure strictly increasing (helps the sequential reader)
+        indices = sorted(set(max(0, min(total_frames - 1, i)) for i in indices))
+
+        # Try to preserve RAW depth values (10-bit+) by using the same ffmpeg-backed reader used by render.
+        depth_stream_info = None
+        bit_depth = 8
+        pix_fmt = ""
+        try:
+            depth_stream_info = get_video_stream_info(depth_path)
+            bit_depth = _infer_depth_bit_depth(depth_stream_info)
+            pix_fmt = str((depth_stream_info or {}).get("pix_fmt", ""))
+        except Exception:
+            depth_stream_info = None
+            bit_depth = 8
+            pix_fmt = ""
+
+        # Determine an output size for sampling. If the previewer is active, match its current depth native size.
+        out_w = None
+        out_h = None
+        try:
+            if self.previewer is not None and getattr(self.previewer, "_depth_path", None) == depth_path:
+                out_w = int(getattr(self.previewer, "_depth_native_w", 0) or 0)
+                out_h = int(getattr(self.previewer, "_depth_native_h", 0) or 0)
+        except Exception:
+            out_w, out_h = None, None
+
+        # Fallback: take from ffprobe stream info
+        if not out_w or not out_h:
+            try:
+                out_w = int((depth_stream_info or {}).get("width", 0) or 0)
+                out_h = int((depth_stream_info or {}).get("height", 0) or 0)
+            except Exception:
+                out_w, out_h = 0, 0
+
+        if not out_w or not out_h:
+            return None
+
+        # We only need sampled frames; no need to match clip resolution here (keeps it fast).
+        # This still matches parity better than RGB-expanded reads.
+        try:
+            depth_reader, _, _, _, _ = load_pre_rendered_depth(
+                depth_map_path=depth_path,
+                process_length=-1,
+                target_height=out_h,
+                target_width=out_w,
+                match_resolution_to_target=False,
+            )
+        except Exception:
+            # Fallback to Decord if the ffmpeg-backed reader cannot be created.
+            try:
+                depth_reader = VideoReader(depth_path, ctx=cpu(0))
+            except Exception:
+                return None
+
+        max_total = None
+
+        # Optional: adopt the same "sidecar forces GN off" behavior used in preview.
+        enable_global_norm = bool(p.get("enable_global_norm", False))
+        try:
+            sidecar_folder = self._get_sidecar_base_folder()
+            depth_map_basename = os.path.splitext(os.path.basename(depth_path))[0]
+            sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+            json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
+            if os.path.exists(json_sidecar_path):
+                enable_global_norm = False
+        except Exception:
+            pass
+
+        # Fetch cached global min/max if GN is enabled (rare for estimator because sidecar usually exists).
+        global_min, global_max = 0.0, 1.0
+        if enable_global_norm:
+            try:
+                c = self._clip_norm_cache.get(depth_path)
+                if c:
+                    global_min = float(c.get("min", 0.0))
+                    global_max = float(c.get("max", 1.0))
+            except Exception:
+                global_min, global_max = 0.0, 1.0
+
+        for idx in indices:
+            try:
+                # Read raw frame as (1,H,W,1)
+                if hasattr(depth_reader, "seek"):
+                    depth_reader.seek(int(idx))
+                frame_np = depth_reader.get_batch([int(idx)]).asnumpy()
+
+                # Ensure numeric + channel-last gray
+                if frame_np.ndim == 3:
+                    # (1,H,W) -> (1,H,W,1)
+                    frame_np = frame_np[..., None]
+                elif frame_np.ndim == 4 and frame_np.shape[-1] >= 1:
+                    # If somehow RGB, take the first channel (depth stored as gray replicated)
+                    if frame_np.shape[-1] != 1:
+                        frame_np = frame_np[..., :1]
+                else:
+                    continue
+
+                frame_raw = frame_np.astype(np.float32, copy=False)
+
+                # Mirror preview: determine per-frame max content value (used in processing + normalization)
+                max_raw_content_value = float(np.max(frame_raw))
+                if max_raw_content_value < 1.0:
+                    max_raw_content_value = 1.0
+
+                # Pre-process (dilate/blur, left-edge ops) exactly like preview
+                try:
+                    processed = self._process_depth_batch(
+                        batch_depth_numpy_raw=frame_raw,
+                        depth_stream_info=depth_stream_info,
+                        depth_gamma=depth_gamma,
+                        depth_dilate_size_x=depth_dilate_size_x,
+                        depth_dilate_size_y=depth_dilate_size_y,
+                        depth_blur_size_x=depth_blur_size_x,
+                        depth_blur_size_y=depth_blur_size_y,
+                        is_low_res_task=False,
+                        max_raw_value=max_raw_content_value,
+                        global_depth_min=global_min,
+                        global_depth_max=global_max,
+                        depth_dilate_left=depth_dilate_left,
+                        depth_blur_left=depth_blur_left,
+                        debug_batch_index=0,
+                        debug_frame_index=int(idx),
+                        debug_task_name="EstimateMaxTotal",
+                    )
+                except Exception:
+                    processed = frame_raw  # fallback
+
+                # _process_depth_batch already returns normalized + gamma-applied depth in 0..1 (preview/render parity).
+                # Only fall back to manual scaling+gamma if the processor failed and returned raw code values.
+                try:
+                    if hasattr(processed, "ndim") and processed.ndim == 4:
+                        depth_norm = processed[0, ..., 0]
+                    elif hasattr(processed, "ndim") and processed.ndim == 3:
+                        depth_norm = processed[0, ...]
+                    else:
+                        depth_norm = processed
+                except Exception:
+                    depth_norm = processed[0, ..., 0]
+
+                try:
+                    maxv = float(np.max(depth_norm))
+                except Exception:
+                    maxv = 1.0
+
+                # If we're still in raw code space (e.g., 10-bit TV-range values ~64..940), scale using fixed ranges (NOT observed max).
+                if maxv > 1.5:
+                    if maxv <= 256.0:
+                        depth_norm = depth_norm / 255.0
+                    elif maxv <= 1024.0:
+                        depth_norm = depth_norm / 1023.0
+                    elif maxv <= 4096.0:
+                        depth_norm = depth_norm / 4095.0
+                    elif maxv <= 65536.0:
+                        depth_norm = depth_norm / 65535.0
+                    else:
+                        depth_norm = depth_norm / float(maxv)
+                    depth_norm = np.clip(depth_norm, 0.0, 1.0)
+                    if depth_gamma and abs(depth_gamma - 1.0) > 1e-6:
+                        inv = 1.0 - depth_norm
+                        inv = np.clip(inv, 0.0, 1.0)
+                        depth_norm = 1.0 - np.power(inv, float(depth_gamma))
+
+                depth_norm = np.clip(depth_norm, 0.0, 1.0)
+
+                # Compute Total(D+P) for this frame (match preview: stride sample + ignore holes)
+                ds = depth_norm[::max(1, int(pixel_stride)), ::max(1, int(pixel_stride))].astype(np.float32, copy=False)
+                valid = (ds > 0.001) & (ds < 0.999)
+                if not np.any(valid):
+                    continue
+                dmin = float(np.min(ds[valid]))
+                dmax = float(np.max(ds[valid]))
+
+                tv_disp_comp = 1.0
+                if not enable_global_norm:
+                    try:
+                        if _infer_depth_bit_depth(depth_stream_info) > 8 and str((depth_stream_info or {}).get("color_range", "unknown")).lower() == "tv":
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                    except Exception:
+                        tv_disp_comp = 1.0
+
+                scale = 2.0 * (float(max_disp) / 20.0) * tv_disp_comp
+                min_pct = (dmin - float(convergence_point)) * scale
+                max_pct = (dmax - float(convergence_point)) * scale
+
+                depth_pct = abs(min_pct) if min_pct < 0 else 0.0
+                pop_pct = max_pct if max_pct > 0 else 0.0
+                total = float(depth_pct + pop_pct)
+
+                if max_total is None or total > max_total:
+                    max_total = total
+
+            except Exception:
+                continue
+
+        try:
+            if hasattr(depth_reader, "close"):
+                depth_reader.close()
+        except Exception:
+            pass
+
+        return max_total
+
+    def run_estimate_dp_total_max(self):
+        """Compute a quick sampled estimate of this clip's Max Total(D+P) and seed the overlay."""
+        try:
+            if getattr(self, "previewer", None) is None:
+                return
+            depth_path = getattr(self.previewer, "_depth_path", None)
+            if not depth_path:
+                return
+
+            try:
+                logger.info(f"Estimate Max Total(D+P): sampling clip depth map: {os.path.basename(depth_path)}")
+            except Exception:
+                pass
+
+            params = None
+            try:
+                # Use the same parameters the preview processing uses (includes sidecar overrides)
+                if getattr(self.previewer, "get_params_callback", None):
+                    params = self.previewer.get_params_callback()
+            except Exception:
+                params = None
+
+            if isinstance(params, dict):
+                conv = float(params.get("zero_disparity_anchor", self.zero_disparity_anchor_var.get()))
+                max_disp = float(params.get("max_disparity", self.max_disp_var.get()))
+                gamma = float(params.get("depth_gamma", self.depth_gamma_var.get()))
+            else:
+                conv = float(self.zero_disparity_anchor_var.get())
+                max_disp = float(self.max_disp_var.get())
+                gamma = float(self.depth_gamma_var.get())
+
+            total_frames_override = None
+            try:
+                # Reuse already-known frame count from the active preview (avoids re-probing/decord hangs)
+                if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "frame_scrubber"):
+                    total_frames_override = int(self.previewer.frame_scrubber.cget("to")) + 1
+            except Exception:
+                total_frames_override = None
+
+            sig = self._dp_total_signature(depth_path, conv, max_disp, gamma)
+
+            try:
+                if hasattr(self, "btn_est_dp_total"):
+                    self.btn_est_dp_total.config(state="disabled")
+            except Exception:
+                pass
+
+            est_start_ts = time.time()
+
+            def _worker():
+                try:
+                    est = self._estimate_dp_total_max_for_depth_video(
+                    depth_path, conv, max_disp, gamma, sample_frames=10, pixel_stride=8, total_frames_override=total_frames_override, params=params
+                )
+                except Exception as e:
+                    try:
+                        logger.exception(f"Estimate Max Total(D+P) failed: {e}")
+                    except Exception:
+                        pass
+                    est = None
+
+                def _apply():
+                    try:
+                        if est is not None:
+                            try:
+                                logger.info(f"Estimate Max Total(D+P): {float(est):.2f}%")
+                            except Exception:
+                                pass
+                            self._dp_total_est_cache[sig] = float(est)
+                            if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
+                                ui_sig = None
+                            try:
+                                ui_sig = getattr(self.previewer, "_dp_signature", None)
+                            except Exception:
+                                ui_sig = None
+                            if not ui_sig:
+                                ui_sig = sig
+                            self.previewer.set_depth_pop_max_estimate(float(est), ui_sig)
+                    finally:
+                        try:
+                            if est is None:
+                                elapsed = None
+                                try:
+                                    elapsed = time.time() - est_start_ts
+                                except Exception:
+                                    pass
+                                if elapsed is not None:
+                                    logger.info(f"Estimate Max Total(D+P): (no result)  (took {elapsed:.2f}s)")
+                                else:
+                                    logger.info("Estimate Max Total(D+P): (no result)")
+                        except Exception:
+                            pass
+
+                        try:
+                            if hasattr(self, "btn_est_dp_total"):
+                                self.btn_est_dp_total.config(state="normal")
+                        except Exception:
+                            pass
+
+                self.after(0, _apply)
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            try:
+                if hasattr(self, "btn_est_dp_total"):
+                    self.btn_est_dp_total.config(state="normal")
+            except Exception:
+                pass
+
+    def _get_cached_dp_total_est_for_current(self) -> Optional[float]:
+        try:
+            if getattr(self, "previewer", None) is None:
+                return None
+            depth_path = getattr(self.previewer, "_depth_path", None)
+            if not depth_path:
+                return None
+            conv = float(self.zero_disparity_anchor_var.get())
+            max_disp = float(self.max_disp_var.get())
+            gamma = float(self.depth_gamma_var.get())
+            sig = self._dp_total_signature(depth_path, conv, max_disp, gamma)
+            v = self._dp_total_est_cache.get(sig, None)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _auto_pass_csv_get_path(self) -> str:
+        try:
+            return os.path.join(self._get_sidecar_base_folder(), "auto_pass_export.csv")
+        except Exception:
+            return "auto_pass_export.csv"
+
+    def _auto_pass_csv_load_cache(self, csv_path: str) -> None:
+        """Load CSV rows into memory (keyed by source_video basename)."""
+        try:
+            self._auto_pass_csv_path = csv_path
+            rows = {}
+            if os.path.exists(csv_path):
+                with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        # Prefer source_video as the stable key; fall back to depth_map for older exports.
+                        key = str(row.get("source_video", "")).strip()
+                        if not key:
+                            key = str(row.get("depth_map", "")).strip()
+                        if key:
+                            rows[key] = dict(row)
+            self._auto_pass_csv_cache = rows
+        except Exception:
+            self._auto_pass_csv_cache = {}
+
+    def _auto_pass_csv_flush_cache(self, fieldnames: list) -> None:
+        try:
+            if not self._auto_pass_csv_path or self._auto_pass_csv_cache is None:
+                return
+
+            # Always write the CSV (for Resolve / general interoperability)
+            with open(self._auto_pass_csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for key in sorted(self._auto_pass_csv_cache.keys()):
+                    w.writerow(self._auto_pass_csv_cache[key])
+
+            # TSV export removed (CSV import works fine in LibreOffice after clicking OK).
+        except Exception:
+            pass
+
+    def _auto_pass_csv_update_row_from_current(self) -> None:
+        """If auto_pass_export.csv exists, update this clip's row when sidecar changes."""
+        try:
+            csv_path = self._auto_pass_csv_get_path()
+            if not os.path.exists(csv_path):
+                return
+
+            if self._auto_pass_csv_cache is None or self._auto_pass_csv_path != csv_path:
+                self._auto_pass_csv_load_cache(csv_path)
+
+            if getattr(self, "previewer", None) is None:
+                return
+            idx = getattr(self.previewer, "current_video_index", -1)
+            if idx is None or idx < 0:
+                return
+            src = self.previewer.video_list[idx].get("source_video", "")
+            depth = self.previewer.video_list[idx].get("depth_map", "")
+            depth_bn = os.path.basename(depth) if depth else ""
+            src_bn = os.path.basename(src) if src else ""
+
+            # Frame token: last underscore + digits at end of source basename (before extension).
+            frame_num = ""
+            try:
+                stem = os.path.splitext(src_bn)[0]
+                mfr = re.search(r"_([0-9]+)$", stem)
+                frame_num = mfr.group(1) if mfr else ""
+            except Exception:
+                frame_num = ""
+            if not frame_num:
+                # Fallback: try depth basename pattern "..._<digits>_depth"
+                try:
+                    stem = os.path.splitext(depth_bn)[0]
+                    if stem.endswith("_depth"):
+                        stem = stem[:-6]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+
+            res = self._get_current_sidecar_paths_and_data()
+            if not res:
+                return
+            _, _, current_data = res
+
+            dp_est = self._get_cached_dp_total_est_for_current()
+            if dp_est is None:
+                try:
+                    dp_est = current_data.get("dp_total_max_est", None)
+                except Exception:
+                    dp_est = None
+
+            # Best-effort: measured (render-time) max Total(D+P), if available
+            dp_true = None
+            try:
+                sig = self._dp_total_signature(
+                    depth,
+                    float(current_data.get("convergence_plane", 0.5)),
+                    float(current_data.get("max_disparity", 0.0)),
+                    float(current_data.get("gamma", 1.0)),
+                )
+                dp_true = self._dp_total_true_cache.get(sig, None)
+            except Exception:
+                dp_true = None
+            if dp_true is None:
+                try:
+                    dp_true = current_data.get("dp_total_max_true", None)
+                except Exception:
+                    dp_true = None
+
+            row = {
+                "frame": frame_num,
+                "source_video": src_bn,
+                "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                "border_mode": str(current_data.get("border_mode", "")),
+                "set_disparity": round(float(current_data.get("max_disparity", 0.0)), 3),
+                "true_max_disp": round(float(dp_true), 3) if dp_true is not None else "",
+                "est_max_disp": round(float(dp_est), 3) if dp_est is not None else "",
+                "gamma": round(float(current_data.get("gamma", 1.0)), 3),
+            }
+
+            # Key by source basename (stable + avoids collisions across multi-map folders).
+            self._auto_pass_csv_cache[src_bn] = row
+
+            fieldnames = [
+                "frame",
+                "source_video",
+                "selected_depth_map",
+                "convergence_plane",
+                "left_border",
+                "right_border",
+                "border_mode",
+                "set_disparity",
+                "true_max_disp",
+                "est_max_disp",
+                "gamma",
+            ]
+            self._auto_pass_csv_flush_cache(fieldnames)
+        except Exception:
+            pass
+
+    def _auto_pass_csv_update_row_for_paths(
+        self,
+        source_video_path: str,
+        depth_map_path: str,
+        current_data: dict,
+        dp_total_max_true: Optional[float] = None,
+    ) -> None:
+        """Best-effort: update/merge a single row in the AUTO-PASS CSV (if it exists).
+
+        This is used by non-preview code paths (e.g. render) where we already know the
+        source/depth paths and a dict of the most relevant settings.
+        """
+        try:
+            csv_path = self._auto_pass_csv_get_path()
+            if not csv_path:
+                return
+            # Ensure destination folder exists (CSV may be created on-demand)
+            try:
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            return
+
+        try:
+            self._auto_pass_csv_load_cache(csv_path)
+        except Exception:
+            return
+
+        try:
+            depth_bn = os.path.basename(depth_map_path)
+            src_bn = os.path.basename(source_video_path)
+
+            # Frame token: last underscore + digits at end of source basename (before extension).
+            frame_num = ""
+            try:
+                stem = os.path.splitext(src_bn)[0]
+                mfr = re.search(r"_([0-9]+)$", stem)
+                frame_num = mfr.group(1) if mfr else ""
+            except Exception:
+                frame_num = ""
+            if not frame_num:
+                # Fallback: try depth basename pattern "..._<digits>_depth"
+                try:
+                    stem = os.path.splitext(depth_bn)[0]
+                    if stem.endswith("_depth"):
+                        stem = stem[:-6]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+
+            # Preserve anything already present for this clip unless we are explicitly overwriting it.
+            existing = dict(self._auto_pass_csv_cache.get(src_bn, {}))
+            row = dict(existing)
+
+            row.update(
+                {
+                    "frame": frame_num,
+                    "source_video": src_bn,
+                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "border_mode": str(current_data.get("border_mode", "")),
+                    "set_disparity": round(
+                        float(current_data.get("max_disparity", current_data.get("set_disparity", 0.0))),
+                        3,
+                    ),
+                    "gamma": round(float(current_data.get("gamma", 1.0)), 3),
+                }
+            )
+
+            # Optional columns (keep internal names, change only CSV keys)
+            try:
+                if current_data.get("dp_total_max_est", None) not in ("", None):
+                    row["est_max_disp"] = round(float(current_data.get("dp_total_max_est")), 3)
+            except Exception:
+                pass
+
+            if dp_total_max_true is not None:
+                try:
+                    row["true_max_disp"] = round(float(dp_total_max_true), 3)
+                except Exception:
+                    row["true_max_disp"] = dp_total_max_true
+
+            self._auto_pass_csv_cache[src_bn] = row
+
+            fieldnames = [
+                "frame",
+                "source_video",
+                "selected_depth_map",
+                "convergence_plane",
+                "left_border",
+                "right_border",
+                "border_mode",
+                "set_disparity",
+                "true_max_disp",
+                "est_max_disp",
+                "gamma",
+            ]
+            self._auto_pass_csv_flush_cache(fieldnames=fieldnames)
+        except Exception:
+            return
 
     def _save_current_settings_and_notify(self):
         """Saves current GUI settings to default config file and notifies the user."""
@@ -7070,12 +5372,389 @@ class SplatterGUI(ThemedTk):
                 "Save Error", f"Failed to save settings to {config_filename}:\n{e}"
             )
 
+    def run_auto_pass(self) -> None:
+        """Run AUTO-PASS over the preview list (or From/To range) without rendering."""
+        if not getattr(self, "previewer", None) or not getattr(self.previewer, "video_list", None):
+            messagebox.showwarning("AUTO-PASS", "Load/Refresh the Preview list first.")
+            return
+
+        available_entries = self.previewer.video_list
+        total_videos = len(available_entries)
+        if total_videos == 0:
+            messagebox.showwarning("AUTO-PASS", "No clips found in the preview list.")
+            return
+
+        # Range selection (1-based in UI, 0-based internally)
+        start_index_0 = 0
+        end_index_0 = total_videos
+
+        try:
+            from_str = self.process_from_var.get().strip()
+            to_str = self.process_to_var.get().strip()
+
+            from_ui = int(from_str) if from_str else 1
+            to_ui = int(to_str) if to_str else total_videos
+
+            from_ui = max(1, min(from_ui, total_videos))
+            to_ui = max(1, min(to_ui, total_videos))
+
+            start_index_0 = from_ui - 1
+            end_index_0 = to_ui
+            if start_index_0 >= end_index_0:
+                raise ValueError("From must be <= To.")
+
+        except Exception:
+            messagebox.showerror(
+                "Invalid Range",
+                f"Please enter a valid From/To range between 1 and {total_videos}.",
+            )
+            return
+
+        # Snapshot the current GUI settings ONCE (thread-safe)
+        try:
+            base_sidecar_data = {
+                "convergence_plane": self._safe_float(self.zero_disparity_anchor_var, 0.5),
+                "max_disparity": self._safe_float(self.max_disp_var, 20.0),
+                "gamma": float(f"{self._safe_float(self.depth_gamma_var, 1.0):.2f}"),
+                "depth_dilate_size_x": self._safe_float(self.depth_dilate_size_x_var),
+                "depth_dilate_size_y": self._safe_float(self.depth_dilate_size_y_var),
+                "depth_blur_size_x": self._safe_float(self.depth_blur_size_x_var),
+                "depth_blur_size_y": self._safe_float(self.depth_blur_size_y_var),
+                "depth_dilate_left": self._safe_float(self.depth_dilate_left_var),
+                "depth_blur_left": int(round(self._safe_float(self.depth_blur_left_var))),
+                "depth_blur_left_mix": self._safe_float(self.depth_blur_left_mix_var, 0.5),
+                "selected_depth_map": self.selected_depth_map_var.get(),
+            }
+
+            auto_conv_mode = self.auto_convergence_mode_var.get()
+            border_mode = self.border_mode_var.get()
+            process_length = int(self.process_length_var.get())
+            batch_size = int(self.batch_size_var.get())
+
+            border_w = self._safe_float(self.border_width_var)
+            border_b = self._safe_float(self.border_bias_var)
+
+        except Exception as e:
+            messagebox.showerror("AUTO-PASS", f"Could not read current settings: {e}")
+            return
+
+        # Disable interactive controls while AUTO-PASS runs
+        self.stop_event.clear()
+        try:
+            self.stop_button.config(state="normal")
+        except Exception:
+            pass
+        try:
+            self.start_button.config(state="disabled")
+            self.start_single_button.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.update_sidecar_button.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.btn_auto_converge_preview.config(state="disabled")
+            self.btn_auto_pass.config(state="disabled")
+        except Exception:
+            pass
+
+        self.status_label.config(
+            text=f"AUTO-PASS running… ({start_index_0 + 1}–{end_index_0} of {total_videos})"
+        )
+
+        worker_args = (
+            available_entries,
+            start_index_0,
+            end_index_0,
+            base_sidecar_data,
+            auto_conv_mode,
+            border_mode,
+            process_length,
+            batch_size,
+            border_w,
+            border_b,
+        )
+
+        t = threading.Thread(target=self._auto_pass_worker, args=worker_args, daemon=True)
+        t.start()
+
+    def _auto_pass_worker(
+        self,
+        available_entries,
+        start_index_0,
+        end_index_0,
+        base_sidecar_data,
+        auto_conv_mode,
+        border_mode,
+        process_length,
+        batch_size,
+        border_w,
+        border_b,
+    ) -> None:
+        total = max(0, end_index_0 - start_index_0)
+        completed = 0
+
+
+        # AUTO-PASS export (CSV) - optional helper output for timeline/Resolve workflows
+        rows_for_csv = []
+        csv_out_path = None
+        try:
+            csv_out_path = os.path.join(self._get_sidecar_base_folder(), "auto_pass_export.csv")
+        except Exception:
+            csv_out_path = "auto_pass_export.csv"
+        # Pre-compute manual borders from the current Width/Bias (used when mode is Off/Manual)
+        try:
+            w = float(border_w)
+            b = float(border_b)
+        except Exception:
+            w = 0.0
+            b = 0.0
+
+        if b >= 0:
+            manual_right = w
+            manual_left = w * (1.0 - b)
+        else:
+            manual_left = w
+            manual_right = w * (1.0 + b)
+
+        manual_left = min(5.0, max(0.0, manual_left))
+        manual_right = min(5.0, max(0.0, manual_right))
+
+        sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+        sidecar_base_folder = self._get_sidecar_base_folder()
+        os.makedirs(sidecar_base_folder, exist_ok=True)
+
+        gamma = float(base_sidecar_data.get("gamma", 1.0))
+        max_disp = float(base_sidecar_data.get("max_disparity", 20.0))
+        fallback_anchor = float(base_sidecar_data.get("convergence_plane", 0.5))
+
+        for idx in range(start_index_0, end_index_0):
+            if self.stop_event.is_set():
+                break
+
+            entry = available_entries[idx]
+            rgb_path = entry.get("source_video")
+            depth_path = entry.get("depth_map")
+            if not rgb_path or not depth_path:
+                continue
+
+            depth_basename = os.path.splitext(os.path.basename(depth_path))[0]
+            json_sidecar_path = os.path.join(sidecar_base_folder, f"{depth_basename}{sidecar_ext}")
+
+            current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
+
+            # Apply current GUI settings snapshot (preserves overlap/bias from existing sidecar)
+            current_data.update(base_sidecar_data)
+
+            # 1) AUTO-CONVERGE (optional)
+            conv_val = fallback_anchor
+            if auto_conv_mode and auto_conv_mode != "Off":
+                avg_val, peak_val = self._determine_auto_convergence(
+                    rgb_path,
+                    depth_path,
+                    process_length,
+                    batch_size,
+                    fallback_anchor,
+                    gamma=gamma,
+                )
+                if auto_conv_mode == "Average":
+                    conv_val = avg_val
+                elif auto_conv_mode == "Peak":
+                    conv_val = peak_val
+                elif auto_conv_mode == "Hybrid":
+                    conv_val = 0.5 * (avg_val + peak_val)
+                else:
+                    conv_val = avg_val
+
+            current_data["convergence_plane"] = float(conv_val)
+
+            # 2) AUTO-BORDER (optional) – runs AFTER convergence (conv_val affects borders)
+            if border_mode == "Auto Basic":
+                tv_disp_comp = 1.0
+                try:
+                    _info = get_video_stream_info(depth_path)
+                    if _infer_depth_bit_depth(_info) > 8 and str((_info or {}).get("color_range", "unknown")).lower() == "tv":
+                        tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                except Exception:
+                    tv_disp_comp = 1.0
+
+                width = max(0.0, (1.0 - conv_val) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+                width = min(5.0, width)
+                current_data["left_border"] = round(float(width), 3)
+                current_data["right_border"] = round(float(width), 3)
+                # Freeze borders into manual left/right so it's easy to tweak later
+                current_data["border_mode"] = "Manual"
+
+            elif border_mode == "Auto Adv.":
+                scan = self._scan_borders_for_depth_path(depth_path, float(conv_val), max_disp, gamma)
+                if scan:
+                    l_val, r_val = scan
+                else:
+                    l_val, r_val = 0.0, 0.0
+                current_data["left_border"] = float(l_val)
+                current_data["right_border"] = float(r_val)
+                current_data["border_mode"] = "Manual"
+
+            else:
+                # Off or Manual – do not touch borders (preserve existing per-clip values)
+                pass
+
+            # Save sidecar
+            # Optional: estimate per-clip Max Total(D+P) (sampled) for CSV + later review
+            try:
+                dp_est = self._estimate_dp_total_max_for_depth_video(
+                    depth_path,
+                    float(current_data.get("convergence_plane", conv_val)),
+                    float(current_data.get("max_disparity", max_disp)),
+                    float(current_data.get("gamma", gamma)),
+                    sample_frames=10,
+                    pixel_stride=8,
+                    params=current_data,
+                )
+                if dp_est is not None:
+                    current_data["dp_total_max_est"] = round(float(dp_est), 3)
+            except Exception:
+                pass
+
+            self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data)
+
+
+            # Collect row for optional CSV export
+            try:
+                depth_bn = os.path.basename(depth_path)
+                src_bn = os.path.basename(rgb_path)
+                # Frame token: last underscore + digits at end of source basename (before extension).
+                frame_num = ""
+                try:
+                    stem = os.path.splitext(src_bn)[0]
+                    mfr = re.search(r"_([0-9]+)$", stem)
+                    frame_num = mfr.group(1) if mfr else ""
+                except Exception:
+                    frame_num = ""
+                if not frame_num:
+                    try:
+                        stem = os.path.splitext(depth_bn)[0]
+                        if stem.endswith("_depth"):
+                            stem = stem[:-6]
+                        mfr = re.search(r"_([0-9]+)$", stem)
+                        frame_num = mfr.group(1) if mfr else ""
+                    except Exception:
+                        frame_num = ""
+                rows_for_csv.append({
+                    "frame": frame_num,
+                    "source_video": src_bn,
+                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "border_mode": str(current_data.get("border_mode", "")),
+                    "set_disparity": round(float(current_data.get("max_disparity", max_disp)), 3),
+                    "true_max_disp": current_data.get("dp_total_max_true", ""),
+                    "est_max_disp": current_data.get("dp_total_max_est", ""),
+                    "gamma": round(float(current_data.get("gamma", gamma)), 3),
+                })
+            except Exception:
+                pass
+            completed += 1
+            self.after(
+                0,
+                lambda c=completed, t=total: self.status_label.config(
+                    text=f"AUTO-PASS… {c}/{t}"
+                ),
+            )
+        # Write optional CSV export (best-effort; never blocks completion)
+        try:
+            if rows_for_csv and csv_out_path:
+                fieldnames = [
+                    "frame",
+                    "source_video",
+                    "selected_depth_map",
+                    "convergence_plane",
+                    "left_border",
+                    "right_border",
+                    "border_mode",
+                    "set_disparity",
+                    "true_max_disp",
+                    "est_max_disp",
+                    "gamma",
+                ]
+
+                # Merge/update existing CSV instead of overwriting (source_video basename is the key)
+                existing_rows = {}
+                try:
+                    if os.path.exists(csv_out_path):
+                        with open(csv_out_path, "r", newline="", encoding="utf-8") as rf:
+                            rcsv = csv.DictReader(rf)
+                            for rrow in rcsv:
+                                k = str(rrow.get("source_video", "")).strip()
+                                if k:
+                                    existing_rows[k] = dict(rrow)
+                except Exception:
+                    existing_rows = {}
+
+                for row in rows_for_csv:
+                    try:
+                        k = str(row.get("source_video", "")).strip()
+                        if k:
+                            existing_rows[k] = row
+                    except Exception:
+                        pass
+
+                with open(csv_out_path, "w", newline="", encoding="utf-8") as f:
+                    wcsv = csv.DictWriter(f, fieldnames=fieldnames)
+                    wcsv.writeheader()
+                    for k in sorted(existing_rows.keys()):
+                        wcsv.writerow(existing_rows[k])
+        except Exception:
+            pass
+
+        was_stopped = self.stop_event.is_set()
+        self.after(0, lambda: self._complete_auto_pass(completed, total, was_stopped))
+
+    def _complete_auto_pass(self, completed: int, total: int, was_stopped: bool) -> None:
+        try:
+            self.stop_button.config(state="disabled")
+        except Exception:
+            pass
+
+        # Re-enable controls
+        try:
+            self.start_button.config(state="normal")
+            self.start_single_button.config(state="normal")
+        except Exception:
+            pass
+        try:
+            self.btn_auto_converge_preview.config(state="normal")
+            self.btn_auto_pass.config(state="normal")
+        except Exception:
+            pass
+
+        self.stop_event.clear()
+        self._toggle_sidecar_update_button_state()
+
+        if was_stopped:
+            self.status_label.config(text=f"AUTO-PASS stopped ({completed}/{total}).")
+        else:
+            self.status_label.config(text=f"AUTO-PASS complete ({completed}/{total}).")
+
+        # Refresh current clip UI (convergence/border) so the results are immediately visible
+        try:
+            if getattr(self, "previewer", None) and 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
+                _depth_map = self.previewer.video_list[self.previewer.current_video_index].get("depth_map")
+                if _depth_map:
+                    self.update_gui_from_sidecar(_depth_map)
+                    try:
+                        self.previewer.update_preview()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _save_config(self):
-        """Saves current GUI settings to the default file."""
-        config = self._get_current_config()
-        config_filename = self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]
-        with open(config_filename, "w") as f:
-            json.dump(config, f, indent=4)
+        """Saves current GUI settings using the ConfigManager."""
+        self.config_manager.config = self._get_current_config()
+        self.config_manager.save()
 
     def _save_current_sidecar_data(
         self,
@@ -7111,7 +5790,7 @@ class SplatterGUI(ThemedTk):
                     self.zero_disparity_anchor_var, 0.5
                 ),
                 "max_disparity": self._safe_float(self.max_disp_var, 20.0),
-                "gamma": self._safe_float(self.depth_gamma_var, 1.0),
+                "gamma": float(f"{self._safe_float(self.depth_gamma_var, 1.0):.2f}"),
                 "depth_dilate_size_x": self._safe_float(self.depth_dilate_size_x_var),
                 "depth_dilate_size_y": self._safe_float(self.depth_dilate_size_y_var),
                 "depth_blur_size_x": self._safe_float(self.depth_blur_size_x_var),
@@ -7155,15 +5834,24 @@ class SplatterGUI(ThemedTk):
                 final_auto_L = current_data.get("auto_border_L", 0.0)
                 final_auto_R = current_data.get("auto_border_R", 0.0)
 
-            gui_save_data.update(
-                {
-                    "left_border": round(left_b, 3),
-                    "right_border": round(right_b, 3),
-                    "border_mode": mode,
-                    "auto_border_L": round(final_auto_L, 3),
-                    "auto_border_R": round(final_auto_R, 3),
-                }
-            )
+            if final_auto_L is None:
+                final_auto_L = 0.0
+            if final_auto_R is None:
+                final_auto_R = 0.0
+
+            if mode == "Off":
+                # Preserve any existing per-clip borders; do not overwrite or clear.
+                pass
+            else:
+                gui_save_data.update(
+                    {
+                        "left_border": round(left_b, 3),
+                        "right_border": round(right_b, 3),
+                        "border_mode": mode,
+                        "auto_border_L": round(final_auto_L, 3),
+                        "auto_border_R": round(final_auto_R, 3),
+                    }
+                )
         except ValueError:
             logger.error("Sidecar Save: Invalid input value in GUI. Skipping save.")
             if not is_auto_save:
@@ -7292,19 +5980,19 @@ class SplatterGUI(ThemedTk):
         self._save_debug_image(data, filename_tag, batch_index, frame_index, task_name)
 
     def save_settings(self):
-        """Saves current GUI settings to a user-selected JSON file."""
+        """Saves current GUI settings to a user-selected JSON file using ConfigManager."""
         filename = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json")],
+            defaultextension=".splatcfg",
+            filetypes=[("Splat Config", "*.splatcfg"), ("JSON files", "*.json")],
             title="Save Settings to File",
         )
         if not filename:
             return
 
         try:
+            from core.splatting.config_manager import save_settings_to_file
             config_to_save = self._get_current_config()
-            with open(filename, "w") as f:
-                json.dump(config_to_save, f, indent=4)
+            save_settings_to_file(config_to_save, filename)
 
             messagebox.showinfo(
                 "Settings Saved",
@@ -7424,94 +6112,9 @@ class SplatterGUI(ThemedTk):
         # Store the actual width that was applied (which is current_width) for save_config
         self.window_width = current_width  # Update instance variable for save_config
 
-    def _setup_batch_processing(self, settings):
-        """
-        Handles input path validation, mode determination (single file vs batch),
-        and creates necessary 'finished' folders.
-
-        Returns a dict:
-
-            {
-                "input_videos": [...],
-                "is_single_file_mode": bool,
-                "finished_source_folder": str or None,
-                "finished_depth_folder": str or None,
-            }
-
-        or, on error:
-
-            { "error": "message" }
-        """
-        input_source_clips_path = settings["input_source_clips"]
-        input_depth_maps_path = settings["input_depth_maps"]
-        output_splatted = settings["output_splatted"]
-
-        is_source_file = os.path.isfile(input_source_clips_path)
-        is_source_dir = os.path.isdir(input_source_clips_path)
-        is_depth_file = os.path.isfile(input_depth_maps_path)
-        is_depth_dir = os.path.isdir(input_depth_maps_path)
-
-        input_videos = []
-        finished_source_folder = None
-        finished_depth_folder = None
-        is_single_file_mode = False
-
-        if is_source_file and is_depth_file:
-            # Single-file mode
-            is_single_file_mode = True
-            logger.debug(
-                "==> Running in single file mode. Files will not be moved to "
-                "'finished' folders (unless specifically enabled in Single Process mode)."
-            )
-            input_videos.append(input_source_clips_path)
-            os.makedirs(output_splatted, exist_ok=True)
-
-        elif is_source_dir and is_depth_dir:
-            # Batch (folder) mode
-            logger.debug("==> Running in batch (folder) mode.")
-
-            if settings["move_to_finished"]:
-                finished_source_folder = os.path.join(
-                    input_source_clips_path, "finished"
-                )
-                finished_depth_folder = os.path.join(input_depth_maps_path, "finished")
-                os.makedirs(finished_source_folder, exist_ok=True)
-                os.makedirs(finished_depth_folder, exist_ok=True)
-                logger.debug("Finished folders enabled for batch mode.")
-            else:
-                logger.debug(
-                    "Finished folders DISABLED by user setting. "
-                    "Files will remain in input folders."
-                )
-
-            os.makedirs(output_splatted, exist_ok=True)
-
-            video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
-            for ext in video_extensions:
-                input_videos.extend(
-                    glob.glob(os.path.join(input_source_clips_path, ext))
-                )
-            input_videos = sorted(input_videos)
-
-        else:
-            msg = (
-                "==> Error: Input Source Clips and Input Depth Maps must both be "
-                "either files or directories. Skipping processing."
-            )
-            logger.error(msg)
-            return {"error": msg}
-
-        if not input_videos:
-            msg = f"No video files found in {input_source_clips_path}"
-            logger.error(msg)
-            return {"error": msg}
-
-        return {
-            "input_videos": input_videos,
-            "is_single_file_mode": is_single_file_mode,
-            "finished_source_folder": finished_source_folder,
-            "finished_depth_folder": finished_depth_folder,
-        }
+    def _setup_batch_processing(self, settings: ProcessingSettings) -> BatchSetupResult:
+        """Handles input path validation and determine mode via core BatchProcessor."""
+        return self.batch_processor.setup_batch_processing(settings)
 
     def show_about(self):
         """Displays the 'About' message box."""
@@ -7678,42 +6281,10 @@ class SplatterGUI(ThemedTk):
             self.stop_button.config(state="disabled")
             return
 
-        settings = {
-            "input_source_clips": self.input_source_clips_var.get(),
-            "input_depth_maps": self.input_depth_maps_var.get(),
-            "output_splatted": self.output_splatted_var.get(),
-            "max_disp": float(self.max_disp_var.get()),
-            "process_length": int(self.process_length_var.get()),
-            "enable_full_resolution": self.enable_full_res_var.get(),
-            "full_res_batch_size": int(self.batch_size_var.get()),
-            "enable_low_resolution": self.enable_low_res_var.get(),
-            "low_res_width": int(self.pre_res_width_var.get()),
-            "low_res_height": int(self.pre_res_height_var.get()),
-            "low_res_batch_size": int(self.low_res_batch_size_var.get()),
-            "dual_output": self.dual_output_var.get(),
-            "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
-            "enable_global_norm": self.enable_global_norm_var.get(),  # Renamed
-            "match_depth_res": True,
-            "move_to_finished": self.move_to_finished_var.get(),
-            "output_crf": int(self.output_crf_full_var.get()),  # legacy
-            "output_crf_full": int(self.output_crf_full_var.get()),
-            "output_crf_low": int(self.output_crf_low_var.get()),
-            # --- Depth Pre-processing & Auto-Convergence Settings ---
-            "depth_gamma": depth_gamma_val,
-            "depth_dilate_size_x": depth_dilate_size_x_val,
-            "depth_dilate_size_y": depth_dilate_size_y_val,
-            "depth_blur_size_x": depth_blur_size_x_val,
-            "depth_blur_size_y": depth_blur_size_y_val,
-            "depth_dilate_left": float(self.depth_dilate_left_var.get()),
-            "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
-            "auto_convergence_mode": self.auto_convergence_mode_var.get(),
-            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
-            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
-        }
-        self.processing_thread = threading.Thread(
-            target=self._run_batch_process, args=(settings,)
-        )
-        self.processing_thread.start()
+        settings = self._get_processing_settings()
+
+        # Start processing in a new thread
+        threading.Thread(target=self._run_batch_process, args=(settings,)).start()
         self.check_queue()
 
     def start_single_processing(self):
@@ -7869,43 +6440,12 @@ class SplatterGUI(ThemedTk):
                 f"Single Process: Finished folders set to: {single_finished_source_folder}"
             )
 
-        settings = {
-            # --- OVERRIDDEN INPUTS FOR SINGLE MODE ---
-            "input_source_clips": single_video_path,
-            "input_depth_maps": single_depth_path,
-            "output_splatted": self.output_splatted_var.get(),  # Use the batch output folder
-            # --- END OVERRIDE ---
-            "max_disp": float(self.max_disp_var.get()),
-            "process_length": int(self.process_length_var.get()),
-            "enable_full_resolution": self.enable_full_res_var.get(),
-            "full_res_batch_size": int(self.batch_size_var.get()),
-            "enable_low_resolution": self.enable_low_res_var.get(),
-            "low_res_width": int(self.pre_res_width_var.get()),
-            "low_res_height": int(self.pre_res_height_var.get()),
-            "low_res_batch_size": int(self.low_res_batch_size_var.get()),
-            "dual_output": self.dual_output_var.get(),
-            "zero_disparity_anchor": float(self.zero_disparity_anchor_var.get()),
-            "enable_global_norm": self.enable_global_norm_var.get(),  # Renamed
-            "match_depth_res": True,
-            "output_crf": int(self.output_crf_full_var.get()),  # legacy
-            "output_crf_full": int(self.output_crf_full_var.get()),
-            "output_crf_low": int(self.output_crf_low_var.get()),
-            # --- Depth Pre-processing Settings ---
-            "depth_gamma": float(self.depth_gamma_var.get()),
-            "depth_dilate_size_x": int(float(self.depth_dilate_size_x_var.get())),
-            "depth_dilate_size_y": int(float(self.depth_dilate_size_y_var.get())),
-            "depth_blur_size_x": int(float(self.depth_blur_size_x_var.get())),
-            "depth_blur_size_y": int(float(self.depth_blur_size_y_var.get())),
-            "depth_dilate_left": float(self.depth_dilate_left_var.get()),
-            "depth_blur_left": int(round(float(self.depth_blur_left_var.get()))),
-            "depth_blur_left_mix": float(self.depth_blur_left_mix_var.get()),
-            "auto_convergence_mode": self.auto_convergence_mode_var.get(),
-            "enable_sidecar_gamma": self.enable_sidecar_gamma_var.get(),
-            "enable_sidecar_blur_dilate": self.enable_sidecar_blur_dilate_var.get(),
-            "single_finished_source_folder": single_finished_source_folder,
-            "single_finished_depth_folder": single_finished_depth_folder,
-            "move_to_finished": self.move_to_finished_var.get(),
-        }
+        settings = self._get_processing_settings()
+        # Single-mode overrides
+        settings.input_source_clips = single_video_path
+        settings.input_depth_maps = single_depth_path
+        settings.single_finished_source_folder = single_finished_source_folder
+        settings.single_finished_depth_folder = single_finished_depth_folder
 
         # 4. Start the processing thread
         self.stop_event.clear()
@@ -8176,6 +6716,19 @@ class SplatterGUI(ThemedTk):
         gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
         self.depth_gamma_var.set(gamma_val)
 
+        # Seed preview overlay "Max Total" from sidecar (most-accurate available):
+        # prefer dp_total_max_true (render-measured) else dp_total_max_est (sampled).
+        try:
+            dp_seed = sidecar_config.get("dp_total_max_true", None)
+            if dp_seed is None:
+                dp_seed = sidecar_config.get("dp_total_max_est", None)
+            if dp_seed is not None and getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
+                sig = self._dp_total_signature(depth_map_path, conv_val, disp_val, gamma_val)
+                self.previewer.set_depth_pop_max_estimate(float(dp_seed), sig)
+        except Exception:
+            pass
+
+
         # Dilate X
         dilate_x_val = sidecar_config.get(
             "depth_dilate_size_x", self.depth_dilate_size_x_var.get()
@@ -8368,6 +6921,11 @@ class SplatterGUI(ThemedTk):
         if self._save_current_sidecar_data(is_auto_save=False):
             # Immediately refresh the preview to show the *effect* of the newly saved sidecar
             self.on_slider_release(None)
+            # If an AUTO-PASS CSV exists, keep its row in sync with sidecar edits
+            try:
+                self._auto_pass_csv_update_row_from_current()
+            except Exception:
+                pass
 
 
 def compute_global_depth_stats(
@@ -8406,7 +6964,7 @@ def compute_global_depth_stats(
         if chunk_max > global_max:
             global_max = chunk_max
 
-        # draw_progress_bar(i + len(current_indices), total_frames, prefix="  Depth Stats:", suffix="Complete")
+        # draw_progress_bar(i + len(current_indices), total_frames, prefix="  Depth Stats:", suffix="Complete    ")
 
     logger.info(
         f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}"
@@ -8414,323 +6972,12 @@ def compute_global_depth_stats(
     return float(global_min), float(global_max)
 
 
-def read_video_frames(
-    video_path: str,
-    process_length: int,
-    set_pre_res: bool,
-    pre_res_width: int,
-    pre_res_height: int,
-    dataset: str = "open",
-) -> Tuple[VideoReader, float, int, int, int, int, Optional[dict], int]:
-    """
-    Initializes a VideoReader for chunked reading.
-    Returns: (video_reader, fps, original_height, original_width, actual_processed_height, actual_processed_width, video_stream_info, total_frames_to_process)
-    """
-    if dataset == "open":
-        logger.debug(f"==> Initializing VideoReader for: {video_path}")
-        vid_info_only = VideoReader(
-            video_path, ctx=cpu(0)
-        )  # Use separate reader for info
-        original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
-        total_frames_original = len(vid_info_only)
-        logger.debug(
-            f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame"
-        )
-
-        height_for_reader = original_height
-        width_for_reader = original_width
-
-        if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
-            height_for_reader = pre_res_height
-            width_for_reader = pre_res_width
-            logger.debug(
-                f"==> Pre-processing resolution set to: {width_for_reader}x{height_for_reader}"
-            )
-        else:
-            logger.debug(
-                f"==> Using original video resolution for reading: {width_for_reader}x{height_for_reader}"
-            )
-
-    else:
-        raise NotImplementedError(f"Dataset '{dataset}' not supported.")
-
-    # decord automatically resizes if width/height are passed to VideoReader
-    video_reader = VideoReader(
-        video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader
-    )
-
-    # Verify the actual shape after Decord processing, using the first frame
-    first_frame_shape = video_reader.get_batch([0]).shape
-    actual_processed_height, actual_processed_width = first_frame_shape[1:3]
-
-    fps = video_reader.get_avg_fps()  # Use actual FPS from the reader
-
-    total_frames_available = len(video_reader)
-    total_frames_to_process = total_frames_available  # Use available frames directly
-    if process_length != -1 and process_length < total_frames_available:
-        total_frames_to_process = process_length
-
-    logger.debug(
-        f"==> VideoReader initialized. Final processing dimensions: {actual_processed_width}x{actual_processed_height}. Total frames for processing: {total_frames_to_process}"
-    )
-
-    video_stream_info = get_video_stream_info(
-        video_path
-    )  # Get stream info for FFmpeg later
-
-    return (
-        video_reader,
-        fps,
-        original_height,
-        original_width,
-        actual_processed_height,
-        actual_processed_width,
-        video_stream_info,
-        total_frames_to_process,
-    )
-
-
-# -----------------------------
-# 10-bit+ depth decode helpers
-# -----------------------------
-class _NumpyBatch:
-    """Minimal wrapper to match Decord's get_batch(...).asnumpy() API."""
-
-    def __init__(self, arr: np.ndarray):
-        self._arr = arr
-
-    def asnumpy(self) -> np.ndarray:
-        return self._arr
-
-
-def _infer_depth_bit_depth(depth_stream_info: Optional[dict]) -> int:
-    """Best-effort bit-depth inference from ffprobe info."""
-    if not depth_stream_info:
-        return 8
-    pix_fmt = str(depth_stream_info.get("pix_fmt", "")).lower()
-    profile = str(depth_stream_info.get("profile", "")).lower()
-
-    # Common patterns: yuv420p10le, yuv444p12le, gray16le, etc.
-    m = re.search(r"(?:p|gray)(\d+)", pix_fmt)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    if "main10" in profile or "10" in profile:
-        return 10
-    return 8
-
-
-def _build_depth_vf(pix_fmt: str, out_w: int, out_h: int) -> str:
-    pix_fmt = (pix_fmt or "").lower()
-    # If it's already gray*, don't try to extract planes.
-    if pix_fmt.startswith("gray"):
-        return f"scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
-    # Otherwise, extract luma plane (Y) and convert to gray16.
-    return f"extractplanes=y,scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
-
-
-class FFmpegDepthPipeReader:
-    """
-    Sequential ffmpeg-backed depth reader that preserves 10-bit+ values.
-    Implements a small subset of Decord's VideoReader API used by the splatter:
-      - __len__()
-      - seek(idx)
-      - get_batch([idx0, idx1, ...]).asnumpy()
-    NOTE: This reader is optimized for sequential access (render path).
-    """
-
-    def __init__(
-        self,
-        path: str,
-        out_w: int,
-        out_h: int,
-        bit_depth: int,
-        num_frames: int,
-        pix_fmt: str = "",
-    ):
-        self.path = path
-        self.out_w = int(out_w)
-        self.out_h = int(out_h)
-        self.bit_depth = int(bit_depth) if bit_depth else 16
-        self._num_frames = int(num_frames) if num_frames is not None else 0
-        self._pix_fmt = pix_fmt or ""
-        self._proc: Optional[subprocess.Popen] = None
-        self._next_index = 0
-        self._frame_bytes = self.out_w * self.out_h * 2  # gray16le
-        self._msb_shift: Optional[int] = None
-        self._use_16_to_n_scale: bool = False
-        self._start_process()
-
-    def __len__(self) -> int:
-        return self._num_frames
-
-    def _start_process(self):
-        self.close()
-        vf = _build_depth_vf(self._pix_fmt, self.out_w, self.out_h)
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            self.path,
-            "-an",
-            "-sn",
-            "-dn",
-            "-vframes",
-            str(self._num_frames)
-            if self._num_frames and self._num_frames > 0
-            else "999999999",
-            "-vf",
-            vf,
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ]
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        self._next_index = 0
-        self._msb_shift = None
-
-    def close(self):
-        try:
-            if self._proc is not None:
-                if self._proc.stdout:
-                    try:
-                        self._proc.stdout.close()
-                    except Exception:
-                        pass
-                if self._proc.stderr:
-                    try:
-                        self._proc.stderr.close()
-                    except Exception:
-                        pass
-                try:
-                    self._proc.terminate()
-                except Exception:
-                    pass
-        finally:
-            self._proc = None
-
-    def __del__(self):
-        self.close()
-
-    def seek(self, idx: int):
-        """Best-effort seek. Efficient only if seeking forward sequentially."""
-        idx = int(idx)
-        if idx == self._next_index:
-            return
-        if idx < self._next_index:
-            # Restart and fast-forward by discarding frames (rare in render path).
-            self._start_process()
-        # Discard until we reach idx
-        to_skip = idx - self._next_index
-        if to_skip <= 0:
-            self._next_index = idx
-            return
-        if self._proc is None or self._proc.stdout is None:
-            self._start_process()
-        discard_bytes = to_skip * self._frame_bytes
-        _ = self._proc.stdout.read(discard_bytes)
-        self._next_index = idx
-
-    def _read_exact(self, nbytes: int) -> bytes:
-        if self._proc is None or self._proc.stdout is None:
-            self._start_process()
-        buf = b""
-        while len(buf) < nbytes:
-            chunk = self._proc.stdout.read(nbytes - len(buf))
-            if not chunk:
-                break
-            buf += chunk
-        return buf
-
-    def _maybe_apply_shift(self, arr_u16: np.ndarray) -> np.ndarray:
-        """Normalize decoded gray16 values back into the native bit-depth range (e.g., 0..1023 for 10-bit).
-
-        ffmpeg's format conversion to gray16le may either:
-          1) left-shift the original N-bit values into the MSBs (exact multiples of 2^(16-N)), or
-          2) scale values to the full 16-bit range (0..65535).
-
-        We detect the likely behavior once and then apply either a right-shift or a scale-down so the
-        output values land back in 0..(2^bit_depth-1).
-        """
-        if self._msb_shift is None:
-            expected_max = (
-                (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
-            )
-            if expected_max is None:
-                self._msb_shift = 0
-                self._use_16_to_n_scale = False
-            else:
-                # Sample to avoid full-frame scans on large batches
-                flat = arr_u16.reshape(-1)
-                step = max(1, flat.size // 50000)
-                sample = flat[::step]
-                max_val = int(sample.max(initial=0))
-
-                if max_val <= expected_max:
-                    self._msb_shift = 0
-                    self._use_16_to_n_scale = False
-                else:
-                    shift = 16 - self.bit_depth
-                    if shift <= 0:
-                        self._msb_shift = 0
-                        self._use_16_to_n_scale = False
-                    else:
-                        low_mask = (1 << shift) - 1
-                        # If the sample's low bits are consistently zero, it's very likely MSB-aligned (pure left shift).
-                        low_bits_max = int((sample & low_mask).max(initial=0))
-                        if low_bits_max == 0:
-                            self._msb_shift = shift
-                            self._use_16_to_n_scale = False
-                        else:
-                            # Otherwise assume scaled-to-16bit; scale back down into expected range.
-                            self._msb_shift = 0
-                            self._use_16_to_n_scale = True
-
-        expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
-        if expected_max is None:
-            return arr_u16
-
-        if self._msb_shift and self._msb_shift > 0:
-            return (arr_u16 >> self._msb_shift).astype(np.uint16)
-
-        if self._use_16_to_n_scale:
-            # Map 0..65535 -> 0..expected_max with rounding.
-            arr32 = arr_u16.astype(np.uint32)
-            return ((arr32 * expected_max + 32767) // 65535).astype(np.uint16)
-
-        return arr_u16
-
-    def get_batch(self, indices):
-        indices = list(indices)
-        if not indices:
-            return _NumpyBatch(
-                np.zeros((0, self.out_h, self.out_w, 1), dtype=np.uint16)
-            )
-
-        # Render path calls are contiguous and increasing. Enforce best-effort alignment.
-        first = int(indices[0])
-        if first != self._next_index:
-            self.seek(first)
-
-        n = len(indices)
-        expected = self._frame_bytes * n
-        buf = self._read_exact(expected)
-        if len(buf) != expected:
-            raise EOFError(
-                f"FFmpegDepthPipeReader: expected {expected} bytes, got {len(buf)}"
-            )
-
-        arr = np.frombuffer(buf, dtype=np.uint16).reshape(n, self.out_h, self.out_w, 1)
-        arr = self._maybe_apply_shift(arr)
-        self._next_index = first + n
-        return _NumpyBatch(arr.copy())
+# [REFACTORED] Depth processing functions replaced with core imports
+from core.splatting.depth_processing import (
+    _infer_depth_bit_depth,
+    _build_depth_vf,
+    FFmpegDepthPipeReader,
+)
 
 
 def load_pre_rendered_depth(
@@ -8761,12 +7008,21 @@ def load_pre_rendered_depth(
         # Determine total frames available (for mismatch checks) without relying on the ffmpeg pipe.
         total_depth_frames_available = 0
         try:
-            _tmp = VideoReader(depth_map_path, ctx=cpu(0))
-            total_depth_frames_available = len(_tmp)
-            del _tmp
+            # Prefer ffprobe-derived frame count when available; Decord can be slow on some files.
+            nb = None
+            if isinstance(depth_stream_info, dict):
+                nb = depth_stream_info.get("nb_frames")
+                if nb in (None, "", "N/A"):
+                    nb = depth_stream_info.get("num_frames") or depth_stream_info.get("nb_read_frames")
+            if nb not in (None, "", "N/A"):
+                total_depth_frames_available = int(float(nb))
+            else:
+                _tmp = VideoReader(depth_map_path, ctx=cpu(0))
+                total_depth_frames_available = len(_tmp)
+                del _tmp
         except Exception as e:
             logger.warning(
-                f"Could not determine depth frame count via Decord for '{depth_map_path}': {e}"
+                f"Could not determine depth frame count for '{depth_map_path}': {e}"
             )
 
         total_depth_frames_to_process = total_depth_frames_available

@@ -82,7 +82,7 @@ cython_debug/
 outputs/
 weights/
 old/
-
+temp/
 
 
 config.json
@@ -100,3 +100,4 @@ sidecaredit_config.json
 config_sidecaredit.json
 config_merging.mergecfg
 config_splat.splatcfg
+nul

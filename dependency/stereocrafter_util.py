@@ -15,8 +15,9 @@ import subprocess
 import cv2
 import gc
 import time
+import re
 
-VERSION = "26-01-20.3"
+VERSION = "26-01-30.0"
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -100,6 +101,10 @@ class SidecarConfigManager:
     SIDECAR_KEY_MAP = {
         "convergence_plane": (float, 0.5),
         "max_disparity": (float, 20.0),
+        # --- Optional max-metric keys (persisted when present) ---
+        "true_max": (float, None),
+        "dp_total_max_true": (float, None),
+        "dp_total_max_est": (float, None),
         "gamma": (float, 1.0),
         "input_bias": (float, 0.0),
         "depth_dilate_size_x": (float, 0.0),
@@ -216,7 +221,11 @@ class SidecarConfigManager:
             # Iterate over the new map structure: key, (expected_type, default_val)
             for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
                 if key in data:
-                    output_data[key] = data[key]
+                    v = data[key]
+                    # Avoid writing noisy nulls for optional fields (e.g., true_max / estimates)
+                    if v is None:
+                        continue
+                    output_data[key] = v
 
             # 3. Write to file (mode 'w' creates the file if it doesn't exist)
             with open(file_path, "w") as f:
@@ -958,7 +967,7 @@ def draw_progress_bar(current, total, bar_length=50, prefix="Progress:", suffix=
     # Format the suffix for completion
     actual_suffix = suffix
     if current == total:
-        actual_suffix = "Complete"
+        actual_suffix = "Complete      "
 
     print(f"\r{prefix} |{bar}| {percent:.1f}% {actual_suffix}", end="", flush=True)
 
@@ -1761,7 +1770,7 @@ def start_ffmpeg_pipe_process(
     }
 
     if debug_label:
-        logger.info(
+        logger.debug(
             f"[COLOR_META][{debug_label}] src(pix_fmt={src_pix_fmt}, range={src_range}, primaries={src_prim}, trc={src_trc}, matrix={src_matrix}) "
             f"-> enc(codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, primaries={color_primaries}, trc={transfer_characteristics}, matrix={color_space}, {quality_mode}={quality_value})"
         )
