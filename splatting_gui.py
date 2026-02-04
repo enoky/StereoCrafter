@@ -87,7 +87,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-02-02.Big Refactoring"
+GUI_VERSION = "26-02-04.0"
 
 
 
