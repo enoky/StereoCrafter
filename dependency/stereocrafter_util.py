@@ -476,15 +476,20 @@ def create_single_slider_with_label_updater(
 
     sync_external_change()
 
-    # --- Default marker & right-click reset (does not affect layout) ---
-    if default_value is not None:
-
-        def _reset_to_default(event=None):
-            try:
-                var.set(default_value)
+    # --- Click handlers for trough positioning and reset ---
+    def _on_trough_click(event=None):
+        """Move slider to the mouse pointer position on the trough (middle-click or left-click on trough)."""
+        try:
+            # Check if click is on trough (not the slider handle)
+            if event and 'trough' in slider.identify(event.x, event.y):
+                slider.update_idletasks()
+                new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
+                new_value = max(from_, min(to, new_value))
+                
+                var.set(new_value)
                 sync_external_change()
-
-                # Keep UX consistent with a normal slider release: refresh preview immediately.
+                
+                # Trigger preview update like a normal slider release
                 try:
                     if hasattr(GUI_self, "on_slider_release"):
                         GUI_self.on_slider_release(None)
@@ -492,15 +497,41 @@ def create_single_slider_with_label_updater(
                         GUI_self.update_preview_from_controls()
                 except Exception:
                     pass
+                return "break"
+        except Exception:
+            pass
+        return None
+
+    def _reset_to_default(event=None):
+        """Reset slider to default value (right-click)."""
+        try:
+            var.set(default_value)
+            sync_external_change()
+
+            # Keep UX consistent with a normal slider release: refresh preview immediately.
+            try:
+                if hasattr(GUI_self, "on_slider_release"):
+                    GUI_self.on_slider_release(None)
+                elif hasattr(GUI_self, "update_preview_from_controls"):
+                    GUI_self.update_preview_from_controls()
             except Exception:
                 pass
-            return "break"
+        except Exception:
+            pass
+        return "break"
 
-        # Right-click reset (Windows: Button-3; some systems: Button-2)
+    # Bind middle-click to move to mouse pointer position
+    for _w in (slider, value_label):
+        try:
+            _w.bind("<Button-2>", _on_trough_click)
+        except Exception:
+            pass
+
+    # Right-click reset to default (only if default_value provided)
+    if default_value is not None:
         for _w in (slider, value_label):
             try:
                 _w.bind("<Button-3>", _reset_to_default)
-                _w.bind("<Button-2>", _reset_to_default)
             except Exception:
                 pass
 

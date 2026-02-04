@@ -21,7 +21,8 @@ import queue
 import subprocess
 import time
 import logging
-from typing import Optional, Tuple, Any
+import platform
+from typing import Optional, Tuple, Any, Dict
 from PIL import Image
 import math
 
@@ -86,7 +87,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-02-02.Big Refactoring"
+GUI_VERSION = "26-02-04.0"
 
 
 
@@ -102,6 +103,11 @@ from core.splatting import (
     ProcessingSettings,
     ProcessingTask,
     BatchSetupResult,
+)
+from core.splatting.depth_processing import (
+    DEPTH_VIS_TV10_BLACK_NORM,
+    DEPTH_VIS_TV10_WHITE_NORM,
+    _infer_depth_bit_depth,
 )
 from core.splatting.config_manager import ConfigManager
 
@@ -446,14 +452,28 @@ class SplatterGUI(ThemedTk):
         """Worker thread for running the Auto-Convergence calculation."""
 
         # Use the extracted ConvergenceEstimatorWrapper
-        new_anchor_avg, new_anchor_peak = self.convergence_estimator.estimate_convergence(
+        # Now returns average, peak, and (NEW) max_edge_l, max_edge_r
+        res = self.convergence_estimator.estimate_convergence(
             rgb_path=rgb_path,
             depth_path=depth_map_path,
             process_length=int(process_length),
             gamma=float(gamma),
             fallback_value=float(fallback_value),
-            stop_event=self.stop_event
+            stop_event=self.stop_event,
+            scan_borders=True, # Enable combined scan
         )
+        
+        new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r = res
+
+        # Determine TV range compensation for border calculation
+        # This is fast if called here (usually cached or metadata-only)
+        tv_disp_comp = 1.0
+        if hasattr(self, "border_scanner"):
+            # We don't have a VideoReader here, so we'll let BorderScanner handle it or calculate it later.
+            # For simplicity, we can pass the path and let BorderScanner handle it if we modify it, 
+            # but actually BorderScanner._get_tv_compensation uses VideoReader.
+            # We'll just pass the depth_map_path and do it in the UI thread or use a helper.
+            pass
 
         # Use self.after to safely update the GUI from the worker thread
         self.after(
@@ -461,8 +481,11 @@ class SplatterGUI(ThemedTk):
             lambda: self._complete_auto_converge_update(
                 new_anchor_avg,
                 new_anchor_peak,
+                max_edge_l,
+                max_edge_r,
                 fallback_value,
-                mode,  # Still pass the current mode to know which value to select immediately
+                mode,
+                depth_map_path,
             ),
         )
 
@@ -489,6 +512,23 @@ class SplatterGUI(ThemedTk):
         folder = filedialog.askdirectory(initialdir=initial_dir)
         if folder:
             var.set(folder)
+
+    def _open_folder_in_explorer(self, var):
+        """Opens the folder path from StringVar in Windows Explorer."""
+        folder_path = var.get()
+        if os.path.isdir(folder_path):
+            try:
+                os.startfile(folder_path)
+            except Exception as e:
+                logger.error(f"Failed to open folder in explorer: {e}")
+        elif os.path.exists(folder_path):
+            # If it's a file, open its parent directory
+            parent_dir = os.path.dirname(folder_path)
+            if os.path.isdir(parent_dir):
+                try:
+                    os.startfile(parent_dir)
+                except Exception as e:
+                    logger.error(f"Failed to open folder in explorer: {e}")
 
     def _browse_file(self, var, filetypes_list):
         """Opens a file dialog and updates a StringVar."""
@@ -1160,8 +1200,11 @@ class SplatterGUI(ThemedTk):
         self,
         new_anchor_avg: float,
         new_anchor_peak: float,
+        max_edge_l: Optional[float],
+        max_edge_r: Optional[float],
         fallback_value: float,
         mode: str,
+        depth_map_path: str = None,
     ):
         """
         Safely updates the GUI and preview after Auto-Convergence worker is done.
@@ -1219,8 +1262,48 @@ class SplatterGUI(ThemedTk):
             if not is_setter_successful:
                 self.zero_disparity_anchor_var.set(f"{anchor_to_apply:.2f}")
 
+            # 5. Calculate and apply Auto Borders (Combined Scan Result)
+            border_info_text = ""
+            if max_edge_l is not None and max_edge_r is not None:
+                try:
+                    # Determine TV compensation (fast meta lookup)
+                    tv_disp_comp = 1.0
+                    if depth_map_path:
+                        info = get_video_stream_info(depth_map_path)
+                        if info and _infer_depth_bit_depth(info) > 8:
+                            if str(info.get("color_range")).lower() == "tv":
+                                tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                    
+                    max_disp = self._safe_float(self.max_disp_var, 20.0)
+                    
+                    # Use the same logic as BorderScanner: b = (d - conv) * scale
+                    # Result is percentage (e.g. 1.5 for 1.5%)
+                    scale = 2.0 * (max_disp / 20.0) * tv_disp_comp
+                    newL = max(0.0, (max_edge_l - anchor_to_apply) * scale)
+                    newR = max(0.0, (max_edge_r - anchor_to_apply) * scale)
+                    
+                    # Cap at 5.0% as per app standard
+                    newL = min(5.0, round(float(newL), 3))
+                    newR = min(5.0, round(float(newR), 3))
+                    
+                    self.auto_border_L_var.set(str(newL))
+                    self.auto_border_R_var.set(str(newR))
+                    
+                    # Update sliders if relevant mode
+                    mode_border = self.border_mode_var.get()
+                    if mode_border in ("Auto Adv.", "Auto Basic"):
+                        self._sync_sliders_to_auto_borders(newL, newR)
+                    elif mode_border == "Manual":
+                        # If in Manual, we don't force sliders, but we've updated the auto values
+                        pass
+                    
+                    border_info_text = f", Borders: L={newL}%, R={newR}%"
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating auto-borders in combined scan: {e}")
+
             self.status_label.config(
-                text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f})"
+                text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f}){border_info_text}"
             )
 
             # 4. Immediately trigger a preview update to show the change
@@ -1381,6 +1464,10 @@ class SplatterGUI(ThemedTk):
         self.btn_browse_source_clips_folder.grid(
             row=current_row, column=2, padx=2, pady=0
         )
+        self.btn_browse_source_clips_folder.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.input_source_clips_var),
+        )
         self.btn_select_source_clips_file = ttk.Button(
             self.folder_frame,
             text="Select File",
@@ -1423,6 +1510,10 @@ class SplatterGUI(ThemedTk):
         self.btn_browse_input_depth_maps_folder.grid(
             row=current_row, column=2, padx=2, pady=0
         )
+        self.btn_browse_input_depth_maps_folder.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.input_depth_maps_var),
+        )
         self.btn_select_input_depth_maps_file = ttk.Button(
             self.folder_frame,
             text="Select File",
@@ -1461,6 +1552,10 @@ class SplatterGUI(ThemedTk):
             command=lambda: self._browse_folder(self.output_splatted_var),
         )
         self.btn_browse_output_splatted.grid(row=current_row, column=2, padx=5, pady=0)
+        self.btn_browse_output_splatted.bind(
+            "<Button-3>",
+            lambda e: self._open_folder_in_explorer(self.output_splatted_var),
+        )
         self.chk_multi_map = ttk.Checkbutton(
             self.folder_frame,
             text="Multi-Map",
@@ -6921,222 +7016,11 @@ class SplatterGUI(ThemedTk):
                 pass
 
 
-def compute_global_depth_stats(
-    depth_map_reader: VideoReader, total_frames: int, chunk_size: int = 100
-) -> Tuple[float, float]:
-    """
-    Computes the global min and max depth values from a depth video by reading it in chunks.
-    Assumes raw pixel values that need to be scaled (e.g., from 0-255 or 0-1023 range).
-    """
-    logger.info(
-        f"==> Starting global depth stats pre-pass for {total_frames} frames..."
-    )
-    global_min, global_max = np.inf, -np.inf
-
-    for i in range(0, total_frames, chunk_size):
-        current_indices = list(range(i, min(i + chunk_size, total_frames)))
-        if not current_indices:
-            break
-
-        chunk_numpy_raw = depth_map_reader.get_batch(current_indices).asnumpy()
-
-        # Handle RGB vs Grayscale depth maps
-        if chunk_numpy_raw.ndim == 4:
-            if chunk_numpy_raw.shape[-1] == 3:  # RGB
-                chunk_numpy = chunk_numpy_raw.mean(axis=-1)
-            else:  # Grayscale with channel dim
-                chunk_numpy = chunk_numpy_raw.squeeze(-1)
-        else:
-            chunk_numpy = chunk_numpy_raw
-
-        chunk_min = chunk_numpy.min()
-        chunk_max = chunk_numpy.max()
-
-        if chunk_min < global_min:
-            global_min = chunk_min
-        if chunk_max > global_max:
-            global_max = chunk_max
-
-        # draw_progress_bar(i + len(current_indices), total_frames, prefix="  Depth Stats:", suffix="Complete    ")
-
-    logger.info(
-        f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}"
-    )
-    return float(global_min), float(global_max)
-
-
-# [REFACTORED] Depth processing functions replaced with core imports
+# [REFACTORED] Depth processing functions imported from core module
 from core.splatting.depth_processing import (
-    _infer_depth_bit_depth,
-    _build_depth_vf,
-    FFmpegDepthPipeReader,
+    compute_global_depth_stats,
+    load_pre_rendered_depth,
 )
-
-
-def load_pre_rendered_depth(
-    depth_map_path: str,
-    process_length: int,
-    target_height: int,
-    target_width: int,
-    match_resolution_to_target: bool,
-) -> Tuple[Any, int, int, int, Optional[dict]]:
-    """
-    Initializes a reader for chunked depth map reading.
-    Preserves 10-bit+ depth maps by using an ffmpeg-backed reader when needed.
-    No normalization or autogain is applied here.
-    Returns:
-        (depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width, depth_stream_info)
-    """
-    logger.debug(f"==> Initializing depth reader from: {depth_map_path}")
-
-    depth_stream_info = get_video_stream_info(depth_map_path)
-    bit_depth = _infer_depth_bit_depth(depth_stream_info)
-    pix_fmt = str((depth_stream_info or {}).get("pix_fmt", ""))
-
-    logger.info(
-        f"==> Depth map stream: pix_fmt='{pix_fmt}', profile='{str((depth_stream_info or {}).get('profile', ''))}', inferred_bit_depth={bit_depth}"
-    )
-
-    if depth_map_path.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-        # Determine total frames available (for mismatch checks) without relying on the ffmpeg pipe.
-        total_depth_frames_available = 0
-        try:
-            # Prefer ffprobe-derived frame count when available; Decord can be slow on some files.
-            nb = None
-            if isinstance(depth_stream_info, dict):
-                nb = depth_stream_info.get("nb_frames")
-                if nb in (None, "", "N/A"):
-                    nb = depth_stream_info.get("num_frames") or depth_stream_info.get("nb_read_frames")
-            if nb not in (None, "", "N/A"):
-                total_depth_frames_available = int(float(nb))
-            else:
-                _tmp = VideoReader(depth_map_path, ctx=cpu(0))
-                total_depth_frames_available = len(_tmp)
-                del _tmp
-        except Exception as e:
-            logger.warning(
-                f"Could not determine depth frame count for '{depth_map_path}': {e}"
-            )
-
-        total_depth_frames_to_process = total_depth_frames_available
-        if process_length != -1 and process_length < total_depth_frames_available:
-            total_depth_frames_to_process = process_length
-
-        # Choose reader implementation
-        if bit_depth > 8:
-            depth_reader = FFmpegDepthPipeReader(
-                depth_map_path,
-                out_w=target_width,
-                out_h=target_height,
-                bit_depth=bit_depth,
-                num_frames=total_depth_frames_available,
-                pix_fmt=pix_fmt,
-            )
-        else:
-            # 8-bit: decode at native res with Decord, then (optionally) resize with OpenCV for parity.
-            depth_reader = VideoReader(
-                depth_map_path, ctx=cpu(0)
-            )  # decode at native res; resize with OpenCV later for parity
-
-            # --- NEW: When match_resolution_to_target=True, wrap the reader so it *outputs* frames at (target_width,target_height)
-            # using OpenCV resizing (NOT Decord scaling). This keeps 8-bit preview/render parity and also enables the low-res
-            # pipeline to preprocess at clip resolution (depth_target_w/h are set to original clip res for low-res tasks).
-            class _NumpyBatch:
-                def __init__(self, arr):
-                    self._arr = arr
-
-                def asnumpy(self):
-                    return self._arr
-
-            class _ResizingDepthReader:
-                def __init__(self, inner_reader, out_w, out_h):
-                    self._inner = inner_reader
-                    self._out_w = int(out_w)
-                    self._out_h = int(out_h)
-
-                def __len__(self):
-                    return len(self._inner)
-
-                def seek(self, *args, **kwargs):
-                    return self._inner.seek(*args, **kwargs)
-
-                def get_batch(self, indices):
-                    arr = self._inner.get_batch(indices).asnumpy()
-                    # arr is typically (N,H,W,C) from Decord
-                    in_h = int(arr.shape[1])
-                    in_w = int(arr.shape[2])
-                    if in_w == self._out_w and in_h == self._out_h:
-                        return _NumpyBatch(arr)
-
-                    interp = (
-                        cv2.INTER_LINEAR
-                        if (self._out_w > in_w or self._out_h > in_h)
-                        else cv2.INTER_AREA
-                    )
-
-                    if arr.ndim == 4:
-                        out = np.empty(
-                            (arr.shape[0], self._out_h, self._out_w, arr.shape[3]),
-                            dtype=arr.dtype,
-                        )
-                        for i in range(arr.shape[0]):
-                            out[i] = cv2.resize(
-                                arr[i], (self._out_w, self._out_h), interpolation=interp
-                            )
-                    else:
-                        out = np.empty(
-                            (arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype
-                        )
-                        for i in range(arr.shape[0]):
-                            out[i] = cv2.resize(
-                                arr[i], (self._out_w, self._out_h), interpolation=interp
-                            )
-
-                    return _NumpyBatch(out)
-
-            first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
-            actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
-
-            if match_resolution_to_target and (
-                actual_depth_width != target_width
-                or actual_depth_height != target_height
-            ):
-                depth_reader = _ResizingDepthReader(
-                    depth_reader, out_w=target_width, out_h=target_height
-                )
-                actual_depth_height, actual_depth_width = (
-                    int(target_height),
-                    int(target_width),
-                )
-
-        first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
-        actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
-
-        logger.debug(
-            f"==> Depth reader ready. Final depth resolution: {actual_depth_width}x{actual_depth_height}. "
-            f"Frames available: {total_depth_frames_available}. Frames to process: {total_depth_frames_to_process}. "
-            f"bit_depth={bit_depth}, pix_fmt='{pix_fmt}'."
-        )
-
-        return (
-            depth_reader,
-            total_depth_frames_to_process,
-            actual_depth_height,
-            actual_depth_width,
-            depth_stream_info,
-        )
-
-    elif depth_map_path.lower().endswith(".npz"):
-        logger.error(
-            "NPZ support is temporarily disabled with disk chunking refactor. Please convert NPZ to MP4 depth video."
-        )
-        raise NotImplementedError(
-            "NPZ depth map loading is not yet supported with disk chunking."
-        )
-    else:
-        raise ValueError(
-            f"Unsupported depth map format: {os.path.basename(depth_map_path)}. Only MP4 are supported with disk chunking."
-        )
 
 
 if __name__ == "__main__":
