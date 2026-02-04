@@ -1,6 +1,6 @@
 # Splatting GUI Changelog
 All notable changes to the splatting GUI and related components.
-## [Unreleased] - 2026-02-04
+## [Released] - 2026-02-04
 ### Refactored
 - **Code Consolidation**: Removed duplicate depth processing code from `splatting_gui.py` (lines 7018-7234)
   - `compute_global_depth_stats()` function now imported from `core.splatting.depth_processing`
