@@ -238,6 +238,144 @@ class SidecarConfigManager:
             return False
 
 
+def find_video_by_core_name(folder: str, core_name: str) -> Optional[str]:
+    """Scans a folder for a file matching the core_name with any common video extension."""
+    video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm")
+    for ext in video_extensions:
+        full_path = os.path.join(folder, f"{core_name}{ext[1:]}")
+        if os.path.exists(full_path):
+            return full_path
+    return None
+
+
+def find_sidecar_file(base_path: str) -> Optional[str]:
+    """Looks for a sidecar JSON file next to the video file."""
+    sidecar_path = f"{os.path.splitext(base_path)[0]}.fssidecar"
+    if os.path.exists(sidecar_path):
+        return sidecar_path
+    # Also check .json extension for backwards compatibility
+    json_path = f"{os.path.splitext(base_path)[0]}.json"
+    if os.path.exists(json_path):
+        return json_path
+    return None
+
+
+def find_sidecar_in_folder(folder: str, core_name: str) -> Optional[str]:
+    """Looks for a sidecar file in a specific folder."""
+    fssidecar_path = os.path.join(folder, f"{core_name}.fssidecar")
+    if os.path.exists(fssidecar_path):
+        return fssidecar_path
+    # Also check .json extension for backwards compatibility
+    json_path = os.path.join(folder, f"{core_name}.json")
+    if os.path.exists(json_path):
+        return json_path
+    return None
+
+
+def read_clip_sidecar(
+    sidecar_manager: SidecarConfigManager,
+    video_path: str,
+    core_name: str,
+    search_folders: Optional[list] = None,
+) -> dict:
+    """
+    Reads the sidecar file for a clip if it exists.
+    Returns a dictionary of sidecar data merged with defaults.
+
+    Args:
+        sidecar_manager: SidecarConfigManager instance
+        video_path: Path to the video file
+        core_name: Core name of the clip
+        search_folders: Optional list of additional folders to search for sidecar files
+    """
+    # Check inpainted folder first (user requested)
+    if search_folders:
+        for folder in search_folders:
+            sidecar_path = find_sidecar_in_folder(folder, core_name)
+            if sidecar_path:
+                logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+                return sidecar_manager.load_sidecar_data(sidecar_path)
+
+    # Then check next to video file
+    sidecar_path = find_sidecar_file(video_path)
+    if sidecar_path:
+        logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+        return sidecar_manager.load_sidecar_data(sidecar_path)
+
+    logger.debug(f"No sidecar file found for '{core_name}'. Using defaults.")
+    return sidecar_manager._get_defaults()
+
+
+def apply_borders_to_frames(
+    left_border_pct: float,
+    right_border_pct: float,
+    original_left: torch.Tensor,
+    blended_right: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply borders to the left and right eye frames by zeroing out border pixels.
+    This creates black borders while keeping the original frame dimensions.
+
+    Args:
+        left_border_pct: Left border value (can be percentage or pixels if > 100)
+        right_border_pct: Right border value (can be percentage or pixels if > 100)
+        original_left: Left eye tensor [B, C, H, W]
+        blended_right: Right eye tensor [B, C, H, W]
+
+    Returns:
+        Tuple of (left_with_border, right_with_border) tensors with borders applied
+    """
+    if left_border_pct <= 0 and right_border_pct <= 0:
+        return original_left, blended_right
+
+    _, _, H, W = original_left.shape
+
+    # Check if values are likely pixels (if > 100) or percentage (<= 100)
+    if left_border_pct > 100 or right_border_pct > 100:
+        # Assume values are in pixels
+        left_px = int(round(left_border_pct))
+        right_px = int(round(right_border_pct))
+        left_is_pct = False
+        right_is_pct = False
+    else:
+        # Assume values are in percentage
+        left_px = int(round(W * left_border_pct / 100.0))
+        right_px = int(round(W * right_border_pct / 100.0))
+        left_is_pct = True
+        right_is_pct = True
+
+    logger.debug(
+        f"Apply borders: W={W}, left={left_border_pct}({'px' if not left_is_pct else '%'}->{left_px}px), right={right_border_pct}({'px' if not right_is_pct else '%'}->{right_px}px)"
+    )
+
+    # Validate pixel values
+    if left_px < 0:
+        left_px = 0
+    if right_px < 0:
+        right_px = 0
+    if left_px >= W or right_px >= W:
+        logger.warning(
+            f"Borders too large (left={left_px}, right={right_px}) for width={W}. Skipping."
+        )
+        return original_left, blended_right
+
+    # Create copies to avoid modifying originals
+    left_with_border = original_left.clone()
+    right_with_border = blended_right.clone()
+
+    # Zero out the border pixels (create black borders)
+    if left_px > 0:
+        left_with_border[:, :, :, :left_px] = 0.0
+        logger.debug(f"Zeroed left border: {left_px} pixels")
+    if right_px > 0:
+        right_with_border[:, :, :, -right_px:] = 0.0
+        logger.debug(f"Zeroed right border: {right_px} pixels")
+
+    logger.debug(f"Borders applied successfully")
+
+    return left_with_border, right_with_border
+
+
 def apply_color_transfer(
     source_frame: torch.Tensor, target_frame: torch.Tensor
 ) -> torch.Tensor:
@@ -481,14 +619,14 @@ def create_single_slider_with_label_updater(
         """Move slider to the mouse pointer position on the trough (middle-click or left-click on trough)."""
         try:
             # Check if click is on trough (not the slider handle)
-            if event and 'trough' in slider.identify(event.x, event.y):
+            if event and "trough" in slider.identify(event.x, event.y):
                 slider.update_idletasks()
                 new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
                 new_value = max(from_, min(to, new_value))
-                
+
                 var.set(new_value)
                 sync_external_change()
-                
+
                 # Trigger preview update like a normal slider release
                 try:
                     if hasattr(GUI_self, "on_slider_release"):
@@ -1349,7 +1487,11 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
             # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
             # "Expecting ',' delimiter: line 13 column 40 (char 229)"
-            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r'\1,\2\3', result.stdout)
+            repaired = re.sub(
+                r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)',
+                r"\1,\2\3",
+                result.stdout,
+            )
             data = json.loads(repaired)
 
         stream_info = {}

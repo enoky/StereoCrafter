@@ -22,8 +22,9 @@ This section allows you to see a real-time preview of your blending settings on 
 -   **Preview Window:** Displays the output image. It's scrollable if the preview size is larger than the window.
 -   **Frame Scrubber:** A slider to select which frame of the video you want to preview.
 -   **Preview Source:** A dropdown menu to view different layers of the composition for diagnostics (e.g., just the mask, the original left eye, or the final blended image).
--   **Load/Refresh List:** Scans the `Inpainted Video Folder` and loads the first video for preview.
+-   **Load/Refresh List:** On the first click, scans the folder for all video files. Subsequent clicks refresh the preview without rescanning (faster). If folder paths change, the next click will scan again.
 -   **Prev / Next / Jump to:** Buttons to navigate between the videos found in your inpainted folder.
+-   **Preview Source:** Dropdown to view different layers of the composition. Your selection is saved and restored on the next session.
 
 ### 3. Mask Processing Parameters
 
@@ -40,6 +41,8 @@ These sliders give you fine-grained control over how the mask is processed befor
 -   **Output Format:** A dropdown menu to select the final 3D video format. Options include standard Full Side-by-Side (SBS), Half-SBS for compatibility, Double SBS (anamorphic for frame-packed displays), Cross-eye viewing, and Anaglyph for red/cyan glasses.
 -   **Enable Color Transfer:** Corrects color shifts that may have been introduced by the inpainting model by matching the right eye's color palette to the original left eye.
 -   **Pad to 16:9:** If your source video is not a standard 16:9 aspect ratio (e.g., a wide 2.35:1 movie), check this to add black bars (letterbox) to the output, making it a standard 16:9 video for better player compatibility.
+-   **Add Borders:** If checked, applies borders from sidecar files (.fssidecar) to mask edge artifacts from the warping process. Borders are read from sidecars in the inpainted folder or original video folder.
+-   **Resume:** If checked, moves successfully processed files to a `finished` subfolder after encoding and skips them on subsequent runs. Useful for resuming interrupted batch processing. Use "Restore Finished Files" in the File menu to move files back if needed.
 -   **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 -   **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
 
@@ -47,8 +50,10 @@ These sliders give you fine-grained control over how the mask is processed befor
 
 -   **Progress Bar:** Shows the progress of the overall batch operation.
 -   **Status Label:** Displays the current status, such as which video is being processed or if an error has occurred.
+-   **Borders Info:** Displays the border values read from sidecar files (e.g., "Borders: L=1.5%, R=2.8%").
 -   **Start Blending:** Begins the batch processing for all found videos.
 -   **Stop:** Halts the batch processing after the current video chunk is finished.
+-   **Process Current Clip:** Processes only the currently selected clip in the preview. Useful for testing settings on a single video without processing the entire batch.
 
 ## Basic Workflow
 
@@ -64,3 +69,22 @@ These sliders give you fine-grained control over how the mask is processed befor
 -   **Help Menu:** Contains an "About" dialog and a checkbox to **Enable Debug Logging**, which prints much more detailed information to the console for troubleshooting.
 
 > **Tip:** Hover your mouse over any control to see a detailed tooltip explaining its function.
+
+## Sidecar Files
+
+The Merging GUI can read configuration from sidecar files (.fssidecar) to automatically apply settings:
+
+-   **Sidecar Location:** Sidecars are looked for in:
+    1.  The inpainted video folder (checked first)
+    2.  The original video folder
+    3.  Next to the inpainted video file (e.g., `video.fssidecar` next to `video.mp4`)
+
+-   **Sidecar Format:** JSON files with `.fssidecar` extension containing:
+    -   `left_border`: Left border percentage (e.g., 1.5)
+    -   `right_border`: Right border percentage (e.g., 2.8)
+    -   `convergence_plane`: Convergence plane value
+    -   `max_disparity`: Maximum disparity value
+
+-   **Borders:** When "Add Borders" is enabled, borders from the sidecar are applied to zero out edge pixels that may contain artifacts from the warping process.
+
+> **Tip:** Enable "Enable Debug Logging" in the Help menu to see which sidecar files are being loaded and their values.
