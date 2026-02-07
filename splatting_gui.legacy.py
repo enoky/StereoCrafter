@@ -33,7 +33,7 @@ DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
 DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
 
 try:
-    from moviepy.editor import VideoFileClip
+    from moviepy.video.io.VideoFileClip import VideoFileClip
 except ImportError:
     # Fallback/stub for systems without moviepy
     class VideoFileClip:

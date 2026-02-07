@@ -1,0 +1,40 @@
+[project]
+name = "stereocrafter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.12.0",
+    "decord>=0.6.0",
+    "diffusers>=0.36.0",
+    "fire>=0.7.1",
+    "imageio>=2.37.2",
+    "imageio-ffmpeg>=0.6.0",
+    "imath>=0.0.2",
+    "matplotlib>=3.10.8",
+    "mediapy>=1.2.6",
+    "moviepy>=2.1.1",
+    "numpy==1.26.4",
+    "opencv-python>=4.11.0.86",
+    "openexr>=3.4.4",
+    "pyperclip>=1.11.0",
+    "torch==2.9.1",
+    "torchaudio==2.9.1",
+    "torchvision==0.24.1",
+    "transformers>=5.1.0",
+    "triton-windows>=3.6.0.post25",
+    "ttkthemes>=3.3.0",
+    "xformers==0.0.33.post2",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+xformers = { index = "pytorch" }

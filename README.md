@@ -13,10 +13,6 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
        `git --version`<br>
      If it shows a version, Git is installed and on PATH.
    
-   - PYTHON: Ensure Python 3.12 is installed and added to your PATH.<br>
-     Download here: https://www.python.org/downloads<br>
-     You can check by running the command:<br>
-       `python --version`
    - CUDA ToolKit: Ensure CUDA 12.8 is installed and added to your PATH.<br>
      Download here: https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64<br>
 
@@ -25,14 +21,14 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
 
 
 #### INSTALL:
-   - Run <a href="https://github.com/enoky/StereoCrafter/blob/90257ee4f032b649530281b0eceb95ea460db115/1click_installer_script/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
+   - Run <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
    - Download and extract <a href="https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso">model</a> "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
 
 <hr>
 
 ### Option 2: Manual Install
 
-For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/55dce8ec0b8f9d1ddfd69bc1fbaf831f6473bba5/1click_installer_script/StereoCrafter_Manual_Install.md">Click Here</a>
+For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_Manual_Install.md">Click Here</a>
 
 <hr>
 <div align="center">
@@ -74,7 +70,7 @@ Here we show some examples of input videos and their corresponding stereo output
 </div>
 
 
-## 🛠️ Installation
+## 🛠️ Installation (for the original repository)
 
 #### 1. Set up the environment
 We run our code on Python 3.8 and Cuda 11.8.
