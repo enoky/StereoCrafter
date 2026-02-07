@@ -238,6 +238,74 @@ class SidecarConfigManager:
             return False
 
 
+def find_video_by_core_name(folder: str, core_name: str) -> Optional[str]:
+    """Scans a folder for a file matching the core_name with any common video extension."""
+    video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm")
+    for ext in video_extensions:
+        full_path = os.path.join(folder, f"{core_name}{ext[1:]}")
+        if os.path.exists(full_path):
+            return full_path
+    return None
+
+
+def find_sidecar_file(base_path: str) -> Optional[str]:
+    """Looks for a sidecar JSON file next to the video file."""
+    sidecar_path = f"{os.path.splitext(base_path)[0]}.fssidecar"
+    if os.path.exists(sidecar_path):
+        return sidecar_path
+    # Also check .json extension for backwards compatibility
+    json_path = f"{os.path.splitext(base_path)[0]}.json"
+    if os.path.exists(json_path):
+        return json_path
+    return None
+
+
+def find_sidecar_in_folder(folder: str, core_name: str) -> Optional[str]:
+    """Looks for a sidecar file in a specific folder."""
+    fssidecar_path = os.path.join(folder, f"{core_name}.fssidecar")
+    if os.path.exists(fssidecar_path):
+        return fssidecar_path
+    # Also check .json extension for backwards compatibility
+    json_path = os.path.join(folder, f"{core_name}.json")
+    if os.path.exists(json_path):
+        return json_path
+    return None
+
+
+def read_clip_sidecar(
+    sidecar_manager: SidecarConfigManager,
+    video_path: str,
+    core_name: str,
+    search_folders: Optional[list] = None,
+) -> dict:
+    """
+    Reads the sidecar file for a clip if it exists.
+    Returns a dictionary of sidecar data merged with defaults.
+
+    Args:
+        sidecar_manager: SidecarConfigManager instance
+        video_path: Path to the video file
+        core_name: Core name of the clip
+        search_folders: Optional list of additional folders to search for sidecar files
+    """
+    # Check inpainted folder first (user requested)
+    if search_folders:
+        for folder in search_folders:
+            sidecar_path = find_sidecar_in_folder(folder, core_name)
+            if sidecar_path:
+                logger.info(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+                return sidecar_manager.load_sidecar_data(sidecar_path)
+
+    # Then check next to video file
+    sidecar_path = find_sidecar_file(video_path)
+    if sidecar_path:
+        logger.info(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+        return sidecar_manager.load_sidecar_data(sidecar_path)
+
+    logger.debug(f"No sidecar file found for '{core_name}'. Using defaults.")
+    return sidecar_manager._get_defaults()
+
+
 def apply_color_transfer(
     source_frame: torch.Tensor, target_frame: torch.Tensor
 ) -> torch.Tensor:
@@ -481,14 +549,14 @@ def create_single_slider_with_label_updater(
         """Move slider to the mouse pointer position on the trough (middle-click or left-click on trough)."""
         try:
             # Check if click is on trough (not the slider handle)
-            if event and 'trough' in slider.identify(event.x, event.y):
+            if event and "trough" in slider.identify(event.x, event.y):
                 slider.update_idletasks()
                 new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
                 new_value = max(from_, min(to, new_value))
-                
+
                 var.set(new_value)
                 sync_external_change()
-                
+
                 # Trigger preview update like a normal slider release
                 try:
                     if hasattr(GUI_self, "on_slider_release"):
@@ -1349,7 +1417,11 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
             # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
             # "Expecting ',' delimiter: line 13 column 40 (char 229)"
-            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r'\1,\2\3', result.stdout)
+            repaired = re.sub(
+                r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)',
+                r"\1,\2\3",
+                result.stdout,
+            )
             data = json.loads(repaired)
 
         stream_info = {}
