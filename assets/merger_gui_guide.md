@@ -22,8 +22,9 @@ This section allows you to see a real-time preview of your blending settings on 
 -   **Preview Window:** Displays the output image. It's scrollable if the preview size is larger than the window.
 -   **Frame Scrubber:** A slider to select which frame of the video you want to preview.
 -   **Preview Source:** A dropdown menu to view different layers of the composition for diagnostics (e.g., just the mask, the original left eye, or the final blended image).
--   **Load/Refresh List:** Scans the `Inpainted Video Folder` and loads the first video for preview.
+-   **Load/Refresh List:** On the first click, scans the folder for all video files. Subsequent clicks refresh the preview without rescanning (faster). If folder paths change, the next click will scan again.
 -   **Prev / Next / Jump to:** Buttons to navigate between the videos found in your inpainted folder.
+-   **Preview Source:** Dropdown to view different layers of the composition. Your selection is saved and restored on the next session.
 
 ### 3. Mask Processing Parameters
 
@@ -41,6 +42,7 @@ These sliders give you fine-grained control over how the mask is processed befor
 -   **Enable Color Transfer:** Corrects color shifts that may have been introduced by the inpainting model by matching the right eye's color palette to the original left eye.
 -   **Pad to 16:9:** If your source video is not a standard 16:9 aspect ratio (e.g., a wide 2.35:1 movie), check this to add black bars (letterbox) to the output, making it a standard 16:9 video for better player compatibility.
 -   **Add Borders:** If checked, applies borders from sidecar files (.fssidecar) to mask edge artifacts from the warping process. Borders are read from sidecars in the inpainted folder or original video folder.
+-   **Resume:** If checked, moves successfully processed files to a `finished` subfolder after encoding and skips them on subsequent runs. Useful for resuming interrupted batch processing. Use "Restore Finished Files" in the File menu to move files back if needed.
 -   **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 -   **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
 

@@ -1,6 +1,46 @@
 # Merging GUI Change Log
 
-## Version 26-02-07.1 (Today's Changes)
+## Version 26-02-07.2 (Today's Changes)
+
+### New Features
+
+#### Load/Refresh List Improvements
+- First press scans all video files
+- Subsequent presses only refresh preview (faster)
+- Automatically rescans if folder paths change
+
+#### Resume Mode
+- Added "Resume" checkbox in Options section
+- When enabled, skips files already in "finished" subfolder
+- Automatically moves completed files to "finished" subfolder
+- Moves: inpainted videos, splatted videos, original videos, and sidecar files
+- Useful for resuming interrupted batch processing
+- "Restore Finished Files" in File menu can undo the moves
+
+#### Preview Source Persistence
+- Preview Source dropdown selection is now saved to config
+- Restored on next session launch
+
+#### Add Borders Live Update
+- Toggling "Add Borders" checkbox now updates preview instantly
+
+### UI Improvements
+
+- Updated "Load/Refresh List" button behavior documentation
+- Added "Resume" documentation to Options section
+- Added Preview Source persistence to documentation
+
+### Files Modified
+
+- `merging_gui.py`: Added resume mode, preview source persistence, live update for borders
+- `dependency/video_previewer.py`: Modified _handle_load_refresh for smarter scanning
+- `dependency/merge_help.json`: Added help text for resume option
+- `assets/merger_gui_guide.md`: Updated documentation
+- `assets/merger_change_log.md`: Updated with latest changes
+
+---
+
+## Version 26-02-07.1
 
 ### New Features
 

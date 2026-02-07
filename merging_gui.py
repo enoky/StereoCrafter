@@ -204,14 +204,17 @@ class MergingGUI(ThemedTk):
                 "inpainted_folder", self.APP_DEFAULTS["inpainted_folder"]
             )
         )
+        self.inpainted_folder_var.trace_add("write", self._on_folder_changed)
         self.original_folder_var = tk.StringVar(
             value=self.app_config.get(
                 "original_folder", self.APP_DEFAULTS["original_folder"]
             )
         )
+        self.original_folder_var.trace_add("write", self._on_folder_changed)
         self.mask_folder_var = tk.StringVar(
             value=self.app_config.get("mask_folder", self.APP_DEFAULTS["mask_folder"])
         )
+        self.mask_folder_var.trace_add("write", self._on_folder_changed)
         self.output_folder_var = tk.StringVar(
             value=self.app_config.get(
                 "output_folder", self.APP_DEFAULTS["output_folder"]
@@ -305,7 +308,9 @@ class MergingGUI(ThemedTk):
                 )
             )
         )
-        self.preview_source_var = tk.StringVar(value="Blended Image")
+        self.preview_source_var = tk.StringVar(
+            value=self.app_config.get("preview_source", "Blended Image")
+        )
         self.preview_size_var = tk.StringVar(
             value=str(self.app_config.get("preview_size", "100%"))
         )
@@ -932,12 +937,24 @@ class MergingGUI(ThemedTk):
 
         # --- NEW: Add Borders checkbox ---
         self.add_borders_var = tk.BooleanVar(value=True)
+        self.add_borders_var.trace_add("write", self._on_add_borders_changed)
         borders_check = ttk.Checkbutton(
             options_frame, text="Add Borders", variable=self.add_borders_var
         )
         borders_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(borders_check, "add_borders")
         self.widgets_to_disable.append(borders_check)
+        # --- END NEW ---
+
+        # --- NEW: Resume checkbox ---
+        self.resume_var = tk.BooleanVar(value=False)
+        self.resume_var.trace_add("write", self._on_resume_changed)
+        resume_check = ttk.Checkbutton(
+            options_frame, text="Resume", variable=self.resume_var
+        )
+        resume_check.pack(side="left", padx=(15, 5))
+        self._create_hover_tooltip(resume_check, "resume")
+        self.widgets_to_disable.append(resume_check)
         # --- END NEW ---
 
         # Add Batch Chunk Size option
@@ -1043,6 +1060,22 @@ class MergingGUI(ThemedTk):
         params = self.get_current_settings()
         if params:
             self.previewer.set_parameters(params)
+
+    def _on_add_borders_changed(self, *args):
+        """Called when the Add Borders checkbox is toggled. Updates the preview."""
+        if hasattr(self, "previewer") and self.previewer.video_list:
+            self.previewer.update_preview()
+
+    def _on_folder_changed(self, *args):
+        """Called when a folder path changes. Resets the video list scan flag."""
+        if hasattr(self, "previewer"):
+            self.previewer.reset_video_list_scan()
+
+    def _on_resume_changed(self, *args):
+        """Called when the Resume checkbox is changed. Clears preview to apply new setting."""
+        if hasattr(self, "previewer") and self.previewer.video_list:
+            # Update preview to reflect the new setting
+            self.previewer.update_preview()
 
     def _set_ui_processing_state(self, is_processing: bool):
         """Disables or enables all interactive widgets during processing."""
@@ -1295,10 +1328,12 @@ class MergingGUI(ThemedTk):
                 "use_gpu": self.use_gpu_var.get(),
                 "pad_to_16_9": self.pad_to_16_9_var.get(),
                 "add_borders": self.add_borders_var.get(),
+                "resume": self.resume_var.get(),
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": self.preview_size_var.get(),
+                "preview_source": self.preview_source_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(
                     self.mask_binarize_threshold_var.get()
@@ -1366,6 +1401,37 @@ class MergingGUI(ThemedTk):
             )
             self.after(0, self.processing_done)
             return
+
+        # --- NEW: Skip already finished files when Resume is enabled ---
+        resume_enabled = settings.get("resume", False)
+        if resume_enabled and not single_mode:
+            finished_dir = os.path.join(settings["inpainted_folder"], "finished")
+            if os.path.isdir(finished_dir):
+                finished_files = set(os.listdir(finished_dir))
+                original_count = len(inpainted_videos)
+                inpainted_videos = [
+                    v
+                    for v in inpainted_videos
+                    if os.path.basename(v) not in finished_files
+                ]
+                skipped_count = original_count - len(inpainted_videos)
+                if skipped_count > 0:
+                    logger.info(
+                        f"Resume: Skipped {skipped_count} already processed files."
+                    )
+            else:
+                logger.info("Resume: No 'finished' folder found. Processing all files.")
+
+        if not inpainted_videos:
+            self.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Info", "All videos have already been processed (Resume mode)."
+                ),
+            )
+            self.after(0, self.processing_done)
+            return
+        # --- END NEW ---
 
         # --- NEW: Clear any failed moves from a previous run ---
         self.failed_moves = []
@@ -1851,16 +1917,30 @@ class MergingGUI(ThemedTk):
                     time.sleep(0.1)  # Give OS a moment to release file handles
                     logger.debug("Source video file handles released.")
 
-                    self.cleanup_queue.put(
-                        (inpainted_video_path, settings["inpainted_folder"])
-                    )
-                    self.cleanup_queue.put(
-                        (splatted_file_path, settings["mask_folder"])
-                    )
-                    if original_video_path_to_move:
+                    # --- NEW: Move files to finished folder if Resume is enabled ---
+                    if settings.get("resume", False):
                         self.cleanup_queue.put(
-                            (original_video_path_to_move, settings["original_folder"])
+                            (inpainted_video_path, settings["inpainted_folder"])
                         )
+                        self.cleanup_queue.put(
+                            (splatted_file_path, settings["mask_folder"])
+                        )
+                        if original_video_path_to_move:
+                            self.cleanup_queue.put(
+                                (
+                                    original_video_path_to_move,
+                                    settings["original_folder"],
+                                )
+                            )
+                        # Also move sidecar if it exists
+                        inpainted_base = os.path.splitext(inpainted_video_path)[0]
+                        for ext in [".fssidecar", ".json"]:
+                            sidecar_path = inpainted_base + ext
+                            if os.path.exists(sidecar_path):
+                                self.cleanup_queue.put(
+                                    (sidecar_path, settings["inpainted_folder"])
+                                )
+                    # --- END NEW ---
             except Exception as e:
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
                 if splatted_reader:
@@ -1952,6 +2032,16 @@ class MergingGUI(ThemedTk):
         self.update_status_label(
             f"Restore complete. Moved {restored_count} files with {error_count} errors."
         )
+
+        # --- NEW: Reset video list scan flag and refresh preview ---
+        if hasattr(self, "previewer"):
+            self.previewer.reset_video_list_scan()
+            # Trigger a full refresh scan
+            if self.previewer.find_sources_callback:
+                self.previewer.load_video_list(
+                    find_sources_callback=self.previewer.find_sources_callback
+                )
+        # --- END NEW ---
 
     def _find_preview_sources_callback(self) -> list:
         """
