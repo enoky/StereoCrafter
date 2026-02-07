@@ -87,8 +87,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-02-04.0"
-
+GUI_VERSION = "26-02-07.1"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -114,6 +113,7 @@ from core.splatting.config_manager import ConfigManager
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
 from core.common import ThemeManager
 from core.common.video_io import read_video_frames, _NumpyBatch
+
 
 class SplatterGUI(ThemedTk):
     # --- UI MINIMUM WIDTHS (tweak these numbers) ---
@@ -199,7 +199,6 @@ class SplatterGUI(ThemedTk):
         self._auto_pass_csv_cache = None
         self._auto_pass_csv_path = None
 
-
         # --- NEW CACHE AND STATE ---
         self._auto_conv_cache = {"Average": None, "Peak": None}
         self._auto_conv_cached_path = None
@@ -238,7 +237,7 @@ class SplatterGUI(ThemedTk):
         self._current_video_sidecar_map = None
         self._suppress_sidecar_map_update = False
         self._last_loaded_source_video = None
-        
+
         self.input_depth_maps_var.trace_add(
             "write", lambda *args: self._on_depth_map_folder_changed()
         )
@@ -269,13 +268,19 @@ class SplatterGUI(ThemedTk):
         self.depth_pop_enabled_var = tk.BooleanVar(value=False)
         self.auto_convergence_mode_var = tk.StringVar(value="Off")
         self.depth_gamma_var = tk.StringVar(value=defaults["DEPTH_GAMMA"])
-        self.depth_dilate_size_x_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_X"])
-        self.depth_dilate_size_y_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_Y"])
+        self.depth_dilate_size_x_var = tk.StringVar(
+            value=defaults["DEPTH_DILATE_SIZE_X"]
+        )
+        self.depth_dilate_size_y_var = tk.StringVar(
+            value=defaults["DEPTH_DILATE_SIZE_Y"]
+        )
         self.depth_blur_size_x_var = tk.StringVar(value=defaults["DEPTH_BLUR_SIZE_X"])
         self.depth_blur_size_y_var = tk.StringVar(value=defaults["DEPTH_BLUR_SIZE_Y"])
         self.depth_dilate_left_var = tk.StringVar(value=defaults["DEPTH_DILATE_LEFT"])
         self.depth_blur_left_var = tk.StringVar(value=defaults["DEPTH_BLUR_LEFT"])
-        self.depth_blur_left_mix_var = tk.StringVar(value=defaults["DEPTH_BLUR_LEFT_MIX"])
+        self.depth_blur_left_mix_var = tk.StringVar(
+            value=defaults["DEPTH_BLUR_LEFT_MIX"]
+        )
         self.enable_sidecar_gamma_var = tk.BooleanVar(value=True)
         self.enable_sidecar_blur_dilate_var = tk.BooleanVar(value=True)
         self.update_slider_from_sidecar_var = tk.BooleanVar(value=True)
@@ -287,19 +292,23 @@ class SplatterGUI(ThemedTk):
         self.auto_border_R_var = tk.StringVar(value=defaults["AUTO_BORDER_R"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
-        
+
         # --- NEW Sync from ConfigManager ---
         self.config_manager.sync_to_tk_vars(self.__dict__)
-        
+
         # Manual sync for non-standard mappings
         if "convergence_point" in self.app_config:
-            self.zero_disparity_anchor_var.set(str(self.app_config["convergence_point"]))
+            self.zero_disparity_anchor_var.set(
+                str(self.app_config["convergence_point"])
+            )
         if "multi_map_enabled" in self.app_config:
             self.multi_map_var.set(bool(self.app_config["multi_map_enabled"]))
         if "dark_mode_enabled" in self.app_config:
             self.dark_mode_var.set(bool(self.app_config["dark_mode_enabled"]))
         if "enable_full_resolution" in self.app_config:
-            self.enable_full_res_var.set(bool(self.app_config["enable_full_resolution"]))
+            self.enable_full_res_var.set(
+                bool(self.app_config["enable_full_resolution"])
+            )
         if "enable_low_resolution" in self.app_config:
             self.enable_low_res_var.set(bool(self.app_config["enable_low_resolution"]))
 
@@ -447,7 +456,14 @@ class SplatterGUI(ThemedTk):
         self.update_idletasks()
 
     def _auto_converge_worker(
-        self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode
+        self,
+        rgb_path,
+        depth_map_path,
+        process_length,
+        batch_size,
+        fallback_value,
+        gamma,
+        mode,
     ):
         """Worker thread for running the Auto-Convergence calculation."""
 
@@ -460,9 +476,9 @@ class SplatterGUI(ThemedTk):
             gamma=float(gamma),
             fallback_value=float(fallback_value),
             stop_event=self.stop_event,
-            scan_borders=True, # Enable combined scan
+            scan_borders=True,  # Enable combined scan
         )
-        
+
         new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r = res
 
         # Determine TV range compensation for border calculation
@@ -470,7 +486,7 @@ class SplatterGUI(ThemedTk):
         tv_disp_comp = 1.0
         if hasattr(self, "border_scanner"):
             # We don't have a VideoReader here, so we'll let BorderScanner handle it or calculate it later.
-            # For simplicity, we can pass the path and let BorderScanner handle it if we modify it, 
+            # For simplicity, we can pass the path and let BorderScanner handle it if we modify it,
             # but actually BorderScanner._get_tv_compensation uses VideoReader.
             # We'll just pass the depth_map_path and do it in the UI thread or use a helper.
             pass
@@ -489,15 +505,18 @@ class SplatterGUI(ThemedTk):
             ),
         )
 
-    def _auto_save_current_sidecar(self):
-        """
-        Saves the current GUI values to the sidecar file without user interaction.
-        Only runs if self.auto_save_sidecar_var is True.
-        """
-        if not self.auto_save_sidecar_var.get():
-            return
+    def _on_clip_navigate_with_cache_clear(self):
+        """Callback for clip navigation that clears auto-convergence cache and saves sidecar."""
+        # Clear auto-convergence cache when switching clips
+        self._auto_conv_cache = {"Average": None, "Peak": None}
+        self._auto_conv_cached_path = None
 
-        self._save_current_sidecar_data(is_auto_save=True)
+        # Clear processing information display
+        self.clear_processing_info()
+
+        # Save sidecar if auto-save is enabled (inlined from old _auto_save_current_sidecar)
+        if self.auto_save_sidecar_var.get():
+            self._save_current_sidecar_data(is_auto_save=True)
 
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
@@ -653,7 +672,6 @@ class SplatterGUI(ThemedTk):
             c = float(c_val)
             d = float(d_val)
 
-
             # TV-range 10-bit depth maps preserve the 64–940 code window; compensate so set_disparity feels the same as full-range.
             tv_disp_comp = 1.0
             try:
@@ -665,9 +683,13 @@ class SplatterGUI(ThemedTk):
                             self._depth_color_range_cache = {}
                         if _dpath not in self._depth_color_range_cache:
                             _info = get_video_stream_info(_dpath)
-                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                            self._depth_color_range_cache[_dpath] = str(
+                                (_info or {}).get("color_range", "unknown")
+                            ).lower()
                         if self._depth_color_range_cache.get(_dpath) == "tv":
-                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                            tv_disp_comp = 1.0 / (
+                                DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
+                            )
             except Exception:
                 tv_disp_comp = 1.0
 
@@ -1272,23 +1294,26 @@ class SplatterGUI(ThemedTk):
                         info = get_video_stream_info(depth_map_path)
                         if info and _infer_depth_bit_depth(info) > 8:
                             if str(info.get("color_range")).lower() == "tv":
-                                tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
-                    
+                                tv_disp_comp = 1.0 / (
+                                    DEPTH_VIS_TV10_WHITE_NORM
+                                    - DEPTH_VIS_TV10_BLACK_NORM
+                                )
+
                     max_disp = self._safe_float(self.max_disp_var, 20.0)
-                    
+
                     # Use the same logic as BorderScanner: b = (d - conv) * scale
                     # Result is percentage (e.g. 1.5 for 1.5%)
                     scale = 2.0 * (max_disp / 20.0) * tv_disp_comp
                     newL = max(0.0, (max_edge_l - anchor_to_apply) * scale)
                     newR = max(0.0, (max_edge_r - anchor_to_apply) * scale)
-                    
+
                     # Cap at 5.0% as per app standard
                     newL = min(5.0, round(float(newL), 3))
                     newR = min(5.0, round(float(newR), 3))
-                    
+
                     self.auto_border_L_var.set(str(newL))
                     self.auto_border_R_var.set(str(newR))
-                    
+
                     # Update sliders if relevant mode
                     mode_border = self.border_mode_var.get()
                     if mode_border in ("Auto Adv.", "Auto Basic"):
@@ -1296,11 +1321,13 @@ class SplatterGUI(ThemedTk):
                     elif mode_border == "Manual":
                         # If in Manual, we don't force sliders, but we've updated the auto values
                         pass
-                    
+
                     border_info_text = f", Borders: L={newL}%, R={newR}%"
-                    
+
                 except Exception as e:
-                    logger.error(f"Error calculating auto-borders in combined scan: {e}")
+                    logger.error(
+                        f"Error calculating auto-borders in combined scan: {e}"
+                    )
 
             self.status_label.config(
                 text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f}){border_info_text}"
@@ -1349,7 +1376,9 @@ class SplatterGUI(ThemedTk):
             # Try the provided key first, then a few common variants (no file writes).
             candidates = [
                 key,
-                f"{key}_button" if not str(key).endswith("_button") else str(key).replace("_button", ""),
+                f"{key}_button"
+                if not str(key).endswith("_button")
+                else str(key).replace("_button", ""),
                 str(key).replace("btn_", ""),
                 str(key).replace("button_", ""),
             ]
@@ -1579,7 +1608,7 @@ class SplatterGUI(ThemedTk):
             preview_size_var=self.preview_size_var,  # Pass the preview size variable
             resize_callback=self._adjust_window_height_for_content,  # Pass the resize callback
             update_clip_callback=self._update_clip_state_and_text,
-            on_clip_navigate_callback=self._auto_save_current_sidecar,
+            on_clip_navigate_callback=self._on_clip_navigate_with_cache_clear,
             help_data=self.help_texts,
         )
         self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
@@ -2003,9 +2032,11 @@ class SplatterGUI(ThemedTk):
         # Trigger an immediate preview refresh when the mix selector changes
         left_blur_mix_combo.bind(
             "<<ComboboxSelected>>",
-            lambda e: self.previewer.update_preview()
-            if getattr(self, "previewer", None)
-            else None,
+            lambda e: (
+                self.previewer.update_preview()
+                if getattr(self, "previewer", None)
+                else None
+            ),
         )
 
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
@@ -2173,15 +2204,19 @@ class SplatterGUI(ThemedTk):
             variable=self.crosshair_enabled_var,
             takefocus=False,
             command=lambda: (
-                self.previewer.set_crosshair_settings(
-                    self.crosshair_enabled_var.get(),
-                    self.crosshair_white_var.get(),
-                    self.crosshair_multi_var.get(),
-                ),
-                getattr(self.previewer, "preview_canvas", self.previewer).focus_set(),
-            )
-            if getattr(self, "previewer", None)
-            else None,
+                (
+                    self.previewer.set_crosshair_settings(
+                        self.crosshair_enabled_var.get(),
+                        self.crosshair_white_var.get(),
+                        self.crosshair_multi_var.get(),
+                    ),
+                    getattr(
+                        self.previewer, "preview_canvas", self.previewer
+                    ).focus_set(),
+                )
+                if getattr(self, "previewer", None)
+                else None
+            ),
         )
         self.crosshair_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.crosshair_checkbox, "crosshair_enabled")
@@ -2192,15 +2227,19 @@ class SplatterGUI(ThemedTk):
             variable=self.crosshair_white_var,
             takefocus=False,
             command=lambda: (
-                self.previewer.set_crosshair_settings(
-                    self.crosshair_enabled_var.get(),
-                    self.crosshair_white_var.get(),
-                    self.crosshair_multi_var.get(),
-                ),
-                getattr(self.previewer, "preview_canvas", self.previewer).focus_set(),
-            )
-            if getattr(self, "previewer", None)
-            else None,
+                (
+                    self.previewer.set_crosshair_settings(
+                        self.crosshair_enabled_var.get(),
+                        self.crosshair_white_var.get(),
+                        self.crosshair_multi_var.get(),
+                    ),
+                    getattr(
+                        self.previewer, "preview_canvas", self.previewer
+                    ).focus_set(),
+                )
+                if getattr(self, "previewer", None)
+                else None
+            ),
         )
         self.crosshair_white_checkbox.pack(side="left", padx=(6, 0))
         self._create_hover_tooltip(self.crosshair_white_checkbox, "crosshair_white")
@@ -2211,15 +2250,19 @@ class SplatterGUI(ThemedTk):
             variable=self.crosshair_multi_var,
             takefocus=False,
             command=lambda: (
-                self.previewer.set_crosshair_settings(
-                    self.crosshair_enabled_var.get(),
-                    self.crosshair_white_var.get(),
-                    self.crosshair_multi_var.get(),
-                ),
-                getattr(self.previewer, "preview_canvas", self.previewer).focus_set(),
-            )
-            if getattr(self, "previewer", None)
-            else None,
+                (
+                    self.previewer.set_crosshair_settings(
+                        self.crosshair_enabled_var.get(),
+                        self.crosshair_white_var.get(),
+                        self.crosshair_multi_var.get(),
+                    ),
+                    getattr(
+                        self.previewer, "preview_canvas", self.previewer
+                    ).focus_set(),
+                )
+                if getattr(self, "previewer", None)
+                else None
+            ),
         )
         self.crosshair_multi_checkbox.pack(side="left", padx=(6, 0))
         self._create_hover_tooltip(self.crosshair_multi_checkbox, "crosshair_multi")
@@ -2229,13 +2272,17 @@ class SplatterGUI(ThemedTk):
             variable=self.depth_pop_enabled_var,
             takefocus=False,
             command=lambda: (
-                getattr(self.previewer, "set_depth_pop_enabled", lambda *_: None)(
-                    self.depth_pop_enabled_var.get()
-                ),
-                getattr(self.previewer, "preview_canvas", self.previewer).focus_set(),
-            )
-            if getattr(self, "previewer", None)
-            else None,
+                (
+                    getattr(self.previewer, "set_depth_pop_enabled", lambda *_: None)(
+                        self.depth_pop_enabled_var.get()
+                    ),
+                    getattr(
+                        self.previewer, "preview_canvas", self.previewer
+                    ).focus_set(),
+                )
+                if getattr(self, "previewer", None)
+                else None
+            ),
         )
         self.depth_pop_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.depth_pop_checkbox, "depth_pop_readout")
@@ -2402,21 +2449,24 @@ class SplatterGUI(ThemedTk):
         self.chk_skip_lowres_preproc.grid(row=0, column=0, sticky="w", padx=5, pady=0)
         self._create_hover_tooltip(self.chk_skip_lowres_preproc, "skip_lowres_preproc")
 
-
         self.chk_track_dp_total_true = ttk.Checkbutton(
             self.dev_tools_frame,
             text="True Max",
             variable=self.track_dp_total_true_on_render_var,
         )
-        self.chk_track_dp_total_true.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=0)
-        self._create_hover_tooltip(self.chk_track_dp_total_true, "track_dp_total_true_on_render")
+        self.chk_track_dp_total_true.grid(
+            row=0, column=3, sticky="w", padx=(10, 0), pady=0
+        )
+        self._create_hover_tooltip(
+            self.chk_track_dp_total_true, "track_dp_total_true_on_render"
+        )
         self.chk_map_test = ttk.Checkbutton(
             self.dev_tools_frame,
             text="Map Test",
             variable=self.map_test_var,
-            command=lambda: self.splat_test_var.set(False)
-            if self.map_test_var.get()
-            else None,
+            command=lambda: (
+                self.splat_test_var.set(False) if self.map_test_var.get() else None
+            ),
         )
         self.chk_map_test.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=0)
         self._create_hover_tooltip(self.chk_map_test, "map_test")
@@ -2425,9 +2475,9 @@ class SplatterGUI(ThemedTk):
             self.dev_tools_frame,
             text="Splat Test",
             variable=self.splat_test_var,
-            command=lambda: self.map_test_var.set(False)
-            if self.splat_test_var.get()
-            else None,
+            command=lambda: (
+                self.map_test_var.set(False) if self.splat_test_var.get() else None
+            ),
         )
         self.chk_splat_test.grid(row=0, column=2, sticky="w", padx=(10, 0), pady=0)
         self._create_hover_tooltip(self.chk_splat_test, "splat_test")
@@ -2812,6 +2862,7 @@ class SplatterGUI(ThemedTk):
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary using ConfigManager."""
         from core.splatting.config_manager import get_current_config
+
         config = get_current_config(self.__dict__, self.config_manager.defaults)
 
         # Map non-standard variable names to expected config keys
@@ -2888,13 +2939,21 @@ class SplatterGUI(ThemedTk):
             # NEW fields
             multi_map=self.multi_map_var.get(),
             selected_depth_map=self.selected_depth_map_var.get().strip(),
-            color_tags_mode=self.color_tags_mode_var.get() if hasattr(self, "color_tags_mode_var") else "Auto",
-            is_test_mode=False, # Standard batch mode
+            color_tags_mode=self.color_tags_mode_var.get()
+            if hasattr(self, "color_tags_mode_var")
+            else "Auto",
+            is_test_mode=False,  # Standard batch mode
             test_target_frame_idx=None,
-            skip_lowres_preproc=bool(getattr(self, "skip_lowres_preproc_var", None) and self.skip_lowres_preproc_var.get()),
+            skip_lowres_preproc=bool(
+                getattr(self, "skip_lowres_preproc_var", None)
+                and self.skip_lowres_preproc_var.get()
+            ),
             sidecar_ext=self.APP_CONFIG_DEFAULTS["SIDECAR_EXT"],
             sidecar_folder=self._get_sidecar_base_folder(),
-            track_dp_total_true_on_render=bool(getattr(self, "track_dp_total_true_on_render_var", None) and self.track_dp_total_true_on_render_var.get()),
+            track_dp_total_true_on_render=bool(
+                getattr(self, "track_dp_total_true_on_render_var", None)
+                and self.track_dp_total_true_on_render_var.get()
+            ),
         )
 
     def get_current_preview_settings(self) -> dict:
@@ -3507,6 +3566,7 @@ class SplatterGUI(ThemedTk):
 
         try:
             from core.splatting.config_manager import load_settings_from_file
+
             load_settings_from_file(filename, tk_vars=self.__dict__)
 
             self._apply_theme()  # Re-apply theme in case dark mode setting was loaded
@@ -3679,14 +3739,19 @@ class SplatterGUI(ThemedTk):
         # Check cache logic
         cached_value = None
         if mode == "Hybrid":
-             if self._auto_conv_cache.get("Average") is not None and self._auto_conv_cache.get("Peak") is not None:
-                 cached_value = (self._auto_conv_cache["Average"] + self._auto_conv_cache["Peak"]) / 2.0
+            if (
+                self._auto_conv_cache.get("Average") is not None
+                and self._auto_conv_cache.get("Peak") is not None
+            ):
+                cached_value = (
+                    self._auto_conv_cache["Average"] + self._auto_conv_cache["Peak"]
+                ) / 2.0
         elif self._auto_conv_cache.get(mode) is not None:
-             cached_value = self._auto_conv_cache[mode]
+            cached_value = self._auto_conv_cache[mode]
 
         if cached_value is not None:
             # Value is cached, apply it immediately
-            
+
             # 1. Set the Tkinter variable to the cached value (needed for the setter)
             self.zero_disparity_anchor_var.set(f"{cached_value:.2f}")
 
@@ -4256,15 +4321,20 @@ class SplatterGUI(ThemedTk):
                             self._depth_color_range_cache = {}
                         if _dpath not in self._depth_color_range_cache:
                             _info = get_video_stream_info(_dpath)
-                            self._depth_color_range_cache[_dpath] = str((_info or {}).get("color_range", "unknown")).lower()
+                            self._depth_color_range_cache[_dpath] = str(
+                                (_info or {}).get("color_range", "unknown")
+                            ).lower()
                         if self._depth_color_range_cache.get(_dpath) == "tv":
-                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                            tv_disp_comp = 1.0 / (
+                                DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
+                            )
             except Exception:
                 tv_disp_comp = 1.0
 
-
         # Calculate disparity in pixels based on the TARGET width (W_target)
-        actual_max_disp_pixels = (params["max_disp"] / 20.0 / 100.0) * W_target * tv_disp_comp
+        actual_max_disp_pixels = (
+            (params["max_disp"] / 20.0 / 100.0) * W_target * tv_disp_comp
+        )
         disp_map_tensor = disp_map_tensor * actual_max_disp_pixels
 
         # Preview-only depth/pop separation metrics (percent of screen width)
@@ -4291,7 +4361,8 @@ class SplatterGUI(ThemedTk):
                         _disp_pct = (
                             (_ds - params["convergence_point"])
                             * 2.0
-                            * (params["max_disp"] / 20.0) * tv_disp_comp
+                            * (params["max_disp"] / 20.0)
+                            * tv_disp_comp
                         )
                         _min_pct = float(_disp_pct.min())
                         _max_pct = float(_disp_pct.max())
@@ -4304,7 +4375,12 @@ class SplatterGUI(ThemedTk):
                     sig = None
                     try:
                         _dp_path = getattr(self.previewer, "_depth_path", "")
-                        sig = self._dp_total_signature(_dp_path, params.get("convergence_point", 0.0), params.get("max_disp", 0.0), params.get("depth_gamma", 1.0))
+                        sig = self._dp_total_signature(
+                            _dp_path,
+                            params.get("convergence_point", 0.0),
+                            params.get("max_disp", 0.0),
+                            params.get("depth_gamma", 1.0),
+                        )
                     except Exception:
                         sig = None
                     try:
@@ -4493,6 +4569,7 @@ class SplatterGUI(ThemedTk):
             return
 
         from core.splatting.config_manager import reset_to_defaults
+
         reset_to_defaults(self.__dict__, self.config_manager.defaults)
 
         # Ensure UI/Toggles match the new reset states
@@ -4605,7 +4682,7 @@ class SplatterGUI(ThemedTk):
         # Parse From/To range
         from_idx = 0
         to_idx = None
-        
+
         from_str = self.process_from_var.get().strip()
         if from_str:
             try:
@@ -4766,7 +4843,9 @@ class SplatterGUI(ThemedTk):
         )
         self.auto_converge_thread.start()
 
-    def _dp_total_signature(self, depth_path: str, conv: float, max_disp: float, gamma: float) -> str:
+    def _dp_total_signature(
+        self, depth_path: str, conv: float, max_disp: float, gamma: float
+    ) -> str:
         """Signature for caching Total(D+P) metrics.
 
         IMPORTANT: Convergence changes should NOT invalidate the cached display/estimate.
@@ -4828,12 +4907,24 @@ class SplatterGUI(ThemedTk):
                 return float(default)
 
         # NOTE: sidecars store these keys (depth_*) via _save_current_sidecar_data.
-        depth_dilate_size_x = _pfloat("depth_dilate_size_x", self._safe_float(self.depth_dilate_size_x_var))
-        depth_dilate_size_y = _pfloat("depth_dilate_size_y", self._safe_float(self.depth_dilate_size_y_var))
-        depth_blur_size_x = _pfloat("depth_blur_size_x", self._safe_float(self.depth_blur_size_x_var))
-        depth_blur_size_y = _pfloat("depth_blur_size_y", self._safe_float(self.depth_blur_size_y_var))
-        depth_dilate_left = _pfloat("depth_dilate_left", self._safe_float(self.depth_dilate_left_var))
-        depth_blur_left = _pfloat("depth_blur_left", self._safe_float(self.depth_blur_left_var))
+        depth_dilate_size_x = _pfloat(
+            "depth_dilate_size_x", self._safe_float(self.depth_dilate_size_x_var)
+        )
+        depth_dilate_size_y = _pfloat(
+            "depth_dilate_size_y", self._safe_float(self.depth_dilate_size_y_var)
+        )
+        depth_blur_size_x = _pfloat(
+            "depth_blur_size_x", self._safe_float(self.depth_blur_size_x_var)
+        )
+        depth_blur_size_y = _pfloat(
+            "depth_blur_size_y", self._safe_float(self.depth_blur_size_y_var)
+        )
+        depth_dilate_left = _pfloat(
+            "depth_dilate_left", self._safe_float(self.depth_dilate_left_var)
+        )
+        depth_blur_left = _pfloat(
+            "depth_blur_left", self._safe_float(self.depth_blur_left_var)
+        )
 
         # Gamma used for the estimator math (prefer explicit param dict if present).
         try:
@@ -4864,7 +4955,10 @@ class SplatterGUI(ThemedTk):
         if sample_frames >= total_frames:
             indices = list(range(total_frames))
         else:
-            indices = [int(round(i * (total_frames - 1) / (sample_frames - 1))) for i in range(sample_frames)]
+            indices = [
+                int(round(i * (total_frames - 1) / (sample_frames - 1)))
+                for i in range(sample_frames)
+            ]
         # Ensure strictly increasing (helps the sequential reader)
         indices = sorted(set(max(0, min(total_frames - 1, i)) for i in indices))
 
@@ -4885,7 +4979,10 @@ class SplatterGUI(ThemedTk):
         out_w = None
         out_h = None
         try:
-            if self.previewer is not None and getattr(self.previewer, "_depth_path", None) == depth_path:
+            if (
+                self.previewer is not None
+                and getattr(self.previewer, "_depth_path", None) == depth_path
+            ):
                 out_w = int(getattr(self.previewer, "_depth_native_w", 0) or 0)
                 out_h = int(getattr(self.previewer, "_depth_native_h", 0) or 0)
         except Exception:
@@ -4927,7 +5024,9 @@ class SplatterGUI(ThemedTk):
             sidecar_folder = self._get_sidecar_base_folder()
             depth_map_basename = os.path.splitext(os.path.basename(depth_path))[0]
             sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
-            json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
+            json_sidecar_path = os.path.join(
+                sidecar_folder, f"{depth_map_basename}{sidecar_ext}"
+            )
             if os.path.exists(json_sidecar_path):
                 enable_global_norm = False
         except Exception:
@@ -5030,7 +5129,9 @@ class SplatterGUI(ThemedTk):
                 depth_norm = np.clip(depth_norm, 0.0, 1.0)
 
                 # Compute Total(D+P) for this frame (match preview: stride sample + ignore holes)
-                ds = depth_norm[::max(1, int(pixel_stride)), ::max(1, int(pixel_stride))].astype(np.float32, copy=False)
+                ds = depth_norm[
+                    :: max(1, int(pixel_stride)), :: max(1, int(pixel_stride))
+                ].astype(np.float32, copy=False)
                 valid = (ds > 0.001) & (ds < 0.999)
                 if not np.any(valid):
                     continue
@@ -5040,8 +5141,16 @@ class SplatterGUI(ThemedTk):
                 tv_disp_comp = 1.0
                 if not enable_global_norm:
                     try:
-                        if _infer_depth_bit_depth(depth_stream_info) > 8 and str((depth_stream_info or {}).get("color_range", "unknown")).lower() == "tv":
-                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                        if (
+                            _infer_depth_bit_depth(depth_stream_info) > 8
+                            and str(
+                                (depth_stream_info or {}).get("color_range", "unknown")
+                            ).lower()
+                            == "tv"
+                        ):
+                            tv_disp_comp = 1.0 / (
+                                DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
+                            )
                     except Exception:
                         tv_disp_comp = 1.0
 
@@ -5077,7 +5186,9 @@ class SplatterGUI(ThemedTk):
                 return
 
             try:
-                logger.info(f"Estimate Max Total(D+P): sampling clip depth map: {os.path.basename(depth_path)}")
+                logger.info(
+                    f"Estimate Max Total(D+P): sampling clip depth map: {os.path.basename(depth_path)}"
+                )
             except Exception:
                 pass
 
@@ -5090,7 +5201,11 @@ class SplatterGUI(ThemedTk):
                 params = None
 
             if isinstance(params, dict):
-                conv = float(params.get("zero_disparity_anchor", self.zero_disparity_anchor_var.get()))
+                conv = float(
+                    params.get(
+                        "zero_disparity_anchor", self.zero_disparity_anchor_var.get()
+                    )
+                )
                 max_disp = float(params.get("max_disparity", self.max_disp_var.get()))
                 gamma = float(params.get("depth_gamma", self.depth_gamma_var.get()))
             else:
@@ -5101,8 +5216,12 @@ class SplatterGUI(ThemedTk):
             total_frames_override = None
             try:
                 # Reuse already-known frame count from the active preview (avoids re-probing/decord hangs)
-                if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "frame_scrubber"):
-                    total_frames_override = int(self.previewer.frame_scrubber.cget("to")) + 1
+                if getattr(self, "previewer", None) is not None and hasattr(
+                    self.previewer, "frame_scrubber"
+                ):
+                    total_frames_override = (
+                        int(self.previewer.frame_scrubber.cget("to")) + 1
+                    )
             except Exception:
                 total_frames_override = None
 
@@ -5119,8 +5238,15 @@ class SplatterGUI(ThemedTk):
             def _worker():
                 try:
                     est = self._estimate_dp_total_max_for_depth_video(
-                    depth_path, conv, max_disp, gamma, sample_frames=10, pixel_stride=8, total_frames_override=total_frames_override, params=params
-                )
+                        depth_path,
+                        conv,
+                        max_disp,
+                        gamma,
+                        sample_frames=10,
+                        pixel_stride=8,
+                        total_frames_override=total_frames_override,
+                        params=params,
+                    )
                 except Exception as e:
                     try:
                         logger.exception(f"Estimate Max Total(D+P) failed: {e}")
@@ -5132,11 +5258,15 @@ class SplatterGUI(ThemedTk):
                     try:
                         if est is not None:
                             try:
-                                logger.info(f"Estimate Max Total(D+P): {float(est):.2f}%")
+                                logger.info(
+                                    f"Estimate Max Total(D+P): {float(est):.2f}%"
+                                )
                             except Exception:
                                 pass
                             self._dp_total_est_cache[sig] = float(est)
-                            if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
+                            if getattr(self, "previewer", None) is not None and hasattr(
+                                self.previewer, "set_depth_pop_max_estimate"
+                            ):
                                 ui_sig = None
                             try:
                                 ui_sig = getattr(self.previewer, "_dp_signature", None)
@@ -5144,7 +5274,9 @@ class SplatterGUI(ThemedTk):
                                 ui_sig = None
                             if not ui_sig:
                                 ui_sig = sig
-                            self.previewer.set_depth_pop_max_estimate(float(est), ui_sig)
+                            self.previewer.set_depth_pop_max_estimate(
+                                float(est), ui_sig
+                            )
                     finally:
                         try:
                             if est is None:
@@ -5154,7 +5286,9 @@ class SplatterGUI(ThemedTk):
                                 except Exception:
                                     pass
                                 if elapsed is not None:
-                                    logger.info(f"Estimate Max Total(D+P): (no result)  (took {elapsed:.2f}s)")
+                                    logger.info(
+                                        f"Estimate Max Total(D+P): (no result)  (took {elapsed:.2f}s)"
+                                    )
                                 else:
                                     logger.info("Estimate Max Total(D+P): (no result)")
                         except Exception:
@@ -5240,7 +5374,10 @@ class SplatterGUI(ThemedTk):
             if not os.path.exists(csv_path):
                 return
 
-            if self._auto_pass_csv_cache is None or self._auto_pass_csv_path != csv_path:
+            if (
+                self._auto_pass_csv_cache is None
+                or self._auto_pass_csv_path != csv_path
+            ):
                 self._auto_pass_csv_load_cache(csv_path)
 
             if getattr(self, "previewer", None) is None:
@@ -5306,12 +5443,18 @@ class SplatterGUI(ThemedTk):
                 "frame": frame_num,
                 "source_video": src_bn,
                 "selected_depth_map": str(current_data.get("selected_depth_map", "")),
-                "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                "convergence_plane": round(
+                    float(current_data.get("convergence_plane", 0.5)), 6
+                ),
                 "left_border": round(float(current_data.get("left_border", 0.0)), 3),
                 "right_border": round(float(current_data.get("right_border", 0.0)), 3),
                 "border_mode": str(current_data.get("border_mode", "")),
-                "set_disparity": round(float(current_data.get("max_disparity", 0.0)), 3),
-                "true_max_disp": round(float(dp_true), 3) if dp_true is not None else "",
+                "set_disparity": round(
+                    float(current_data.get("max_disparity", 0.0)), 3
+                ),
+                "true_max_disp": round(float(dp_true), 3)
+                if dp_true is not None
+                else "",
                 "est_max_disp": round(float(dp_est), 3) if dp_est is not None else "",
                 "gamma": round(float(current_data.get("gamma", 1.0)), 3),
             }
@@ -5396,13 +5539,25 @@ class SplatterGUI(ThemedTk):
                 {
                     "frame": frame_num,
                     "source_video": src_bn,
-                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
-                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
-                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
-                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "selected_depth_map": str(
+                        current_data.get("selected_depth_map", "")
+                    ),
+                    "convergence_plane": round(
+                        float(current_data.get("convergence_plane", 0.5)), 6
+                    ),
+                    "left_border": round(
+                        float(current_data.get("left_border", 0.0)), 3
+                    ),
+                    "right_border": round(
+                        float(current_data.get("right_border", 0.0)), 3
+                    ),
                     "border_mode": str(current_data.get("border_mode", "")),
                     "set_disparity": round(
-                        float(current_data.get("max_disparity", current_data.get("set_disparity", 0.0))),
+                        float(
+                            current_data.get(
+                                "max_disparity", current_data.get("set_disparity", 0.0)
+                            )
+                        ),
                         3,
                     ),
                     "gamma": round(float(current_data.get("gamma", 1.0)), 3),
@@ -5412,7 +5567,9 @@ class SplatterGUI(ThemedTk):
             # Optional columns (keep internal names, change only CSV keys)
             try:
                 if current_data.get("dp_total_max_est", None) not in ("", None):
-                    row["est_max_disp"] = round(float(current_data.get("dp_total_max_est")), 3)
+                    row["est_max_disp"] = round(
+                        float(current_data.get("dp_total_max_est")), 3
+                    )
             except Exception:
                 pass
 
@@ -5462,7 +5619,9 @@ class SplatterGUI(ThemedTk):
 
     def run_auto_pass(self) -> None:
         """Run AUTO-PASS over the preview list (or From/To range) without rendering."""
-        if not getattr(self, "previewer", None) or not getattr(self.previewer, "video_list", None):
+        if not getattr(self, "previewer", None) or not getattr(
+            self.previewer, "video_list", None
+        ):
             messagebox.showwarning("AUTO-PASS", "Load/Refresh the Preview list first.")
             return
 
@@ -5501,7 +5660,9 @@ class SplatterGUI(ThemedTk):
         # Snapshot the current GUI settings ONCE (thread-safe)
         try:
             base_sidecar_data = {
-                "convergence_plane": self._safe_float(self.zero_disparity_anchor_var, 0.5),
+                "convergence_plane": self._safe_float(
+                    self.zero_disparity_anchor_var, 0.5
+                ),
                 "max_disparity": self._safe_float(self.max_disp_var, 20.0),
                 "gamma": float(f"{self._safe_float(self.depth_gamma_var, 1.0):.2f}"),
                 "depth_dilate_size_x": self._safe_float(self.depth_dilate_size_x_var),
@@ -5509,8 +5670,12 @@ class SplatterGUI(ThemedTk):
                 "depth_blur_size_x": self._safe_float(self.depth_blur_size_x_var),
                 "depth_blur_size_y": self._safe_float(self.depth_blur_size_y_var),
                 "depth_dilate_left": self._safe_float(self.depth_dilate_left_var),
-                "depth_blur_left": int(round(self._safe_float(self.depth_blur_left_var))),
-                "depth_blur_left_mix": self._safe_float(self.depth_blur_left_mix_var, 0.5),
+                "depth_blur_left": int(
+                    round(self._safe_float(self.depth_blur_left_var))
+                ),
+                "depth_blur_left_mix": self._safe_float(
+                    self.depth_blur_left_mix_var, 0.5
+                ),
                 "selected_depth_map": self.selected_depth_map_var.get(),
             }
 
@@ -5564,7 +5729,9 @@ class SplatterGUI(ThemedTk):
             border_b,
         )
 
-        t = threading.Thread(target=self._auto_pass_worker, args=worker_args, daemon=True)
+        t = threading.Thread(
+            target=self._auto_pass_worker, args=worker_args, daemon=True
+        )
         t.start()
 
     def _auto_pass_worker(
@@ -5583,12 +5750,13 @@ class SplatterGUI(ThemedTk):
         total = max(0, end_index_0 - start_index_0)
         completed = 0
 
-
         # AUTO-PASS export (CSV) - optional helper output for timeline/Resolve workflows
         rows_for_csv = []
         csv_out_path = None
         try:
-            csv_out_path = os.path.join(self._get_sidecar_base_folder(), "auto_pass_export.csv")
+            csv_out_path = os.path.join(
+                self._get_sidecar_base_folder(), "auto_pass_export.csv"
+            )
         except Exception:
             csv_out_path = "auto_pass_export.csv"
         # Pre-compute manual borders from the current Width/Bias (used when mode is Off/Manual)
@@ -5628,7 +5796,9 @@ class SplatterGUI(ThemedTk):
                 continue
 
             depth_basename = os.path.splitext(os.path.basename(depth_path))[0]
-            json_sidecar_path = os.path.join(sidecar_base_folder, f"{depth_basename}{sidecar_ext}")
+            json_sidecar_path = os.path.join(
+                sidecar_base_folder, f"{depth_basename}{sidecar_ext}"
+            )
 
             current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
 
@@ -5662,12 +5832,20 @@ class SplatterGUI(ThemedTk):
                 tv_disp_comp = 1.0
                 try:
                     _info = get_video_stream_info(depth_path)
-                    if _infer_depth_bit_depth(_info) > 8 and str((_info or {}).get("color_range", "unknown")).lower() == "tv":
-                        tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                    if (
+                        _infer_depth_bit_depth(_info) > 8
+                        and str((_info or {}).get("color_range", "unknown")).lower()
+                        == "tv"
+                    ):
+                        tv_disp_comp = 1.0 / (
+                            DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
+                        )
                 except Exception:
                     tv_disp_comp = 1.0
 
-                width = max(0.0, (1.0 - conv_val) * 2.0 * (max_disp / 20.0) * tv_disp_comp)
+                width = max(
+                    0.0, (1.0 - conv_val) * 2.0 * (max_disp / 20.0) * tv_disp_comp
+                )
                 width = min(5.0, width)
                 current_data["left_border"] = round(float(width), 3)
                 current_data["right_border"] = round(float(width), 3)
@@ -5675,7 +5853,9 @@ class SplatterGUI(ThemedTk):
                 current_data["border_mode"] = "Manual"
 
             elif border_mode == "Auto Adv.":
-                scan = self._scan_borders_for_depth_path(depth_path, float(conv_val), max_disp, gamma)
+                scan = self._scan_borders_for_depth_path(
+                    depth_path, float(conv_val), max_disp, gamma
+                )
                 if scan:
                     l_val, r_val = scan
                 else:
@@ -5707,7 +5887,6 @@ class SplatterGUI(ThemedTk):
 
             self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data)
 
-
             # Collect row for optional CSV export
             try:
                 depth_bn = os.path.basename(depth_path)
@@ -5729,19 +5908,31 @@ class SplatterGUI(ThemedTk):
                         frame_num = mfr.group(1) if mfr else ""
                     except Exception:
                         frame_num = ""
-                rows_for_csv.append({
-                    "frame": frame_num,
-                    "source_video": src_bn,
-                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
-                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
-                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
-                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
-                    "border_mode": str(current_data.get("border_mode", "")),
-                    "set_disparity": round(float(current_data.get("max_disparity", max_disp)), 3),
-                    "true_max_disp": current_data.get("dp_total_max_true", ""),
-                    "est_max_disp": current_data.get("dp_total_max_est", ""),
-                    "gamma": round(float(current_data.get("gamma", gamma)), 3),
-                })
+                rows_for_csv.append(
+                    {
+                        "frame": frame_num,
+                        "source_video": src_bn,
+                        "selected_depth_map": str(
+                            current_data.get("selected_depth_map", "")
+                        ),
+                        "convergence_plane": round(
+                            float(current_data.get("convergence_plane", 0.5)), 6
+                        ),
+                        "left_border": round(
+                            float(current_data.get("left_border", 0.0)), 3
+                        ),
+                        "right_border": round(
+                            float(current_data.get("right_border", 0.0)), 3
+                        ),
+                        "border_mode": str(current_data.get("border_mode", "")),
+                        "set_disparity": round(
+                            float(current_data.get("max_disparity", max_disp)), 3
+                        ),
+                        "true_max_disp": current_data.get("dp_total_max_true", ""),
+                        "est_max_disp": current_data.get("dp_total_max_est", ""),
+                        "gamma": round(float(current_data.get("gamma", gamma)), 3),
+                    }
+                )
             except Exception:
                 pass
             completed += 1
@@ -5772,7 +5963,9 @@ class SplatterGUI(ThemedTk):
                 existing_rows = {}
                 try:
                     if os.path.exists(csv_out_path):
-                        with open(csv_out_path, "r", newline="", encoding="utf-8") as rf:
+                        with open(
+                            csv_out_path, "r", newline="", encoding="utf-8"
+                        ) as rf:
                             rcsv = csv.DictReader(rf)
                             for rrow in rcsv:
                                 k = str(rrow.get("source_video", "")).strip()
@@ -5800,7 +5993,9 @@ class SplatterGUI(ThemedTk):
         was_stopped = self.stop_event.is_set()
         self.after(0, lambda: self._complete_auto_pass(completed, total, was_stopped))
 
-    def _complete_auto_pass(self, completed: int, total: int, was_stopped: bool) -> None:
+    def _complete_auto_pass(
+        self, completed: int, total: int, was_stopped: bool
+    ) -> None:
         try:
             self.stop_button.config(state="disabled")
         except Exception:
@@ -5828,8 +6023,14 @@ class SplatterGUI(ThemedTk):
 
         # Refresh current clip UI (convergence/border) so the results are immediately visible
         try:
-            if getattr(self, "previewer", None) and 0 <= self.previewer.current_video_index < len(self.previewer.video_list):
-                _depth_map = self.previewer.video_list[self.previewer.current_video_index].get("depth_map")
+            if getattr(
+                self, "previewer", None
+            ) and 0 <= self.previewer.current_video_index < len(
+                self.previewer.video_list
+            ):
+                _depth_map = self.previewer.video_list[
+                    self.previewer.current_video_index
+                ].get("depth_map")
                 if _depth_map:
                     self.update_gui_from_sidecar(_depth_map)
                     try:
@@ -6079,6 +6280,7 @@ class SplatterGUI(ThemedTk):
 
         try:
             from core.splatting.config_manager import save_settings_to_file
+
             config_to_save = self._get_current_config()
             save_settings_to_file(config_to_save, filename)
 
@@ -6810,12 +7012,17 @@ class SplatterGUI(ThemedTk):
             dp_seed = sidecar_config.get("dp_total_max_true", None)
             if dp_seed is None:
                 dp_seed = sidecar_config.get("dp_total_max_est", None)
-            if dp_seed is not None and getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_max_estimate"):
-                sig = self._dp_total_signature(depth_map_path, conv_val, disp_val, gamma_val)
+            if (
+                dp_seed is not None
+                and getattr(self, "previewer", None) is not None
+                and hasattr(self.previewer, "set_depth_pop_max_estimate")
+            ):
+                sig = self._dp_total_signature(
+                    depth_map_path, conv_val, disp_val, gamma_val
+                )
                 self.previewer.set_depth_pop_max_estimate(float(dp_seed), sig)
         except Exception:
             pass
-
 
         # Dilate X
         dilate_x_val = sidecar_config.get(

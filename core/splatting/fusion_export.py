@@ -12,7 +12,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from moviepy.editor import VideoFileClip
+    from moviepy.video.io.VideoFileClip import VideoFileClip
 except ImportError:
     # Fallback/stub for systems without moviepy
     class VideoFileClip:

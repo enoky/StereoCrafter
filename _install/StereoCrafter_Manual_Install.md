@@ -36,8 +36,6 @@ Cuda compilation tools, release 12.8, V12.8.89
 
 > If `nvcc` is not found or the version is incorrect, install the correct version from [NVIDIA's CUDA Toolkit page](https://developer.nvidia.com/cuda-toolkit).
 
----
-
 ### 2. Install uv Package Manager
 
 ```bash
@@ -46,9 +44,8 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 ```
 
----
 
-### 3. Clone the Repository with Submodules & change directory
+### 3. Clone the Repository with Submodules & Change Directory Path
 
 ```bash
 
@@ -71,40 +68,45 @@ uv sync
 
 ```
 
----
 
-## Stereocrafter weights install
+## 📦 Model Weights Installation
 
-Download and extract [model](https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso) "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
+The models are required to run StereoCrafter. You can download them automatically using the Hugging Face CLI (provided by the huggingface-hub package in your environment).
 
-Or manually download from the original locations below..
+### 1. Prerequisite: Accept Model Terms
 
+The SVD model is "Gated." You must manually accept the terms of use before you can download it:
 
-#### 1. Download the [SVD img2vid model](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) for the image encoder and VAE.
+- 1. Log in to [Hugging Face.](https://huggingface.co/)
+- 2. Visit the [SVD XT 1.1 Page.](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1)
+- 3. Click **"Agree and access repository"**.
+
+### 2. Authenticate your PC
+You need a "Read" Token from your [Hugging Face Settings.](https://huggingface.co/settings/tokens) Run this command and paste your token when prompted:
 
 ```bash
-# in StereoCrafter project root directory
-mkdir weights
-cd weights
-git lfs install
-git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1
-```
 
-#### 2. Download the [DepthCrafter model](https://huggingface.co/tencent/DepthCrafter) for the video depth estimation.
-```bash
-
-git clone https://huggingface.co/tencent/DepthCrafter
+uv run hf auth login
 
 ```
 
-#### 3. Download the [StereoCrafter model](https://huggingface.co/TencentARC/StereoCrafter) for the stereo video generation.
-```bash
+### 3. Download the Models
+Run these commands from the `StereoCrafter` root folder. The CLI will automatically create the `weights` folder if it doesn't exist:
 
-git clone https://huggingface.co/TencentARC/StereoCrafter
+```bash
+# 1. Download SVD img2vid (Gated - Requires Login)
+uv run hf download stabilityai/stable-video-diffusion-img2vid-xt-1-1 --local-dir weights/stable-video-diffusion-img2vid-xt-1-1
+
+# 2. Download DepthCrafter (Open)
+uv run hf download tencent/DepthCrafter --local-dir weights/DepthCrafter
+
+# 3. Download StereoCrafter (Open)
+uv run hf download TencentARC/StereoCrafter --local-dir weights/StereoCrafter
 
 ```
 
-You downloaded weights files should match the visual hiearchy below
+**Note:** Total download size is approximately 22GB. Ensure you have enough disk space.
+Your downloaded weights should contain files matching the visual hiearchy below.
 
 ```text
 
@@ -114,12 +116,8 @@ You downloaded weights files should match the visual hiearchy below
    │       config.json                                  
    │       diffusion_pytorch_model.safetensors          
    │                                                    
-   ├───stable-video-diffusion-img2vid-xt-1-1/
-   │   │   gitattributes                                
-   │   │   LICENSE.md                                   
-   │   │   model_index.json                             
-   │   │   README.md                                    
-   │   │   svd11.webp                                   
+   ├───stable-video-diffusion-img2vid-xt-1-1/  
+   │   │   model_index.json                            
    │   │   svd_xt_1_1.safetensors                       
    │   │                                                
    │   ├───feature_extractor/
@@ -143,22 +141,11 @@ You downloaded weights files should match the visual hiearchy below
    │           diffusion_pytorch_model.fp16.safetensors 
    │           diffusion_pytorch_model.safetensors      
    │                                                    
-   └───StereoCrafter/
-           .gitattributes                               
+   └───StereoCrafter/                        
            config.json                                  
-           diffusion_pytorch_model.safetensors          
-           LICENSE                                      
-           NOTICE                                       
-           README.md
+           diffusion_pytorch_model.safetensors         
 
 ```
----
-
-```
-
-> If this fails, ensure your NVIDIA driver, CUDA Toolkit, and PyTorch installation are compatible.
-
----
 
 ## ✅ Final Notes
 

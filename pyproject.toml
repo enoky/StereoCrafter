@@ -14,7 +14,7 @@ dependencies = [
     "imath>=0.0.2",
     "matplotlib>=3.10.8",
     "mediapy>=1.2.6",
-    "moviepy==1.0.3",
+    "moviepy>=2.1.1",
     "numpy==1.26.4",
     "opencv-python>=4.11.0.86",
     "openexr>=3.4.4",
