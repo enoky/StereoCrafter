@@ -75,6 +75,7 @@ cython_debug/
 
 # VS Code
 .vscode/
+.vs/
 
 # Custom
 

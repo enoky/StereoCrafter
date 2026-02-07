@@ -1,25 +1,62 @@
 @echo off
-REM --- StereoCrafter Repository Update Script ---
-REM This script is designed to be run from the root directory of a local Git repository.
+setlocal enabledelayedexpansion
 
 echo.
-echo Navigating to the script's directory...
-REM Change the current directory to the directory where this batch file is located.
+echo === StereoCrafter Modern Update Script ===
+echo.
+
+:: Change to the directory of this batch file
 cd /d "%~dp0"
 
-echo.
-echo Attempting to pull the latest changes from the remote GitHub repository (StereoCrafter)...
-REM Execute the git pull command to fetch and merge changes.
+:: 1. Git Pull
+echo [1/3] Pulling latest changes from GitHub...
 git pull
+if %errorlevel% neq 0 (
+    echo.
+    echo [ERROR] Git pull failed. You may have local changes that conflict.
+    echo Please commit or stash your changes and try again.
+    pause
+    exit /b %errorlevel%
+)
 
-REM Check the exit code of the last command (git pull)
+:: 2. Update Submodules
+:: Since StereoCrafter uses submodules, we MUST update them too 
+:: in case the developer updated a submodule link.
+echo [2/3] Updating submodules...
+git submodule update --init --recursive
+
+:: 3. UV Sync
+echo [3/3] Syncing dependencies with uv...
+
+:: Verify uv is installed (just in case they moved to a new machine)
+where uv >nul 2>&1
+if %errorlevel% neq 0 (
+    echo uv not found. Installing uv...
+    powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+    set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+)
+
+:: Run the sync
+uv sync
+
 if %errorlevel% equ 0 (
-echo.
-echo Successfully updated the repository.
+    echo.
+    echo =================================================
+    echo UPDATE SUCCESSFUL
+    echo Project and environment are now up to date.
+    echo =================================================
+    
+    :: Check for the old redundant venv folder
+    if exist "venv" (
+        echo.
+        echo [NOTE] A legacy 'venv' folder was detected. 
+        echo This project now uses '.venv' (with a dot) via UV.
+        echo The 'venv' folder is now REDUNDANT and can be safely deleted 
+        echo to save several GBs of disk space.
+    )
 ) else (
-echo.
-echo ERROR: Git pull failed [Error Code: %errorlevel%].
-echo Please check the error message above. You may need to commit or stash local changes first.
+    echo.
+    echo [WARNING] uv sync failed. Your environment might be inconsistent.
 )
 
 echo.

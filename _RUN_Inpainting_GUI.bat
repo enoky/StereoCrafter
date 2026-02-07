@@ -8,7 +8,7 @@ set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
 set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%PATH%"
 
 :: Activate the virtual environment
-call venv\scripts\activate.bat
+call .venv\Scripts\activate.bat
 
 :: Count how many GPUs are present
 set GPU_COUNT=0
