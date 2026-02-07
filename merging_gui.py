@@ -35,10 +35,11 @@ from dependency.stereocrafter_util import (
     find_video_by_core_name,
     find_sidecar_file,
     read_clip_sidecar,
+    apply_borders_to_frames,
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-01-17.0"
+GUI_VERSION = "26-01-17.1"
 
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
@@ -929,6 +930,16 @@ class MergingGUI(ThemedTk):
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
         self.widgets_to_disable.append(pad_check)
 
+        # --- NEW: Add Borders checkbox ---
+        self.add_borders_var = tk.BooleanVar(value=True)
+        borders_check = ttk.Checkbutton(
+            options_frame, text="Add Borders", variable=self.add_borders_var
+        )
+        borders_check.pack(side="left", padx=(15, 5))
+        self._create_hover_tooltip(borders_check, "add_borders")
+        self.widgets_to_disable.append(borders_check)
+        # --- END NEW ---
+
         # Add Batch Chunk Size option
         ttk.Label(options_frame, text="Batch Chunk Size:").pack(
             side="left", padx=(20, 5)
@@ -953,6 +964,13 @@ class MergingGUI(ThemedTk):
         )
         self.status_label.pack(pady=5)
 
+        # --- Border Info ---
+        self.border_info_var = tk.StringVar(value="Borders: N/A")
+        self.border_info_label = ttk.Label(
+            progress_frame, textvariable=self.border_info_var
+        )
+        self.border_info_label.pack(pady=2)
+
         buttons_frame = ttk.Frame(self, padding=10)
         buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(
@@ -967,6 +985,17 @@ class MergingGUI(ThemedTk):
         # Stop button is handled separately in _set_ui_processing_state
         self.stop_button.pack(side="left", padx=5, expand=True)
         self._create_hover_tooltip(self.stop_button, "stop_blending")
+
+        # --- NEW: Process Current Clip button ---
+        self.process_current_button = ttk.Button(
+            buttons_frame,
+            text="Process Current Clip",
+            command=self.process_current_clip,
+        )
+        self.process_current_button.pack(side="left", padx=5, expand=True)
+        self._create_hover_tooltip(self.process_current_button, "process_current_clip")
+        self.widgets_to_disable.append(self.process_current_button)
+        # --- END NEW ---
 
     def _browse_folder(self, var: tk.StringVar):
         folder = filedialog.askdirectory(initialdir=var.get())
@@ -994,6 +1023,19 @@ class MergingGUI(ThemedTk):
         return read_clip_sidecar(
             self.sidecar_manager, video_path, core_name, search_folders
         )
+
+    def _update_border_info(self, left_border: float, right_border: float):
+        """Updates the border info display in the GUI."""
+        if left_border > 0 or right_border > 0:
+            self.border_info_var.set(
+                f"Borders: L={left_border:.3f}%, R={right_border:.3f}%"
+            )
+        else:
+            self.border_info_var.set("Borders: None")
+
+    def _clear_border_info(self):
+        """Clears the border info display."""
+        self.border_info_var.set("Borders: N/A")
 
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
@@ -1174,7 +1216,7 @@ class MergingGUI(ThemedTk):
 
         # Run in a separate thread
         self.processing_thread = threading.Thread(
-            target=self.run_batch_process, args=(settings,), daemon=True
+            target=self.run_batch_process, args=(settings, None), daemon=True
         )
         self.processing_thread.start()
 
@@ -1183,12 +1225,58 @@ class MergingGUI(ThemedTk):
             self.stop_event.set()
             self.update_status_label("Stopping...")
 
+    def process_current_clip(self):
+        """Process the currently selected clip only."""
+        if self.is_processing:
+            messagebox.showwarning("Busy", "Processing is already in progress.")
+            return
+
+        # Get current video from previewer
+        if not hasattr(self, "previewer") or not self.previewer.video_list:
+            messagebox.showwarning("No Video", "No video loaded in previewer.")
+            return
+
+        current_index = getattr(self.previewer, "current_video_index", 0)
+        if current_index < 0 or current_index >= len(self.previewer.video_list):
+            messagebox.showwarning("Invalid Index", "No video selected.")
+            return
+
+        source_dict = self.previewer.video_list[current_index]
+        inpainted_path = source_dict.get("inpainted")
+
+        if not inpainted_path or not os.path.exists(inpainted_path):
+            messagebox.showwarning("Invalid Path", "Inpainted video path not found.")
+            return
+
+        # Get current settings
+        settings = self.get_current_settings()
+        if not settings:
+            return
+
+        # Temporarily set inpainted_folder to just this file's directory
+        settings["inpainted_folder"] = os.path.dirname(inpainted_path)
+
+        self.is_processing = True
+        self.stop_event.clear()
+        self._set_ui_processing_state(True)
+        self._clear_preview_resources()
+        base_name = os.path.basename(inpainted_path)
+        self.update_status_label(f"Processing single clip: {base_name}")
+
+        # Run in a separate thread using the existing batch processor
+        # Pass the specific video path to process only this one
+        self.processing_thread = threading.Thread(
+            target=self.run_batch_process, args=(settings, inpainted_path), daemon=True
+        )
+        self.processing_thread.start()
+
     def processing_done(self, stopped=False):
         self.is_processing = False
         self._set_ui_processing_state(False)  # Re-enable UI
         message = "Processing stopped." if stopped else "Processing completed."
         self.update_status_label(message)
         self.progress_var.set(0)
+        self._clear_border_info()
 
         # --- NEW: Schedule VRAM release after a short delay to ensure stability ---
         delay_ms = 2000  # 2 seconds
@@ -1206,6 +1294,7 @@ class MergingGUI(ThemedTk):
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
                 "pad_to_16_9": self.pad_to_16_9_var.get(),
+                "add_borders": self.add_borders_var.get(),
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
@@ -1249,17 +1338,25 @@ class MergingGUI(ThemedTk):
             if pipe:
                 pipe.close()
 
-    def run_batch_process(self, settings):
+    def run_batch_process(self, settings, single_video_path=None):
         """
         This is the main logic that will run in a background thread.
+        If single_video_path is provided, only process that one video.
         """
         if settings is None:
             self.after(0, self.processing_done, True)
             return
 
-        inpainted_videos = sorted(
-            glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4"))
-        )
+        # Single video mode
+        if single_video_path and os.path.exists(single_video_path):
+            inpainted_videos = [single_video_path]
+            single_mode = True
+        else:
+            inpainted_videos = sorted(
+                glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4"))
+            )
+            single_mode = False
+
         if not inpainted_videos:
             self.after(
                 0,
@@ -1279,6 +1376,10 @@ class MergingGUI(ThemedTk):
         for i, inpainted_video_path in enumerate(inpainted_videos):
             if self.stop_event.is_set():
                 logger.info("Processing stopped by user.")
+                break
+
+            # In single mode, stop after processing the first video
+            if single_mode and i > 0:
                 break
 
             base_name = os.path.basename(inpainted_video_path)
@@ -1319,9 +1420,12 @@ class MergingGUI(ThemedTk):
                 clip_sidecar_data = self._read_clip_sidecar(
                     inpainted_video_path, core_name
                 )
-                logger.debug(
-                    f"Sidecar data for '{core_name}': convergence_plane={clip_sidecar_data.get('convergence_plane')}, max_disparity={clip_sidecar_data.get('max_disparity')}"
+                logger.info(
+                    f"Sidecar for '{core_name}': convergence_plane={clip_sidecar_data.get('convergence_plane')}, max_disparity={clip_sidecar_data.get('max_disparity')}, left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}"
                 )
+                left_border = clip_sidecar_data.get("left_border", 0.0)
+                right_border = clip_sidecar_data.get("right_border", 0.0)
+                self._update_border_info(left_border, right_border)
                 # --- END NEW ---
 
                 mask_folder = settings["mask_folder"]
@@ -1610,6 +1714,24 @@ class MergingGUI(ThemedTk):
                         + inpainted * processed_mask
                     )
 
+                    # --- NEW: Apply borders from sidecar ---
+                    left_border = clip_sidecar_data.get("left_border", 0.0)
+                    right_border = clip_sidecar_data.get("right_border", 0.0)
+                    logger.debug(f"Borders: left={left_border}%, right={right_border}%")
+                    if settings.get("add_borders", True) and (
+                        left_border > 0 or right_border > 0
+                    ):
+                        logger.debug(
+                            f"Before border: original_left shape={original_left.shape}, blended_right_eye shape={blended_right_eye.shape}"
+                        )
+                        original_left, blended_right_eye = apply_borders_to_frames(
+                            left_border, right_border, original_left, blended_right_eye
+                        )
+                        logger.debug(
+                            f"After border: original_left shape={original_left.shape}, blended_right_eye shape={blended_right_eye.shape}"
+                        )
+                    # --- END NEW ---
+
                     # --- NEW: Assemble final frame based on output format ---
                     if output_format == "Full SBS (Left-Right)":
                         final_chunk = torch.cat(
@@ -1853,6 +1975,8 @@ class MergingGUI(ThemedTk):
         ]
 
         video_source_list = []
+        self._clear_border_info()  # Clear border info before scanning
+
         for inpainted_path in valid_inpainted_videos:
             base_name = os.path.basename(inpainted_path)
             inpaint_suffix = "_inpainted_right_eye.mp4"
@@ -1880,8 +2004,11 @@ class MergingGUI(ThemedTk):
             # --- NEW: Read sidecar file for this clip ---
             clip_sidecar_data = self._read_clip_sidecar(inpainted_path, core_name)
             logger.debug(
-                f"Preview Scan: Sidecar for '{core_name}': convergence_plane={clip_sidecar_data.get('convergence_plane')}, max_disparity={clip_sidecar_data.get('max_disparity')}"
+                f"Preview Scan: Sidecar for '{core_name}': convergence_plane={clip_sidecar_data.get('convergence_plane')}, max_disparity={clip_sidecar_data.get('max_disparity')}, left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}"
             )
+            left_border = clip_sidecar_data.get("left_border", 0.0)
+            right_border = clip_sidecar_data.get("right_border", 0.0)
+            self._update_border_info(left_border, right_border)
             # --- END NEW ---
 
             mask_folder = self.mask_folder_var.get()
@@ -1903,6 +2030,7 @@ class MergingGUI(ThemedTk):
                 "original": None,
                 "is_sbs_input": is_sbs_input,
                 "is_quad_input": False,
+                "sidecar": clip_sidecar_data,  # Store sidecar data for borders
             }
 
             if splatted4_matches:
@@ -2087,6 +2215,31 @@ class MergingGUI(ThemedTk):
             blended_frame = (
                 right_eye_original * (1 - processed_mask) + inpainted * processed_mask
             )
+
+            # --- NEW: Apply borders from sidecar ---
+            current_source_metadata = self.previewer.video_list[
+                self.previewer.current_video_index
+            ]
+            clip_sidecar = current_source_metadata.get("sidecar", {})
+            left_border = clip_sidecar.get("left_border", 0.0)
+            right_border = clip_sidecar.get("right_border", 0.0)
+            logger.debug(f"Preview Borders: left={left_border}%, right={right_border}%")
+            if clip_sidecar:
+                self._update_border_info(left_border, right_border)
+            else:
+                self._clear_border_info()
+
+            if self.add_borders_var.get() and (left_border > 0 or right_border > 0):
+                logger.debug(
+                    f"Preview: Before border - original_left shape={original_left.shape}, blended_frame shape={blended_frame.shape}"
+                )
+                original_left, blended_frame = apply_borders_to_frames(
+                    left_border, right_border, original_left, blended_frame
+                )
+                logger.debug(
+                    f"Preview: After border - original_left shape={original_left.shape}, blended_frame shape={blended_frame.shape}"
+                )
+            # --- END NEW ---
 
             # 4. Select the final frame to display based on the dropdown
             preview_source = self.preview_source_var.get()

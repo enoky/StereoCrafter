@@ -293,17 +293,87 @@ def read_clip_sidecar(
         for folder in search_folders:
             sidecar_path = find_sidecar_in_folder(folder, core_name)
             if sidecar_path:
-                logger.info(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+                logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
                 return sidecar_manager.load_sidecar_data(sidecar_path)
 
     # Then check next to video file
     sidecar_path = find_sidecar_file(video_path)
     if sidecar_path:
-        logger.info(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
+        logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
         return sidecar_manager.load_sidecar_data(sidecar_path)
 
     logger.debug(f"No sidecar file found for '{core_name}'. Using defaults.")
     return sidecar_manager._get_defaults()
+
+
+def apply_borders_to_frames(
+    left_border_pct: float,
+    right_border_pct: float,
+    original_left: torch.Tensor,
+    blended_right: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply borders to the left and right eye frames by zeroing out border pixels.
+    This creates black borders while keeping the original frame dimensions.
+
+    Args:
+        left_border_pct: Left border value (can be percentage or pixels if > 100)
+        right_border_pct: Right border value (can be percentage or pixels if > 100)
+        original_left: Left eye tensor [B, C, H, W]
+        blended_right: Right eye tensor [B, C, H, W]
+
+    Returns:
+        Tuple of (left_with_border, right_with_border) tensors with borders applied
+    """
+    if left_border_pct <= 0 and right_border_pct <= 0:
+        return original_left, blended_right
+
+    _, _, H, W = original_left.shape
+
+    # Check if values are likely pixels (if > 100) or percentage (<= 100)
+    if left_border_pct > 100 or right_border_pct > 100:
+        # Assume values are in pixels
+        left_px = int(round(left_border_pct))
+        right_px = int(round(right_border_pct))
+        left_is_pct = False
+        right_is_pct = False
+    else:
+        # Assume values are in percentage
+        left_px = int(round(W * left_border_pct / 100.0))
+        right_px = int(round(W * right_border_pct / 100.0))
+        left_is_pct = True
+        right_is_pct = True
+
+    logger.debug(
+        f"Apply borders: W={W}, left={left_border_pct}({'px' if not left_is_pct else '%'}->{left_px}px), right={right_border_pct}({'px' if not right_is_pct else '%'}->{right_px}px)"
+    )
+
+    # Validate pixel values
+    if left_px < 0:
+        left_px = 0
+    if right_px < 0:
+        right_px = 0
+    if left_px >= W or right_px >= W:
+        logger.warning(
+            f"Borders too large (left={left_px}, right={right_px}) for width={W}. Skipping."
+        )
+        return original_left, blended_right
+
+    # Create copies to avoid modifying originals
+    left_with_border = original_left.clone()
+    right_with_border = blended_right.clone()
+
+    # Zero out the border pixels (create black borders)
+    if left_px > 0:
+        left_with_border[:, :, :, :left_px] = 0.0
+        logger.debug(f"Zeroed left border: {left_px} pixels")
+    if right_px > 0:
+        right_with_border[:, :, :, -right_px:] = 0.0
+        logger.debug(f"Zeroed right border: {right_px} pixels")
+
+    logger.debug(f"Borders applied successfully")
+
+    return left_with_border, right_with_border
 
 
 def apply_color_transfer(
