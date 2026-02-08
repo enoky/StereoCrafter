@@ -1446,6 +1446,16 @@ class SplatterGUI(ThemedTk):
         self.file_menu.add_command(
             label="Restore Finished", command=self.restore_finished_files
         )
+        self.file_menu.add_separator()
+
+        self.file_menu.add_command(
+            label="Sidecars: Depth → Source (remove _depth)",
+            command=self.move_sidecars_depth_to_source,
+        )
+        self.file_menu.add_command(
+            label="Sidecars: Source → Depth (add _depth)",
+            command=self.move_sidecars_source_to_depth,
+        )
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.debug_logging_var = tk.BooleanVar(value=self._debug_logging_enabled)
@@ -1829,7 +1839,7 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo = ttk.Combobox(
             self.auto_conv_frame,
             textvariable=self.auto_convergence_mode_var,
-            values=["Off", "Average", "Peak", "Hybrid"],
+            values=["Off", "Manual", "Average", "Peak", "Hybrid"],
             state="readonly",
             width=10,
         )
@@ -4662,6 +4672,121 @@ class SplatterGUI(ThemedTk):
                 "Restore Complete", "No files found in 'finished' folders to restore."
             )
 
+    def move_sidecars_depth_to_source(self):
+        """Moves sidecar files from depth folder to source folder, removing _depth suffix."""
+        depth_dir = self.input_depth_maps_var.get()
+        source_dir = self.input_source_clips_var.get()
+
+        if not os.path.isdir(depth_dir):
+            messagebox.showerror(
+                "Error", "Depth Maps folder is not set or doesn't exist."
+            )
+            return
+        if not os.path.isdir(source_dir):
+            messagebox.showerror(
+                "Error", "Source Clips folder is not set or doesn't exist."
+            )
+            return
+
+        sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+
+        moved_count = 0
+        errors_count = 0
+
+        if not messagebox.askyesno(
+            "Sidecars: Depth → Source",
+            f"This will move sidecar files from:\n  {depth_dir}\nto:\n  {source_dir}\n\nRemoving '_depth' suffix from filenames.\n\nContinue?",
+        ):
+            return
+
+        for filename in os.listdir(depth_dir):
+            if filename.endswith(sidecar_ext):
+                depth_name = filename[: -len(sidecar_ext)]
+                if depth_name.endswith("_depth"):
+                    source_name = depth_name[:-6] + sidecar_ext
+                else:
+                    source_name = depth_name + sidecar_ext
+
+                src_path = os.path.join(depth_dir, filename)
+                dest_path = os.path.join(source_dir, source_name)
+
+                if os.path.isfile(dest_path):
+                    logger.debug(f"Destination sidecar exists, skipping: {source_name}")
+                    continue
+
+                try:
+                    shutil.move(src_path, dest_path)
+                    moved_count += 1
+                    logger.debug(f"Moved '{filename}' → '{source_name}'")
+                except Exception as e:
+                    errors_count += 1
+                    logger.error(f"Error moving '{filename}': {e}")
+
+        self.clear_processing_info()
+        self.status_label.config(
+            text=f"Moved {moved_count} sidecars, {errors_count} errors."
+        )
+        messagebox.showinfo(
+            "Complete",
+            f"Sidecars moved: {moved_count}\nErrors: {errors_count}",
+        )
+
+    def move_sidecars_source_to_depth(self):
+        """Moves sidecar files from source folder to depth folder, adding _depth suffix."""
+        source_dir = self.input_source_clips_var.get()
+        depth_dir = self.input_depth_maps_var.get()
+
+        if not os.path.isdir(source_dir):
+            messagebox.showerror(
+                "Error", "Source Clips folder is not set or doesn't exist."
+            )
+            return
+        if not os.path.isdir(depth_dir):
+            messagebox.showerror(
+                "Error", "Depth Maps folder is not set or doesn't exist."
+            )
+            return
+
+        sidecar_ext = self.APP_CONFIG_DEFAULTS.get("SIDECAR_EXT", ".fssidecar")
+
+        moved_count = 0
+        errors_count = 0
+
+        if not messagebox.askyesno(
+            "Sidecars: Source → Depth",
+            f"This will move sidecar files from:\n  {source_dir}\nto:\n  {depth_dir}\n\nAdding '_depth' suffix to filenames.\n\nContinue?",
+        ):
+            return
+
+        for filename in os.listdir(source_dir):
+            if filename.endswith(sidecar_ext):
+                source_name = filename[: -len(sidecar_ext)]
+                depth_name = source_name + "_depth" + sidecar_ext
+
+                src_path = os.path.join(source_dir, filename)
+                dest_path = os.path.join(depth_dir, depth_name)
+
+                if os.path.isfile(dest_path):
+                    logger.debug(f"Destination sidecar exists, skipping: {depth_name}")
+                    continue
+
+                try:
+                    shutil.move(src_path, dest_path)
+                    moved_count += 1
+                    logger.debug(f"Moved '{filename}' → '{depth_name}'")
+                except Exception as e:
+                    errors_count += 1
+                    logger.error(f"Error moving '{filename}': {e}")
+
+        self.clear_processing_info()
+        self.status_label.config(
+            text=f"Moved {moved_count} sidecars, {errors_count} errors."
+        )
+        messagebox.showinfo(
+            "Complete",
+            f"Sidecars moved: {moved_count}\nErrors: {errors_count}",
+        )
+
     def _round_slider_variable_value(self, tk_var: tk.Variable, decimals: int):
         """Rounds the float/string value of a tk.Variable and sets it back."""
         try:
@@ -5802,12 +5927,24 @@ class SplatterGUI(ThemedTk):
 
             current_data = self.sidecar_manager.load_sidecar_data(json_sidecar_path)
 
-            # Apply current GUI settings snapshot (preserves overlap/bias from existing sidecar)
-            current_data.update(base_sidecar_data)
-
-            # 1) AUTO-CONVERGE (optional)
-            conv_val = fallback_anchor
-            if auto_conv_mode and auto_conv_mode != "Off":
+            # 1) AUTO-CONVERGENCE / MANUAL
+            # "Off" - preserve existing sidecar values (don't touch convergence_plane or max_disparity)
+            # "Manual" - write current slider values
+            # "Average"/"Peak"/"Hybrid" - calculate and write auto-convergence values
+            conv_val = None  # Will be set if we're not in "Off" mode
+            if auto_conv_mode == "Off":
+                # Don't touch convergence_plane or max_disparity - preserve from sidecar
+                pass
+            elif auto_conv_mode == "Manual":
+                # Write current slider values but don't calculate
+                current_data["convergence_plane"] = float(
+                    base_sidecar_data.get("convergence_plane", fallback_anchor)
+                )
+                current_data["max_disparity"] = float(
+                    base_sidecar_data.get("max_disparity", max_disp)
+                )
+            else:
+                # Calculate auto-convergence
                 avg_val, peak_val = self._determine_auto_convergence(
                     rgb_path,
                     depth_path,
@@ -5825,9 +5962,20 @@ class SplatterGUI(ThemedTk):
                 else:
                     conv_val = avg_val
 
-            current_data["convergence_plane"] = float(conv_val)
+                current_data["convergence_plane"] = float(conv_val)
+                # Apply GUI snapshot for non-convergence settings (preserves overlap/bias)
+                current_data.update(base_sidecar_data)
 
-            # 2) AUTO-BORDER (optional) – runs AFTER convergence (conv_val affects borders)
+            # Get conv_val for border calculations (may be None if auto_conv_mode was "Off")
+            effective_conv_val = conv_val
+            if effective_conv_val is None:
+                effective_conv_val = float(
+                    current_data.get("convergence_plane", fallback_anchor)
+                )
+            effective_max_disp = float(current_data.get("max_disparity", max_disp))
+
+            # 2) AUTO-BORDER (optional) – runs AFTER convergence
+            # GUI border_mode overrides sidecar unless set to "Off"
             if border_mode == "Auto Basic":
                 tv_disp_comp = 1.0
                 try:
@@ -5844,28 +5992,39 @@ class SplatterGUI(ThemedTk):
                     tv_disp_comp = 1.0
 
                 width = max(
-                    0.0, (1.0 - conv_val) * 2.0 * (max_disp / 20.0) * tv_disp_comp
+                    0.0,
+                    (1.0 - effective_conv_val)
+                    * 2.0
+                    * (effective_max_disp / 20.0)
+                    * tv_disp_comp,
                 )
                 width = min(5.0, width)
-                current_data["left_border"] = round(float(width), 3)
-                current_data["right_border"] = round(float(width), 3)
-                # Freeze borders into manual left/right so it's easy to tweak later
-                current_data["border_mode"] = "Manual"
+                # Store auto value for UI caching, left_border/right_border calculated from this
+                current_data["auto_border_L"] = round(float(width), 3)
+                current_data["auto_border_R"] = round(float(width), 3)
+                current_data["border_mode"] = "Auto Basic"
 
             elif border_mode == "Auto Adv.":
                 scan = self._scan_borders_for_depth_path(
-                    depth_path, float(conv_val), max_disp, gamma
+                    depth_path, float(effective_conv_val), effective_max_disp, gamma
                 )
                 if scan:
                     l_val, r_val = scan
                 else:
                     l_val, r_val = 0.0, 0.0
-                current_data["left_border"] = float(l_val)
-                current_data["right_border"] = float(r_val)
+                # Store auto values for UI caching
+                current_data["auto_border_L"] = float(l_val)
+                current_data["auto_border_R"] = float(r_val)
+                current_data["border_mode"] = "Auto Adv."
+
+            elif border_mode == "Manual":
+                # Write current GUI border slider values to sidecar
+                current_data["left_border"] = float(manual_left)
+                current_data["right_border"] = float(manual_right)
                 current_data["border_mode"] = "Manual"
 
             else:
-                # Off or Manual – do not touch borders (preserve existing per-clip values)
+                # "Off" – do not touch borders (preserve existing per-clip values from sidecar)
                 pass
 
             # Save sidecar
@@ -5873,8 +6032,8 @@ class SplatterGUI(ThemedTk):
             try:
                 dp_est = self._estimate_dp_total_max_for_depth_video(
                     depth_path,
-                    float(current_data.get("convergence_plane", conv_val)),
-                    float(current_data.get("max_disparity", max_disp)),
+                    effective_conv_val,
+                    effective_max_disp,
                     float(current_data.get("gamma", gamma)),
                     sample_frames=10,
                     pixel_stride=8,

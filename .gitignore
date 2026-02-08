@@ -102,3 +102,4 @@ config_sidecaredit.json
 config_merging.mergecfg
 config_splat.splatcfg
 nul
+AGENTS.md

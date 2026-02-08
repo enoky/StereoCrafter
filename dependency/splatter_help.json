@@ -23,7 +23,7 @@
     "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
     "color_tags_mode": "Writes color metadata tags into output file headers (primaries/transfer/matrix/range). Auto uses detected tags when available; otherwise falls back to BT.709. This changes metadata only. Increases compatability.",
-    "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged or peak throughout the clip.",
+    "auto_convergence_toggle": "Select auto-convergence mode. Off: preserve existing sidecar values. Manual: write current slider values. Average/Peak/Hybrid: calculate auto-convergence from depth. Used by Preview Auto-Converge and AUTO-PASS.",
     "depth_dilate_size_x": "Horizontal Dilate for the Depthhmask. Bilinear blending for decimals. 0 to disable. Below 0 applies erosion.",
     "depth_dilate_size_y": "Vertical Dilate for the Depthhmask. Bilinear blending for decimals. 0 to disable. Below 0 applies erosion.",
     "depth_blur_size_x": "Horizontal Blur for the Depth Mask.",
@@ -52,7 +52,7 @@
     "process_to": "Optional: Enter an ending video number (1-based) to stop processing at that point in the list. Leave empty to process to the end.",
     "stop_button": "Stops the currently running processing task cleanly.",
     "preview_auto_converge": "Runs the Auto-Convergence pre-pass on the current preview clip. The calculated value overrides the Convergence Point slider. Requires Auto-Convergence Mode to be 'Average' or 'Peak'.",
-    "auto_pass_button": "Runs through the Preview list (or From/To range), per clip: (1) Auto-Converge (Average/Peak/Hybrid unless Off), then (2) Auto-Border if Auto Basic or Auto Adv, then (3) saves sidecar with the computed convergence and borders plus your current slider settings. Auto-Border results are written into left_border/right_border (saved as Manual) so you can tweak them afterward. Takes map gamma into account. Best run once BEFORE specific scene edits.",
+    "auto_pass_button": "Runs through the Preview list (or From/To range), per clip: (1) Converge (Off=preserve, Manual=write sliders, Average/Peak/Hybrid=calculate), (2) Auto-Border if Auto Basic/Adv, then (3) saves sidecar. Auto-Border writes left_border/right_border (Manual mode). Best run once BEFORE scene edits.",
     "update_sidecar_button": "Saves/Edit the current depth setting to the to the sidecar file for inpainting_gui to process. Shortcut: Enter",
     "skip_lowres_preproc": "EXPERIMENTAL: Skip depthmap dilation/erosion/blur for low-res splatting. Also skips the resize to clip-resolution parity path for the low-res pass."
 }

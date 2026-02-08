@@ -32,10 +32,11 @@ These parameters configure the core splatting and output encoding process.
 
 - **Process Length:** Sets how many frames to process before moving on to the next video. Use `-1` to process all frames.
 - **Auto-Convergence:**
-  - **Off:** Disable auto-convergence.
+  - **Off:** Disable auto-convergence and preserve existing sidecar values.
+  - **Manual:** Write current slider values to sidecar (useful for batch-updating settings).
   - **Average:** Simple auto-convergence derived from the temporal average of the center 75% depth region.
   - **Peak:** Simple auto-convergence derived from the temporal maximum of the center 75% depth region.
-  - **Note:** If a sidecar file exists, its values will take precedence unless overridden.
+  - **Hybrid:** Combines Average and Peak (50/50 blend).
 - **Output CRF (Full / Low):** Constant Rate Factor for video encoding. Lower values mean higher quality. You can now set different quality levels for the Full Resolution and Low Resolution outputs independently.
 - **Color Tags:** Metadata-only tags written into the output file headers (e.g., BT.709, BT.2020). This does not affect the splatting math but helps players/editors interpret the color space correctly.
 
@@ -93,6 +94,8 @@ Settings here apply to both Full and Low-resolution outputs.
   - **Auto Save Sidecar on Next:** Automatically saves current slider values to the sidecar when navigating clips.
   - **Update Slider from Sidecar:** Automatically updates sliders to match the sidecar values when a new clip is loaded.
   - **Reset to Default / Restore Finished:** Reset GUI settings or move files back from a "finished" folder.
+  - **Sidecars: Depth → Source (remove _depth):** Moves sidecar files from the Depth Maps folder to the Source Clips folder, removing the `_depth` suffix from filenames. Useful for migrating sidecars to the new location.
+  - **Sidecars: Source → Depth (add _depth):** Moves sidecar files from the Source Clips folder to the Depth Maps folder, adding the `_depth` suffix to filenames. Useful for moving sidecars back to the depth folder.
 - **Help Menu:**
   - **User Guide:** Opens this document.
   - **Debug Logging:** Enables verbose console output for troubleshooting.
