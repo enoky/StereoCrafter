@@ -2731,6 +2731,9 @@ class SplatterGUI(ThemedTk):
             return fallback_anchor, fallback_anchor
 
         try:
+            logger.debug(
+                f"_determine_auto_convergence: Processing {os.path.basename(rgb_path)}..."
+            )
             res = self.convergence_estimator.estimate_convergence(
                 rgb_path=rgb_path,
                 depth_path=depth_path,
@@ -2741,9 +2744,14 @@ class SplatterGUI(ThemedTk):
                 scan_borders=False,  # Don't scan borders for this call
             )
             avg_val, peak_val, _, _ = res
+            logger.debug(
+                f"_determine_auto_convergence: {os.path.basename(rgb_path)} -> avg={avg_val:.4f}, peak={peak_val:.4f}"
+            )
             return avg_val, peak_val
         except Exception as e:
-            logger.error(f"Auto-convergence determination failed: {e}")
+            logger.error(
+                f"Auto-convergence determination failed for {os.path.basename(rgb_path)}: {e}"
+            )
             return fallback_anchor, fallback_anchor
 
     def exit_app(self):
@@ -5988,6 +5996,9 @@ class SplatterGUI(ThemedTk):
                 )
             else:
                 # Calculate auto-convergence
+                logger.debug(
+                    f"AUTO-PASS: Calculating convergence for {os.path.basename(rgb_path)}..."
+                )
                 avg_val, peak_val = self._determine_auto_convergence(
                     rgb_path,
                     depth_path,
@@ -5995,6 +6006,9 @@ class SplatterGUI(ThemedTk):
                     batch_size,
                     fallback_anchor,
                     gamma=gamma,
+                )
+                logger.debug(
+                    f"AUTO-PASS: {os.path.basename(rgb_path)} - avg={avg_val:.4f}, peak={peak_val:.4f}"
                 )
                 if auto_conv_mode == "Average":
                     conv_val = avg_val
@@ -6005,9 +6019,18 @@ class SplatterGUI(ThemedTk):
                 else:
                     conv_val = avg_val
 
-                current_data["convergence_plane"] = float(conv_val)
                 # Apply GUI snapshot for non-convergence settings (preserves overlap/bias)
-                current_data.update(base_sidecar_data)
+                # but remove convergence_plane and max_disparity so they don't overwrite our calculated values
+                filtered_sidecar_data = base_sidecar_data.copy()
+                filtered_sidecar_data.pop("convergence_plane", None)
+                filtered_sidecar_data.pop("max_disparity", None)
+                current_data.update(filtered_sidecar_data)
+
+                # Now set the calculated convergence value (won't be overwritten)
+                current_data["convergence_plane"] = float(conv_val)
+                logger.info(
+                    f"Auto-Converge Saved: convergence={conv_val:.4f} for {os.path.basename(rgb_path)}"
+                )
 
             # Get conv_val for border calculations (may be None if auto_conv_mode was "Off")
             effective_conv_val = conv_val
