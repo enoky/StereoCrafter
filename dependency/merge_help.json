@@ -16,9 +16,12 @@
     "output_format": "Selects the 3D format for the final video. Full SBS is highest quality. Half SBS is more compatible but lower resolution. Double SBS is a vertically stretched format for some 3D displays. Anaglyph is for Red/Cyan glasses.",
     "use_gpu": "If checked, mask processing will be performed on the GPU for speed. Uncheck to use the CPU, which is slower but uses very little VRAM.",
     "pad_to_16_9": "If checked, adds black bars to the top and bottom of the video to force a 16:9 aspect ratio. Useful for non-standard resolutions (e.g., 1920x800) to ensure compatibility with 3D players.",
+    "add_borders": "If checked, applies borders from sidecar files to mask edge artifacts. Uncheck to disable border application for testing.",
+    "resume": "If checked, moves processed files to a 'finished' subfolder after successful encoding and skips them on subsequent runs. Useful for resuming interrupted batch processing.",
     "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
     "batch_chunk_size": "The number of frames to process in memory at one time during batch processing. Lower this value if you run out of RAM on long videos.",
 
     "start_blending": "Starts the batch process to merge all found videos using the current settings.",
-    "stop_blending": "Stops the batch process after the current video chunk is finished."
+    "stop_blending": "Stops the batch process after the current video chunk is finished.",
+    "process_current_clip": "Processes only the currently selected clip in the preview. Useful for testing settings on a single video without processing the entire batch."
 }
