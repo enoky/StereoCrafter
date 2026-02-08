@@ -39,7 +39,7 @@ from dependency.stereocrafter_util import (
 )
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-01-17.1"
+GUI_VERSION = "26-02-08.3"
 
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
