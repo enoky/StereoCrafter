@@ -947,7 +947,7 @@ class MergingGUI(ThemedTk):
         # --- END NEW ---
 
         # --- NEW: Resume checkbox ---
-        self.resume_var = tk.BooleanVar(value=False)
+        self.resume_var = tk.BooleanVar(value=self.app_config.get("resume", False))
         self.resume_var.trace_add("write", self._on_resume_changed)
         resume_check = ttk.Checkbutton(
             options_frame, text="Resume", variable=self.resume_var
@@ -1487,7 +1487,7 @@ class MergingGUI(ThemedTk):
                     inpainted_video_path, core_name
                 )
                 logger.info(
-                    f"Sidecar for '{core_name}': convergence_plane={clip_sidecar_data.get('convergence_plane')}, max_disparity={clip_sidecar_data.get('max_disparity')}, left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}"
+                    f"Sidecar for '{core_name}': left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}"
                 )
                 left_border = clip_sidecar_data.get("left_border", 0.0)
                 right_border = clip_sidecar_data.get("right_border", 0.0)
@@ -1932,6 +1932,16 @@ class MergingGUI(ThemedTk):
                                     settings["original_folder"],
                                 )
                             )
+                            # Also move sidecar for original video
+                            original_base = os.path.splitext(
+                                original_video_path_to_move
+                            )[0]
+                            for ext in [".fssidecar", ".json"]:
+                                sidecar_path = original_base + ext
+                                if os.path.exists(sidecar_path):
+                                    self.cleanup_queue.put(
+                                        (sidecar_path, settings["original_folder"])
+                                    )
                         # Also move sidecar if it exists
                         inpainted_base = os.path.splitext(inpainted_video_path)[0]
                         for ext in [".fssidecar", ".json"]:
