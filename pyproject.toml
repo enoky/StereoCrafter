@@ -38,3 +38,23 @@ torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 xformers = { index = "pytorch" }
+
+[tool.ruff]
+# Global settings go here
+line-length = 120
+indent-width = 4  # Moved out of [tool.ruff.format]
+
+[tool.ruff.format]
+# Formatter-specific settings go here
+indent-style = "space"
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+# Linter-specific settings go here
+ignore = ["E501"]
+select = ["E", "F", "W"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.0",
+]
