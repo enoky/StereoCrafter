@@ -1061,6 +1061,26 @@ class VideoPreviewer(ttk.Frame):
 
         main_source_path = source_paths.get("source_video", None)
 
+        # Check if source exists but depth map is missing
+        depth_map_path = source_paths.get("depth_map", None)
+        if main_source_path and os.path.exists(main_source_path):
+            if not depth_map_path or not os.path.exists(depth_map_path):
+                logger.warning(
+                    f"Source video exists but depth map is missing for: {base_name}. "
+                    f"Expected depth map at: {depth_map_path}"
+                )
+                messagebox.showwarning(
+                    "Missing Depth Map",
+                    f"Source video found but depth map is missing:\n\n"
+                    f"Video: {base_name}\n"
+                    f"Expected depth map: {depth_map_path or 'Not specified'}\n\n"
+                    f"Please check your depth maps folder or generate the depth map first.",
+                )
+                self.load_preview_button.config(
+                    text="Load/Refresh List", style="TButton"
+                )
+                return
+
         initial_frame = 0
         if main_source_path == self.last_loaded_video_path:
             # If the path is the SAME, retain the last frame index.

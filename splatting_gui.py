@@ -2701,7 +2701,50 @@ class SplatterGUI(ThemedTk):
         except ValueError:
             pass  # Invalid current value
 
-    # _determine_auto_convergence definition removed (moved to earlier in file)
+    def _determine_auto_convergence(
+        self,
+        rgb_path: str,
+        depth_path: str,
+        process_length: int,
+        batch_size: int,
+        fallback_anchor: float,
+        gamma: float = 1.0,
+    ):
+        """Determine auto-convergence values for a video clip.
+
+        Args:
+            rgb_path: Path to the RGB source video
+            depth_path: Path to the depth map video
+            process_length: Number of frames to process (-1 for all)
+            batch_size: Unused (legacy parameter)
+            fallback_anchor: Fallback value if estimation fails
+            gamma: Gamma correction for depth (default: 1.0)
+
+        Returns:
+            Tuple of (average_convergence, peak_convergence)
+        """
+        if (
+            not hasattr(self, "convergence_estimator")
+            or self.convergence_estimator is None
+        ):
+            logger.error("Convergence estimator not initialized")
+            return fallback_anchor, fallback_anchor
+
+        try:
+            res = self.convergence_estimator.estimate_convergence(
+                rgb_path=rgb_path,
+                depth_path=depth_path,
+                process_length=int(process_length),
+                gamma=float(gamma),
+                fallback_value=float(fallback_anchor),
+                stop_event=self.stop_event,
+                scan_borders=False,  # Don't scan borders for this call
+            )
+            avg_val, peak_val, _, _ = res
+            return avg_val, peak_val
+        except Exception as e:
+            logger.error(f"Auto-convergence determination failed: {e}")
+            return fallback_anchor, fallback_anchor
 
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
