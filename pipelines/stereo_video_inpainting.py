@@ -98,7 +98,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.mask_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=False, do_convert_grayscale=True
         )
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance):
@@ -359,6 +359,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         self,
         frames: Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor],
         frames_mask: Union[PIL.Image.Image, List[PIL.Image.Image], torch.FloatTensor],
+        mask_binarize_threshold: Optional[float] = 0.5,
         height: int = 576,
         width: int = 1024,
         num_frames: Optional[int] = None,
@@ -383,6 +384,8 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         Args:
             frames: (f, c, h, w) in [0, 1], torch.FloatTensor
             frames_mask: (f, 1, h, w) in [0, 1], torch.FloatTensor
+            mask_binarize_threshold (`float`, *optional*, defaults to `0.5`):
+                Threshold used to binarize `frames_mask` before denoising. Set to `None` to keep soft mask values.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -491,6 +494,16 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         frames = frames + noise_aug_strength * noise
         
         frames_mask = self.mask_processor.preprocess(frames_mask, height=height,width=width)
+        if mask_binarize_threshold is not None:
+            try:
+                threshold = float(mask_binarize_threshold)
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid mask_binarize_threshold '{mask_binarize_threshold}', defaulting to 0.5")
+                threshold = 0.5
+            if not (0.0 <= threshold <= 1.0):
+                logger.warning(f"mask_binarize_threshold {threshold} outside [0,1], defaulting to 0.5")
+                threshold = 0.5
+            frames_mask = (frames_mask >= threshold).to(dtype=frames_mask.dtype)
 
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
