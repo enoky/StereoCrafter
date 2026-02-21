@@ -318,12 +318,12 @@ class RenderProcessor:
         
         if mode == "Auto":
             for k, v in defaults.items(): info.setdefault(k, v)
-        elif mode == "BT.709 L":
+        elif mode in ("BT.709", "BT.709 L"):
             info.update(defaults)
         elif mode == "BT.709 F":
             info.update(defaults)
             info["color_range"] = "pc"
-        elif mode == "BT.2020 PQ":
+        elif mode in ("BT.2020", "BT.2020 PQ"):
             info.update({"color_primaries": "bt2020", "transfer_characteristics": "smpte2084", "color_space": "bt2020nc", "color_range": "tv"})
         elif mode == "BT.2020 HLG":
             info.update({"color_primaries": "bt2020", "transfer_characteristics": "arib-std-b67", "color_space": "bt2020nc", "color_range": "tv"})
@@ -441,10 +441,10 @@ class RenderProcessor:
         results = []
         for j in range(len(batch_video_numpy)):
             results.append({
-                "left": (np.clip(left_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "right": (np.clip(right_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "occlusion": (np.clip(occl_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "depth": (np.clip(depth_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
+                "left": np.clip(left_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                "right": np.clip(right_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                "occlusion": np.clip(occl_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                "depth": np.clip(depth_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
             })
         return results
 
@@ -475,10 +475,11 @@ class RenderProcessor:
         Returns float32 array in range [0, 1]
         """
         # Convert uint8 back to float for grid assembly
-        left = res["left"].astype(np.float32) / 255.0
-        right = res["right"].astype(np.float32) / 255.0
-        occlusion = res["occlusion"].astype(np.float32) / 255.0
-        depth = res["depth"].astype(np.float32) / 255.0
+        # Input frames are already float32 in range [0, 1]
+        left = res["left"]
+        right = res["right"]
+        occlusion = res["occlusion"]
+        depth = res["depth"]
         
         # Ensure all are 3-channel
         if occlusion.ndim == 2 or (occlusion.ndim == 3 and occlusion.shape[-1] == 1):
