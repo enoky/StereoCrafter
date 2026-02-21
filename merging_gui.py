@@ -43,9 +43,7 @@ GUI_VERSION = "26-02-08.3"
 
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
-def apply_mask_dilation(
-    mask: torch.Tensor, kernel_size: int, use_gpu: bool = True
-) -> torch.Tensor:
+def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
     if kernel_size <= 0:
         return mask
     kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
@@ -64,28 +62,19 @@ def apply_mask_dilation(
         return torch.stack(processed_frames).to(mask.device)
 
 
-def apply_gaussian_blur(
-    mask: torch.Tensor, kernel_size: int, use_gpu: bool = True
-) -> torch.Tensor:
+def apply_gaussian_blur(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
     if kernel_size <= 0:
         return mask
     kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
 
     if use_gpu:
         sigma = kernel_val / 6.0
-        ax = torch.arange(
-            -kernel_val // 2 + 1.0, kernel_val // 2 + 1.0, device=mask.device
-        )
+        ax = torch.arange(-kernel_val // 2 + 1.0, kernel_val // 2 + 1.0, device=mask.device)
         gauss = torch.exp(-(ax**2) / (2 * sigma**2))
         kernel_1d = (gauss / gauss.sum()).view(1, 1, 1, kernel_val)
+        blurred_mask = F.conv2d(mask, kernel_1d, padding=(0, kernel_val // 2), groups=mask.shape[1])
         blurred_mask = F.conv2d(
-            mask, kernel_1d, padding=(0, kernel_val // 2), groups=mask.shape[1]
-        )
-        blurred_mask = F.conv2d(
-            blurred_mask,
-            kernel_1d.permute(0, 1, 3, 2),
-            padding=(kernel_val // 2, 0),
-            groups=mask.shape[1],
+            blurred_mask, kernel_1d.permute(0, 1, 3, 2), padding=(kernel_val // 2, 0), groups=mask.shape[1]
         )
         return torch.clamp(blurred_mask, 0.0, 1.0)
     else:
@@ -139,9 +128,7 @@ def apply_shadow_blur(
                 curved_t = time_step**decay_gamma
                 current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
                 total_shift = (i + 1) * shift_per_step
-                shifted_stamp = np.roll(
-                    stamp_source_np, total_shift, axis=1
-                )  # axis=1 for HxW
+                shifted_stamp = np.roll(stamp_source_np, total_shift, axis=1)  # axis=1 for HxW
                 canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
             processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
         return torch.stack(processed_frames).to(mask.device)
@@ -182,12 +169,8 @@ class MergingGUI(ThemedTk):
         # --- Window Geometry ---
         self.window_x = self.app_config.get("window_x", None)
         self.window_y = self.app_config.get("window_y", None)
-        self.window_width = self.app_config.get(
-            "window_width", 700
-        )  # A reasonable default
-        self.window_height = self.app_config.get(
-            "window_height", 800
-        )  # A reasonable default
+        self.window_width = self.app_config.get("window_width", 700)  # A reasonable default
+        self.window_height = self.app_config.get("window_height", 800)  # A reasonable default
 
         # --- Core App State ---
         self.stop_event = threading.Event()
@@ -200,120 +183,60 @@ class MergingGUI(ThemedTk):
         # --- GUI Variables ---
         self.pil_image_for_preview = None
         self.inpainted_folder_var = tk.StringVar(
-            value=self.app_config.get(
-                "inpainted_folder", self.APP_DEFAULTS["inpainted_folder"]
-            )
+            value=self.app_config.get("inpainted_folder", self.APP_DEFAULTS["inpainted_folder"])
         )
         self.inpainted_folder_var.trace_add("write", self._on_folder_changed)
         self.original_folder_var = tk.StringVar(
-            value=self.app_config.get(
-                "original_folder", self.APP_DEFAULTS["original_folder"]
-            )
+            value=self.app_config.get("original_folder", self.APP_DEFAULTS["original_folder"])
         )
         self.original_folder_var.trace_add("write", self._on_folder_changed)
-        self.mask_folder_var = tk.StringVar(
-            value=self.app_config.get("mask_folder", self.APP_DEFAULTS["mask_folder"])
-        )
+        self.mask_folder_var = tk.StringVar(value=self.app_config.get("mask_folder", self.APP_DEFAULTS["mask_folder"]))
         self.mask_folder_var.trace_add("write", self._on_folder_changed)
         self.output_folder_var = tk.StringVar(
-            value=self.app_config.get(
-                "output_folder", self.APP_DEFAULTS["output_folder"]
-            )
+            value=self.app_config.get("output_folder", self.APP_DEFAULTS["output_folder"])
         )
 
         # --- Mask Processing Parameters ---
         self.mask_binarize_threshold_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "mask_binarize_threshold",
-                    self.APP_DEFAULTS["mask_binarize_threshold"],
-                )
-            )
+            value=float(self.app_config.get("mask_binarize_threshold", self.APP_DEFAULTS["mask_binarize_threshold"]))
         )
         self.mask_dilate_kernel_size_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "mask_dilate_kernel_size",
-                    self.APP_DEFAULTS["mask_dilate_kernel_size"],
-                )
-            )
+            value=float(self.app_config.get("mask_dilate_kernel_size", self.APP_DEFAULTS["mask_dilate_kernel_size"]))
         )
         self.mask_blur_kernel_size_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "mask_blur_kernel_size", self.APP_DEFAULTS["mask_blur_kernel_size"]
-                )
-            )
+            value=float(self.app_config.get("mask_blur_kernel_size", self.APP_DEFAULTS["mask_blur_kernel_size"]))
         )
         self.shadow_shift_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get("shadow_shift", self.APP_DEFAULTS["shadow_shift"])
-            )
+            value=float(self.app_config.get("shadow_shift", self.APP_DEFAULTS["shadow_shift"]))
         )
         self.shadow_decay_gamma_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "shadow_decay_gamma", self.APP_DEFAULTS["shadow_decay_gamma"]
-                )
-            )
+            value=float(self.app_config.get("shadow_decay_gamma", self.APP_DEFAULTS["shadow_decay_gamma"]))
         )
         self.shadow_start_opacity_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "shadow_start_opacity", self.APP_DEFAULTS["shadow_start_opacity"]
-                )
-            )
+            value=float(self.app_config.get("shadow_start_opacity", self.APP_DEFAULTS["shadow_start_opacity"]))
         )
         self.shadow_opacity_decay_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "shadow_opacity_decay", self.APP_DEFAULTS["shadow_opacity_decay"]
-                )
-            )
+            value=float(self.app_config.get("shadow_opacity_decay", self.APP_DEFAULTS["shadow_opacity_decay"]))
         )
         self.shadow_min_opacity_var = tk.DoubleVar(
-            value=float(
-                self.app_config.get(
-                    "shadow_min_opacity", self.APP_DEFAULTS["shadow_min_opacity"]
-                )
-            )
+            value=float(self.app_config.get("shadow_min_opacity", self.APP_DEFAULTS["shadow_min_opacity"]))
         )
 
-        self.use_gpu_var = tk.BooleanVar(
-            value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"])
-        )
+        self.use_gpu_var = tk.BooleanVar(value=self.app_config.get("use_gpu", self.APP_DEFAULTS["use_gpu"]))
         self.output_format_var = tk.StringVar(
-            value=self.app_config.get(
-                "output_format", self.APP_DEFAULTS["output_format"]
-            )
+            value=self.app_config.get("output_format", self.APP_DEFAULTS["output_format"])
         )
-        self.pad_to_16_9_var = tk.BooleanVar(
-            value=self.app_config.get("pad_to_16_9", self.APP_DEFAULTS["pad_to_16_9"])
-        )
+        self.pad_to_16_9_var = tk.BooleanVar(value=self.app_config.get("pad_to_16_9", self.APP_DEFAULTS["pad_to_16_9"]))
         self.enable_color_transfer_var = tk.BooleanVar(
-            value=self.app_config.get(
-                "enable_color_transfer", self.APP_DEFAULTS["enable_color_transfer"]
-            )
+            value=self.app_config.get("enable_color_transfer", self.APP_DEFAULTS["enable_color_transfer"])
         )
-        self.debug_logging_var = tk.BooleanVar(
-            value=self.app_config.get("debug_logging_enabled", False)
-        )
-        self.dark_mode_var = tk.BooleanVar(
-            value=self.app_config.get("dark_mode_enabled", False)
-        )
+        self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
+        self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         self.batch_chunk_size_var = tk.StringVar(
-            value=str(
-                self.app_config.get(
-                    "batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"]
-                )
-            )
+            value=str(self.app_config.get("batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"]))
         )
-        self.preview_source_var = tk.StringVar(
-            value=self.app_config.get("preview_source", "Blended Image")
-        )
-        self.preview_size_var = tk.StringVar(
-            value=str(self.app_config.get("preview_size", "100%"))
-        )
+        self.preview_source_var = tk.StringVar(value=self.app_config.get("preview_source", "Blended Image"))
+        self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -329,9 +252,7 @@ class MergingGUI(ThemedTk):
 
         self._apply_theme()
         self._configure_logging()  # Set initial logging level
-        self.after(
-            0, lambda: setattr(self, "_is_startup", False)
-        )  # Set startup flag to false after GUI is built
+        self.after(0, lambda: setattr(self, "_is_startup", False))  # Set startup flag to false after GUI is built
         self.after(0, self._set_saved_geometry)  # Restore window position
         self.protocol("WM_DELETE_WINDOW", self.exit_application)
 
@@ -355,9 +276,7 @@ class MergingGUI(ThemedTk):
         # 1. Use the saved/default width and height, with fallbacks
         current_width = self.window_width
         current_height = self.window_height
-        logger.debug(
-            f"  - Using saved/default width: {current_width}, height: {current_height}"
-        )
+        logger.debug(f"  - Using saved/default width: {current_width}, height: {current_height}")
 
         if current_width < 500:  # Minimum sensible width
             current_width = 700
@@ -385,31 +304,18 @@ class MergingGUI(ThemedTk):
         # --- File Menu ---
         self.file_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="File", menu=self.file_menu)
-        self.file_menu.add_command(
-            label="Load Settings...", command=self.load_settings_dialog
-        )
-        self.file_menu.add_command(
-            label="Save Settings...", command=self.save_settings_dialog
-        )
+        self.file_menu.add_command(label="Load Settings...", command=self.load_settings_dialog)
+        self.file_menu.add_command(label="Save Settings...", command=self.save_settings_dialog)
         self.file_menu.add_separator()
-        self.file_menu.add_command(
-            label="Save Preview Frame...",
-            command=lambda: self.previewer.save_preview_frame(),
-        )
+        self.file_menu.add_command(label="Save Preview Frame...", command=lambda: self.previewer.save_preview_frame())
         self.file_menu.add_command(
             label="Save Preview as SBS...", command=self._save_preview_sbs_frame
         )  # Keep this one here as it needs access to both eyes
         self.file_menu.add_separator()
-        self.file_menu.add_command(
-            label="Reset to Default", command=self.reset_to_defaults
-        )
-        self.file_menu.add_command(
-            label="Restore Finished Files", command=self.restore_finished_files
-        )
+        self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
+        self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
         self.file_menu.add_separator()
-        self.file_menu.add_checkbutton(
-            label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme
-        )
+        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.exit_application)
 
@@ -417,9 +323,7 @@ class MergingGUI(ThemedTk):
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
         self.help_menu.add_checkbutton(
-            label="Enable Debug Logging",
-            variable=self.debug_logging_var,
-            command=self._toggle_debug_logging,
+            label="Enable Debug Logging", variable=self.debug_logging_var, command=self._toggle_debug_logging
         )
         self.help_menu.add_separator()
         self.help_menu.add_command(label="User Guide", command=self.show_user_guide)
@@ -443,21 +347,10 @@ class MergingGUI(ThemedTk):
         self.style.configure("TFrame", background=bg_color)
         self.style.configure("TLabel", background=bg_color, foreground=fg_color)
         self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-        self.style.configure(
-            "TLabelframe.Label", background=bg_color, foreground=fg_color
-        )
+        self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
         self.style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
-        self.style.map(
-            "TCheckbutton",
-            foreground=[("active", fg_color)],
-            background=[("active", bg_color)],
-        )
-        self.style.configure(
-            "TEntry",
-            fieldbackground=entry_bg,
-            foreground=fg_color,
-            insertcolor=fg_color,
-        )
+        self.style.map("TCheckbutton", foreground=[("active", fg_color)], background=[("active", bg_color)])
+        self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
         # --- NEW: Add Combobox styling ---
         self.style.map(
             "TCombobox",
@@ -497,14 +390,11 @@ class MergingGUI(ThemedTk):
                 guide_content = f.read()
         except FileNotFoundError:
             messagebox.showerror(
-                "File Not Found",
-                f"The user guide file could not be found at:\n{os.path.abspath(guide_path)}",
+                "File Not Found", f"The user guide file could not be found at:\n{os.path.abspath(guide_path)}"
             )
             return
         except Exception as e:
-            messagebox.showerror(
-                "Error", f"An error occurred while reading the user guide:\n{e}"
-            )
+            messagebox.showerror("Error", f"An error occurred while reading the user guide:\n{e}")
             return
 
         # Determine colors based on current theme
@@ -542,9 +432,7 @@ class MergingGUI(ThemedTk):
         text_widget.insert(tk.END, guide_content)
         text_widget.config(state=tk.DISABLED)  # Make it read-only
 
-        scrollbar = ttk.Scrollbar(
-            text_frame, orient=tk.VERTICAL, command=text_widget.yview
-        )
+        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
         text_widget["yscrollcommand"] = scrollbar.set
 
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -558,8 +446,7 @@ class MergingGUI(ThemedTk):
     def reset_to_defaults(self):
         """Resets all GUI parameters to their default values using the _apply_settings method."""
         if not messagebox.askyesno(
-            "Reset Settings",
-            "Are you sure you want to reset all settings to their default values?",
+            "Reset Settings", "Are you sure you want to reset all settings to their default values?"
         ):
             return  # User cancelled
 
@@ -573,9 +460,7 @@ class MergingGUI(ThemedTk):
         A centralized function to apply a dictionary of settings to the GUI's tk.Variables.
         This is used by both Load Settings and Reset to Defaults.
         """
-        logger.debug(
-            f"Applying settings dictionary:\n{json.dumps(settings_dict, indent=2)}"
-        )
+        logger.debug(f"Applying settings dictionary:\n{json.dumps(settings_dict, indent=2)}")
         for key, value in settings_dict.items():
             var_name = key + "_var"
             if hasattr(self, var_name):
@@ -583,9 +468,7 @@ class MergingGUI(ThemedTk):
                 try:
                     tk_var.set(value)
                 except (ValueError, tk.TclError) as e:
-                    logger.error(
-                        f"Could not apply setting for '{key}' with value '{value}': {e}"
-                    )
+                    logger.error(f"Could not apply setting for '{key}' with value '{value}': {e}")
 
         # After setting all variables, manually update the slider labels to match.
         for updater in self.slider_label_updaters:
@@ -634,10 +517,7 @@ class MergingGUI(ThemedTk):
 
         # Get the actual height of the displayed preview image, if it exists
         preview_image_height = 0
-        if (
-            hasattr(self.previewer, "preview_image_tk")
-            and self.previewer.preview_image_tk
-        ):
+        if hasattr(self.previewer, "preview_image_tk") and self.previewer.preview_image_tk:
             preview_image_height = self.previewer.preview_image_tk.height()
 
         # Add a small buffer for padding/borders
@@ -648,9 +528,7 @@ class MergingGUI(ThemedTk):
         # --- END NEW ---
 
         self.geometry(f"{current_actual_width}x{new_height}")
-        logger.debug(
-            f"Content resize applied geometry: {current_actual_width}x{new_height}"
-        )
+        logger.debug(f"Content resize applied geometry: {current_actual_width}x{new_height}")
 
         # Update stored width and height for the next time save_config is called.
         self.window_width = current_actual_width
@@ -679,65 +557,45 @@ class MergingGUI(ThemedTk):
         folder_frame.grid_columnconfigure(1, weight=1)
 
         # Inpainted Video Folder
-        ttk.Label(folder_frame, text="Inpainted Video Folder:").grid(
-            row=0, column=0, sticky="e", padx=5, pady=2
-        )
+        ttk.Label(folder_frame, text="Inpainted Video Folder:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
         entry_inpaint = ttk.Entry(folder_frame, textvariable=self.inpainted_folder_var)
         entry_inpaint.grid(row=0, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_inpaint, "inpainted_folder")
         btn_inpaint = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.inpainted_folder_var),
+            folder_frame, text="Browse", command=lambda: self._browse_folder(self.inpainted_folder_var)
         )
         btn_inpaint.grid(row=0, column=2, padx=5)
         self.widgets_to_disable.append(entry_inpaint)
         self.widgets_to_disable.append(btn_inpaint)
 
         # Original Video Folder (for Left Eye)
-        ttk.Label(folder_frame, text="Original Video Folder:").grid(
-            row=1, column=0, sticky="e", padx=5, pady=2
-        )
+        ttk.Label(folder_frame, text="Original Video Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
         entry_orig = ttk.Entry(folder_frame, textvariable=self.original_folder_var)
         entry_orig.grid(row=1, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_orig, "original_folder")
         btn_orig = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.original_folder_var),
+            folder_frame, text="Browse", command=lambda: self._browse_folder(self.original_folder_var)
         )
         btn_orig.grid(row=1, column=2, padx=5)
         self.widgets_to_disable.append(entry_orig)
         self.widgets_to_disable.append(btn_orig)
 
         # Mask Folder
-        ttk.Label(folder_frame, text="Mask Folder:").grid(
-            row=2, column=0, sticky="e", padx=5, pady=2
-        )
+        ttk.Label(folder_frame, text="Mask Folder:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
         entry_mask = ttk.Entry(folder_frame, textvariable=self.mask_folder_var)
         entry_mask.grid(row=2, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_mask, "mask_folder")
-        btn_mask = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.mask_folder_var),
-        )
+        btn_mask = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.mask_folder_var))
         btn_mask.grid(row=2, column=2, padx=5)
         self.widgets_to_disable.append(entry_mask)
         self.widgets_to_disable.append(btn_mask)
 
         # Output Folder
-        ttk.Label(folder_frame, text="Output Folder:").grid(
-            row=3, column=0, sticky="e", padx=5, pady=2
-        )
+        ttk.Label(folder_frame, text="Output Folder:").grid(row=3, column=0, sticky="e", padx=5, pady=2)
         entry_out = ttk.Entry(folder_frame, textvariable=self.output_folder_var)
         entry_out.grid(row=3, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_out, "output_folder")
-        btn_out = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.output_folder_var),
-        )
+        btn_out = ttk.Button(folder_frame, text="Browse", command=lambda: self._browse_folder(self.output_folder_var))
         btn_out.grid(row=3, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
@@ -753,9 +611,7 @@ class MergingGUI(ThemedTk):
             resize_callback=self._adjust_window_height_for_content,  # Pass the resize callback
             help_data=self.help_data,
         )
-        self.previewer.preview_source_combo.configure(
-            textvariable=self.preview_source_var
-        )
+        self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
 
         # --- FIX: Add previewer's buttons to the list of widgets to disable ---
         self.widgets_to_disable.append(self.previewer.load_preview_button)
@@ -766,9 +622,7 @@ class MergingGUI(ThemedTk):
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
 
         # --- MASK PROCESSING PARAMETERS ---
-        param_frame = ttk.LabelFrame(
-            self, text="Mask Processing Parameters", padding=10
-        )
+        param_frame = ttk.LabelFrame(self, text="Mask Processing Parameters", padding=10)
         param_frame.pack(fill="x", padx=10, pady=5)
         param_frame.grid_columnconfigure(1, weight=1)
 
@@ -825,30 +679,14 @@ class MergingGUI(ThemedTk):
             step_size=0.01,
         )
         create_single_slider_with_label_updater(
-            self,
-            param_frame,
-            "Dilate Kernel:",
-            self.mask_dilate_kernel_size_var,
-            0,
-            101,
-            1,
+            self, param_frame, "Dilate Kernel:", self.mask_dilate_kernel_size_var, 0, 101, 1
         )
         create_single_slider_with_label_updater(
             self, param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2
         )
+        create_single_slider_with_label_updater(self, param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3)
         create_single_slider_with_label_updater(
-            self, param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3
-        )
-        create_single_slider_with_label_updater(
-            self,
-            param_frame,
-            "Shadow Gamma:",
-            self.shadow_decay_gamma_var,
-            0.1,
-            5.0,
-            4,
-            decimals=2,
-            step_size=0.01,
+            self, param_frame, "Shadow Gamma:", self.shadow_decay_gamma_var, 0.1, 5.0, 4, decimals=2, step_size=0.01
         )
         create_single_slider_with_label_updater(
             self,
@@ -888,9 +726,7 @@ class MergingGUI(ThemedTk):
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
         options_frame.pack(fill="x", padx=10, pady=5)
 
-        gpu_check = ttk.Checkbutton(
-            options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var
-        )
+        gpu_check = ttk.Checkbutton(options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var)
         gpu_check.pack(side="left", padx=5)
         self._create_hover_tooltip(gpu_check, "use_gpu")
         self.widgets_to_disable.append(gpu_check)
@@ -907,11 +743,7 @@ class MergingGUI(ThemedTk):
             "Right-Eye Only",
         ]
         output_format_combo = ttk.Combobox(
-            options_frame,
-            textvariable=self.output_format_var,
-            values=output_formats,
-            state="readonly",
-            width=28,
+            options_frame, textvariable=self.output_format_var, values=output_formats, state="readonly", width=28
         )
         output_format_combo.pack(side="left", padx=5)
         self._create_hover_tooltip(output_format_combo, "output_format")
@@ -919,18 +751,14 @@ class MergingGUI(ThemedTk):
         # --- END NEW ---
 
         color_check = ttk.Checkbutton(
-            options_frame,
-            text="Enable Color Transfer",
-            variable=self.enable_color_transfer_var,
+            options_frame, text="Enable Color Transfer", variable=self.enable_color_transfer_var
         )
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
         self.widgets_to_disable.append(color_check)
 
         # --- NEW: Pad to 16:9 Checkbox ---
-        pad_check = ttk.Checkbutton(
-            options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var
-        )
+        pad_check = ttk.Checkbutton(options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var)
         pad_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
         self.widgets_to_disable.append(pad_check)
@@ -938,9 +766,7 @@ class MergingGUI(ThemedTk):
         # --- NEW: Add Borders checkbox ---
         self.add_borders_var = tk.BooleanVar(value=True)
         self.add_borders_var.trace_add("write", self._on_add_borders_changed)
-        borders_check = ttk.Checkbutton(
-            options_frame, text="Add Borders", variable=self.add_borders_var
-        )
+        borders_check = ttk.Checkbutton(options_frame, text="Add Borders", variable=self.add_borders_var)
         borders_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(borders_check, "add_borders")
         self.widgets_to_disable.append(borders_check)
@@ -949,21 +775,15 @@ class MergingGUI(ThemedTk):
         # --- NEW: Resume checkbox ---
         self.resume_var = tk.BooleanVar(value=self.app_config.get("resume", False))
         self.resume_var.trace_add("write", self._on_resume_changed)
-        resume_check = ttk.Checkbutton(
-            options_frame, text="Resume", variable=self.resume_var
-        )
+        resume_check = ttk.Checkbutton(options_frame, text="Resume", variable=self.resume_var)
         resume_check.pack(side="left", padx=(15, 5))
         self._create_hover_tooltip(resume_check, "resume")
         self.widgets_to_disable.append(resume_check)
         # --- END NEW ---
 
         # Add Batch Chunk Size option
-        ttk.Label(options_frame, text="Batch Chunk Size:").pack(
-            side="left", padx=(20, 5)
-        )
-        entry_chunk = ttk.Entry(
-            options_frame, textvariable=self.batch_chunk_size_var, width=7
-        )
+        ttk.Label(options_frame, text="Batch Chunk Size:").pack(side="left", padx=(20, 5))
+        entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=7)
         entry_chunk.pack(side="left")
         self._create_hover_tooltip(entry_chunk, "batch_chunk_size")
         self.widgets_to_disable.append(entry_chunk)
@@ -971,33 +791,23 @@ class MergingGUI(ThemedTk):
         # --- PROGRESS & BUTTONS ---
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
-        self.progress_bar = ttk.Progressbar(
-            progress_frame, variable=self.progress_var, length=400, mode="determinate"
-        )
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, length=400, mode="determinate")
         self.progress_bar.pack(fill="x")
         self.status_label_var = tk.StringVar(value="Ready")
-        self.status_label = ttk.Label(
-            progress_frame, textvariable=self.status_label_var
-        )
+        self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
         self.status_label.pack(pady=5)
 
         # --- Border Info ---
         self.border_info_var = tk.StringVar(value="Borders: N/A")
-        self.border_info_label = ttk.Label(
-            progress_frame, textvariable=self.border_info_var
-        )
+        self.border_info_label = ttk.Label(progress_frame, textvariable=self.border_info_var)
         self.border_info_label.pack(pady=2)
 
         buttons_frame = ttk.Frame(self, padding=10)
         buttons_frame.pack(fill="x")
-        self.start_button = ttk.Button(
-            buttons_frame, text="Start Blending", command=self.start_processing
-        )
+        self.start_button = ttk.Button(buttons_frame, text="Start Blending", command=self.start_processing)
         self.start_button.pack(side="left", padx=5, expand=True)
         self._create_hover_tooltip(self.start_button, "start_blending")
-        self.stop_button = ttk.Button(
-            buttons_frame, text="Stop", command=self.stop_processing, state="disabled"
-        )
+        self.stop_button = ttk.Button(buttons_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.widgets_to_disable.append(self.start_button)  # Add to disable list
         # Stop button is handled separately in _set_ui_processing_state
         self.stop_button.pack(side="left", padx=5, expand=True)
@@ -1005,9 +815,7 @@ class MergingGUI(ThemedTk):
 
         # --- NEW: Process Current Clip button ---
         self.process_current_button = ttk.Button(
-            buttons_frame,
-            text="Process Current Clip",
-            command=self.process_current_clip,
+            buttons_frame, text="Process Current Clip", command=self.process_current_clip
         )
         self.process_current_button.pack(side="left", padx=5, expand=True)
         self._create_hover_tooltip(self.process_current_button, "process_current_clip")
@@ -1037,16 +845,12 @@ class MergingGUI(ThemedTk):
             search_folders.append(self.inpainted_folder_var.get())
         if self.original_folder_var.get():
             search_folders.append(self.original_folder_var.get())
-        return read_clip_sidecar(
-            self.sidecar_manager, video_path, core_name, search_folders
-        )
+        return read_clip_sidecar(self.sidecar_manager, video_path, core_name, search_folders)
 
     def _update_border_info(self, left_border: float, right_border: float):
         """Updates the border info display in the GUI."""
         if left_border > 0 or right_border > 0:
-            self.border_info_var.set(
-                f"Borders: L={left_border:.3f}%, R={right_border:.3f}%"
-            )
+            self.border_info_var.set(f"Borders: L={left_border:.3f}%, R={right_border:.3f}%")
         else:
             self.border_info_var.set("Borders: None")
 
@@ -1118,9 +922,7 @@ class MergingGUI(ThemedTk):
                 item = self.cleanup_queue.get(timeout=1)
 
                 if item is None:
-                    logger.debug(
-                        "Cleanup worker received stop signal. Will exit when queue is empty."
-                    )
+                    logger.debug("Cleanup worker received stop signal. Will exit when queue is empty.")
                     stop_signal_received = True
                     continue  # Continue loop to check if queue is empty
 
@@ -1138,19 +940,13 @@ class MergingGUI(ThemedTk):
                     dest_path = os.path.join(finished_dir, os.path.basename(src_path))
 
                     if os.path.exists(dest_path):
-                        logger.debug(
-                            f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source."
-                        )
+                        logger.debug(f"Cleanup: Destination '{os.path.basename(dest_path)}' exists. Deleting source.")
                         os.remove(src_path)
                     else:
                         shutil.move(src_path, finished_dir)
-                    logger.info(
-                        f"Cleanup: Successfully moved '{os.path.basename(src_path)}'."
-                    )
+                    logger.debug(f"Cleanup: Successfully moved '{os.path.basename(src_path)}'.")
                 except (PermissionError, OSError):
-                    logger.debug(
-                        f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds..."
-                    )
+                    logger.debug(f"Cleanup: File '{os.path.basename(src_path)}' is locked. Retrying in 3 seconds...")
                     time.sleep(3)
                     self.cleanup_queue.put(item)  # Put it back on the queue to retry
                 except Exception as e:
@@ -1169,9 +965,7 @@ class MergingGUI(ThemedTk):
         if not self.failed_moves:
             return
 
-        logger.info(
-            f"Retrying {len(self.failed_moves)} previously failed file moves..."
-        )
+        logger.info(f"Retrying {len(self.failed_moves)} previously failed file moves...")
 
         # Use a copy of the list to iterate over, so we can safely remove from the original
         remaining_failures = []
@@ -1198,28 +992,17 @@ class MergingGUI(ThemedTk):
                         logger.error(
                             f"Retry: Failed to delete source '{os.path.basename(src_path)}' even though destination exists: {e_del}"
                         )
-                        remaining_failures.append(
-                            (src_path, dest_folder)
-                        )  # Keep it for the next final retry
+                        remaining_failures.append((src_path, dest_folder))  # Keep it for the next final retry
                 else:
                     # Destination does not exist, but we know the source does. This is a true move retry.
                     shutil.move(src_path, finished_dir)
-                    logger.debug(
-                        f"Successfully moved previously failed file: {os.path.basename(src_path)}"
-                    )
+                    logger.debug(f"Successfully moved previously failed file: {os.path.basename(src_path)}")
 
             except (PermissionError, OSError) as e:
-                logger.warning(
-                    f"Retry failed for {os.path.basename(src_path)}: {e}. Will try again later."
-                )
-                remaining_failures.append(
-                    (src_path, dest_folder)
-                )  # Add back to the list for the next attempt
+                logger.warning(f"Retry failed for {os.path.basename(src_path)}: {e}. Will try again later.")
+                remaining_failures.append((src_path, dest_folder))  # Add back to the list for the next attempt
             except Exception as e:
-                logger.error(
-                    f"Unexpected error during retry for {os.path.basename(src_path)}: {e}",
-                    exc_info=True,
-                )
+                logger.error(f"Unexpected error during retry for {os.path.basename(src_path)}: {e}", exc_info=True)
 
         self.failed_moves = remaining_failures
 
@@ -1248,9 +1031,7 @@ class MergingGUI(ThemedTk):
         settings = self.get_current_settings()
 
         # Run in a separate thread
-        self.processing_thread = threading.Thread(
-            target=self.run_batch_process, args=(settings, None), daemon=True
-        )
+        self.processing_thread = threading.Thread(target=self.run_batch_process, args=(settings, None), daemon=True)
         self.processing_thread.start()
 
     def stop_processing(self):
@@ -1335,9 +1116,7 @@ class MergingGUI(ThemedTk):
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 # Mask params
-                "mask_binarize_threshold": float(
-                    self.mask_binarize_threshold_var.get()
-                ),
+                "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
                 "mask_blur_kernel_size": int(self.mask_blur_kernel_size_var.get()),
                 "shadow_shift": int(self.shadow_shift_var.get()),
@@ -1349,8 +1128,7 @@ class MergingGUI(ThemedTk):
             return settings
         except (ValueError, TypeError) as e:
             messagebox.showerror(
-                "Invalid Settings",
-                f"Please check your parameter values. They must be valid numbers.\n\nError: {e}",
+                "Invalid Settings", f"Please check your parameter values. They must be valid numbers.\n\nError: {e}"
             )
             return None
 
@@ -1358,15 +1136,10 @@ class MergingGUI(ThemedTk):
         """Helper method to read FFmpeg's output without blocking."""
         try:
             # Use iter to read line by line
-            for line in iter(
-                pipe.readline, b""
-            ):  # Read bytes until an empty byte string
+            for line in iter(pipe.readline, b""):  # Read bytes until an empty byte string
                 if line:
                     # Decode bytes to string for logging, ignoring potential decoding errors
-                    logger.log(
-                        log_level,
-                        f"FFmpeg: {line.decode('utf-8', errors='ignore').strip()}",
-                    )
+                    logger.log(log_level, f"FFmpeg: {line.decode('utf-8', errors='ignore').strip()}")
         except Exception as e:
             logger.error(f"Error reading FFmpeg pipe: {e}")
         finally:
@@ -1387,18 +1160,11 @@ class MergingGUI(ThemedTk):
             inpainted_videos = [single_video_path]
             single_mode = True
         else:
-            inpainted_videos = sorted(
-                glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4"))
-            )
+            inpainted_videos = sorted(glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4")))
             single_mode = False
 
         if not inpainted_videos:
-            self.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Info", "No .mp4 files found in the inpainted video folder."
-                ),
-            )
+            self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in the inpainted video folder."))
             self.after(0, self.processing_done)
             return
 
@@ -1409,26 +1175,15 @@ class MergingGUI(ThemedTk):
             if os.path.isdir(finished_dir):
                 finished_files = set(os.listdir(finished_dir))
                 original_count = len(inpainted_videos)
-                inpainted_videos = [
-                    v
-                    for v in inpainted_videos
-                    if os.path.basename(v) not in finished_files
-                ]
+                inpainted_videos = [v for v in inpainted_videos if os.path.basename(v) not in finished_files]
                 skipped_count = original_count - len(inpainted_videos)
                 if skipped_count > 0:
-                    logger.info(
-                        f"Resume: Skipped {skipped_count} already processed files."
-                    )
+                    logger.info(f"Resume: Skipped {skipped_count} already processed files.")
             else:
                 logger.info("Resume: No 'finished' folder found. Processing all files.")
 
         if not inpainted_videos:
-            self.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Info", "All videos have already been processed (Resume mode)."
-                ),
-            )
+            self.after(0, lambda: messagebox.showinfo("Info", "All videos have already been processed (Resume mode)."))
             self.after(0, self.processing_done)
             return
         # --- END NEW ---
@@ -1449,11 +1204,7 @@ class MergingGUI(ThemedTk):
                 break
 
             base_name = os.path.basename(inpainted_video_path)
-            self.after(
-                0,
-                self.update_status_label,
-                f"Processing {i + 1}/{total_videos}: {base_name}",
-            )
+            self.after(0, self.update_status_label, f"Processing {i + 1}/{total_videos}: {base_name}")
 
             # Initialize readers to None for robust cleanup
             inpainted_reader, splatted_reader, original_reader = None, None, None
@@ -1464,9 +1215,7 @@ class MergingGUI(ThemedTk):
                 sbs_suffix = "_inpainted_sbs.mp4"
                 is_sbs_input = base_name.endswith(sbs_suffix)
                 core_name_with_width = (
-                    base_name[: -len(sbs_suffix)]
-                    if is_sbs_input
-                    else base_name[: -len(inpaint_suffix)]
+                    base_name[: -len(sbs_suffix)] if is_sbs_input else base_name[: -len(inpaint_suffix)]
                 )
 
                 # --- FIX: Gracefully handle cases where the filename format is unexpected ---
@@ -1475,17 +1224,13 @@ class MergingGUI(ThemedTk):
                     logger.error(
                         f"Could not parse core name from '{core_name_with_width}'. Skipping video '{base_name}'."
                     )
-                    self.after(
-                        0, self.progress_var.set, i + 1
-                    )  # Still advance progress bar
+                    self.after(0, self.progress_var.set, i + 1)  # Still advance progress bar
                     continue
                 core_name = core_name_with_width[:last_underscore_idx]
                 # --- END FIX ---
 
                 # --- NEW: Read sidecar file for this clip ---
-                clip_sidecar_data = self._read_clip_sidecar(
-                    inpainted_video_path, core_name
-                )
+                clip_sidecar_data = self._read_clip_sidecar(inpainted_video_path, core_name)
                 logger.info(
                     f"Sidecar for '{core_name}': left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}"
                 )
@@ -1495,12 +1240,8 @@ class MergingGUI(ThemedTk):
                 # --- END NEW ---
 
                 mask_folder = settings["mask_folder"]
-                splatted4_pattern = os.path.join(
-                    mask_folder, f"{core_name}_*_splatted4.mp4"
-                )
-                splatted2_pattern = os.path.join(
-                    mask_folder, f"{core_name}_*_splatted2.mp4"
-                )
+                splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
+                splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
                 splatted4_matches = glob.glob(splatted4_pattern)
                 splatted2_matches = glob.glob(splatted2_pattern)
 
@@ -1528,12 +1269,8 @@ class MergingGUI(ThemedTk):
                 original_reader = None  # Assume None initially
                 if is_dual_input:  # splatted2
                     # --- MODIFIED: Use helper to find original video with any extension ---
-                    original_video_path = self._find_video_by_core_name(
-                        settings["original_folder"], core_name
-                    )
-                    original_video_path_to_move = (
-                        original_video_path  # Track for moving later
-                    )
+                    original_video_path = self._find_video_by_core_name(settings["original_folder"], core_name)
+                    original_video_path_to_move = original_video_path  # Track for moving later
 
                     if original_video_path and os.path.exists(original_video_path):
                         logger.info(
@@ -1541,9 +1278,7 @@ class MergingGUI(ThemedTk):
                         )
                         original_reader = VideoReader(original_video_path, ctx=cpu(0))
                     else:
-                        logger.warning(
-                            f"Original video not found for dual-input mode: '{core_name}.*'."
-                        )
+                        logger.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
                         logger.warning(
                             "Will proceed, but only 'Right-Eye Only' output will be possible for this video."
                         )
@@ -1590,9 +1325,7 @@ class MergingGUI(ThemedTk):
                     output_width = hires_W * 2
                     output_height = hires_H * 2
                     output_suffix = "_merged_half_sbs.mp4"
-                    perceived_width_for_filename = (
-                        hires_W * 2
-                    )  # Use the full file width for the filename
+                    perceived_width_for_filename = hires_W * 2  # Use the full file width for the filename
                 elif output_format == "Half SBS (Left-Right)":
                     output_width = hires_W
                     output_suffix = "_merged_half_sbs.mp4"
@@ -1606,15 +1339,11 @@ class MergingGUI(ThemedTk):
                     output_suffix = "_merged_right_eye.mp4"
                     # Perceived width is the full output width
 
-                if (
-                    "output_height" not in locals()
-                ):  # Set default height if not already set by a special format
+                if "output_height" not in locals():  # Set default height if not already set by a special format
                     output_height = hires_H
 
                 # Construct the final filename using the core name and the new perceived width
-                output_filename = (
-                    f"{core_name}_{perceived_width_for_filename}{output_suffix}"
-                )
+                output_filename = f"{core_name}_{perceived_width_for_filename}{output_suffix}"
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
@@ -1634,14 +1363,10 @@ class MergingGUI(ThemedTk):
 
                 # --- NEW: Start threads to read stdout and stderr to prevent deadlock ---
                 stdout_thread = threading.Thread(
-                    target=self._read_ffmpeg_output,
-                    args=(ffmpeg_process.stdout, logging.DEBUG),
-                    daemon=True,
+                    target=self._read_ffmpeg_output, args=(ffmpeg_process.stdout, logging.DEBUG), daemon=True
                 )
                 stderr_thread = threading.Thread(
-                    target=self._read_ffmpeg_output,
-                    args=(ffmpeg_process.stderr, logging.DEBUG),
-                    daemon=True,
+                    target=self._read_ffmpeg_output, args=(ffmpeg_process.stderr, logging.DEBUG), daemon=True
                 )
                 stdout_thread.start()
                 stderr_thread.start()
@@ -1658,9 +1383,7 @@ class MergingGUI(ThemedTk):
                         break
 
                     self.after(
-                        0,
-                        self.update_status_label,
-                        f"Processing frames {frame_start + 1}-{frame_end}/{num_frames}...",
+                        0, self.update_status_label, f"Processing frames {frame_start + 1}-{frame_end}/{num_frames}..."
                     )
 
                     # Load current chunk
@@ -1669,18 +1392,10 @@ class MergingGUI(ThemedTk):
 
                     # Convert to tensors and extract parts (same logic as preview)
                     # ... (this logic is identical to update_preview's frame loading part)
-                    inpainted_tensor_full = (
-                        torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float()
-                        / 255.0
-                    )
-                    splatted_tensor = (
-                        torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float()
-                        / 255.0
-                    )
+                    inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+                    splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
                     inpainted = (
-                        inpainted_tensor_full[
-                            :, :, :, inpainted_tensor_full.shape[3] // 2 :
-                        ]
+                        inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3] // 2 :]
                         if is_sbs_input
                         else inpainted_tensor_full
                     )
@@ -1690,19 +1405,10 @@ class MergingGUI(ThemedTk):
                         # --- NEW: Handle missing original_reader for dual input ---
                         if original_reader is None:
                             # Create a black tensor as a placeholder for the left eye
-                            original_left = torch.zeros_like(
-                                inpainted
-                            )  # Match inpainted shape
+                            original_left = torch.zeros_like(inpainted)  # Match inpainted shape
                         else:
-                            original_np = original_reader.get_batch(
-                                frame_indices
-                            ).asnumpy()
-                            original_left = (
-                                torch.from_numpy(original_np)
-                                .permute(0, 3, 1, 2)
-                                .float()
-                                / 255.0
-                            )
+                            original_np = original_reader.get_batch(frame_indices).asnumpy()
+                            original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
                         # --- END NEW ---
                         mask_raw = splatted_tensor[:, :, :, : W // 2]
                         warped_original = splatted_tensor[:, :, :, W // 2 :]
@@ -1726,24 +1432,15 @@ class MergingGUI(ThemedTk):
 
                     if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
                         inpainted = F.interpolate(
-                            inpainted,
-                            size=(hires_H, hires_W),
-                            mode="bicubic",
-                            align_corners=False,
+                            inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
                         )
-                        mask = F.interpolate(
-                            mask,
-                            size=(hires_H, hires_W),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
+                        mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
                     if settings["enable_color_transfer"]:
                         adjusted_frames = []
                         for frame_idx in range(inpainted.shape[0]):
                             adjusted_frame = apply_color_transfer(
-                                original_left[frame_idx].cpu(),
-                                inpainted[frame_idx].cpu(),
+                                original_left[frame_idx].cpu(), inpainted[frame_idx].cpu()
                             )
                             adjusted_frames.append(adjusted_frame.to(device))
                         inpainted = torch.stack(adjusted_frames)
@@ -1751,18 +1448,14 @@ class MergingGUI(ThemedTk):
                     processed_mask = mask.clone()
                     # --- NEW: Binarization as the first step ---
                     if settings["mask_binarize_threshold"] >= 0.0:
-                        processed_mask = (
-                            mask > settings["mask_binarize_threshold"]
-                        ).float()
+                        processed_mask = (mask > settings["mask_binarize_threshold"]).float()
 
                     if settings["mask_dilate_kernel_size"] > 0:
                         processed_mask = apply_mask_dilation(
                             processed_mask, settings["mask_dilate_kernel_size"], use_gpu
                         )
                     if settings["mask_blur_kernel_size"] > 0:
-                        processed_mask = apply_gaussian_blur(
-                            processed_mask, settings["mask_blur_kernel_size"], use_gpu
-                        )
+                        processed_mask = apply_gaussian_blur(processed_mask, settings["mask_blur_kernel_size"], use_gpu)
 
                     if settings["shadow_shift"] > 0:
                         processed_mask = apply_shadow_blur(
@@ -1775,18 +1468,13 @@ class MergingGUI(ThemedTk):
                             use_gpu,
                         )
 
-                    blended_right_eye = (
-                        warped_original * (1 - processed_mask)
-                        + inpainted * processed_mask
-                    )
+                    blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
 
                     # --- NEW: Apply borders from sidecar ---
                     left_border = clip_sidecar_data.get("left_border", 0.0)
                     right_border = clip_sidecar_data.get("right_border", 0.0)
                     logger.debug(f"Borders: left={left_border}%, right={right_border}%")
-                    if settings.get("add_borders", True) and (
-                        left_border > 0 or right_border > 0
-                    ):
+                    if settings.get("add_borders", True) and (left_border > 0 or right_border > 0):
                         logger.debug(
                             f"Before border: original_left shape={original_left.shape}, blended_right_eye shape={blended_right_eye.shape}"
                         )
@@ -1800,43 +1488,28 @@ class MergingGUI(ThemedTk):
 
                     # --- NEW: Assemble final frame based on output format ---
                     if output_format == "Full SBS (Left-Right)":
-                        final_chunk = torch.cat(
-                            [original_left, blended_right_eye], dim=3
-                        )
+                        final_chunk = torch.cat([original_left, blended_right_eye], dim=3)
                     elif output_format == "Full SBS Cross-eye (Right-Left)":
-                        final_chunk = torch.cat(
-                            [blended_right_eye, original_left], dim=3
-                        )
+                        final_chunk = torch.cat([blended_right_eye, original_left], dim=3)
                     elif output_format == "Half SBS (Left-Right)":
                         resized_left = F.interpolate(
-                            original_left,
-                            size=(hires_H, hires_W // 2),
-                            mode="bilinear",
-                            align_corners=False,
+                            original_left, size=(hires_H, hires_W // 2), mode="bilinear", align_corners=False
                         )
                         resized_right = F.interpolate(
-                            blended_right_eye,
-                            size=(hires_H, hires_W // 2),
-                            mode="bilinear",
-                            align_corners=False,
+                            blended_right_eye, size=(hires_H, hires_W // 2), mode="bilinear", align_corners=False
                         )
                         final_chunk = torch.cat([resized_left, resized_right], dim=3)
                     elif output_format == "Double SBS":
                         sbs_chunk = torch.cat([original_left, blended_right_eye], dim=3)
                         final_chunk = F.interpolate(
-                            sbs_chunk,
-                            size=(hires_H * 2, hires_W * 2),
-                            mode="bilinear",
-                            align_corners=False,
+                            sbs_chunk, size=(hires_H * 2, hires_W * 2), mode="bilinear", align_corners=False
                         )
                     elif output_format == "Anaglyph (Red/Cyan)":
                         # Red from Left, Green/Blue from Right
                         final_chunk = torch.cat(
                             [
                                 original_left[:, 0:1, :, :],  # R channel from left
-                                blended_right_eye[
-                                    :, 1:3, :, :
-                                ],  # G, B channels from right
+                                blended_right_eye[:, 1:3, :, :],  # G, B channels from right
                             ],
                             dim=1,
                         )
@@ -1851,9 +1524,7 @@ class MergingGUI(ThemedTk):
                         final_chunk = torch.cat(
                             [
                                 left_gray,  # R channel from grayscale left
-                                blended_right_eye[
-                                    :, 1:3, :, :
-                                ],  # G, B channels from right
+                                blended_right_eye[:, 1:3, :, :],  # G, B channels from right
                             ],
                             dim=1,
                         )
@@ -1865,16 +1536,12 @@ class MergingGUI(ThemedTk):
                     cpu_chunk = final_chunk.cpu()
                     for frame_tensor in cpu_chunk:
                         frame_np = frame_tensor.permute(1, 2, 0).numpy()
-                        frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(
-                            np.uint16
-                        )
+                        frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
                         frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
                         ffmpeg_process.stdin.write(frame_bgr.tobytes())
 
                     # --- NEW: Draw console progress bar for the current video's chunks ---
-                    draw_progress_bar(
-                        frame_end, num_frames, prefix=f"  Encoding {base_name}:"
-                    )
+                    draw_progress_bar(frame_end, num_frames, prefix=f"  Encoding {base_name}:")
 
                 # 5. Finalize FFmpeg process
                 if ffmpeg_process.stdin:
@@ -1887,18 +1554,12 @@ class MergingGUI(ThemedTk):
                 # --- END FIX ---
 
                 if ffmpeg_process.returncode != 0:
-                    logger.error(
-                        f"FFmpeg encoding failed for {base_name}. Check console for details."
-                    )
+                    logger.error(f"FFmpeg encoding failed for {base_name}. Check console for details.")
                 elif self.stop_event.is_set():
-                    logger.warning(
-                        f"Processing was stopped for {base_name}. Source files will not be moved."
-                    )
+                    logger.warning(f"Processing was stopped for {base_name}. Source files will not be moved.")
                     # Do not queue files for moving if the job was stopped.
                 else:
-                    logger.debug(
-                        "FFmpeg process and threads terminated, proceeding to move files."
-                    )
+                    logger.debug("FFmpeg process and threads terminated, proceeding to move files.")
                     logger.info(f"Successfully encoded video to {output_path}")
 
                     # Explicitly close video readers BEFORE attempting to move their files
@@ -1909,47 +1570,28 @@ class MergingGUI(ThemedTk):
                         del splatted_reader
                     if original_reader:
                         del original_reader
-                    inpainted_reader, splatted_reader, original_reader = (
-                        None,
-                        None,
-                        None,
-                    )
+                    inpainted_reader, splatted_reader, original_reader = (None, None, None)
                     time.sleep(0.1)  # Give OS a moment to release file handles
                     logger.debug("Source video file handles released.")
 
                     # --- NEW: Move files to finished folder if Resume is enabled ---
                     if settings.get("resume", False):
-                        self.cleanup_queue.put(
-                            (inpainted_video_path, settings["inpainted_folder"])
-                        )
-                        self.cleanup_queue.put(
-                            (splatted_file_path, settings["mask_folder"])
-                        )
+                        self.cleanup_queue.put((inpainted_video_path, settings["inpainted_folder"]))
+                        self.cleanup_queue.put((splatted_file_path, settings["mask_folder"]))
                         if original_video_path_to_move:
-                            self.cleanup_queue.put(
-                                (
-                                    original_video_path_to_move,
-                                    settings["original_folder"],
-                                )
-                            )
+                            self.cleanup_queue.put((original_video_path_to_move, settings["original_folder"]))
                             # Also move sidecar for original video
-                            original_base = os.path.splitext(
-                                original_video_path_to_move
-                            )[0]
+                            original_base = os.path.splitext(original_video_path_to_move)[0]
                             for ext in [".fssidecar", ".json"]:
                                 sidecar_path = original_base + ext
                                 if os.path.exists(sidecar_path):
-                                    self.cleanup_queue.put(
-                                        (sidecar_path, settings["original_folder"])
-                                    )
+                                    self.cleanup_queue.put((sidecar_path, settings["original_folder"]))
                         # Also move sidecar if it exists
                         inpainted_base = os.path.splitext(inpainted_video_path)[0]
                         for ext in [".fssidecar", ".json"]:
                             sidecar_path = inpainted_base + ext
                             if os.path.exists(sidecar_path):
-                                self.cleanup_queue.put(
-                                    (sidecar_path, settings["inpainted_folder"])
-                                )
+                                self.cleanup_queue.put((sidecar_path, settings["inpainted_folder"]))
                     # --- END NEW ---
             except Exception as e:
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
@@ -1963,8 +1605,7 @@ class MergingGUI(ThemedTk):
                 self.after(
                     0,
                     lambda base_name=base_name, e=e: messagebox.showerror(
-                        "Processing Error",
-                        f"An error occurred while processing {base_name}:\n\n{e}",
+                        "Processing Error", f"An error occurred while processing {base_name}:\n\n{e}"
                     ),
                 )
                 # --- NEW: Stop the entire batch if one video fails critically ---
@@ -1985,9 +1626,7 @@ class MergingGUI(ThemedTk):
 
         # --- NEW: Signal the cleanup worker to stop after it finishes its queue ---
         self.cleanup_queue.put(None)
-        logger.info(
-            "Main processing loop finished. Stop signal sent to cleanup worker."
-        )
+        logger.info("Main processing loop finished. Stop signal sent to cleanup worker.")
 
         self.after(0, self.processing_done, self.stop_event.is_set())
 
@@ -2027,30 +1666,22 @@ class MergingGUI(ThemedTk):
                         logger.debug(f"Restored '{filename}' to '{base_folder}'")
                     except Exception as e:
                         error_count += 1
-                        logger.error(
-                            f"Error restoring file '{filename}': {e}", exc_info=True
-                        )
+                        logger.error(f"Error restoring file '{filename}': {e}", exc_info=True)
             else:
-                logger.info(
-                    f"No 'finished' subfolder found in '{base_folder}'. Nothing to restore."
-                )
+                logger.info(f"No 'finished' subfolder found in '{base_folder}'. Nothing to restore.")
 
         messagebox.showinfo(
             "Restore Complete",
             f"Restore operation finished.\n\nFiles Restored: {restored_count}\nErrors: {error_count}",
         )
-        self.update_status_label(
-            f"Restore complete. Moved {restored_count} files with {error_count} errors."
-        )
+        self.update_status_label(f"Restore complete. Moved {restored_count} files with {error_count} errors.")
 
         # --- NEW: Reset video list scan flag and refresh preview ---
         if hasattr(self, "previewer"):
             self.previewer.reset_video_list_scan()
             # Trigger a full refresh scan
             if self.previewer.find_sources_callback:
-                self.previewer.load_video_list(
-                    find_sources_callback=self.previewer.find_sources_callback
-                )
+                self.previewer.load_video_list(find_sources_callback=self.previewer.find_sources_callback)
         # --- END NEW ---
 
     def _find_preview_sources_callback(self) -> list:
@@ -2061,17 +1692,12 @@ class MergingGUI(ThemedTk):
         """
         inpainted_folder = self.inpainted_folder_var.get()
         if not os.path.isdir(inpainted_folder):
-            messagebox.showerror(
-                "Error", "Inpainted Video Folder is not a valid directory."
-            )
+            messagebox.showerror("Error", "Inpainted Video Folder is not a valid directory.")
             return []
 
         all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
         valid_inpainted_videos = [
-            f
-            for f in all_mp4s
-            if f.endswith("_inpainted_right_eye.mp4")
-            or f.endswith("_inpainted_sbs.mp4")
+            f for f in all_mp4s if f.endswith("_inpainted_right_eye.mp4") or f.endswith("_inpainted_sbs.mp4")
         ]
 
         video_source_list = []
@@ -2112,12 +1738,8 @@ class MergingGUI(ThemedTk):
             # --- END NEW ---
 
             mask_folder = self.mask_folder_var.get()
-            splatted4_pattern = os.path.join(
-                mask_folder, f"{core_name}_*_splatted4.mp4"
-            )
-            splatted2_pattern = os.path.join(
-                mask_folder, f"{core_name}_*_splatted2.mp4"
-            )
+            splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
+            splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
             logger.debug(
                 f"  - Searching for splatted file with patterns: '{splatted4_pattern}' and '{splatted2_pattern}'"
             )
@@ -2135,26 +1757,18 @@ class MergingGUI(ThemedTk):
 
             if splatted4_matches:
                 splatted_path = splatted4_matches[0]
-                logger.debug(
-                    f"  - Found quad-splatted match: {os.path.basename(splatted_path)}"
-                )
+                logger.debug(f"  - Found quad-splatted match: {os.path.basename(splatted_path)}")
                 source_dict["splatted"] = splatted_path
                 source_dict["is_quad_input"] = True  # Set flag for quad-splatted input
                 # 'original' remains None, which is the necessary structural fix for the crash
             elif splatted2_matches:
                 splatted_path = splatted2_matches[0]
-                logger.debug(
-                    f"  - Found dual-splatted match: {os.path.basename(splatted_path)}"
-                )
+                logger.debug(f"  - Found dual-splatted match: {os.path.basename(splatted_path)}")
                 source_dict["splatted"] = splatted_path
-                original_path = self._find_video_by_core_name(
-                    self.original_folder_var.get(), core_name
-                )
+                original_path = self._find_video_by_core_name(self.original_folder_var.get(), core_name)
 
                 if original_path:
-                    logger.debug(
-                        f"  - Found matching original video: {os.path.basename(original_path)}"
-                    )
+                    logger.debug(f"  - Found matching original video: {os.path.basename(original_path)}")
                     source_dict["original"] = original_path
                 else:
                     logger.warning(
@@ -2169,9 +1783,7 @@ class MergingGUI(ThemedTk):
             video_source_list.append(source_dict)
         return video_source_list
 
-    def _preview_processing_callback(
-        self, source_frames: dict, params: dict
-    ) -> Optional[Image.Image]:
+    def _preview_processing_callback(self, source_frames: dict, params: dict) -> Optional[Image.Image]:
         """
         This function contains the actual blending logic for the preview.
         It's called by the VideoPreviewer module.
@@ -2186,23 +1798,15 @@ class MergingGUI(ThemedTk):
             # 1. Extract tensors from the source_frames dict
             inpainted_tensor_full = source_frames.get("inpainted")
             splatted_tensor = source_frames.get("splatted")
-            original_tensor = source_frames.get(
-                "original"
-            )  # Will be None for quad input
+            original_tensor = source_frames.get("original")  # Will be None for quad input
 
             if inpainted_tensor_full is None or splatted_tensor is None:
-                raise ValueError(
-                    "Missing 'inpainted' or 'splatted' source for preview."
-                )
+                raise ValueError("Missing 'inpainted' or 'splatted' source for preview.")
 
             # --- FIX: Determine input type based on metadata from the video list ---
-            current_source_metadata = self.previewer.video_list[
-                self.previewer.current_video_index
-            ]
+            current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             is_sbs_input = current_source_metadata.get("is_sbs_input", False)
-            is_quad_input = current_source_metadata.get(
-                "is_quad_input", False
-            )  # <--- GET NEW FLAG
+            is_quad_input = current_source_metadata.get("is_quad_input", False)  # <--- GET NEW FLAG
             # --- END FIX ---
 
             # 2. Determine input types and extract frame parts
@@ -2269,30 +1873,17 @@ class MergingGUI(ThemedTk):
                 logger.debug(
                     f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}"
                 )
-                inpainted = F.interpolate(
-                    inpainted,
-                    size=(hires_H, hires_W),
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                mask = F.interpolate(
-                    mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False
-                )
+                inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone()  # No need to unsqueeze, it's already 4D
             if params.get("mask_binarize_threshold", -1.0) >= 0.0:
-                processed_mask = (
-                    processed_mask > params["mask_binarize_threshold"]
-                ).float()
+                processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
             if params.get("mask_dilate_kernel_size", 0) > 0:
-                processed_mask = apply_mask_dilation(
-                    processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu
-                )
+                processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
             if params.get("mask_blur_kernel_size", 0) > 0:
-                processed_mask = apply_gaussian_blur(
-                    processed_mask, int(params["mask_blur_kernel_size"]), use_gpu
-                )
+                processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
             if params.get("shadow_shift", 0) > 0:
                 processed_mask = apply_shadow_blur(
                     processed_mask,
@@ -2308,18 +1899,12 @@ class MergingGUI(ThemedTk):
             if params.get("enable_color_transfer", False):
                 if original_left is not None:
                     logger.debug("Applying color transfer to preview frame...")
-                    inpainted = apply_color_transfer(
-                        original_left.cpu(), inpainted.cpu()
-                    ).to(device)
+                    inpainted = apply_color_transfer(original_left.cpu(), inpainted.cpu()).to(device)
 
-            blended_frame = (
-                right_eye_original * (1 - processed_mask) + inpainted * processed_mask
-            )
+            blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
             # --- NEW: Apply borders from sidecar ---
-            current_source_metadata = self.previewer.video_list[
-                self.previewer.current_video_index
-            ]
+            current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             clip_sidecar = current_source_metadata.get("sidecar", {})
             left_border = clip_sidecar.get("left_border", 0.0)
             right_border = clip_sidecar.get("right_border", 0.0)
@@ -2359,67 +1944,35 @@ class MergingGUI(ThemedTk):
                     final_frame_4d = original_left
                 else:
                     # This case should not be reachable if logic is correct, but as a fallback:
-                    logger.warning(
-                        "Preview: 'Original (Left Eye)' selected, but no source is available."
-                    )
-                    final_frame_4d = torch.zeros_like(
-                        blended_frame
-                    )  # Show a black screen
+                    logger.warning("Preview: 'Original (Left Eye)' selected, but no source is available.")
+                    final_frame_4d = torch.zeros_like(blended_frame)  # Show a black screen
                 # --- END FIX ---
             elif preview_source == "Warped (Right BG)":
                 logger.debug("  -> Displaying Warped (Right BG).")
                 final_frame_4d = right_eye_original
             elif preview_source == "Processed Mask":
                 logger.debug("  -> Displaying Processed Mask.")
-                final_frame_4d = processed_mask.repeat(
-                    1, 3, 1, 1
-                )  # Convert grayscale mask to 3-channel for display
+                final_frame_4d = processed_mask.repeat(1, 3, 1, 1)  # Convert grayscale mask to 3-channel for display
             elif preview_source == "Anaglyph 3D":
                 logger.debug(" -> Displaying Anaglyph 3D.")
-                left_np = (
-                    original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                right_np = (
-                    blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                left_gray_np = cv2.cvtColor(
-                    left_np, cv2.COLOR_RGB2GRAY
-                )  # Use standard for old red/cyan
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY)  # Use standard for old red/cyan
                 anaglyph_np = right_np.copy()
-                anaglyph_np[:, :, 0] = (
-                    left_gray_np  # Red channel from grayscale left eye
-                )
-                final_frame_4d = (
-                    torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0
-                ).unsqueeze(0)
+                anaglyph_np[:, :, 0] = left_gray_np  # Red channel from grayscale left eye
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
             elif preview_source == "Dubois Anaglyph":
                 logger.debug(" -> Displaying Dubois Anaglyph.")
-                left_np = (
-                    original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                right_np = (
-                    blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                anaglyph_np = apply_dubois_anaglyph(
-                    left_np, right_np
-                )  # Use imported utility
-                final_frame_4d = (
-                    torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0
-                ).unsqueeze(0)
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_dubois_anaglyph(left_np, right_np)  # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
             elif preview_source == "Optimized Anaglyph":
                 logger.debug(" -> Displaying Optimized Anaglyph.")
-                left_np = (
-                    original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                right_np = (
-                    blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
-                ).astype(np.uint8)
-                anaglyph_np = apply_optimized_anaglyph(
-                    left_np, right_np
-                )  # Use imported utility
-                final_frame_4d = (
-                    torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0
-                ).unsqueeze(0)
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                anaglyph_np = apply_optimized_anaglyph(left_np, right_np)  # Use imported utility
+                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
             elif preview_source == "Wigglegram":
                 logger.debug(" -> Starting Wigglegram animation.")
                 self.previewer._start_wigglegram_animation(original_left, blended_frame)
@@ -2428,9 +1981,7 @@ class MergingGUI(ThemedTk):
                 logger.debug("  -> Displaying Depth Map.")
                 final_frame_4d = depth_map_vis.to(device)
             else:
-                logger.debug(
-                    f"  -> Fallback: Displaying Blended Image for unknown source '{preview_source}'."
-                )
+                logger.debug(f"  -> Fallback: Displaying Blended Image for unknown source '{preview_source}'.")
                 final_frame_4d = blended_frame
 
             # Fallback in case final_frame wasn't set
@@ -2443,11 +1994,7 @@ class MergingGUI(ThemedTk):
 
             # 5. Convert to PIL Image for returning
             final_frame_cpu = final_frame_4d.cpu()
-            pil_img = Image.fromarray(
-                (final_frame_cpu.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(
-                    np.uint8
-                )
-            )
+            pil_img = Image.fromarray((final_frame_cpu.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
             return pil_img
         except Exception as e:
             logger.error(f"Error in preview processing callback: {e}", exc_info=True)
@@ -2502,9 +2049,7 @@ class MergingGUI(ThemedTk):
             self._apply_theme()
             logger.info(f"Settings loaded from {filepath}")
         except Exception as e:
-            messagebox.showerror(
-                "Load Error", f"Failed to load settings from {filepath}:\n{e}"
-            )
+            messagebox.showerror("Load Error", f"Failed to load settings from {filepath}:\n{e}")
 
     def save_settings_dialog(self):
         """Saves current GUI settings to a user-selected JSON file."""
@@ -2524,30 +2069,20 @@ class MergingGUI(ThemedTk):
                 json.dump(config_to_save, f, indent=4)
             logger.info(f"Settings saved to {filepath}")
         except Exception as e:
-            messagebox.showerror(
-                "Save Error", f"Failed to save settings to {filepath}:\n{e}"
-            )
+            messagebox.showerror("Save Error", f"Failed to save settings to {filepath}:\n{e}")
 
     def _save_preview_sbs_frame(self):
         """Saves the current preview as a full side-by-side image."""
-        if (
-            self.preview_original_left_tensor is None
-            or self.preview_blended_right_tensor is None
-        ):
+        if self.preview_original_left_tensor is None or self.preview_blended_right_tensor is None:
             messagebox.showwarning(
-                "No Preview Data",
-                "There is no preview data to save. Please load and preview a video first.",
+                "No Preview Data", "There is no preview data to save. Please load and preview a video first."
             )
             return
 
         try:
             # Convert tensors to PIL Images
-            left_np = (
-                self.preview_original_left_tensor.permute(1, 2, 0).numpy() * 255
-            ).astype(np.uint8)
-            right_np = (
-                self.preview_blended_right_tensor.permute(1, 2, 0).numpy() * 255
-            ).astype(np.uint8)
+            left_np = (self.preview_original_left_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            right_np = (self.preview_blended_right_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
             left_pil = Image.fromarray(left_np)
             right_pil = Image.fromarray(right_np)
@@ -2569,12 +2104,8 @@ class MergingGUI(ThemedTk):
             # Suggest a default filename
             default_filename = "preview_sbs_frame.png"
             if self.previewer.current_video_index != -1:
-                source_paths = self.previewer.video_list[
-                    self.previewer.current_video_index
-                ]
-                base_name = os.path.splitext(
-                    os.path.basename(next(iter(source_paths.values())))
-                )[0]
+                source_paths = self.previewer.video_list[self.previewer.current_video_index]
+                base_name = os.path.splitext(os.path.basename(next(iter(source_paths.values()))))[0]
                 frame_num = int(self.previewer.frame_scrubber_var.get())
                 default_filename = f"{base_name}_frame_{frame_num:05d}_SBS.png"
 
@@ -2582,11 +2113,7 @@ class MergingGUI(ThemedTk):
                 title="Save SBS Preview Frame As...",
                 initialfile=default_filename,
                 defaultextension=".png",
-                filetypes=[
-                    ("PNG Image", "*.png"),
-                    ("JPEG Image", "*.jpg"),
-                    ("All Files", "*.*"),
-                ],
+                filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg"), ("All Files", "*.*")],
             )
 
             if filepath:
@@ -2594,17 +2121,13 @@ class MergingGUI(ThemedTk):
                 logger.info(f"SBS preview frame saved to: {filepath}")
         except Exception as e:
             logger.error(f"Failed to save SBS preview frame: {e}", exc_info=True)
-            messagebox.showerror(
-                "Save Error",
-                f"An error occurred while creating or saving the SBS image:\n{e}",
-            )
+            messagebox.showerror("Save Error", f"An error occurred while creating or saving the SBS image:\n{e}")
 
     def exit_application(self):
         """Handles application exit gracefully."""
         if self.is_processing:
             if messagebox.askyesno(
-                "Confirm Exit",
-                "Processing is in progress. Are you sure you want to stop and exit?",
+                "Confirm Exit", "Processing is in progress. Are you sure you want to stop and exit?"
             ):
                 self.stop_processing()
                 self.previewer.cleanup()
@@ -2618,10 +2141,6 @@ class MergingGUI(ThemedTk):
 
 if __name__ == "__main__":
     # Basic logging setup
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
     app = MergingGUI()
     app.mainloop()

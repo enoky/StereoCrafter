@@ -1825,10 +1825,10 @@ def start_ffmpeg_pipe_process(
     if video_stream_info:
         if (
             video_stream_info.get("color_primaries") == "bt2020"
-            and video_stream_info.get("transfer_characteristics") == "smpte2084"
+            and video_stream_info.get("transfer_characteristics") in ("smpte2084", "arib-std-b67")
         ):
             is_hdr_source = True
-            logger.debug("Detected HDR source. Targeting HEVC 10-bit HDR output.")
+            logger.debug("Detected HDR source (PQ or HLG). Targeting HEVC 10-bit HDR output.")
 
     is_original_10bit_or_higher = False
     if original_pix_fmt:

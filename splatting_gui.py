@@ -87,7 +87,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-02-07.1"
+GUI_VERSION = "26-02-21.0"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -1653,9 +1653,9 @@ class SplatterGUI(ThemedTk):
         self.combo_color_tags_mode = ttk.Combobox(
             self.color_tags_frame,
             textvariable=self.color_tags_mode_var,
-            values=["Off", "Auto", "BT.709", "BT.2020"],
+            values=["Off", "Auto", "BT.709 L", "BT.709 F", "BT.2020 PQ", "BT.2020 HLG"],
             state="readonly",
-            width=10,
+            width=12,
         )
         self.combo_color_tags_mode.pack(side="left")
         self._create_hover_tooltip(self.lbl_color_tags_mode, "color_tags_mode")
