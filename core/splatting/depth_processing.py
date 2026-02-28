@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants for TV-range depth map normalization
 DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
 DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
-DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
+DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = False
 
 
 def custom_dilate(
@@ -229,8 +229,12 @@ def process_depth_batch(
     depth_blur_left: float = 0.0,
     depth_blur_left_mix: float = 0.5,
     skip_preprocessing: bool = False,
+    debug_task_name: str = "Render",
 ) -> np.ndarray:
     """Unified depth processor for batch of depth maps."""
+    # from dependency.stereocrafter_util import log_debug_args
+    # log_debug_args(locals(), "process_depth_batch", "depth_processing")
+
     if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
         batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
     else:
@@ -240,10 +244,19 @@ def process_depth_batch(
             else batch_depth_numpy_raw
         )
 
-    batch_depth_numpy_float = batch_depth_numpy.astype(np.float32)
+    batch_depth_float = batch_depth_numpy.astype(np.float32)
+    
+    # Standardize input for logging (4D)
+    if batch_depth_numpy_raw.ndim == 3:
+        batch_depth_log_input = batch_depth_numpy_raw[..., None]
+    else:
+        batch_depth_log_input = batch_depth_numpy_raw
+
+    # from dependency.stereocrafter_util import dump_debug_tensor
+    # dump_debug_tensor(batch_depth_log_input, f"{debug_task_name}_0_raw_depth", "depth_processing")
 
     if skip_preprocessing:
-        return batch_depth_numpy_float
+        return batch_depth_float
 
     current_width = (
         batch_depth_numpy_raw.shape[2]
@@ -272,7 +285,7 @@ def process_depth_batch(
         or render_blur_y > 0
     ):
         device = torch.device("cpu")
-        tensor_4d = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).to(device)
+        tensor_4d = torch.from_numpy(batch_depth_float).unsqueeze(1).to(device)
 
         if abs(render_dilate_left) > 1e-5:
             tensor_4d = custom_dilate_left(tensor_4d, float(render_dilate_left), False, max_raw_value)
@@ -314,12 +327,92 @@ def process_depth_batch(
         if render_blur_x > 0 or render_blur_y > 0:
             tensor_4d = custom_blur(tensor_4d, float(render_blur_x), float(render_blur_y), False, max_raw_value)
         
-        batch_depth_numpy_float = tensor_4d.squeeze(1).cpu().numpy()
+        batch_depth_float = tensor_4d.squeeze(1).cpu().numpy()
         del tensor_4d
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    return batch_depth_numpy_float
+    # from dependency.stereocrafter_util import dump_debug_tensor
+    # dump_debug_tensor(batch_depth_float[..., None], f"{debug_task_name}_2_filtered_depth", "depth_processing")
+
+    return batch_depth_float
+
+
+def normalize_and_gamma_depth(
+    batch_depth_numpy_raw: np.ndarray,
+    assume_raw_input: bool,
+    global_depth_max: float,
+    global_depth_min: float,
+    max_expected_raw_value: float,
+    zero_disparity_anchor_val: float,
+    depth_gamma: float,
+    debug_task_name: str = "Render",
+) -> np.ndarray:
+    """Normalizes and applies gamma to a batch of raw depth frames."""
+    # from dependency.stereocrafter_util import log_debug_args
+    # log_debug_args(locals(), "normalize_and_gamma_depth", "depth_processing")
+
+    if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
+        batch_depth_gray = batch_depth_numpy_raw.mean(axis=-1)
+    elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
+        batch_depth_gray = batch_depth_numpy_raw.squeeze(-1)
+    else:
+        batch_depth_gray = batch_depth_numpy_raw
+    
+    batch_depth_float = batch_depth_gray.astype(np.float32)
+    curr_max = float(batch_depth_float.max())
+    
+    if assume_raw_input:
+        # Scale/Unification Mode
+        if global_depth_max > 1.05:
+            batch_depth_normalized = batch_depth_float / global_depth_max
+            logger.debug(f"[DEPTH] Raw Mode: Normalized by global_depth_max={global_depth_max}")
+        elif curr_max > 1.05:
+            # CONTENT IS RAW. Let's decide on the divisor.
+            if curr_max > max_expected_raw_value * 1.5:
+                # The expected bit-depth was likely wrong (e.g. 10-bit reported but 16-bit delivered)
+                if curr_max <= 255.0: divisor = 255.0
+                elif curr_max <= 1024.0: divisor = 1023.0
+                elif curr_max <= 4096.0: divisor = 4095.0
+                else: divisor = 65535.0
+                logger.debug(f"[DEPTH] Raw Mode: Auto-sizing divisor to {divisor} (ContentMax={curr_max:.1f}, ExpMax={max_expected_raw_value:.1f})")
+            else:
+                divisor = max(max_expected_raw_value, 1.0)
+            
+            batch_depth_normalized = batch_depth_float / divisor
+            logger.debug(f"[DEPTH] Raw Mode: Normalized by divisor={divisor}")
+        else:
+            batch_depth_normalized = batch_depth_float
+            logger.debug(f"[DEPTH] Raw Mode: Input already normalized (max={curr_max:.3f})")
+    else:
+        # Global Normalization Mode (AutoGain)
+        depth_range = global_depth_max - global_depth_min
+        if depth_range > 1e-5:
+            batch_depth_normalized = (batch_depth_float - global_depth_min) / depth_range
+            logger.debug(f"[DEPTH] Global Norm Mode: Range [{global_depth_min:.2f}, {global_depth_max:.2f}]")
+        else:
+            batch_depth_normalized = np.full_like(
+                batch_depth_float,
+                fill_value=zero_disparity_anchor_val,
+                dtype=np.float32,
+            )
+            logger.debug(f"[DEPTH] Global Norm Mode: Range too small, using anchor={zero_disparity_anchor_val}")
+    
+    batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
+    
+    if round(float(depth_gamma), 2) != 1.0:
+        batch_depth_normalized = 1.0 - np.power(1.0 - batch_depth_normalized, depth_gamma)
+        batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
+        
+    # --- VITALS LOGGING ---
+    # vital_max = float(batch_depth_normalized.max())
+    # vital_min = float(batch_depth_normalized.min())
+    # print(f"VITALS [{debug_task_name}]: InputMax={curr_max:.1f}, DivMax={global_depth_max:.1f}, ExpMax={max_expected_raw_value:.1f}, OutputRange=[{vital_min:.4f}, {vital_max:.4f}]")
+
+    # from dependency.stereocrafter_util import dump_debug_tensor
+    # dump_debug_tensor(batch_depth_normalized, "1_normalized_gamma_depth", "depth_processing")
+        
+    return batch_depth_normalized
 
 
 def compute_global_depth_stats(

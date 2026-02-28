@@ -69,22 +69,31 @@ Settings here apply to both Full and Low-resolution outputs.
 - **Preview Scale:** Selects the scale factor for the preview image.
 - **Crosshair:** (Checkbox) Enables a centering crosshair on the preview to help with alignment and convergence checking. **White** and **Multi** options adjust the crosshair style.
 - **D/P:** (Checkbox) Depth/Pop readout. Shows depth information at the mouse cursor position in the preview.
+- **SBS:** (Checkbox) Enables a separate Side-by-Side (SBS) preview window. This is ideal for dual-monitor setups or using VR headsets/3D displays to check alignment in real-time.
 
 ## Keyboard Shortcuts (Global)
 
-| Shortcut                       | Action      | Jump Size       |
-| :----------------------------- | :---------- | :-------------- |
-| **Left / Right Arrow**         | Jump frames | 10 frames       |
-| **Shift + Left / Right Arrow** | Jump frames | 100 frames      |
-| **Ctrl + Left / Right Arrow**  | Jump clips  | Previous / Next |
+| Shortcut                       | Action       | Notes / Jump Size |
+| :----------------------------- | :----------- | :---------------- |
+| **Left / Right Arrow**         | Jump frames  | 10 frames         |
+| **Shift + Left / Right Arrow** | Jump frames  | 100 frames        |
+| **Ctrl + Left / Right Arrow**  | Jump clips   | Previous / Next   |
+| **Spacebar**                   | Play / Pause | Shared across GUI |
+| **'X'** (in SBS Window)        | Toggle Cross | Swaps L/R eyes    |
+| **F11** (in SBS Window)        | Fullscreen   | Toggles SBS FS    |
+
+> [!TIP]
+> **Shared Navigation:** Keyboard hotkeys work even when the SBS window is in focus. You can navigate the video without switching back to the main GUI.
+> [!NOTE]
+> **Focus Management:** If the cursor is blinking in an input field (like "Jump to:"), hotkeys are disabled to allow typing. Click anywhere on the preview canvas or the GUI background to "release" the focus and re-enable hotkeys.
 
 ## Basic Workflow
 
-1.  **Set Input/Output Folders:** Fill in paths for Source Clips, Depth Maps, and Output Splatted.
-2.  **Load Preview:** Click `Load/Refresh List`.
-3.  **Adjust Settings**: Adjust `Dilate`, `Blur`, `Gamma`, `Disparity`, and `Convergence`. Use **Preview Auto-Converge** to find a starting point.
-4.  **Save Sidecar:** Click **Update Sidecar** (or check **Auto Save Sidecar on Next** in the File menu).
-5.  **Start Processing:** Click the `START` button to begin batch processing.
+1. **Set Input/Output Folders:** Fill in paths for Source Clips, Depth Maps, and Output Splatted.
+2. **Load Preview:** Click `Load/Refresh List`.
+3. **Adjust Settings**: Adjust `Dilate`, `Blur`, `Gamma`, `Disparity`, and `Convergence`. Use **Preview Auto-Converge** to find a starting point.
+4. **Save Sidecar:** Click **Update Sidecar** (or check **Auto Save Sidecar on Next** in the File menu).
+5. **Start Processing:** Click the `START` button to begin batch processing.
 
 ## Menu Bar
 

@@ -5,11 +5,16 @@ This package contains modularized components for the StereoCrafter
 """
 
 from .common import (
+    VideoIO,
+    read_video_frames,
+)
+
+from .ui import (
     ThemeManager,
     DARK_COLORS,
     LIGHT_COLORS,
-    VideoIO,
-    read_video_frames,
+    PreviewFrameBuffer,
+    SBSPreviewWindow,
 )
 
 from .splatting import (
@@ -32,6 +37,8 @@ __all__ = [
     'ThemeManager',
     'DARK_COLORS',
     'LIGHT_COLORS',
+    'PreviewFrameBuffer',
+    'SBSPreviewWindow',
     'VideoIO',
     'read_video_frames',
     'compute_global_depth_stats',

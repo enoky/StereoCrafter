@@ -4,7 +4,7 @@ import shutil
 import threading
 import tkinter as tk  # Required for Tooltip class
 from tkinter import Toplevel, Label, ttk
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Dict, Any
 import logging
 
 import numpy as np
@@ -16,7 +16,89 @@ import gc
 import time
 import re
 
-VERSION = "26-01-30.0"
+VERSION = "26-02-26.2"
+
+def dump_debug_tensor(tensor_or_numpy, stage_name: str, session_id: str):
+    import logging
+    # Force enabled for this debug session
+    # if not logging.getLogger().isEnabledFor(logging.DEBUG):
+    #     return
+    import os, cv2, numpy as np
+    import torch
+    base_dir = os.path.join("debug_dumps", session_id)
+    os.makedirs(base_dir, exist_ok=True)
+    
+    if isinstance(tensor_or_numpy, torch.Tensor):
+        t = tensor_or_numpy.detach().cpu().numpy()
+    else:
+        t = np.copy(tensor_or_numpy)
+        
+    while t.ndim > 4:
+        t = t[0]
+    if t.ndim == 4:
+        t = t[0]
+
+    # Now t is 3D or 2D
+    if t.ndim == 3:
+        if t.shape[0] == 1 or t.shape[0] == 3:
+            t = t.transpose(1, 2, 0)
+        elif t.shape[-1] != 1 and t.shape[-1] != 3:
+            # likely [Batch, H, W]
+            t = t[0]
+        
+    # If it's a depth map with high values (10-bit or 16-bit), normalize for view
+    # Convert to float for safe math
+    t_float = t.astype(np.float32)
+    max_val = float(t_float.max())
+    
+    if max_val > 1.1:
+        if max_val <= 256.0:
+            t_out = t_float
+        elif max_val <= 1024.0:
+            t_out = (t_float / 1023.0) * 255.0
+        elif max_val <= 4096.0:
+            t_out = (t_float / 4095.0) * 255.0
+        else:
+            t_out = (t_float / 65535.0) * 255.0
+    else:
+        # 0.0-1.0 range
+        t_out = t_float * 255.0
+        
+    t_final = np.clip(t_out, 0, 255).astype(np.uint8)
+    
+    if t_final.ndim == 3 and t_final.shape[-1] == 3:
+        t_final = cv2.cvtColor(t_final, cv2.COLOR_RGB2BGR)
+        
+    cv2.imwrite(os.path.join(base_dir, f"{stage_name}.png"), t_final)
+
+
+def log_debug_args(args_dict: dict, function_name: str, session_id: str):
+    import os, json
+    base_dir = os.path.join("debug_dumps", session_id)
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # Filter for JSON serializable types
+    serializable_args = {}
+    for k, v in args_dict.items():
+        if hasattr(v, "shape"): # Tensors/Numpy
+            serializable_args[k] = f"Tensor/Array {list(v.shape)} {v.dtype}"
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            serializable_args[k] = v
+        else:
+            serializable_args[k] = str(v)
+
+            
+    log_file = os.path.join(base_dir, f"{function_name}_args.json")
+    # Append or overwrite? Overwrite for now to match the PNG behavior if user prefers, 
+    # but maybe separate files for Preview vs Render based on a key?
+    # Let's use the task_name as part of the filename if available in args.
+    task_name = args_dict.get("debug_task_name", "generic")
+    filename = f"{function_name}_{task_name}_args.json"
+    
+    with open(os.path.join(base_dir, filename), "w") as f:
+        json.dump(serializable_args, f, indent=4)
+
+
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
@@ -92,218 +174,7 @@ class Tooltip:
         self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
 
 
-class SidecarConfigManager:
-    """Handles reading, writing, and merging of stereocrafter sidecar files."""
 
-    # 1. CENTRAL KEY MAP: {JSON_KEY: (Python_Type, Default_Value)}
-    # NOTE: Decimal places removed, as rounding is now handled by the GUI slider
-    SIDECAR_KEY_MAP = {
-        "convergence_plane": (float, 0.5),
-        "max_disparity": (float, 20.0),
-        # --- Optional max-metric keys (persisted when present) ---
-        "true_max": (float, None),
-        "dp_total_max_true": (float, None),
-        "dp_total_max_est": (float, None),
-        "gamma": (float, 1.0),
-        "input_bias": (float, 0.0),
-        "depth_dilate_size_x": (float, 0.0),
-        "depth_dilate_size_y": (float, 0.0),
-        "depth_blur_size_x": (float, 0.0),
-        "depth_blur_size_y": (float, 0.0),
-        "depth_dilate_left": (float, 0.0),
-        "depth_blur_left": (float, 0.0),
-        "depth_blur_left_mix": (float, 0.5),
-        "selected_depth_map": (str, ""),
-        "left_border": (float, 0.0),
-        "right_border": (float, 0.0),
-        "border_mode": (str, None),
-        "auto_border_L": (float, None),
-        "auto_border_R": (float, None),
-        # Add future keys here
-    }
-
-    def _get_defaults(self) -> dict:
-        """Returns a dictionary populated with all default values."""
-        defaults = {}
-        # Iterate over the new map structure: key, (expected_type, default_val)
-        for key, (_, default_val) in self.SIDECAR_KEY_MAP.items():
-            defaults[key] = default_val
-        return defaults
-
-    def get_merged_config(
-        self, sidecar_path: str, gui_config: dict, override_keys: list
-    ) -> dict:
-        """
-        Merges sidecar data with GUI configuration, allowing specific keys to
-        be overridden by GUI values.
-
-        gui_config must use the same JSON keys as the sidecar file.
-        """
-        # 1. Load the sidecar data (base config, merged with defaults)
-        merged_config = self.load_sidecar_data(sidecar_path)
-
-        # 2. Apply GUI overrides
-        for key in override_keys:
-            if key in gui_config and key in self.SIDECAR_KEY_MAP:
-                # Get the expected type from the map
-                expected_type = self.SIDECAR_KEY_MAP[key][0]
-
-                # Attempt to cast the GUI value to the expected type
-                try:
-                    val = gui_config[key]
-                    if expected_type is float:
-                        merged_config[key] = float(val)
-                    elif expected_type is int:
-                        merged_config[key] = int(val)
-                    else:
-                        merged_config[key] = val
-                except (ValueError, TypeError):
-                    logger.warning(
-                        f"GUI value for '{key}' is invalid ({gui_config[key]}). Skipping override."
-                    )
-
-        return merged_config
-
-    def load_sidecar_data(self, file_path: str) -> dict:
-        """
-        Loads and validates sidecar data, returning a dictionary merged with defaults.
-        Returns defaults if file is not found or invalid.
-        """
-        data = self._get_defaults()
-        if not os.path.exists(file_path):
-            logger.debug(f"Sidecar not found at {file_path}. Returning defaults.")
-            return data
-
-        try:
-            with open(file_path, "r") as f:
-                sidecar_json = json.load(f)
-
-            # Iterate over the new map structure: key, (expected_type, default_val)
-            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
-                if key in sidecar_json:
-                    val = sidecar_json[key]
-                    try:
-                        # Attempt to cast the value to the expected type
-                        if expected_type is int:
-                            data[key] = int(val)
-                        elif expected_type is float:
-                            data[key] = float(val)
-                        else:
-                            data[key] = val
-                    except (ValueError, TypeError):
-                        logger.warning(
-                            f"Sidecar key '{key}' has invalid value/type. Using default."
-                        )
-
-            # Preserve unknown keys for legacy migration (e.g., manual_border)
-            for key, val in sidecar_json.items():
-                if key not in data:
-                    data[key] = val
-
-        except Exception as e:
-            logger.error(f"Failed to read/parse sidecar at {file_path}: {e}")
-            # Still return defaults + whatever valid data was read before the failure
-
-        return data
-
-    def save_sidecar_data(self, file_path: str, data: dict) -> bool:
-        """
-        Saves a dictionary to the sidecar file, ensuring the directory and file are created.
-        No rounding is applied here, assuming input data is pre-rounded.
-        """
-        try:
-            # 1. Ensure directory exists
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            # 2. Filter data (No rounding step needed)
-            output_data = {}
-            # Iterate over the new map structure: key, (expected_type, default_val)
-            for key, (expected_type, _) in self.SIDECAR_KEY_MAP.items():
-                if key in data:
-                    v = data[key]
-                    # Avoid writing noisy nulls for optional fields (e.g., true_max / estimates)
-                    if v is None:
-                        continue
-                    output_data[key] = v
-
-            # 3. Write to file (mode 'w' creates the file if it doesn't exist)
-            with open(file_path, "w") as f:
-                json.dump(output_data, f, indent=4)
-
-            logger.debug(f"Sidecar saved successfully to {file_path}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to save sidecar to {file_path}: {e}")
-            return False
-
-
-def find_video_by_core_name(folder: str, core_name: str) -> Optional[str]:
-    """Scans a folder for a file matching the core_name with any common video extension."""
-    video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm")
-    for ext in video_extensions:
-        full_path = os.path.join(folder, f"{core_name}{ext[1:]}")
-        if os.path.exists(full_path):
-            return full_path
-    return None
-
-
-def find_sidecar_file(base_path: str) -> Optional[str]:
-    """Looks for a sidecar JSON file next to the video file."""
-    sidecar_path = f"{os.path.splitext(base_path)[0]}.fssidecar"
-    if os.path.exists(sidecar_path):
-        return sidecar_path
-    # Also check .json extension for backwards compatibility
-    json_path = f"{os.path.splitext(base_path)[0]}.json"
-    if os.path.exists(json_path):
-        return json_path
-    return None
-
-
-def find_sidecar_in_folder(folder: str, core_name: str) -> Optional[str]:
-    """Looks for a sidecar file in a specific folder."""
-    fssidecar_path = os.path.join(folder, f"{core_name}.fssidecar")
-    if os.path.exists(fssidecar_path):
-        return fssidecar_path
-    # Also check .json extension for backwards compatibility
-    json_path = os.path.join(folder, f"{core_name}.json")
-    if os.path.exists(json_path):
-        return json_path
-    return None
-
-
-def read_clip_sidecar(
-    sidecar_manager: SidecarConfigManager,
-    video_path: str,
-    core_name: str,
-    search_folders: Optional[list] = None,
-) -> dict:
-    """
-    Reads the sidecar file for a clip if it exists.
-    Returns a dictionary of sidecar data merged with defaults.
-
-    Args:
-        sidecar_manager: SidecarConfigManager instance
-        video_path: Path to the video file
-        core_name: Core name of the clip
-        search_folders: Optional list of additional folders to search for sidecar files
-    """
-    # Check inpainted folder first (user requested)
-    if search_folders:
-        for folder in search_folders:
-            sidecar_path = find_sidecar_in_folder(folder, core_name)
-            if sidecar_path:
-                logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
-                return sidecar_manager.load_sidecar_data(sidecar_path)
-
-    # Then check next to video file
-    sidecar_path = find_sidecar_file(video_path)
-    if sidecar_path:
-        logger.debug(f"Loaded sidecar file: {os.path.basename(sidecar_path)}")
-        return sidecar_manager.load_sidecar_data(sidecar_path)
-
-    logger.debug(f"No sidecar file found for '{core_name}'. Using defaults.")
-    return sidecar_manager._get_defaults()
 
 
 def apply_borders_to_frames(
@@ -1249,7 +1120,7 @@ def encode_frames_to_mp4(
             x265_params.append(
                 f"max-cll={video_stream_info['max_content_light_level']}"
             )
-    elif original_codec_name == "hevc" and is_original_10bit_or_higher:
+    elif is_original_10bit_or_higher and original_codec_name in ("hevc", "prores", "dnxhd", "dnxhr"):
         logger.debug(
             "Detected SDR 10-bit HEVC source. Targeting HEVC 10-bit SDR output."
         )
@@ -1733,6 +1604,7 @@ def start_ffmpeg_pipe_process(
     user_output_crf: Optional[int] = None,
     pad_to_16_9: bool = False,
     debug_label: Optional[str] = None,
+    encoding_options: Optional[dict] = None,
 ) -> Optional[subprocess.Popen]:
     """
     Builds an FFmpeg command and starts a subprocess configured to accept
@@ -1855,7 +1727,7 @@ def start_ffmpeg_pipe_process(
             x265_params.append(
                 f"max-cll={video_stream_info['max_content_light_level']}"
             )
-    elif original_codec_name == "hevc" and is_original_10bit_or_higher:
+    elif is_original_10bit_or_higher and original_codec_name in ("hevc", "prores", "dnxhd", "dnxhr"):
         output_codec = "libx265"
         if CUDA_AVAILABLE:
             output_codec = "hevc_nvenc"
@@ -1872,10 +1744,113 @@ def start_ffmpeg_pipe_process(
             default_cpu_crf = "18"
         output_profile = "main"
 
+    # --- Encoding options (non-destructive defaults) ---
+    enc_opts = encoding_options or {}
+    encoder_mode = str(enc_opts.get("encoder", "Auto"))
+    quality_mode = str(enc_opts.get("quality", "Medium"))
+    tune_mode = str(enc_opts.get("tune", "None"))
+
+    # Back-compat: older configs used "Auto"
+    try:
+        if str(quality_mode).strip().lower() == "auto":
+            quality_mode = "Medium"
+    except Exception:
+        pass
+    try:
+        if str(tune_mode).strip().lower() == "auto":
+            tune_mode = "None"
+    except Exception:
+        pass
+
+    nvenc_quality_map = {
+        "Fastest": "p1",
+        "Faster": "p2",
+        "Fast": "p3",
+        "Medium": "p4",
+        "Slow": "p5",
+        "Slower": "p6",
+        "Slowest": "p7",
+    }
+    cpu_quality_map = {
+        "Fastest": "ultrafast",
+        "Faster": "superfast",
+        "Fast": "veryfast",
+        "Medium": "medium",
+        "Slow": "slow",
+        "Slower": "slower",
+        "Slowest": "veryslow",
+    }
+
+    # Force CPU overrides NVENC selection only (keeps H.264 vs H.265 decision unchanged)
+    if encoder_mode.lower() in ("force cpu", "force_cpu", "cpu"):
+        if output_codec == "hevc_nvenc":
+            output_codec = "libx265"
+        elif output_codec == "h264_nvenc":
+            output_codec = "libx264"
+
+    cpu_preset = None
+    if quality_mode != "Auto":
+        if "nvenc" in output_codec:
+            nvenc_preset = nvenc_quality_map.get(quality_mode, nvenc_preset)
+        elif output_codec in ("libx264", "libx265"):
+            cpu_preset = cpu_quality_map.get(quality_mode, None)
+
+    cpu_tune = None
+    try:
+        t_raw = str(tune_mode).strip().lower()
+        t_raw = re.sub(r"\s+", " ", t_raw)
+    except Exception:
+        t_raw = ""
+
+    if t_raw not in ("", "auto", "none"):
+        if output_codec == "libx264":
+            x264_map = {
+                "film": "film", "animation": "animation", "grain": "grain",
+                "still image": "stillimage", "stillimage": "stillimage",
+                "psnr": "psnr", "ssim": "ssim",
+                "fast decode": "fastdecode", "fastdecode": "fastdecode", "fast-decode": "fastdecode",
+                "zero latency": "zerolatency", "zerolatency": "zerolatency", "zero-latency": "zerolatency",
+            }
+            cpu_tune = x264_map.get(t_raw, None)
+        elif output_codec == "libx265":
+            x265_map = {
+                "grain": "grain", "animation": "animation", "psnr": "psnr", "ssim": "ssim",
+                "fast decode": "fast-decode", "fastdecode": "fast-decode", "fast-decode": "fast-decode",
+                "zero latency": "zero-latency", "zerolatency": "zero-latency", "zero-latency": "zero-latency",
+            }
+            cpu_tune = x265_map.get(t_raw, None)
+
+    nvenc_lookahead_enabled = bool(enc_opts.get("nvenc_lookahead_enabled", False))
+    try:
+        nvenc_lookahead = int(float(enc_opts.get("nvenc_lookahead", 16)))
+    except Exception:
+        nvenc_lookahead = 16
+    nvenc_lookahead = max(0, min(64, nvenc_lookahead))
+
+    nvenc_spatial_aq = bool(enc_opts.get("nvenc_spatial_aq", False))
+    nvenc_temporal_aq = bool(enc_opts.get("nvenc_temporal_aq", False))
+    try:
+        nvenc_aq_strength = int(float(enc_opts.get("nvenc_aq_strength", 8)))
+    except Exception:
+        nvenc_aq_strength = 8
+    nvenc_aq_strength = max(1, min(15, nvenc_aq_strength))
+
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
         ffmpeg_cmd.extend(["-preset", nvenc_preset, "-qp", default_nvenc_cq])
+        if nvenc_lookahead_enabled:
+            ffmpeg_cmd.extend(["-rc-lookahead", str(nvenc_lookahead)])
+        if nvenc_spatial_aq:
+            ffmpeg_cmd.extend(["-spatial-aq", "1"])
+        if nvenc_temporal_aq:
+            ffmpeg_cmd.extend(["-temporal-aq", "1"])
+        if (nvenc_spatial_aq or nvenc_temporal_aq) and nvenc_aq_strength:
+            ffmpeg_cmd.extend(["-aq-strength", str(nvenc_aq_strength)])
     else:
+        if cpu_preset:
+            ffmpeg_cmd.extend(["-preset", cpu_preset])
+        if cpu_tune:
+            ffmpeg_cmd.extend(["-tune", cpu_tune])
         ffmpeg_cmd.extend(["-crf", default_cpu_crf])
 
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
@@ -1990,3 +1965,99 @@ def start_ffmpeg_pipe_process(
     except Exception as e:
         logger.error(f"Failed to start FFmpeg pipe process: {e}", exc_info=True)
         return None
+
+def start_ffmpeg_pipe_process_dnxhr(
+    content_width: int,
+    content_height: int,
+    final_output_mov_path: str,
+    fps: float,
+    dnxhr_profile: str = "HQX",
+) -> Optional[subprocess.Popen]:
+    """
+    Starts an FFmpeg pipe process for DNxHR (Resolve-friendly intermediate).
+    Input: raw 16-bit BGR frames via stdin (bgr48le).
+    Output: .mov DNxHR (default HQX 10-bit 4:2:2).
+    """
+    profile_map = {
+        "SQ": "dnxhr_sq",
+        "HQ": "dnxhr_hq",
+        "HQX": "dnxhr_hqx",
+        "444": "dnxhr_444",
+    }
+    prof_key = (dnxhr_profile or "HQX").strip().upper()
+    # Accept friendly labels like "HQX (10-bit 4:2:2)"
+    try:
+        prof_key = re.split(r"[\s\(]", prof_key, maxsplit=1)[0]
+        prof_key = prof_key.split("-")[0]
+    except Exception:
+        pass
+    ff_prof = profile_map.get(prof_key, "dnxhr_hqx")
+
+    if ff_prof == "dnxhr_444":
+        out_pix_fmt = "yuv444p10le"
+    elif ff_prof == "dnxhr_hqx":
+        out_pix_fmt = "yuv422p10le"
+    else:
+        out_pix_fmt = "yuv422p"
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{content_width}x{content_height}",
+        "-pix_fmt",
+        "bgr48le",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-c:v",
+        "dnxhd",
+        "-profile:v",
+        ff_prof,
+        "-pix_fmt",
+        out_pix_fmt,
+        "-an",
+        final_output_mov_path,
+    ]
+
+    logger.debug(f"Starting DNxHR pipe: {' '.join(ffmpeg_cmd)}")
+    try:
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            process.sc_encode_flags = {
+                "codec": "dnxhd",
+                "profile": ff_prof,
+                "pix_fmt": out_pix_fmt,
+            }  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return process
+    except FileNotFoundError:
+        logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to start DNxHR pipe: {e}", exc_info=True)
+        return None
+
+# --- Sidecar Management (Proxies for core.common.sidecar_manager) ---
+# Moved to end of file to break circular imports between core and util
+from core.common.sidecar_manager import (
+    SidecarConfigManager,
+    find_sidecar_file,
+    find_sidecar_in_folder,
+    read_clip_sidecar,
+    find_video_by_core_name
+)

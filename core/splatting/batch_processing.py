@@ -108,6 +108,8 @@ class ProcessingSettings:
     low_res_height: int = 1080
     low_res_batch_size: int = 50
     dual_output: bool = False
+    strict_ffmpeg_decode: bool = False
+    output_name_suffix: str = ""
     zero_disparity_anchor: float = 0.5
     enable_global_norm: bool = False
     match_depth_res: bool = True
@@ -132,12 +134,72 @@ class ProcessingSettings:
     multi_map: bool = False
     selected_depth_map: str = ""
     color_tags_mode: str = "Auto"
+    encoding_encoder: str = "Auto"
+    encoding_quality: str = "Auto"
+    encoding_tune: str = "Auto"
+    encoding_nvenc_lookahead_enabled: bool = False
+    encoding_nvenc_lookahead: int = 16
+    encoding_nvenc_spatial_aq: bool = False
+    encoding_nvenc_temporal_aq: bool = False
+    encoding_nvenc_aq_strength: int = 8
+    dnxhr_fullres_split: bool = False
+    dnxhr_profile: str = "HQX"
     is_test_mode: bool = False
     test_target_frame_idx: Optional[int] = None
     skip_lowres_preproc: bool = False
     sidecar_ext: str = ".fssidecar"
     sidecar_folder: str = ""
     track_dp_total_true_on_render: bool = False
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(cls, config: dict, **overrides) -> "ProcessingSettings":
+        """Build a ProcessingSettings from a flat config dict.
+
+        Keys in *config* are matched to dataclass field names.  Numeric
+        fields are coerced automatically.  Any explicit *overrides* are
+        applied last so the caller can inject values that don't live in
+        the config dict (e.g. ``sidecar_folder``, ``is_test_mode``).
+
+        Unknown keys in *config* are silently ignored.
+        """
+        import dataclasses as _dc
+
+        field_names = {f.name for f in _dc.fields(cls)}
+        field_types = {f.name: f.type for f in _dc.fields(cls)}
+
+        # --- Key aliases (config key -> dataclass field) ---------------
+        _ALIASES = {
+            "convergence_point": "zero_disparity_anchor",
+            "batch_size": "full_res_batch_size",
+            "pre_res_width": "low_res_width",
+            "pre_res_height": "low_res_height",
+            "enable_full_resolution": "enable_full_resolution",
+            "enable_low_resolution": "enable_low_resolution",
+        }
+
+        kwargs: dict = {}
+        for key, value in config.items():
+            field = _ALIASES.get(key, key)
+            if field not in field_names:
+                continue
+            # Light type coercion
+            target = field_types.get(field, "str")
+            try:
+                if target == "float":
+                    value = float(value)
+                elif target == "int":
+                    value = int(value)
+                elif target == "bool" and not isinstance(value, bool):
+                    value = str(value).lower() in ("true", "1", "yes")
+            except (ValueError, TypeError):
+                pass
+            kwargs[field] = value
+
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
 
 @dataclass
@@ -382,6 +444,7 @@ class BatchProcessor:
     ) -> int:
         """Handles the full processing lifecycle for a single video."""
         video_name = os.path.splitext(os.path.basename(video_path))[0]
+        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
         self.logger.info(f"==> Processing Video: {video_name}")
         self.progress_queue.put(("update_info", {"filename": video_name}))
 
@@ -412,12 +475,22 @@ class BatchProcessor:
                 continue
 
             # Run Rendering
+            encoding_options = {
+                "encoder": settings.encoding_encoder,
+                "quality": settings.encoding_quality,
+                "tune": settings.encoding_tune,
+                "nvenc_lookahead_enabled": settings.encoding_nvenc_lookahead_enabled,
+                "nvenc_lookahead": settings.encoding_nvenc_lookahead,
+                "nvenc_spatial_aq": settings.encoding_nvenc_spatial_aq,
+                "nvenc_temporal_aq": settings.encoding_nvenc_temporal_aq,
+                "nvenc_aq_strength": settings.encoding_nvenc_aq_strength,
+            }
             success = renderer.render_video(
                 input_video_reader=readers["source"],
                 depth_map_reader=readers["depth"],
                 total_frames_to_process=readers["total_frames"],
                 processed_fps=readers["fps"],
-                output_video_path_base=os.path.join(settings.output_splatted, task.output_subdir, f"{video_name}.mp4"),
+                output_video_path_base=os.path.join(settings.output_splatted, task.output_subdir, f"{video_name_out}.mp4"),
                 target_output_height=readers["target_h"],
                 target_output_width=readers["target_w"],
                 max_disp=vid_settings["max_disparity_percentage"],
@@ -442,6 +515,9 @@ class BatchProcessor:
                 depth_blur_left_mix=vid_settings["depth_blur_left_mix"],
                 skip_lowres_preproc=settings.skip_lowres_preproc,
                 color_tags_mode=settings.color_tags_mode,
+                encoding_options=encoding_options,
+                dnxhr_fullres_split=settings.dnxhr_fullres_split,
+                dnxhr_profile=settings.dnxhr_profile,
                 is_test_mode=settings.is_test_mode,
                 test_target_frame_idx=settings.test_target_frame_idx,
             )
@@ -455,6 +531,7 @@ class BatchProcessor:
     def _get_video_specific_settings(self, video_path: str, settings: ProcessingSettings, is_single_file_mode: bool) -> dict:
         """Resolve settings for a specific video, merging sidecar and GUI defaults."""
         video_name = os.path.splitext(os.path.basename(video_path))[0]
+        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
         sidecar_path = os.path.join(settings.sidecar_folder, f"{video_name}_depth{settings.sidecar_ext}")
         
         sidecar_data = {}
@@ -487,6 +564,7 @@ class BatchProcessor:
 
     def _resolve_depth_path(self, video_path: str, settings: ProcessingSettings, sidecar_data: dict, is_single_file: bool) -> Optional[str]:
         video_name = os.path.splitext(os.path.basename(video_path))[0]
+        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
         if is_single_file:
             return settings.input_depth_maps if os.path.isfile(settings.input_depth_maps) else None
         
@@ -516,7 +594,8 @@ class BatchProcessor:
         try:
             source, fps, orig_h, orig_w, target_h, target_w, info, total = read_video_frames(
                 video_path, settings.process_length, set_pre_res=task.set_pre_res,
-                pre_res_width=task.target_width, pre_res_height=task.target_height
+                pre_res_width=task.target_width, pre_res_height=task.target_height,
+                strict_ffmpeg_decode=settings.strict_ffmpeg_decode
             )
             
             # Depth reader setup

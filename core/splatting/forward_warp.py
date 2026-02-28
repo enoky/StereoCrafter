@@ -107,3 +107,58 @@ class ForwardWarpStereo(nn.Module):
             occlu_map.clamp_(0.0, 1.0)
             occlu_map = 1.0 - occlu_map
             return res, occlu_map
+
+
+def execute_forward_warp(
+    stereo_projector: ForwardWarpStereo,
+    source_tensor: torch.Tensor,
+    depth_tensor: torch.Tensor,
+    target_width: int,
+    max_disp: float,
+    zero_disparity_anchor_val: float,
+    input_bias: float = 0.0,
+    tv_disp_comp: float = 1.0,
+    debug_task_name: str = "Render",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Executes the shared forward stereo projection logic.
+
+    Args:
+        stereo_projector: The ForwardWarpStereo module instance
+        source_tensor: Batch of source images [B, C, H, W] in [0, 1] range, on GPU
+        depth_tensor: Batch of depth maps [B, 1, H, W] in [0, 1] range, on GPU
+        target_width: Width of the target image (used for % disparity calculation)
+        max_disp: Maximum disparity percentage
+        zero_disparity_anchor_val: The convergence anchor value [0, 1]
+        input_bias: Depth map float bias adjustment
+        tv_disp_comp: TV-range disparity compensation multiplier
+
+    Returns:
+        Tuple of (right_eye_tensor, occlusion_mask)
+    """
+    # from dependency.stereocrafter_util import log_debug_args
+    # log_debug_args(locals(), "execute_forward_warp", "forward_warp")
+
+    depth_tensor = torch.clip(depth_tensor, 0.0, 1.0)
+
+    
+    if input_bias != 0:
+        depth_tensor = torch.clip(depth_tensor + input_bias, 0.0, 1.0)
+
+    # Disparity calculation
+    disp_map = (depth_tensor - zero_disparity_anchor_val) * 2.0
+    actual_max_disp_pixels = (max_disp / 20.0 / 100.0) * target_width * tv_disp_comp
+    disp_map = disp_map * actual_max_disp_pixels
+
+    with torch.no_grad():
+        right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
+        
+    # from dependency.stereocrafter_util import dump_debug_tensor
+    # dump_debug_tensor(source_tensor, "3_source_video_left", "forward_warp")
+    # dump_debug_tensor(depth_tensor, "4_pre_warp_depth", "forward_warp")
+    # dump_debug_tensor(disp_map, "5_disparity_map", "forward_warp")
+    # dump_debug_tensor(right_eye_raw, "6_warped_right_eye", "forward_warp")
+    # dump_debug_tensor(occlusion_mask, "7_occlusion_mask", "forward_warp")
+        
+    return right_eye_raw, occlusion_mask
+

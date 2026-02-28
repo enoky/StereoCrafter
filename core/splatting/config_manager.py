@@ -65,6 +65,18 @@ SPLATTER_DEFAULT_CONFIG = {
     "window_height": 750,
     "debug_mode_enabled": False,
     "border_manual": False,
+    "strict_ffmpeg_decode": False,
+    "encoding_encoder": "Auto",
+    "encoding_quality": "Auto",
+    "encoding_tune": "Auto",
+    "encoding_nvenc_lookahead_enabled": False,
+    "encoding_nvenc_lookahead": 16,
+    "encoding_nvenc_spatial_aq": False,
+    "encoding_nvenc_temporal_aq": False,
+    "encoding_nvenc_aq_strength": 8,
+    "dnxhr_fullres_split": False,
+    "dnxhr_profile": "HQX",
+    "sbs_enabled": False,
 }
 
 

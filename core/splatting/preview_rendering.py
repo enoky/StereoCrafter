@@ -32,7 +32,7 @@ from .forward_warp import ForwardWarpStereo
 logger = logging.getLogger(__name__)
 
 # Constants
-DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
+DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = False
 
 
 class PreviewRenderer:

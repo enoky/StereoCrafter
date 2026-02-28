@@ -20,11 +20,12 @@ from decord import VideoReader
 
 from dependency.stereocrafter_util import (
     start_ffmpeg_pipe_process,
+    start_ffmpeg_pipe_process_dnxhr,
     release_cuda_memory,
     draw_progress_bar,
 )
 from .forward_warp import ForwardWarpStereo
-from .depth_processing import process_depth_batch
+from .depth_processing import process_depth_batch, normalize_and_gamma_depth
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,9 @@ class RenderProcessor:
         depth_blur_left_mix: float = 0.5,
         skip_lowres_preproc: bool = False,
         color_tags_mode: str = "Auto",
+        encoding_options: Optional[dict] = None,
+        dnxhr_fullres_split: bool = False,
+        dnxhr_profile: str = "HQX",
         is_test_mode: bool = False,
         test_target_frame_idx: Optional[int] = None,
     ) -> bool:
@@ -123,7 +127,8 @@ class RenderProcessor:
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
 
         height, width = target_output_height, target_output_width
-        os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
+        if not is_test_mode:
+            os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
 
         # Determine output grid dimensions and final path
         grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
@@ -135,26 +140,87 @@ class RenderProcessor:
         self._log_color_metadata(video_stream_info, task_name)
 
         ffmpeg_process = None
+        mask_process = None
+        splat_process = None
+        use_dnxhr_split = (
+            bool(dnxhr_fullres_split) and bool(dual_output) and (not is_low_res_task) and (not is_test_mode)
+        )
+
         if not is_test_mode:
             encode_stream_info = self._get_encode_stream_info(video_stream_info, color_tags_mode)
-            ffmpeg_process = start_ffmpeg_pipe_process(
-                content_width=grid_width,
-                content_height=grid_height,
-                final_output_mp4_path=final_output_video_path,
-                fps=processed_fps,
-                video_stream_info=encode_stream_info,
-                user_output_crf=user_output_crf,
-                output_format_str="splatted_grid",
-                debug_label=task_name,
-            )
-            if ffmpeg_process is None:
-                logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
-                return False
+
+            if use_dnxhr_split:
+                base_dir = os.path.dirname(output_video_path_base)
+                stem = os.path.splitext(os.path.basename(output_video_path_base))[0]
+                prefix = f"{stem}{res_suffix}"
+
+                mask_dir = os.path.join(base_dir, "mask")
+                splat_dir = os.path.join(base_dir, "splat")
+                os.makedirs(mask_dir, exist_ok=True)
+                os.makedirs(splat_dir, exist_ok=True)
+
+                mask_output_path = os.path.join(mask_dir, f"{prefix}_mask.mp4")
+                splat_output_path = os.path.join(splat_dir, f"{prefix}_splat.mov")
+
+                mask_process = start_ffmpeg_pipe_process(
+                    content_width=width,
+                    content_height=height,
+                    final_output_mp4_path=mask_output_path,
+                    fps=processed_fps,
+                    video_stream_info=encode_stream_info,
+                    user_output_crf=user_output_crf,
+                    output_format_str="mask_only",
+                    debug_label=task_name,
+                    encoding_options=encoding_options,
+                )
+                if mask_process is None:
+                    logger.error("Failed to start FFmpeg pipe for mask output. Aborting splatting task.")
+                    return False
+
+                splat_process = start_ffmpeg_pipe_process_dnxhr(
+                    content_width=width,
+                    content_height=height,
+                    final_output_mov_path=splat_output_path,
+                    fps=processed_fps,
+                    dnxhr_profile=dnxhr_profile,
+                )
+                if splat_process is None:
+                    logger.error("Failed to start DNxHR pipe for splat output. Aborting splatting task.")
+                    try:
+                        mask_process.stdin.close()
+                        mask_process.wait(timeout=10)
+                    except Exception:
+                        pass
+                    return False
+
+                ffmpeg_process = mask_process
+            else:
+                ffmpeg_process = start_ffmpeg_pipe_process(
+                    content_width=grid_width,
+                    content_height=grid_height,
+                    final_output_mp4_path=final_output_video_path,
+                    fps=processed_fps,
+                    video_stream_info=encode_stream_info,
+                    user_output_crf=user_output_crf,
+                    output_format_str="splatted_grid",
+                    debug_label=task_name,
+                    encoding_options=encoding_options,
+                )
+                if ffmpeg_process is None:
+                    logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
+                    return False
             
             self._compare_encoding_flags(ffmpeg_process, task_name)
 
         max_expected_raw_value = self._get_max_expected_raw_depth(depth_stream_info)
         logger.debug(f"[DEPTH] Max expected raw value: {max_expected_raw_value}, assume_raw_input: {assume_raw_input}, global_depth_min: {global_depth_min:.2f}, global_depth_max: {global_depth_max:.2f}")
+        
+        tv_disp_comp = 1.0
+        if assume_raw_input and depth_stream_info and max_expected_raw_value > 256.0:
+            if str(depth_stream_info.get("color_range", "")).lower() == "tv":
+                from core.splatting.depth_processing import DEPTH_VIS_TV10_WHITE_NORM, DEPTH_VIS_TV10_BLACK_NORM
+                tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+                logger.debug(f"[DEPTH] TV range compensation enabled: {tv_disp_comp:.3f}")
         
         frame_count = 0
         encoding_successful = True
@@ -167,7 +233,7 @@ class RenderProcessor:
             )
 
             for i in frame_index_iter:
-                if self.stop_event.is_set() or (ffmpeg_process is not None and ffmpeg_process.poll() is not None):
+                if self.stop_event.is_set() or (ffmpeg_process is not None and ffmpeg_process.poll() is not None) or (use_dnxhr_split and splat_process is not None and splat_process.poll() is not None):
                     break
 
                 batch_indices = list(range(i, min(i + batch_size, total_frames_to_process)))
@@ -178,53 +244,37 @@ class RenderProcessor:
                 batch_video_numpy = input_video_reader.get_batch(batch_indices).asnumpy()
                 batch_depth_numpy_raw = depth_map_reader.get_batch(batch_indices).asnumpy()
 
+                # --- NEW: Aspect Ratio Parity ---
+                # Immediate resize to ensure all following steps (normalization, dilation, blur)
+                # occur at the correct target aspect ratio, matching the GUI previewer.
+                video_h, video_w = batch_video_numpy.shape[1], batch_video_numpy.shape[2]
+                depth_h, depth_w = batch_depth_numpy_raw.shape[1], batch_depth_numpy_raw.shape[2]
+                
+                if depth_h != video_h or depth_w != video_w:
+                    logger.debug(f"Resizing depth from {depth_w}x{depth_h} to match video {video_w}x{video_h} for aspect-ratio parity.")
+                    interp = cv2.INTER_AREA if (video_w < depth_w and video_h < depth_h) else cv2.INTER_LINEAR
+                    resized_depth = np.empty((batch_depth_numpy_raw.shape[0], video_h, video_w), dtype=batch_depth_numpy_raw.dtype)
+                    for idx in range(batch_depth_numpy_raw.shape[0]):
+                        resized_depth[idx] = cv2.resize(
+                            batch_depth_numpy_raw[idx],
+                            (video_w, video_h),
+                            interpolation=interp
+                        )
+                    batch_depth_numpy_raw = resized_depth
+
                 # 2. Normalize and apply gamma (BEFORE dilation/blur)
-                # Convert to grayscale if needed
-                if batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 3:
-                    batch_depth_gray = batch_depth_numpy_raw.mean(axis=-1)
-                elif batch_depth_numpy_raw.ndim == 4 and batch_depth_numpy_raw.shape[-1] == 1:
-                    batch_depth_gray = batch_depth_numpy_raw.squeeze(-1)
-                else:
-                    batch_depth_gray = batch_depth_numpy_raw
+                batch_depth_normalized = normalize_and_gamma_depth(
+                    batch_depth_numpy_raw=batch_depth_numpy_raw,
+                    assume_raw_input=assume_raw_input,
+                    global_depth_max=global_depth_max,
+                    global_depth_min=global_depth_min,
+                    max_expected_raw_value=max_expected_raw_value,
+                    zero_disparity_anchor_val=zero_disparity_anchor_val,
+                    depth_gamma=depth_gamma,
+                    debug_task_name="Render",
+                )
                 
-                batch_depth_float = batch_depth_gray.astype(np.float32)
-                
-                # Debug: Log raw depth range
-                logger.debug(f"[DEPTH] Raw depth range: min={batch_depth_float.min():.2f}, max={batch_depth_float.max():.2f}, shape={batch_depth_float.shape}")
-                
-                # Normalize to 0-1 range (matches original depthSplatting logic)
-                if assume_raw_input:
-                    # Raw input mode:
-                    # If global_depth_max is > 1.0 (e.g. 255 or 1023 passed from content scan), use it.
-                    # Otherwise fallback to max_expected_raw_value from metadata.
-                    if global_depth_max > 1.0:
-                         batch_depth_normalized = batch_depth_float / global_depth_max
-                    else:
-                         batch_depth_normalized = batch_depth_float / max(max_expected_raw_value, 1.0)
-                else:
-                    # Global normalization mode
-                    depth_range = global_depth_max - global_depth_min
-                    if depth_range > 1e-5:
-                        batch_depth_normalized = (batch_depth_float - global_depth_min) / depth_range
-                    else:
-                        # Collapsed range - fill with convergence anchor value
-                        batch_depth_normalized = np.full_like(
-                            batch_depth_float,
-                            fill_value=zero_disparity_anchor_val,
-                            dtype=np.float32,
-                        )
-                        logger.warning(
-                            f"Normalization collapsed to zero range ({global_depth_min:.4f} - {global_depth_max:.4f})."
-                        )
-                
-                batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
-                logger.debug(f"[DEPTH] After normalization: min={batch_depth_normalized.min():.4f}, max={batch_depth_normalized.max():.4f}")
-                
-                # Apply gamma correction (inverted gamma formula)
-                if round(float(depth_gamma), 2) != 1.0:
-                    batch_depth_normalized = 1.0 - np.power(1.0 - batch_depth_normalized, depth_gamma)
-                    batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
-                    logger.debug(f"[DEPTH] After gamma {depth_gamma}: min={batch_depth_normalized.min():.4f}, max={batch_depth_normalized.max():.4f}")
+                logger.debug(f"[DEPTH] After normalization and gamma: min={batch_depth_normalized.min():.4f}, max={batch_depth_normalized.max():.4f}")
                 
                 # Convert back to "raw" format for process_depth_batch (which expects raw-like values)
                 # Scale back to max_raw_value range so dilation/blur work correctly
@@ -263,13 +313,17 @@ class RenderProcessor:
                     max_disp=max_disp,
                     zero_disparity_anchor_val=zero_disparity_anchor_val,
                     input_bias=input_bias,
+                    tv_disp_comp=tv_disp_comp,
                 )
 
                 # 5. Handle results (diag tests or FFmpeg write)
                 if is_test_mode and test_target_frame_idx is not None:
-                    self._handle_diagnostic_capture(batch_processed_frames, dual_output)
+                    self._handle_diagnostic_capture(batch_processed_frames, dual_output, task_name)
                 elif ffmpeg_process:
-                    self._write_to_ffmpeg(ffmpeg_process, batch_processed_frames, dual_output)
+                    if use_dnxhr_split and mask_process and splat_process:
+                        self._write_split_to_ffmpeg(mask_process, splat_process, batch_processed_frames)
+                    else:
+                        self._write_to_ffmpeg(ffmpeg_process, batch_processed_frames, dual_output)
 
                 frame_count += len(batch_indices)
                 self.progress_queue.put(("processed", frame_count))
@@ -290,6 +344,13 @@ class RenderProcessor:
                     ffmpeg_process.wait(timeout=30)
                 except Exception as e:
                     logger.warning(f"Error closing FFmpeg: {e}")
+            
+            if use_dnxhr_split and splat_process:
+                try:
+                    splat_process.stdin.close()
+                    splat_process.wait(timeout=30)
+                except Exception as e:
+                    logger.warning(f"Error closing DNxHR pipe: {e}")
             
             del stereo_projector
             release_cuda_memory()
@@ -350,21 +411,30 @@ class RenderProcessor:
         except Exception: pass
 
     def _get_max_expected_raw_depth(self, info: Optional[dict]) -> float:
-        pix_fmt = info.get("pix_fmt") if info else None
-        profile = info.get("profile") if info else None
-        logger.debug(f"[DEPTH] Detecting bit depth from depth_stream_info: pix_fmt={pix_fmt}, profile={profile}, full_info={info}")
+        pix_fmt = str(info.get("pix_fmt", "")).lower() if info else ""
+        profile = str(info.get("profile", "")).lower() if info else ""
+        
+        logger.debug(f"[DEPTH] Detecting bit depth: pix_fmt='{pix_fmt}', profile='{profile}'")
+        
+        # 1. Check for High-Bit Formats
+        if "16" in pix_fmt or "gray16" in pix_fmt:
+            return 65535.0
+        if "12" in pix_fmt:
+            return 4095.0
+        if "10" in pix_fmt or "main10" in profile or "gray10" in pix_fmt:
+            return 1023.0
+            
+        # 2. Check for Float
+        if "float" in pix_fmt or "f32" in pix_fmt:
+            return 1.0
+            
+        # 3. Default to 8-bit Range (255.0) for everything else (yuv420p, nv12, gray, etc.)
+        # This is safer than 1.0 as it prevents "washed out/white" depth maps if detection is slightly off.
         if pix_fmt:
-            if "10" in pix_fmt or "gray10" in pix_fmt or "12" in pix_fmt or (profile and "main10" in profile):
-                logger.debug(f"[DEPTH] Detected 10-bit depth (pix_fmt={pix_fmt})")
-                return 1023.0
-            if "8" in pix_fmt or pix_fmt in ["yuv420p", "yuv422p", "yuv444p"]:
-                logger.debug(f"[DEPTH] Detected 8-bit depth (pix_fmt={pix_fmt})")
-                return 255.0
-            if "float" in pix_fmt:
-                logger.debug(f"[DEPTH] Detected float depth (pix_fmt={pix_fmt})")
-                return 1.0
-        logger.warning(f"[DEPTH] Could not detect bit depth, defaulting to 1.0 (pix_fmt={pix_fmt})")
-        return 1.0
+            logger.debug(f"[DEPTH] Defaulting to 8-bit (255.0) for pix_fmt='{pix_fmt}'")
+            return 255.0
+            
+        return 255.0
 
     def _process_gpu_splatting(
         self,
@@ -376,6 +446,7 @@ class RenderProcessor:
         max_disp: float,
         zero_disparity_anchor_val: float,
         input_bias: float,
+        tv_disp_comp: float = 1.0,
     ) -> List[np.ndarray]:
         """Process GPU splatting on normalized depth maps.
         
@@ -395,42 +466,26 @@ class RenderProcessor:
             elif batch_depth_numpy_float.shape[-1] == 3:
                 batch_depth_numpy_float = batch_depth_numpy_float[..., 0]
         
-        depth_h, depth_w = batch_depth_numpy_float.shape[1], batch_depth_numpy_float.shape[2]
-        
-        # Resize depth if dimensions don't match
-        if depth_h != video_h or depth_w != video_w:
-            logger.debug(f"Resizing depth from {depth_w}x{depth_h} to match video {video_w}x{video_h}")
-
-            
-            interp = cv2.INTER_AREA if (video_w < depth_w and video_h < depth_h) else cv2.INTER_LINEAR
-            resized_depth = np.empty((batch_depth_numpy_float.shape[0], video_h, video_w), dtype=batch_depth_numpy_float.dtype)
-            
-            for idx in range(batch_depth_numpy_float.shape[0]):
-                resized_depth[idx] = cv2.resize(
-                    batch_depth_numpy_float[idx],
-                    (video_w, video_h),
-                    interpolation=interp
-                )
-            batch_depth_numpy_float = resized_depth
+        # Depth is already resized to video dimensions at the start of the render loop.
         
         # Move to GPU
         source_tensor = torch.from_numpy(batch_video_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
         depth_tensor = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).float().cuda()
 
-        # Depth is already normalized to [0, 1], just clip and apply bias
-        depth_tensor = torch.clip(depth_tensor, 0.0, 1.0)
+        from core.splatting.forward_warp import execute_forward_warp
         
-        if input_bias != 0:
-            depth_tensor = torch.clip(depth_tensor + input_bias, 0.0, 1.0)
-
-        # Disparity calculation
-        disp_map = (depth_tensor - zero_disparity_anchor_val) * 2.0
-        actual_max_disp_pixels = (max_disp / 20.0 / 100.0) * target_width
-        disp_map = disp_map * actual_max_disp_pixels
-
-        # Forward warp
-        with torch.no_grad():
-            right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
+        right_eye_raw, occlusion_mask = execute_forward_warp(
+            stereo_projector=stereo_projector,
+            source_tensor=source_tensor,
+            depth_tensor=depth_tensor,
+            target_width=target_width,
+            max_disp=max_disp,
+            zero_disparity_anchor_val=zero_disparity_anchor_val,
+            input_bias=input_bias,
+            tv_disp_comp=tv_disp_comp,
+            debug_task_name="Render",
+        )
+        
         
         # CPU conversion
         left_cpu = source_tensor.cpu().numpy()
@@ -449,13 +504,14 @@ class RenderProcessor:
         return results
 
 
-    def _handle_diagnostic_capture(self, batch_results: List[dict], dual_output: bool):
+    def _handle_diagnostic_capture(self, batch_results: List[dict], dual_output: bool, task_name: str):
         # In test mode, we usually only have one frame
+        if not batch_results:
+            return
         res = batch_results[0]
-        # This is a bit tricky since we don't have direct access to GUI previewer here.
-        # We'll put it in the queue for the GUI to handle.
-        grid = self._construct_grid(res, dual_output)
-        self.progress_queue.put(("diagnostic_capture", grid))
+        # For diagnostic captures, we always use the 4-panel grid so the depth map is available
+        grid = self._construct_grid(res, dual_output=False)
+        self.progress_queue.put(("diagnostic_capture", {"grid": grid, "task_name": task_name}))
 
     def _write_to_ffmpeg(self, process: Any, batch_results: List[dict], dual_output: bool):
         for res in batch_results:
@@ -464,6 +520,24 @@ class RenderProcessor:
             grid_uint16 = (np.clip(grid, 0.0, 1.0) * 65535.0).astype(np.uint16)
             grid_bgr = cv2.cvtColor(grid_uint16, cv2.COLOR_RGB2BGR)
             process.stdin.write(grid_bgr.tobytes())
+
+    def _write_split_to_ffmpeg(self, mask_process: Any, splat_process: Any, batch_results: List[dict]):
+        """Write mask + splat as separate full-res files (used by DNxHR split mode)."""
+        for res in batch_results:
+            occlusion = res["occlusion"]
+            right = res["right"]
+
+            if occlusion.ndim == 2 or (occlusion.ndim == 3 and occlusion.shape[-1] == 1):
+                occlusion = np.stack([occlusion.squeeze()] * 3, axis=-1)
+
+            occl_u16 = (np.clip(occlusion, 0.0, 1.0) * 65535.0).astype(np.uint16)
+            right_u16 = (np.clip(right, 0.0, 1.0) * 65535.0).astype(np.uint16)
+
+            occl_bgr = cv2.cvtColor(occl_u16, cv2.COLOR_RGB2BGR)
+            right_bgr = cv2.cvtColor(right_u16, cv2.COLOR_RGB2BGR)
+
+            mask_process.stdin.write(occl_bgr.tobytes())
+            splat_process.stdin.write(right_bgr.tobytes())
 
     def _construct_grid(self, res: dict, dual_output: bool) -> np.ndarray:
         """Construct output grid for encoding.
