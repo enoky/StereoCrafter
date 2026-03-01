@@ -35,6 +35,7 @@ from dependency.stereocrafter_util import (
     apply_borders_to_frames,
 )
 from dependency.video_previewer import VideoPreviewer
+from core.common.file_organizer import move_files_to_finished, restore_finished_files
 
 GUI_VERSION = "26-02-28.0"
 
@@ -1175,22 +1176,13 @@ class MergingGUI(ThemedTk):
         ):
             return
 
-        # Move files directly (synchronously for immediate feedback)
-        moved_count = 0
-        failed_files = []
-        for src_path, dest_folder in files_to_move:
-            try:
-                finished_dir = os.path.join(dest_folder, "finished")
-                os.makedirs(finished_dir, exist_ok=True)
-                dest_path = os.path.join(finished_dir, os.path.basename(src_path))
-                if os.path.exists(dest_path):
-                    os.remove(src_path)
-                else:
-                    shutil.move(src_path, dest_path)
-                moved_count += 1
-            except Exception as e:
-                failed_files.append((os.path.basename(src_path), str(e)))
-                logger.error(f"Failed to move {os.path.basename(src_path)}: {e}")
+        # Move files using the common utility
+        moved_count, failed_count, failed_files = move_files_to_finished(
+            files_to_move=files_to_move,
+            logger=logger,
+            wait_before_move=0.5,
+            close_handles_callback=lambda: self.previewer._clear_preview_resources(),
+        )
 
         # Remove the clip from video_list without rescanning
         self.previewer.video_list.pop(current_index)
@@ -1820,37 +1812,29 @@ class MergingGUI(ThemedTk):
         ):
             return
 
-        folders_to_check = {
-            "Inpainted": self.inpainted_folder_var.get(),
-            "Original": self.original_folder_var.get(),
-            "Mask": self.mask_folder_var.get(),
-        }
+        restore_dirs = [
+            ("Inpainted", self.inpainted_folder_var.get()),
+            ("Original", self.original_folder_var.get()),
+            ("Mask", self.mask_folder_var.get()),
+        ]
 
-        restored_count = 0
-        error_count = 0
-
-        for folder_name, base_folder in folders_to_check.items():
-            if not base_folder or not os.path.isdir(base_folder):
+        # Filter valid directories
+        valid_restore_dirs = []
+        for folder_name, base_folder in restore_dirs:
+            if base_folder and os.path.isdir(base_folder):
+                valid_restore_dirs.append((base_folder, "finished"))
+            else:
                 logger.warning(
                     f"Skipping restore for '{folder_name}' folder: Path is not a valid directory ('{base_folder}')."
                 )
-                continue
 
-            finished_dir = os.path.join(base_folder, "finished")
-            if os.path.isdir(finished_dir):
-                logger.info(f"Checking for files to restore in: {finished_dir}")
-                for filename in os.listdir(finished_dir):
-                    src_path = os.path.join(finished_dir, filename)
-                    dest_path = os.path.join(base_folder, filename)
-                    try:
-                        shutil.move(src_path, dest_path)
-                        restored_count += 1
-                        logger.debug(f"Restored '{filename}' to '{base_folder}'")
-                    except Exception as e:
-                        error_count += 1
-                        logger.error(f"Error restoring file '{filename}': {e}", exc_info=True)
-            else:
-                logger.info(f"No 'finished' subfolder found in '{base_folder}'. Nothing to restore.")
+        if not valid_restore_dirs:
+            messagebox.showinfo("Restore Complete", "No valid folders to restore.")
+            return
+
+        restored_count, error_count, failed_files = restore_finished_files(
+            restore_dirs=valid_restore_dirs, logger=logger
+        )
 
         messagebox.showinfo(
             "Restore Complete",
