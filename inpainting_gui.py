@@ -90,7 +90,7 @@ class InpaintingGUI(ThemedTk):
             value=str(self.app_config.get("inpaint_mask_dilate_kernel_size", self.app_config.get("mask_dilate_kernel_size", 5)))
         )
         self.inpaint_mask_blur_kernel_size_var = tk.StringVar(
-            value=str(self.app_config.get("inpaint_mask_blur_kernel_size", self.app_config.get("mask_blur_kernel_size", 10)))
+            value=str(self.app_config.get("inpaint_mask_blur_kernel_size", self.app_config.get("mask_blur_kernel_size", 5)))
         )
 
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
@@ -99,7 +99,7 @@ class InpaintingGUI(ThemedTk):
         )
         self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 0.0)))
         self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 5)))        
-        self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 10)))
+        self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 5)))
         self.blend_mask_source_var = tk.StringVar(value=str(self.app_config.get("blend_mask_source", "hybrid")).lower())
 
         self.enable_post_inpainting_blend = tk.BooleanVar(value=self.app_config.get("enable_post_inpainting_blend", False))

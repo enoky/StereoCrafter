@@ -35,7 +35,7 @@ from dependency.stereocrafter_util import (
     apply_borders_to_frames,
 )
 from dependency.video_previewer import VideoPreviewer
-from core.common.file_organizer import move_files_to_finished, restore_finished_files
+from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 
 GUI_VERSION = "26-02-28.0"
 
@@ -1832,7 +1832,7 @@ class MergingGUI(ThemedTk):
             messagebox.showinfo("Restore Complete", "No valid folders to restore.")
             return
 
-        restored_count, error_count, failed_files = restore_finished_files(
+        restored_count, error_count, failed_files = _restore_finished_files(
             restore_dirs=valid_restore_dirs, logger=logger
         )
 
