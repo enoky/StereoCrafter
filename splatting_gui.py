@@ -468,64 +468,33 @@ class SplatterGUI(ThemedTk):
         if hasattr(self, "info_frame") and hasattr(self, "info_labels"):
             self.theme_manager.apply_theme_to_labels(self.info_labels)
 
-        # 3. Apply a few compact/custom widget styles used only by this GUI
-        panel_bg = "#3a4047" if self.dark_mode_var.get() else "#e6ebf2"
-        panel_trough = "#262b31" if self.dark_mode_var.get() else "#bcc6d3"
-        panel_bar = "#5d96e0" if self.dark_mode_var.get() else "#4f83cc"
-        try:
-            self.style.configure("SmallTool.TButton", padding=(0, 0), anchor="center")
-            self.style.configure("CompactAction.TButton", padding=(4, 0), anchor="center")
-            self.style.configure("Loading.TButton", padding=(4, 0), anchor="center")
-            # Keep entry/combo heights stable across light/dark themes so dark mode
-            # does not steal preview space with taller field chrome.
-            self.style.configure("TEntry", padding=(1, 0))
-            self.style.configure("TCombobox", padding=(1, 0), arrowsize=10)
-            self.style.configure("TSpinbox", padding=(1, 0), arrowsize=10)
-            self.style.configure(
-                "Custom.Horizontal.TProgressbar",
-                troughcolor=panel_trough,
-                background=panel_bar,
-                lightcolor=panel_bar,
-                darkcolor=panel_bar,
-                bordercolor=panel_trough,
-                thickness=12,
+        # 3. Apply compact/custom widget styles via ThemeManager
+        self.theme_manager.configure_compact_styles(self.style)
+
+        colors = self.theme_manager.get_colors()
+        self.theme_manager.configure_progressbar_style(self.style)
+
+        # Apply theme to labelframes
+        labelframes = [
+            getattr(self, name, None)
+            for name in (
+                "folder_frame",
+                "preprocessing_frame",
+                "output_settings_frame",
+                "depth_prep_frame",
+                "depth_all_settings_frame",
+                "info_frame",
+                "dev_tools_frame",
             )
-            self.style.configure("ProgressPanel.TLabel", background=panel_bg, foreground=colors["fg"])
-        except Exception:
-            pass
+        ]
+        self.theme_manager.apply_theme_to_labelframes(labelframes)
 
-        for lf_name in (
-            "folder_frame",
-            "preprocessing_frame",
-            "output_settings_frame",
-            "depth_prep_frame",
-            "depth_all_settings_frame",
-            "info_frame",
-            "dev_tools_frame",
-        ):
-            lf = getattr(self, lf_name, None)
-            if lf is not None:
-                try:
-                    lf.configure(bg=colors["bg"], fg=colors["fg"])
-                except Exception:
-                    pass
-
-        for w_name in ("progress_panel", "progress_row_frame", "progress_title_label", "status_label"):
-            w = getattr(self, w_name, None)
-            if w is not None:
-                try:
-                    w.configure(bg=panel_bg, fg=colors["fg"] if hasattr(w, "configure") else None)
-                except Exception:
-                    try:
-                        w.configure(bg=panel_bg)
-                    except Exception:
-                        pass
-
-        if hasattr(self, "progress_title_label") and self.progress_title_label is not None:
-            try:
-                self.progress_title_label.configure(bg=panel_bg, fg=colors["fg"])
-            except Exception:
-                pass
+        # Apply theme to progress panel widgets
+        progress_widgets = {
+            name: getattr(self, name, None)
+            for name in ("progress_panel", "progress_row_frame", "progress_title_label", "status_label")
+        }
+        self.theme_manager.apply_theme_to_widgets_by_names(progress_widgets, fg=colors["fg"])
 
         if hasattr(self, "_configure_map_selector_styles"):
             self._configure_map_selector_styles()
