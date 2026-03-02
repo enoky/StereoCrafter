@@ -86,7 +86,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-02.0"
+GUI_VERSION = "26-03-02.1"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -987,10 +987,7 @@ class SplatterGUI(ThemedTk):
             base_font = tkfont.nametofont("TkDefaultFont")
             selected_fg = "#ffff66" if self.dark_mode_var.get() else "#003c8f"
             selected_font = tkfont.Font(
-                root=self,
-                family=base_font.cget("family"),
-                size=int(base_font.cget("size")) + 1,
-                weight="bold",
+                root=self, family=base_font.cget("family"), size=int(base_font.cget("size")) + 1, weight="bold"
             )
             style.configure("MapSel.TRadiobutton", font=base_font)
             style.configure("MapSelSelected.TRadiobutton", font=selected_font, foreground=selected_fg)
@@ -1814,7 +1811,13 @@ class SplatterGUI(ThemedTk):
         )
         self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
-        for _btn_name in ("load_preview_button", "prev_video_button", "next_video_button", "play_pause_button", "fast_forward_button"):
+        for _btn_name in (
+            "load_preview_button",
+            "prev_video_button",
+            "next_video_button",
+            "play_pause_button",
+            "fast_forward_button",
+        ):
             _btn = getattr(self.previewer, _btn_name, None)
             if _btn is not None:
                 try:
@@ -1881,7 +1884,9 @@ class SplatterGUI(ThemedTk):
         self.process_settings_container.grid_columnconfigure(0, weight=1)
 
         # --- 1. Process Resolution Frame (Top Left) ---
-        self.preprocessing_frame = tk.LabelFrame(self.process_settings_container, text="Process Resolution", labelanchor="nw")
+        self.preprocessing_frame = tk.LabelFrame(
+            self.process_settings_container, text="Process Resolution", labelanchor="nw"
+        )
         self.preprocessing_frame.grid(
             row=0, column=0, padx=(0, 5), sticky="nsew"
         )  # <-- Grid 0,0 in process_settings_container
@@ -1976,7 +1981,9 @@ class SplatterGUI(ThemedTk):
         #   Row 0: Process Length | Auto-Convergence
         #   Row 1: Output CRF Full | Output CRF Low
 
-        self.output_settings_frame = tk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings", labelanchor="nw")
+        self.output_settings_frame = tk.LabelFrame(
+            self.process_settings_container, text="Splatting & Output Settings", labelanchor="nw"
+        )
         self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(2, 0))
         self.output_settings_frame.grid_columnconfigure(0, weight=0)
         self.output_settings_frame.grid_columnconfigure(1, weight=0)
@@ -2100,7 +2107,9 @@ class SplatterGUI(ThemedTk):
 
         # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
         current_depth_row = 0  # Use a new counter for this container
-        self.depth_prep_frame = tk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing", labelanchor="nw")
+        self.depth_prep_frame = tk.LabelFrame(
+            self.depth_settings_container, text="Depth Map Pre-processing", labelanchor="nw"
+        )
         self.depth_prep_frame.grid(
             row=current_depth_row, column=0, sticky="ew"
         )  # Use grid here for placement inside container
@@ -2191,7 +2200,9 @@ class SplatterGUI(ThemedTk):
 
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
-        self.depth_all_settings_frame = tk.LabelFrame(self.depth_settings_container, text="Stereo Projection", labelanchor="nw")
+        self.depth_all_settings_frame = tk.LabelFrame(
+            self.depth_settings_container, text="Stereo Projection", labelanchor="nw"
+        )
         self.depth_all_settings_frame.grid(
             row=current_depth_row, column=0, sticky="ew", pady=(2, 0)
         )  # Pack it below Hi-Res frame
@@ -2247,7 +2258,12 @@ class SplatterGUI(ThemedTk):
         # --- Estimate Max Total(D+P) (quick sampled scan) ---
         try:
             self.btn_est_dp_total = ttk.Button(
-                disp_subframe, text="≈", width=2, style="SmallTool.TButton", command=self.run_estimate_dp_total_max, takefocus=False
+                disp_subframe,
+                text="≈",
+                width=2,
+                style="SmallTool.TButton",
+                command=self.run_estimate_dp_total_max,
+                takefocus=False,
             )
             self.btn_est_dp_total.grid(row=0, column=3, sticky="w", padx=(6, 0))
             if hasattr(self, "_create_hover_tooltip"):
@@ -2417,7 +2433,9 @@ class SplatterGUI(ThemedTk):
         self.right_column_stack.grid_rowconfigure(1, weight=0)
 
         # --- Current Processing Information frame ---
-        self.info_frame = tk.LabelFrame(self.right_column_stack, text="Current Processing Information", labelanchor="nw")
+        self.info_frame = tk.LabelFrame(
+            self.right_column_stack, text="Current Processing Information", labelanchor="nw"
+        )
         self.info_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 2))
 
         # Two-column pairs: [Label, Value] [Label, Value]
@@ -2550,10 +2568,7 @@ class SplatterGUI(ThemedTk):
         self.progress_title_label.pack(side="left", padx=(0, 6))
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(
-            self.progress_row_frame,
-            variable=self.progress_var,
-            maximum=100,
-            style="Custom.Horizontal.TProgressbar",
+            self.progress_row_frame, variable=self.progress_var, maximum=100, style="Custom.Horizontal.TProgressbar"
         )
         self.progress_bar.pack(side="left", fill="x", expand=True, pady=(0, 1))
         self.status_label = tk.Label(self.progress_panel, text="Ready", anchor="center", justify="center")
@@ -2996,6 +3011,7 @@ class SplatterGUI(ThemedTk):
                 "depth_blur_left_mix": self._safe_float(self.depth_blur_left_mix_var),
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
+                "strict_ffmpeg_decode": bool(self.strict_ffmpeg_decode_var.get()),
                 "enable_global_norm": self.enable_global_norm_var.get(),
             }
 

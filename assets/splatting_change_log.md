@@ -2,6 +2,12 @@
 
 All notable changes to the splatting GUI and related components.
 
+## Version 26-03-02.1
+
+### Bug Fixes (v26-03-02.1)
+
+- **ffmpeg decode**: Fixed issue where ffmpeg decode checkbox was not operating correctly.
+
 ## Version 26-02-27.9
 
 ### Added (v26-02-27.9)
