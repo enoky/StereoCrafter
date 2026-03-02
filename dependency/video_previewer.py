@@ -26,7 +26,7 @@ except Exception:
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory, get_video_stream_info
 
-VERSION = "26-02-27.4"
+VERSION = "26-03-02.0"
 
 
 class VideoPreviewer(ttk.Frame):
@@ -984,7 +984,7 @@ class VideoPreviewer(ttk.Frame):
                     f"Expected depth map: {depth_map_path or 'Not specified'}\n\n"
                     f"Please check your depth maps folder or generate the depth map first.",
                 )
-                self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+                self.load_preview_button.config(text="Load/Refresh List", style="CompactAction.TButton")
                 return
 
         initial_frame = 0
@@ -1122,7 +1122,7 @@ class VideoPreviewer(ttk.Frame):
             messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
             logger.error("Preview load failed", exc_info=True)
         finally:
-            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+            self.load_preview_button.config(text="Load/Refresh List", style="CompactAction.TButton")
 
     def _nav_preview_video(self, direction: int):
         """Navigate to the previous or next video in the preview list.
@@ -1602,7 +1602,7 @@ class VideoPreviewer(ttk.Frame):
             self.preview_label.config(image=None, text=f"Error:\n{e}")
         finally:
             release_cuda_memory()
-            self.load_preview_button.config(text="Load/Refresh List", style="TButton")
+            self.load_preview_button.config(text="Load/Refresh List", style="CompactAction.TButton")
 
     def _process_frame_for_preview(self, frame_idx: int, source_frames: dict) -> Image.Image:
         """

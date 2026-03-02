@@ -23,5 +23,6 @@
 
     "start_blending": "Starts the batch process to merge all found videos using the current settings.",
     "stop_blending": "Stops the batch process after the current video chunk is finished.",
-    "process_current_clip": "Processes only the currently selected clip in the preview. Useful for testing settings on a single video without processing the entire batch."
+    "process_current_clip": "Processes only the currently selected clip in the preview. Useful for testing settings on a single video without processing the entire batch.",
+    "move_to_finish": "Moves the current clip's source files (inpainted, splatted, original, sidecars) to a 'finished' subfolder and advances to the next clip. Does not re-scan the folder, making it fast for large clip lists."
 }

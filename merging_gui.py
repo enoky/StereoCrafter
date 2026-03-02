@@ -3,16 +3,15 @@ import glob
 import json
 import shutil
 import threading
-import gc
 import tkinter as tk  # Used for PanedWindow
 from tkinter import filedialog, messagebox, ttk
 from ttkthemes import ThemedTk
-from typing import Optional, Tuple, Callable
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image
 from decord import VideoReader, cpu
 import logging
 import time
@@ -24,8 +23,6 @@ from dependency.stereocrafter_util import (
     draw_progress_bar,
     release_cuda_memory,
     set_util_logger_level,
-    encode_frames_to_mp4,
-    read_video_frames_decord,
     start_ffmpeg_pipe_process,
     apply_color_transfer,
     create_single_slider_with_label_updater,
@@ -38,8 +35,9 @@ from dependency.stereocrafter_util import (
     apply_borders_to_frames,
 )
 from dependency.video_previewer import VideoPreviewer
+from core.common.file_organizer import move_files_to_finished, restore_finished_files
 
-GUI_VERSION = "26-02-25.0"
+GUI_VERSION = "26-02-28.0"
 
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
@@ -822,6 +820,15 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(self.process_current_button)
         # --- END NEW ---
 
+        # --- NEW: Move to Finish button ---
+        self.move_to_finish_button = ttk.Button(
+            buttons_frame, text="Move to Finish", command=self._move_current_to_finish
+        )
+        self.move_to_finish_button.pack(side="left", padx=5, expand=True)
+        self._create_hover_tooltip(self.move_to_finish_button, "move_to_finish")
+        self.widgets_to_disable.append(self.move_to_finish_button)
+        # --- END NEW ---
+
     def _browse_folder(self, var: tk.StringVar):
         folder = filedialog.askdirectory(initialdir=var.get())
         if folder:
@@ -1084,6 +1091,133 @@ class MergingGUI(ThemedTk):
         )
         self.processing_thread.start()
 
+    def _move_current_to_finish(self):
+        """Moves the currently selected clip's source files to the finished folder without processing."""
+        if self.is_processing:
+            messagebox.showwarning("Busy", "Processing is already in progress.")
+            return
+
+        # Get current video from previewer
+        if not hasattr(self, "previewer") or not self.previewer.video_list:
+            messagebox.showwarning("No Video", "No video loaded in previewer.")
+            return
+
+        current_index = getattr(self.previewer, "current_video_index", 0)
+        if current_index < 0 or current_index >= len(self.previewer.video_list):
+            messagebox.showwarning("Invalid Index", "No video selected.")
+            return
+
+        source_dict = self.previewer.video_list[current_index]
+        inpainted_path = source_dict.get("inpainted")
+        splatted_path = source_dict.get("splatted")
+        original_path = source_dict.get("original")
+
+        if not inpainted_path or not os.path.exists(inpainted_path):
+            messagebox.showwarning("Invalid Path", "Inpainted video path not found.")
+            return
+
+        # Close preview resources to release file handles before moving
+        self.previewer._clear_preview_resources()
+        time.sleep(0.5)  # Give OS time to release file handles
+
+        base_name = os.path.basename(inpainted_path)
+
+        # Get folders from settings
+        inpainted_folder = self.inpainted_folder_var.get()
+        mask_folder = self.mask_folder_var.get()
+        original_folder = self.original_folder_var.get()
+
+        # Get core name for sidecar
+        inpaint_suffix = "_inpainted_right_eye.mp4"
+        sbs_suffix = "_inpainted_sbs.mp4"
+        is_sbs_input = base_name.endswith(sbs_suffix)
+        core_name_with_width = base_name[: -len(sbs_suffix)] if is_sbs_input else base_name[: -len(inpaint_suffix)]
+        last_underscore_idx = core_name_with_width.rfind("_")
+        core_name = core_name_with_width[:last_underscore_idx] if last_underscore_idx != -1 else core_name_with_width
+
+        # Queue files for moving
+        files_to_move = []
+
+        # Add inpainted file
+        if os.path.exists(inpainted_path):
+            files_to_move.append((inpainted_path, inpainted_folder))
+
+        # Add splatted file
+        if splatted_path and os.path.exists(splatted_path):
+            files_to_move.append((splatted_path, mask_folder))
+
+        # Add original file
+        if original_path and os.path.exists(original_path):
+            files_to_move.append((original_path, original_folder))
+
+        # Add sidecar files for inpainted
+        inpainted_base = os.path.splitext(inpainted_path)[0]
+        for ext in [".fssidecar", ".json"]:
+            sidecar_path = inpainted_base + ext
+            if os.path.exists(sidecar_path):
+                files_to_move.append((sidecar_path, inpainted_folder))
+
+        # Add sidecar files for original
+        if original_path:
+            original_base = os.path.splitext(original_path)[0]
+            for ext in [".fssidecar", ".json"]:
+                sidecar_path = original_base + ext
+                if os.path.exists(sidecar_path):
+                    files_to_move.append((sidecar_path, original_folder))
+
+        if not files_to_move:
+            messagebox.showwarning("No Files", "No source files found to move.")
+            return
+
+        # Confirm with user
+        file_count = len(files_to_move)
+        if not messagebox.askyesno(
+            "Confirm Move", f"Move {file_count} file(s) for '{core_name}' to finished folder?\n\nThis cannot be undone."
+        ):
+            return
+
+        # Move files using the common utility
+        moved_count, failed_count, failed_files = move_files_to_finished(
+            files_to_move=files_to_move,
+            logger=logger,
+            wait_before_move=0.5,
+            close_handles_callback=lambda: self.previewer._clear_preview_resources(),
+        )
+
+        # Remove the clip from video_list without rescanning
+        self.previewer.video_list.pop(current_index)
+
+        # Adjust index if needed
+        total_clips = len(self.previewer.video_list)
+        if current_index >= total_clips:
+            # Was at the last clip, go to previous
+            new_index = max(0, total_clips - 1)
+        else:
+            new_index = current_index
+
+        # Update preview
+        if total_clips > 0:
+            self.previewer.current_video_index = new_index
+            self.previewer._load_preview_by_index(new_index)
+            # Update video counter
+            if hasattr(self.previewer, "video_status_label_var"):
+                self.previewer.video_status_label_var.set(f"Video: {new_index + 1} / {total_clips}")
+        else:
+            # No more clips
+            self.previewer.current_video_index = -1
+            self.previewer._clear_preview_resources()
+            if hasattr(self.previewer, "video_status_label_var"):
+                self.previewer.video_status_label_var.set("Video: 0 / 0")
+
+        # Show result
+        if failed_files:
+            error_msg = "\n".join([f"{f}: {e}" for f, e in failed_files])
+            messagebox.showwarning(
+                "Move Complete with Errors", f"Moved {moved_count}/{file_count} files.\n\nErrors:\n{error_msg}"
+            )
+        else:
+            messagebox.showinfo("Move Complete", f"Successfully moved {moved_count} file(s) to finished folder.")
+
     def processing_done(self, stopped=False):
         self.is_processing = False
         self._set_ui_processing_state(False)  # Re-enable UI
@@ -1172,7 +1306,7 @@ class MergingGUI(ThemedTk):
 
         # --- NEW: Skip already finished files when Resume is enabled ---
         resume_enabled = settings.get("resume", False)
-        if resume_enabled and not single_mode:
+        if resume_enabled:
             finished_dir = os.path.join(settings["inpainted_folder"], "finished")
             if os.path.isdir(finished_dir):
                 finished_files = set(os.listdir(finished_dir))
@@ -1433,10 +1567,42 @@ class MergingGUI(ThemedTk):
                     )
 
                     if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
-                        inpainted = F.interpolate(
-                            inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
-                        )
-                        mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                        # Calculate aspect-ratio-correct dimensions for inpaint
+                        # The inpaint should match the source aspect ratio, not be stretched uniformly
+                        target_aspect = hires_W / hires_H
+                        inpaint_aspect = inpainted.shape[3] / inpainted.shape[2]
+
+                        if abs(inpaint_aspect - target_aspect) > 0.01:
+                            # Aspect ratios differ - resize to fit within target while preserving aspect ratio
+                            logger.debug(
+                                f"Inpaint aspect ratio ({inpaint_aspect:.4f}) differs from target ({target_aspect:.4f}). "
+                                f"Resizing from {inpainted.shape[3]}x{inpainted.shape[2]} to fit {hires_W}x{hires_H}."
+                            )
+                            # Calculate new dimensions that fit within target while preserving aspect ratio
+                            if inpaint_aspect > target_aspect:
+                                # Inpaint is wider - fit to width
+                                new_w = hires_W
+                                new_h = int(round(hires_W / inpaint_aspect))
+                            else:
+                                # Inpaint is taller - fit to height
+                                new_h = hires_H
+                                new_w = int(round(hires_H * inpaint_aspect))
+                            # First resize to aspect-ratio-correct dimensions
+                            inpainted = F.interpolate(
+                                inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False
+                            )
+                            mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                            # Then do final resize to match target dimensions
+                            inpainted = F.interpolate(
+                                inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
+                            )
+                            mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                        else:
+                            # Aspect ratios match - direct resize
+                            inpainted = F.interpolate(
+                                inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
+                            )
+                            mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
                     if settings["enable_color_transfer"]:
                         adjusted_frames = []
@@ -1594,6 +1760,12 @@ class MergingGUI(ThemedTk):
                             sidecar_path = inpainted_base + ext
                             if os.path.exists(sidecar_path):
                                 self.cleanup_queue.put((sidecar_path, settings["inpainted_folder"]))
+
+                        # In single mode, reset video list scan after moving files
+                        if single_mode:
+                            self.after(
+                                0, lambda: getattr(self, "previewer", None) and self.previewer.reset_video_list_scan()
+                            )
                     # --- END NEW ---
             except Exception as e:
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
@@ -1640,37 +1812,29 @@ class MergingGUI(ThemedTk):
         ):
             return
 
-        folders_to_check = {
-            "Inpainted": self.inpainted_folder_var.get(),
-            "Original": self.original_folder_var.get(),
-            "Mask": self.mask_folder_var.get(),
-        }
+        restore_dirs = [
+            ("Inpainted", self.inpainted_folder_var.get()),
+            ("Original", self.original_folder_var.get()),
+            ("Mask", self.mask_folder_var.get()),
+        ]
 
-        restored_count = 0
-        error_count = 0
-
-        for folder_name, base_folder in folders_to_check.items():
-            if not base_folder or not os.path.isdir(base_folder):
+        # Filter valid directories
+        valid_restore_dirs = []
+        for folder_name, base_folder in restore_dirs:
+            if base_folder and os.path.isdir(base_folder):
+                valid_restore_dirs.append((base_folder, "finished"))
+            else:
                 logger.warning(
                     f"Skipping restore for '{folder_name}' folder: Path is not a valid directory ('{base_folder}')."
                 )
-                continue
 
-            finished_dir = os.path.join(base_folder, "finished")
-            if os.path.isdir(finished_dir):
-                logger.info(f"Checking for files to restore in: {finished_dir}")
-                for filename in os.listdir(finished_dir):
-                    src_path = os.path.join(finished_dir, filename)
-                    dest_path = os.path.join(base_folder, filename)
-                    try:
-                        shutil.move(src_path, dest_path)
-                        restored_count += 1
-                        logger.debug(f"Restored '{filename}' to '{base_folder}'")
-                    except Exception as e:
-                        error_count += 1
-                        logger.error(f"Error restoring file '{filename}': {e}", exc_info=True)
-            else:
-                logger.info(f"No 'finished' subfolder found in '{base_folder}'. Nothing to restore.")
+        if not valid_restore_dirs:
+            messagebox.showinfo("Restore Complete", "No valid folders to restore.")
+            return
+
+        restored_count, error_count, failed_files = restore_finished_files(
+            restore_dirs=valid_restore_dirs, logger=logger
+        )
 
         messagebox.showinfo(
             "Restore Complete",
@@ -1872,11 +2036,33 @@ class MergingGUI(ThemedTk):
 
             hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
             if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
-                logger.debug(
-                    f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}"
-                )
-                inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
-                mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                # Calculate aspect-ratio-correct dimensions for inpaint
+                target_aspect = hires_W / hires_H
+                inpaint_aspect = inpainted.shape[3] / inpainted.shape[2]
+
+                if abs(inpaint_aspect - target_aspect) > 0.01:
+                    # Aspect ratios differ - resize to fit within target while preserving aspect ratio
+                    logger.debug(
+                        f"Preview: Inpaint aspect ratio ({inpaint_aspect:.4f}) differs from target ({target_aspect:.4f}). "
+                        f"Resizing from {inpainted.shape[3]}x{inpainted.shape[2]} to fit {hires_W}x{hires_H}."
+                    )
+                    if inpaint_aspect > target_aspect:
+                        new_w = hires_W
+                        new_h = int(round(hires_W / inpaint_aspect))
+                    else:
+                        new_h = hires_H
+                        new_w = int(round(hires_H * inpaint_aspect))
+                    inpainted = F.interpolate(inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                    # Final resize to target dimensions
+                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                else:
+                    logger.debug(
+                        f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}"
+                    )
+                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
             # --- Process the mask (using a simplified chain from test.py) ---
             processed_mask = mask.clone()  # No need to unsqueeze, it's already 4D

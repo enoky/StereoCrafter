@@ -86,7 +86,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-02-28.0"
+GUI_VERSION = "26-03-02.0"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -468,7 +468,69 @@ class SplatterGUI(ThemedTk):
         if hasattr(self, "info_frame") and hasattr(self, "info_labels"):
             self.theme_manager.apply_theme_to_labels(self.info_labels)
 
-        # 3. Handle window geometry adjustment
+        # 3. Apply a few compact/custom widget styles used only by this GUI
+        panel_bg = "#3a4047" if self.dark_mode_var.get() else "#e6ebf2"
+        panel_trough = "#262b31" if self.dark_mode_var.get() else "#bcc6d3"
+        panel_bar = "#5d96e0" if self.dark_mode_var.get() else "#4f83cc"
+        try:
+            self.style.configure("SmallTool.TButton", padding=(0, 0), anchor="center")
+            self.style.configure("CompactAction.TButton", padding=(4, 0), anchor="center")
+            self.style.configure("Loading.TButton", padding=(4, 0), anchor="center")
+            # Keep entry/combo heights stable across light/dark themes so dark mode
+            # does not steal preview space with taller field chrome.
+            self.style.configure("TEntry", padding=(1, 0))
+            self.style.configure("TCombobox", padding=(1, 0), arrowsize=10)
+            self.style.configure("TSpinbox", padding=(1, 0), arrowsize=10)
+            self.style.configure(
+                "Custom.Horizontal.TProgressbar",
+                troughcolor=panel_trough,
+                background=panel_bar,
+                lightcolor=panel_bar,
+                darkcolor=panel_bar,
+                bordercolor=panel_trough,
+                thickness=12,
+            )
+            self.style.configure("ProgressPanel.TLabel", background=panel_bg, foreground=colors["fg"])
+        except Exception:
+            pass
+
+        for lf_name in (
+            "folder_frame",
+            "preprocessing_frame",
+            "output_settings_frame",
+            "depth_prep_frame",
+            "depth_all_settings_frame",
+            "info_frame",
+            "dev_tools_frame",
+        ):
+            lf = getattr(self, lf_name, None)
+            if lf is not None:
+                try:
+                    lf.configure(bg=colors["bg"], fg=colors["fg"])
+                except Exception:
+                    pass
+
+        for w_name in ("progress_panel", "progress_row_frame", "progress_title_label", "status_label"):
+            w = getattr(self, w_name, None)
+            if w is not None:
+                try:
+                    w.configure(bg=panel_bg, fg=colors["fg"] if hasattr(w, "configure") else None)
+                except Exception:
+                    try:
+                        w.configure(bg=panel_bg)
+                    except Exception:
+                        pass
+
+        if hasattr(self, "progress_title_label") and self.progress_title_label is not None:
+            try:
+                self.progress_title_label.configure(bg=panel_bg, fg=colors["fg"])
+            except Exception:
+                pass
+
+        if hasattr(self, "_configure_map_selector_styles"):
+            self._configure_map_selector_styles()
+
+        # 4. Handle window geometry adjustment
         self.update_idletasks()
 
     def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode):
@@ -908,9 +970,31 @@ class SplatterGUI(ThemedTk):
                 if not rb:
                     continue
                 try:
-                    rb.configure(style="MapSelSelected.TRadiobutton" if name == sel else "MapSel.TRadiobutton")
+                    is_selected = name == sel
+                    rb.configure(
+                        style="MapSelSelected.TRadiobutton" if is_selected else "MapSel.TRadiobutton",
+                        text=f"► {name}" if is_selected else f"  {name}",
+                    )
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _configure_map_selector_styles(self):
+        """Refresh map selector styles so selection remains obvious in both light and dark themes."""
+        try:
+            style = ttk.Style()
+            base_font = tkfont.nametofont("TkDefaultFont")
+            selected_fg = "#ffff66" if self.dark_mode_var.get() else "#003c8f"
+            selected_font = tkfont.Font(
+                root=self,
+                family=base_font.cget("family"),
+                size=int(base_font.cget("size")) + 1,
+                weight="bold",
+            )
+            style.configure("MapSel.TRadiobutton", font=base_font)
+            style.configure("MapSelSelected.TRadiobutton", font=selected_font, foreground=selected_fg)
+            style.map("MapSelSelected.TRadiobutton", foreground=[("!disabled", selected_fg), ("active", selected_fg)])
         except Exception:
             pass
 
@@ -933,27 +1017,12 @@ class SplatterGUI(ThemedTk):
         preview_button_frame = self.previewer.preview_size_combo.master
 
         # --- Map selector styles (selected vs unselected) ---
-        if not getattr(self, "_map_selector_styles_inited", False):
-            try:
-                style = ttk.Style()
-                base_font = tkfont.nametofont("TkDefaultFont")
-                bold_font = tkfont.Font(
-                    root=preview_button_frame,
-                    family=base_font.cget("family"),
-                    size=base_font.cget("size"),
-                    weight="bold",
-                )
-                style.configure("MapSel.TRadiobutton", font=base_font)
-                style.configure("MapSelSelected.TRadiobutton", font=bold_font)
-            except Exception:
-                # Fail quietly; styles are optional
-                pass
-            self._map_selector_styles_inited = True
+        self._configure_map_selector_styles()
 
         for subfolder_name in self.depth_map_subfolders:
             rb = ttk.Radiobutton(
                 preview_button_frame,
-                text=subfolder_name,
+                text=f"  {subfolder_name}",
                 variable=self.selected_depth_map_var,
                 value=subfolder_name,
                 style="MapSel.TRadiobutton",
@@ -1030,6 +1099,10 @@ class SplatterGUI(ThemedTk):
             logger.info(f"Depth map for current video {video_name} not found in {os.path.basename(new_depth_folder)}")
 
         # Refresh previewer so the current video immediately reflects the new map
+        try:
+            self.previewer.invalidate_frame_buffer()
+        except Exception:
+            pass
         try:
             self.previewer.replace_source_path_for_current_video("depth_map", depth_path or "")
         except Exception as e:
@@ -1631,7 +1704,7 @@ class SplatterGUI(ThemedTk):
         self.menubar.add_cascade(label="Help", menu=self.help_menu)
 
         # --- Folder selection frame ---
-        self.folder_frame = ttk.LabelFrame(self, text="Input/Output Folders")
+        self.folder_frame = tk.LabelFrame(self, text="Input/Output Folders", labelanchor="nw")
         self.folder_frame.pack(pady=2, padx=10, fill="x")
         self.folder_frame.grid_columnconfigure(1, weight=1)
 
@@ -1711,6 +1784,18 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.entry_output_splatted, "output_splatted")
         self._create_hover_tooltip(self.chk_multi_map, "multi_map")
         self._create_hover_tooltip(self.btn_browse_output_splatted, "output_splatted")
+
+        for _btn in (
+            self.btn_browse_source_clips_folder,
+            self.btn_select_source_clips_file,
+            self.btn_browse_input_depth_maps_folder,
+            self.btn_select_input_depth_maps_file,
+            self.btn_browse_output_splatted,
+        ):
+            try:
+                _btn.configure(style="CompactAction.TButton")
+            except Exception:
+                pass
         # Reset current_row for next frame
         current_row = 0
 
@@ -1729,6 +1814,13 @@ class SplatterGUI(ThemedTk):
         )
         self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
+        for _btn_name in ("load_preview_button", "prev_video_button", "next_video_button", "play_pause_button", "fast_forward_button"):
+            _btn = getattr(self.previewer, _btn_name, None)
+            if _btn is not None:
+                try:
+                    _btn.configure(style="CompactAction.TButton")
+                except Exception:
+                    pass
 
         # Set the preview options ONCE at startup
         self.previewer.preview_source_combo["values"] = [
@@ -1789,7 +1881,7 @@ class SplatterGUI(ThemedTk):
         self.process_settings_container.grid_columnconfigure(0, weight=1)
 
         # --- 1. Process Resolution Frame (Top Left) ---
-        self.preprocessing_frame = ttk.LabelFrame(self.process_settings_container, text="Process Resolution")
+        self.preprocessing_frame = tk.LabelFrame(self.process_settings_container, text="Process Resolution", labelanchor="nw")
         self.preprocessing_frame.grid(
             row=0, column=0, padx=(0, 5), sticky="nsew"
         )  # <-- Grid 0,0 in process_settings_container
@@ -1884,7 +1976,7 @@ class SplatterGUI(ThemedTk):
         #   Row 0: Process Length | Auto-Convergence
         #   Row 1: Output CRF Full | Output CRF Low
 
-        self.output_settings_frame = ttk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings")
+        self.output_settings_frame = tk.LabelFrame(self.process_settings_container, text="Splatting & Output Settings", labelanchor="nw")
         self.output_settings_frame.grid(row=1, column=0, padx=(0, 5), sticky="ew", pady=(2, 0))
         self.output_settings_frame.grid_columnconfigure(0, weight=0)
         self.output_settings_frame.grid_columnconfigure(1, weight=0)
@@ -1972,6 +2064,7 @@ class SplatterGUI(ThemedTk):
             self.border_mode_frame,
             text="⟳",  # Unicode rescan-like symbol
             width=2,
+            style="SmallTool.TButton",
             command=self._on_border_rescan_click,
             takefocus=False,
         )
@@ -1985,11 +2078,11 @@ class SplatterGUI(ThemedTk):
         self.widgets_to_disable.extend([self.combo_color_tags_mode, self.combo_border_mode, self.btn_border_rescan])
 
         # Row 3, Col 0: Strict FFmpeg decode toggle (affects how the source video is decoded for splatting/preview)
-        self.strict_decode_frame = ttk.Frame(self.output_settings_frame)
-        self.strict_decode_frame.grid(row=3, column=0, sticky="w", padx=5, pady=0)
+        self.strict_decode_frame = ttk.Frame(self.preprocessing_frame)
+        self.strict_decode_frame.grid(row=1, column=2, sticky="w", padx=5, pady=0)
         self.chk_strict_ffmpeg_decode = ttk.Checkbutton(
             self.strict_decode_frame,
-            text="ffmpeg decode",
+            text="ffmpeg",
             variable=self.strict_ffmpeg_decode_var,
             command=self._on_strict_ffmpeg_decode_toggle,
         )
@@ -2007,7 +2100,7 @@ class SplatterGUI(ThemedTk):
 
         # --- Hi-Res Depth Pre-processing Frame (Top-Right) ---
         current_depth_row = 0  # Use a new counter for this container
-        self.depth_prep_frame = ttk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing")
+        self.depth_prep_frame = tk.LabelFrame(self.depth_settings_container, text="Depth Map Pre-processing", labelanchor="nw")
         self.depth_prep_frame.grid(
             row=current_depth_row, column=0, sticky="ew"
         )  # Use grid here for placement inside container
@@ -2098,7 +2191,7 @@ class SplatterGUI(ThemedTk):
 
         # --- NEW: Depth Pre-processing (All) Frame (Bottom-Right) ---
         current_depth_row += 1
-        self.depth_all_settings_frame = ttk.LabelFrame(self.depth_settings_container, text="Stereo Projection")
+        self.depth_all_settings_frame = tk.LabelFrame(self.depth_settings_container, text="Stereo Projection", labelanchor="nw")
         self.depth_all_settings_frame.grid(
             row=current_depth_row, column=0, sticky="ew", pady=(2, 0)
         )  # Pack it below Hi-Res frame
@@ -2154,7 +2247,7 @@ class SplatterGUI(ThemedTk):
         # --- Estimate Max Total(D+P) (quick sampled scan) ---
         try:
             self.btn_est_dp_total = ttk.Button(
-                disp_subframe, text="≈", width=2, command=self.run_estimate_dp_total_max, takefocus=False
+                disp_subframe, text="≈", width=2, style="SmallTool.TButton", command=self.run_estimate_dp_total_max, takefocus=False
             )
             self.btn_est_dp_total.grid(row=0, column=3, sticky="w", padx=(6, 0))
             if hasattr(self, "_create_hover_tooltip"):
@@ -2324,7 +2417,7 @@ class SplatterGUI(ThemedTk):
         self.right_column_stack.grid_rowconfigure(1, weight=0)
 
         # --- Current Processing Information frame ---
-        self.info_frame = ttk.LabelFrame(self.right_column_stack, text="Current Processing Information")
+        self.info_frame = tk.LabelFrame(self.right_column_stack, text="Current Processing Information", labelanchor="nw")
         self.info_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 2))
 
         # Two-column pairs: [Label, Value] [Label, Value]
@@ -2413,7 +2506,7 @@ class SplatterGUI(ThemedTk):
         self.info_labels.extend([lbl_gamma_static, lbl_gamma_value, lbl_map_static, lbl_map_value])
 
         # --- Dev Tools (right column) ---
-        self.dev_tools_frame = ttk.LabelFrame(self.right_column_stack, text="Dev Tools")
+        self.dev_tools_frame = tk.LabelFrame(self.right_column_stack, text="Dev Tools", labelanchor="nw")
         self.dev_tools_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 0))
         self.dev_tools_frame.grid_columnconfigure(0, weight=0)
         self.dev_tools_frame.grid_columnconfigure(1, weight=0)
@@ -2449,13 +2542,22 @@ class SplatterGUI(ThemedTk):
         self.chk_splat_test.grid(row=0, column=2, sticky="w", padx=(10, 0), pady=0)
         self._create_hover_tooltip(self.chk_splat_test, "splat_test")
 
-        progress_frame = ttk.LabelFrame(self, text="Progress")
-        progress_frame.pack(pady=2, padx=10, fill="x")
+        self.progress_panel = tk.Frame(self, bd=1, relief="groove")
+        self.progress_panel.pack(pady=(1, 2), padx=10, fill="x")
+        self.progress_row_frame = tk.Frame(self.progress_panel, bd=0, highlightthickness=0)
+        self.progress_row_frame.pack(fill="x", padx=5, pady=(2, 0))
+        self.progress_title_label = tk.Label(self.progress_row_frame, text="Progress:")
+        self.progress_title_label.pack(side="left", padx=(0, 6))
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill="x", expand=True, padx=5, pady=2)
-        self.status_label = ttk.Label(progress_frame, text="Ready")
-        self.status_label.pack(padx=5, pady=2)
+        self.progress_bar = ttk.Progressbar(
+            self.progress_row_frame,
+            variable=self.progress_var,
+            maximum=100,
+            style="Custom.Horizontal.TProgressbar",
+        )
+        self.progress_bar.pack(side="left", fill="x", expand=True, pady=(0, 1))
+        self.status_label = tk.Label(self.progress_panel, text="Ready", anchor="center", justify="center")
+        self.status_label.pack(fill="x", padx=5, pady=(0, 2))
 
         # --- Button frame ---
         button_frame = ttk.Frame(self)
@@ -4729,11 +4831,15 @@ class SplatterGUI(ThemedTk):
             pass
 
     def _auto_pass_csv_update_row_from_current(self) -> None:
-        """If auto_pass_export.csv exists, update this clip's row when sidecar changes."""
+        """Create/update this clip's row in auto_pass_export.csv when sidecar data changes."""
         try:
             csv_path = self._auto_pass_csv_get_path()
-            if not os.path.exists(csv_path):
+            if not csv_path:
                 return
+            try:
+                os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            except Exception:
+                pass
 
             if self._auto_pass_csv_cache is None or self._auto_pass_csv_path != csv_path:
                 self._auto_pass_csv_load_cache(csv_path)
@@ -4747,6 +4853,8 @@ class SplatterGUI(ThemedTk):
             depth = self.previewer.video_list[idx].get("depth_map", "")
             depth_bn = os.path.basename(depth) if depth else ""
             src_bn = os.path.basename(src) if src else ""
+            if not src_bn and not depth_bn:
+                return
 
             # Frame token: last underscore + digits at end of source basename (before extension).
             frame_num = ""
@@ -4797,19 +4905,31 @@ class SplatterGUI(ThemedTk):
                 except Exception:
                     dp_true = None
 
-            row = {
-                "frame": frame_num,
-                "source_video": src_bn,
-                "selected_depth_map": str(current_data.get("selected_depth_map", "")),
-                "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
-                "left_border": round(float(current_data.get("left_border", 0.0)), 3),
-                "right_border": round(float(current_data.get("right_border", 0.0)), 3),
-                "border_mode": str(current_data.get("border_mode", "")),
-                "set_disparity": round(float(current_data.get("max_disparity", 0.0)), 3),
-                "true_max_disp": round(float(dp_true), 3) if dp_true is not None else "",
-                "est_max_disp": round(float(dp_est), 3) if dp_est is not None else "",
-                "gamma": round(float(current_data.get("gamma", 1.0)), 3),
-            }
+            existing = dict(self._auto_pass_csv_cache.get(src_bn, {}))
+            row = dict(existing)
+            row.update(
+                {
+                    "frame": frame_num,
+                    "source_video": src_bn,
+                    "selected_depth_map": str(current_data.get("selected_depth_map", "")),
+                    "convergence_plane": round(float(current_data.get("convergence_plane", 0.5)), 6),
+                    "left_border": round(float(current_data.get("left_border", 0.0)), 3),
+                    "right_border": round(float(current_data.get("right_border", 0.0)), 3),
+                    "border_mode": str(current_data.get("border_mode", "")),
+                    "set_disparity": round(float(current_data.get("max_disparity", 0.0)), 3),
+                    "gamma": round(float(current_data.get("gamma", 1.0)), 3),
+                }
+            )
+            if dp_true is not None:
+                try:
+                    row["true_max_disp"] = round(float(dp_true), 3)
+                except Exception:
+                    row["true_max_disp"] = dp_true
+            if dp_est is not None:
+                try:
+                    row["est_max_disp"] = round(float(dp_est), 3)
+                except Exception:
+                    row["est_max_disp"] = dp_est
 
             # Key by source basename (stable + avoids collisions across multi-map folders).
             self._auto_pass_csv_cache[src_bn] = row
@@ -5407,8 +5527,9 @@ class SplatterGUI(ThemedTk):
             return False
 
         # 5. Write the updated data back to the file using the manager
+        sidecar_existed_before = os.path.exists(json_sidecar_path)
         if self.sidecar_manager.save_sidecar_data(json_sidecar_path, current_data):
-            action = "Auto-Saved" if is_auto_save else ("Updated" if os.path.exists(json_sidecar_path) else "Created")
+            action = "Auto-Saved" if is_auto_save else ("Updated" if sidecar_existed_before else "Created")
             logger.info(f"{action} sidecar: {os.path.basename(json_sidecar_path)}")
             self.status_label.config(text=f"{action} sidecar.")
             self._update_sidecar_button_text()
