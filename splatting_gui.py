@@ -5492,6 +5492,16 @@ class SplatterGUI(ThemedTk):
         self.config_manager.config = self._get_current_config()
         self.config_manager.save()
 
+    def _auto_save_current_sidecar(self):
+        """
+        Saves the current GUI values to the sidecar file without user interaction.
+        Only runs if self.auto_save_sidecar_var is True.
+        """
+        if not self.auto_save_sidecar_var.get():
+            return
+
+        self._save_current_sidecar_data(is_auto_save=True)
+
     def _save_current_sidecar_data(
         self, is_auto_save: bool = False, force_auto_L: Optional[float] = None, force_auto_R: Optional[float] = None
     ) -> bool:

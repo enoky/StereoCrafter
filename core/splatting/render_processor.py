@@ -222,6 +222,23 @@ class RenderProcessor:
                 tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
                 logger.debug(f"[DEPTH] TV range compensation enabled: {tv_disp_comp:.3f}")
 
+        # Ensure numeric values are actually integers before using them in ranges
+        try:
+            total_frames_to_process = int(total_frames_to_process)
+        except (ValueError, TypeError):
+            total_frames_to_process = 0
+
+        try:
+            batch_size = int(batch_size)
+        except (ValueError, TypeError):
+            batch_size = 1
+
+        if test_target_frame_idx is not None:
+            try:
+                test_target_frame_idx = int(test_target_frame_idx)
+            except (ValueError, TypeError):
+                test_target_frame_idx = None
+
         frame_count = 0
         encoding_successful = True
 
@@ -240,20 +257,8 @@ class RenderProcessor:
                 ):
                     break
 
-                # Ensure total_frames_to_process and batch_size are ints
-                if not isinstance(total_frames_to_process, int):
-                    try:
-                        total_frames_to_process = int(total_frames_to_process)
-                    except (ValueError, TypeError):
-                        total_frames_to_process = 0
-
-                if not isinstance(batch_size, int):
-                    try:
-                        batch_size = int(batch_size)
-                    except (ValueError, TypeError):
-                        batch_size = 1
-
                 batch_indices = list(range(i, min(i + batch_size, total_frames_to_process)))
+
                 if not batch_indices:
                     break
 
@@ -262,8 +267,8 @@ class RenderProcessor:
                 batch_depth_numpy_raw = depth_map_reader.get_batch(batch_indices).asnumpy()
 
                 if flip_horizontal:
-                    batch_video_numpy = np.flip(batch_video_numpy, axis=2)
-                    batch_depth_numpy_raw = np.flip(batch_depth_numpy_raw, axis=2)
+                    batch_video_numpy = np.flip(batch_video_numpy, axis=2).copy()
+                    batch_depth_numpy_raw = np.flip(batch_depth_numpy_raw, axis=2).copy()
 
                 # --- NEW: Aspect Ratio Parity ---
                 # Immediate resize to ensure all following steps (normalization, dilation, blur)

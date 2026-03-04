@@ -1371,6 +1371,7 @@ class MergingGUI(ThemedTk):
                 logger.info(
                     f"Sidecar for '{core_name}': left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}, flip_horizontal={flip_horizontal}"
                 )
+
                 left_border = clip_sidecar_data.get("left_border", 0.0)
                 right_border = clip_sidecar_data.get("right_border", 0.0)
                 self._update_border_info(left_border, right_border)
@@ -1557,44 +1558,76 @@ class MergingGUI(ThemedTk):
                     mask_gray_np = np.mean(mask_np, axis=3)
                     mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
 
-                    # 1. Un-mirror if needed
-                    if flip_horizontal:
-                        original_left = torch.flip(original_left, dims=[3])
-                        inpainted = torch.flip(inpainted, dims=[3])
-                        warped_original = torch.flip(warped_original, dims=[3])
-                        mask = torch.flip(mask, dims=[3])
+                    # Process chunk
+                    use_gpu = settings["use_gpu"] and torch.cuda.is_available()
+                    device = "cuda" if use_gpu else "cpu"
+                    mask, inpainted, original_left, warped_original = (
+                        mask.to(device),
+                        inpainted.to(device),
+                        original_left.to(device),
+                        warped_original.to(device),
+                    )
 
-                    # 2. Aspect Ratio Correction (Inpaint -> Source)
                     if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                        # Calculate aspect-ratio-correct dimensions for inpaint
+                        # The inpaint should match the source aspect ratio, not be stretched uniformly
                         target_aspect = hires_W / hires_H
                         inpaint_aspect = inpainted.shape[3] / inpainted.shape[2]
+
                         if abs(inpaint_aspect - target_aspect) > 0.01:
+                            # Aspect ratios differ - resize to fit within target while preserving aspect ratio
+                            logger.debug(
+                                f"Inpaint aspect ratio ({inpaint_aspect:.4f}) differs from target ({target_aspect:.4f}). "
+                                f"Resizing from {inpainted.shape[3]}x{inpainted.shape[2]} to fit {hires_W}x{hires_H}."
+                            )
+                            # Calculate new dimensions that fit within target while preserving aspect ratio
                             if inpaint_aspect > target_aspect:
+                                # Inpaint is wider - fit to width
                                 new_w = hires_W
                                 new_h = int(round(hires_W / inpaint_aspect))
                             else:
+                                # Inpaint is taller - fit to height
                                 new_h = hires_H
                                 new_w = int(round(hires_H * inpaint_aspect))
-                            new_w = new_w if new_w % 2 == 0 else new_w + 1
-                            new_h = new_h if new_h % 2 == 0 else new_h + 1
+                            # First resize to aspect-ratio-correct dimensions
                             inpainted = F.interpolate(
-                                inpainted, size=(new_h, new_w), mode="bilinear", align_corners=False
+                                inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False
                             )
-                            pad_h = (hires_H - new_h) // 2
-                            pad_w = (hires_W - new_w) // 2
-                            inpainted = F.pad(
-                                inpainted, (pad_w, hires_W - new_w - pad_w, pad_h, hires_H - new_h - pad_h)
+                            mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                            # Then do final resize to match target dimensions
+                            inpainted = F.interpolate(
+                                inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
                             )
+                            mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                        else:
+                            # Aspect ratios match - direct resize
+                            inpainted = F.interpolate(
+                                inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False
+                            )
+                            mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
-                    # 3. Mask Processing (Dilation, Blur, Shadow)
+                    if settings["enable_color_transfer"]:
+                        adjusted_frames = []
+                        for frame_idx in range(inpainted.shape[0]):
+                            adjusted_frame = apply_color_transfer(
+                                original_left[frame_idx].cpu(), inpainted[frame_idx].cpu()
+                            )
+                            adjusted_frames.append(adjusted_frame.to(device))
+                        inpainted = torch.stack(adjusted_frames)
+
                     processed_mask = mask.clone()
+                    # --- NEW: Binarization as the first step ---
+                    if settings["mask_binarize_threshold"] >= 0.0:
+                        processed_mask = (mask > settings["mask_binarize_threshold"]).float()
+
                     if settings["mask_dilate_kernel_size"] > 0:
                         processed_mask = apply_mask_dilation(
                             processed_mask, settings["mask_dilate_kernel_size"], use_gpu
                         )
                     if settings["mask_blur_kernel_size"] > 0:
                         processed_mask = apply_gaussian_blur(processed_mask, settings["mask_blur_kernel_size"], use_gpu)
-                    if settings.get("shadow_shift", 0) > 0:
+
+                    if settings["shadow_shift"] > 0:
                         processed_mask = apply_shadow_blur(
                             processed_mask,
                             settings["shadow_shift"],
@@ -1605,20 +1638,9 @@ class MergingGUI(ThemedTk):
                             use_gpu,
                         )
 
-                    # 4. Blending and Eye Assignment
-                    if flip_horizontal:
-                        # Roles swapped: Generated is Left, Source is Right
-                        blended_left_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
-                        blended_right_eye = original_left
-                        original_left = blended_left_eye
-                    else:
-                        # Standard roles: Source is Left, Generated is Right
-                        blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
-                        # original_left stays as-is
-                    # --- End Flip Logic ---
+                    blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
 
                     # --- NEW: Apply borders from sidecar ---
-
                     left_border = clip_sidecar_data.get("left_border", 0.0)
                     right_border = clip_sidecar_data.get("right_border", 0.0)
                     logger.debug(f"Borders: left={left_border}%, right={right_border}%")
@@ -1681,7 +1703,11 @@ class MergingGUI(ThemedTk):
                         final_chunk = blended_right_eye
                     # --- END NEW ---
 
+                    if flip_horizontal:
+                        final_chunk = torch.flip(final_chunk, dims=[3])
+
                     cpu_chunk = final_chunk.cpu()
+
                     for frame_tensor in cpu_chunk:
                         frame_np = frame_tensor.permute(1, 2, 0).numpy()
                         frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
@@ -2012,34 +2038,46 @@ class MergingGUI(ThemedTk):
             use_gpu = params.get("use_gpu", False) and torch.cuda.is_available()
             device = "cuda" if use_gpu else "cpu"
 
-            # 1. Un-mirror if needed
-            if flip_horizontal:
-                original_left = torch.flip(original_left, dims=[3])
-                inpainted = torch.flip(inpainted, dims=[3])
-                right_eye_original = torch.flip(right_eye_original, dims=[3])
-                mask = torch.flip(mask, dims=[3])
+            # Move tensors to the processing device
+            mask = mask.to(device)
+            inpainted = inpainted.to(device)
+            original_left = original_left.to(device)
+            right_eye_original = right_eye_original.to(device)
 
-            # 2. Aspect Ratio Correction (Inpaint -> Source)
             hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
             if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
+                # Calculate aspect-ratio-correct dimensions for inpaint
                 target_aspect = hires_W / hires_H
                 inpaint_aspect = inpainted.shape[3] / inpainted.shape[2]
+
                 if abs(inpaint_aspect - target_aspect) > 0.01:
+                    # Aspect ratios differ - resize to fit within target while preserving aspect ratio
+                    logger.debug(
+                        f"Preview: Inpaint aspect ratio ({inpaint_aspect:.4f}) differs from target ({target_aspect:.4f}). "
+                        f"Resizing from {inpainted.shape[3]}x{inpainted.shape[2]} to fit {hires_W}x{hires_H}."
+                    )
                     if inpaint_aspect > target_aspect:
                         new_w = hires_W
                         new_h = int(round(hires_W / inpaint_aspect))
                     else:
                         new_h = hires_H
                         new_w = int(round(hires_H * inpaint_aspect))
-                    new_w = new_w if new_w % 2 == 0 else new_w + 1
-                    new_h = new_h if new_h % 2 == 0 else new_h + 1
-                    inpainted = F.interpolate(inpainted, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                    pad_h = (hires_H - new_h) // 2
-                    pad_w = (hires_W - new_w) // 2
-                    inpainted = F.pad(inpainted, (pad_w, hires_W - new_w - pad_w, pad_h, hires_H - new_h - pad_h))
+                    inpainted = F.interpolate(inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                    # Final resize to target dimensions
+                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                else:
+                    logger.debug(
+                        f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}"
+                    )
+                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
-            # 3. Mask Processing (Dilation, Blur, Shadow)
-            processed_mask = mask.clone()
+            # --- Process the mask (using a simplified chain from test.py) ---
+            processed_mask = mask.clone()  # No need to unsqueeze, it's already 4D
+            if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
             if params.get("mask_dilate_kernel_size", 0) > 0:
                 processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
             if params.get("mask_blur_kernel_size", 0) > 0:
@@ -2047,28 +2085,23 @@ class MergingGUI(ThemedTk):
             if params.get("shadow_shift", 0) > 0:
                 processed_mask = apply_shadow_blur(
                     processed_mask,
-                    int(params["shadow_shift"]),
-                    float(params["shadow_start_opacity"]),
-                    float(params["shadow_opacity_decay"]),
-                    float(params["shadow_min_opacity"]),
-                    float(params["shadow_decay_gamma"]),
+                    params["shadow_shift"],
+                    params["shadow_start_opacity"],
+                    params["shadow_opacity_decay"],
+                    params["shadow_min_opacity"],
+                    params["shadow_decay_gamma"],
                     use_gpu,
                 )
+            processed_mask = processed_mask.squeeze(0)  # Remove batch dim
 
-            # 4. Blending and Eye Assignment
-            if flip_horizontal:
-                # Roles swapped: Generated is Left, Source is Right
-                blended_left_eye = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
-                blended_right_eye = original_left
-                original_left = blended_left_eye
-                blended_frame = blended_left_eye
-            else:
-                # Standard roles: Source is Left, Generated is Right
-                blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
-                blended_right_eye = blended_frame
-                # original_left stays as-is
+            if params.get("enable_color_transfer", False):
+                if original_left is not None:
+                    logger.debug("Applying color transfer to preview frame...")
+                    inpainted = apply_color_transfer(original_left.cpu(), inpainted.cpu()).to(device)
 
-            # --- Apply borders from sidecar ---
+            blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
+
+            # --- NEW: Apply borders from sidecar ---
             current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             clip_sidecar = current_source_metadata.get("sidecar", {})
             left_border = clip_sidecar.get("left_border", 0.0)
@@ -2153,7 +2186,11 @@ class MergingGUI(ThemedTk):
             if final_frame_4d is None:
                 final_frame_4d = blended_frame
 
+            if flip_horizontal:
+                final_frame_4d = torch.flip(final_frame_4d, dims=[3])
+
             # Store for saving SBS
+
             self.preview_original_left_tensor = original_left.squeeze(0).cpu()
             self.preview_blended_right_tensor = blended_frame.squeeze(0).cpu()
 
