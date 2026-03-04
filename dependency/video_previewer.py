@@ -1583,6 +1583,11 @@ class VideoPreviewer(ttk.Frame):
                 except Exception:
                     pass
 
+            # Depth Min/Max readout for Depth Map preview mode
+            current_src = self.preview_source_combo.get()
+            if current_src in ("Depth Map", "Depth Map (Color)"):
+                self._draw_depth_minmax_overlay(display_image)
+
             self.preview_image_tk = ImageTk.PhotoImage(display_image)
             # --- FIX: Attach the image reference to the widget to prevent garbage collection ---
             self.preview_label.config(image=self.preview_image_tk, text="")
@@ -1983,9 +1988,44 @@ class VideoPreviewer(ttk.Frame):
         except Exception:
             pass
 
-            if depth_pct is not None and pop_pct is not None:
-                total = float(depth_pct) + float(pop_pct)
-                if self._dp_total_max_seen is None or total > self._dp_total_max_seen:
-                    self._dp_total_max_seen = total
+    def set_depth_minmax(self, raw_min: Optional[float], raw_max: Optional[float]):
+        """Store min/max raw depth values for display in Depth Map preview mode."""
+        self._depth_raw_min = raw_min
+        self._depth_raw_max = raw_max
+
+    def _draw_depth_minmax_overlay(self, display_image: Image.Image):
+        """Draw min/max depth values overlay on the preview image."""
+        raw_min = getattr(self, "_depth_raw_min", None)
+        raw_max = getattr(self, "_depth_raw_max", None)
+
+        if raw_min is None or raw_max is None:
+            return
+
+        try:
+            draw = ImageDraw.Draw(display_image)
+            w_img, h_img = display_image.size
+
+            color = (255, 255, 255) if getattr(self, "crosshair_white", False) else (0, 0, 0)
+
+            txt = f"Depth: {raw_min:.1f} - {raw_max:.1f}"
+
+            try:
+                font_size = max(10, min(20, int(h_img * 0.025)))
+                font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            try:
+                bbox = draw.textbbox((0, 0), txt, font=font)
+                tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+            except Exception:
+                tw, th = draw.textsize(txt, font=font)
+
+            x_txt = 10
+            y_txt = 10
+            draw.text((x_txt, y_txt), txt, fill=color, font=font)
         except Exception:
             pass

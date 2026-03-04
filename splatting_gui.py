@@ -3988,6 +3988,13 @@ class SplatterGUI(ThemedTk):
             f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]"
         )
 
+        # Send depth min/max to previewer for display in Depth Map mode
+        if preview_source in ("Depth Map", "Depth Map (Color)"):
+            if hasattr(self, "previewer") and self.previewer is not None:
+                raw_min = float(depth_numpy_raw.min())
+                raw_max = float(depth_numpy_raw.max())
+                self.previewer.set_depth_minmax(raw_min, raw_max)
+
         # --- Perform Splatting ---
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
         # Ensure depth map is resized to the target resolution (low-res or original)
