@@ -4330,7 +4330,7 @@ class SplatterGUI(ThemedTk):
 
         t_all_finish = time.perf_counter()
 
-        logger.info(
+        logger.debug(
             f"[TIMER] Preview: Total={t_all_finish - t_start:.3f}s | "
             f"Setup={t_setup - t_start:.3f}s | "
             f"Resize={t_resize_depth - t_setup:.3f}s | "
