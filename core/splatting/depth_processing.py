@@ -63,17 +63,11 @@ def custom_dilate(
 
     for t in range(tensor_cpu.shape[0]):
         frame_float = tensor_cpu[t].numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
         effective_max_value = max(max_content_value, 1e-5)
 
         src_img = np.ascontiguousarray(
-            np.clip((frame_2d_raw / effective_max_value) * 65535, 0, 65535).astype(
-                np.uint16
-            )
+            np.clip((frame_2d_raw / effective_max_value) * 65535, 0, 65535).astype(np.uint16)
         )
 
         def do_op(k_w, k_h, img):
@@ -88,19 +82,13 @@ def custom_dilate(
         if is_x_int and is_y_int:
             final_float = do_op(kx_low, ky_low, src_img)
         elif not is_x_int and is_y_int:
-            final_float = (1.0 - tx) * do_op(kx_low, ky_low, src_img) + tx * do_op(
-                kx_high, ky_low, src_img
-            )
+            final_float = (1.0 - tx) * do_op(kx_low, ky_low, src_img) + tx * do_op(kx_high, ky_low, src_img)
         elif is_x_int and not is_y_int:
-            final_float = (1.0 - ty) * do_op(kx_low, ky_low, src_img) + ty * do_op(
-                kx_low, ky_high, src_img
-            )
+            final_float = (1.0 - ty) * do_op(kx_low, ky_low, src_img) + ty * do_op(kx_low, ky_high, src_img)
         else:
             r11, r12 = do_op(kx_low, ky_low, src_img), do_op(kx_low, ky_high, src_img)
             r21, r22 = do_op(kx_high, ky_low, src_img), do_op(kx_high, ky_high, src_img)
-            final_float = (1.0 - tx) * ((1.0 - ty) * r11 + ty * r12) + tx * (
-                (1.0 - ty) * r21 + ty * r22
-            )
+            final_float = (1.0 - tx) * ((1.0 - ty) * r11 + ty * r12) + tx * ((1.0 - ty) * r21 + ty * r22)
 
         processed_raw = (final_float / 65535.0) * effective_max_value
         processed_frames.append(torch.from_numpy(processed_raw).unsqueeze(0).float())
@@ -109,10 +97,7 @@ def custom_dilate(
 
 
 def custom_dilate_left(
-    tensor: torch.Tensor,
-    kernel_size: float,
-    use_gpu: bool = False,
-    max_content_value: float = 1.0,
+    tensor: torch.Tensor, kernel_size: float, use_gpu: bool = False, max_content_value: float = 1.0
 ) -> torch.Tensor:
     """Directional 16-bit fractional dilation to the LEFT."""
     k_raw = float(kernel_size)
@@ -154,15 +139,9 @@ def custom_dilate_left(
     processed_frames = []
     for t_idx in range(tensor.shape[0]):
         frame_float = tensor[t_idx].cpu().numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
         frame_norm_2d = frame_2d_raw / effective_max_value
-        frame_cv_uint16 = np.ascontiguousarray(
-            np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16)
-        )
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
         src = frame_cv_uint16.astype(np.float32)
 
         if abs(t) <= 1e-4:
@@ -179,11 +158,7 @@ def custom_dilate_left(
 
 
 def custom_blur(
-    tensor: torch.Tensor,
-    kernel_size_x: int,
-    kernel_size_y: int,
-    use_gpu: bool = True,
-    max_content_value: float = 1.0,
+    tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True, max_content_value: float = 1.0
 ) -> torch.Tensor:
     """Applies 16-bit Gaussian blur."""
     k_x, k_y = int(kernel_size_x), int(kernel_size_y)
@@ -199,16 +174,10 @@ def custom_blur(
 
     for t in range(tensor.shape[0]):
         frame_float = tensor[t].cpu().numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
         effective_max_value = max(max_content_value, 1e-5)
         frame_norm_2d = frame_2d_raw / effective_max_value
-        frame_cv_uint16 = np.ascontiguousarray(
-            np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16)
-        )
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
         processed_cv_uint16 = cv2.GaussianBlur(frame_cv_uint16, (k_x, k_y), 0)
         processed_norm_float = processed_cv_uint16.astype(np.float32) / 65535.0
         processed_raw_float = processed_norm_float * effective_max_value
@@ -239,13 +208,11 @@ def process_depth_batch(
         batch_depth_numpy = batch_depth_numpy_raw.mean(axis=-1)
     else:
         batch_depth_numpy = (
-            batch_depth_numpy_raw.squeeze(-1)
-            if batch_depth_numpy_raw.ndim == 4
-            else batch_depth_numpy_raw
+            batch_depth_numpy_raw.squeeze(-1) if batch_depth_numpy_raw.ndim == 4 else batch_depth_numpy_raw
         )
 
     batch_depth_float = batch_depth_numpy.astype(np.float32)
-    
+
     # Standardize input for logging (4D)
     if batch_depth_numpy_raw.ndim == 3:
         batch_depth_log_input = batch_depth_numpy_raw[..., None]
@@ -259,9 +226,7 @@ def process_depth_batch(
         return batch_depth_float
 
     current_width = (
-        batch_depth_numpy_raw.shape[2]
-        if batch_depth_numpy_raw.ndim == 4
-        else batch_depth_numpy_raw.shape[1]
+        batch_depth_numpy_raw.shape[2] if batch_depth_numpy_raw.ndim == 4 else batch_depth_numpy_raw.shape[1]
     )
     res_scale = math.sqrt(current_width / 960.0)
 
@@ -302,7 +267,9 @@ def process_depth_batch(
             k_blur = int(round(render_blur_left))
             k_blur = k_blur if k_blur % 2 == 1 else k_blur + 1
             band_half = max(1, int(math.ceil(k_blur / 4.0)))
-            edge_band = (F.max_pool2d(edge_mask, kernel_size=(1, 2 * band_half + 1), stride=1, padding=(0, band_half)) > 0.5).float()
+            edge_band = (
+                F.max_pool2d(edge_mask, kernel_size=(1, 2 * band_half + 1), stride=1, padding=(0, band_half)) > 0.5
+            ).float()
             alpha = torch.clamp(custom_blur(edge_band, 7, 1, False, 1.0), 0.0, 1.0)
 
             mix_f = max(0.0, min(1.0, float(depth_blur_left_mix)))
@@ -312,7 +279,9 @@ def process_depth_batch(
             blurred_v = custom_blur(tensor_4d, 1, k_blur, False, max_raw_value) if BLUR_LEFT_V_WEIGHT > 1e-6 else None
 
             if blurred_h is not None and blurred_v is not None:
-                blurred = (blurred_h * BLUR_LEFT_H_WEIGHT + blurred_v * BLUR_LEFT_V_WEIGHT) / max(BLUR_LEFT_H_WEIGHT + BLUR_LEFT_V_WEIGHT, 1e-6)
+                blurred = (blurred_h * BLUR_LEFT_H_WEIGHT + blurred_v * BLUR_LEFT_V_WEIGHT) / max(
+                    BLUR_LEFT_H_WEIGHT + BLUR_LEFT_V_WEIGHT, 1e-6
+                )
             elif blurred_h is not None:
                 blurred = blurred_h
             elif blurred_v is not None:
@@ -326,7 +295,7 @@ def process_depth_batch(
             tensor_4d = custom_dilate(tensor_4d, float(render_dilate_x), float(render_dilate_y), False, max_raw_value)
         if render_blur_x > 0 or render_blur_y > 0:
             tensor_4d = custom_blur(tensor_4d, float(render_blur_x), float(render_blur_y), False, max_raw_value)
-        
+
         batch_depth_float = tensor_4d.squeeze(1).cpu().numpy()
         del tensor_4d
         if torch.cuda.is_available():
@@ -358,10 +327,10 @@ def normalize_and_gamma_depth(
         batch_depth_gray = batch_depth_numpy_raw.squeeze(-1)
     else:
         batch_depth_gray = batch_depth_numpy_raw
-    
+
     batch_depth_float = batch_depth_gray.astype(np.float32)
     curr_max = float(batch_depth_float.max())
-    
+
     if assume_raw_input:
         # Scale/Unification Mode
         if global_depth_max > 1.05:
@@ -371,14 +340,20 @@ def normalize_and_gamma_depth(
             # CONTENT IS RAW. Let's decide on the divisor.
             if curr_max > max_expected_raw_value * 1.5:
                 # The expected bit-depth was likely wrong (e.g. 10-bit reported but 16-bit delivered)
-                if curr_max <= 255.0: divisor = 255.0
-                elif curr_max <= 1024.0: divisor = 1023.0
-                elif curr_max <= 4096.0: divisor = 4095.0
-                else: divisor = 65535.0
-                logger.debug(f"[DEPTH] Raw Mode: Auto-sizing divisor to {divisor} (ContentMax={curr_max:.1f}, ExpMax={max_expected_raw_value:.1f})")
+                if curr_max <= 255.0:
+                    divisor = 255.0
+                elif curr_max <= 1024.0:
+                    divisor = 1023.0
+                elif curr_max <= 4096.0:
+                    divisor = 4095.0
+                else:
+                    divisor = 65535.0
+                logger.debug(
+                    f"[DEPTH] Raw Mode: Auto-sizing divisor to {divisor} (ContentMax={curr_max:.1f}, ExpMax={max_expected_raw_value:.1f})"
+                )
             else:
                 divisor = max(max_expected_raw_value, 1.0)
-            
+
             batch_depth_normalized = batch_depth_float / divisor
             logger.debug(f"[DEPTH] Raw Mode: Normalized by divisor={divisor}")
         else:
@@ -392,18 +367,16 @@ def normalize_and_gamma_depth(
             logger.debug(f"[DEPTH] Global Norm Mode: Range [{global_depth_min:.2f}, {global_depth_max:.2f}]")
         else:
             batch_depth_normalized = np.full_like(
-                batch_depth_float,
-                fill_value=zero_disparity_anchor_val,
-                dtype=np.float32,
+                batch_depth_float, fill_value=zero_disparity_anchor_val, dtype=np.float32
             )
             logger.debug(f"[DEPTH] Global Norm Mode: Range too small, using anchor={zero_disparity_anchor_val}")
-    
+
     batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
-    
+
     if round(float(depth_gamma), 2) != 1.0:
         batch_depth_normalized = 1.0 - np.power(1.0 - batch_depth_normalized, depth_gamma)
         batch_depth_normalized = np.clip(batch_depth_normalized, 0.0, 1.0)
-        
+
     # --- VITALS LOGGING ---
     # vital_max = float(batch_depth_normalized.max())
     # vital_min = float(batch_depth_normalized.min())
@@ -411,14 +384,12 @@ def normalize_and_gamma_depth(
 
     # from dependency.stereocrafter_util import dump_debug_tensor
     # dump_debug_tensor(batch_depth_normalized, "1_normalized_gamma_depth", "depth_processing")
-        
+
     return batch_depth_normalized
 
 
 def compute_global_depth_stats(
-    depth_map_reader: VideoReader,
-    total_frames: int,
-    chunk_size: int = 100,
+    depth_map_reader: VideoReader, total_frames: int, chunk_size: int = 100
 ) -> Tuple[float, float]:
     """Compute the global min and max depth values from a depth video.
 
@@ -434,9 +405,7 @@ def compute_global_depth_stats(
     Returns:
         Tuple of (global_min, global_max) as float values
     """
-    logger.info(
-        f"==> Starting global depth stats pre-pass for {total_frames} frames..."
-    )
+    logger.info(f"==> Starting global depth stats pre-pass for {total_frames} frames...")
     global_min, global_max = np.inf, -np.inf
 
     for i in range(0, total_frames, chunk_size):
@@ -463,10 +432,7 @@ def compute_global_depth_stats(
         if chunk_max > global_max:
             global_max = chunk_max
 
-    logger.info(
-        f"==> Global depth stats computed: "
-        f"min_raw={global_min:.3f}, max_raw={global_max:.3f}"
-    )
+    logger.info(f"==> Global depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
     return float(global_min), float(global_max)
 
 
@@ -557,15 +523,7 @@ class FFmpegDepthPipeReader:
         typical in the render path.
     """
 
-    def __init__(
-        self,
-        path: str,
-        out_w: int,
-        out_h: int,
-        bit_depth: int,
-        num_frames: int,
-        pix_fmt: str = "",
-    ):
+    def __init__(self, path: str, out_w: int, out_h: int, bit_depth: int, num_frames: int, pix_fmt: str = ""):
         """Initialize the FFmpeg depth pipe reader.
 
         Args:
@@ -580,7 +538,16 @@ class FFmpegDepthPipeReader:
         self.out_w = int(out_w)
         self.out_h = int(out_h)
         self.bit_depth = int(bit_depth) if bit_depth else 16
-        self._num_frames = int(num_frames) if num_frames is not None else 0
+        # Handle string inputs like "N/A" from ffprobe
+        try:
+            if isinstance(num_frames, (int, float)) and not isinstance(num_frames, bool):
+                self._num_frames = int(num_frames)
+            elif isinstance(num_frames, str) and num_frames not in ("", "N/A"):
+                self._num_frames = int(float(num_frames))
+            else:
+                self._num_frames = 0
+        except (ValueError, TypeError):
+            self._num_frames = 0
         self._pix_fmt = pix_fmt or ""
         self._proc: Optional[subprocess.Popen] = None
         self._next_index = 0
@@ -613,18 +580,14 @@ class FFmpegDepthPipeReader:
             "-sn",
             "-dn",
             "-vframes",
-            str(self._num_frames)
-            if self._num_frames and self._num_frames > 0
-            else "999999999",
+            str(self._num_frames) if isinstance(self._num_frames, int) and self._num_frames > 0 else "999999999",
             "-vf",
             vf,
             "-f",
             "rawvideo",
             "pipe:1",
         ]
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._next_index = 0
         self._msb_shift = None
 
@@ -717,9 +680,7 @@ class FFmpegDepthPipeReader:
             Normalized depth array
         """
         if self._msb_shift is None:
-            expected_max = (
-                (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
-            )
+            expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
             if expected_max is None:
                 self._msb_shift = 0
                 self._use_16_to_n_scale = False
@@ -775,9 +736,7 @@ class FFmpegDepthPipeReader:
         """
         indices = list(indices)
         if not indices:
-            return _NumpyBatch(
-                np.zeros((0, self.out_h, self.out_w, 1), dtype=np.uint16)
-            )
+            return _NumpyBatch(np.zeros((0, self.out_h, self.out_w, 1), dtype=np.uint16))
 
         # Render path calls are contiguous and increasing
         first = int(indices[0])
@@ -788,13 +747,9 @@ class FFmpegDepthPipeReader:
         expected = self._frame_bytes * n
         buf = self._read_exact(expected)
         if len(buf) != expected:
-            raise EOFError(
-                f"FFmpegDepthPipeReader: expected {expected} bytes, got {len(buf)}"
-            )
+            raise EOFError(f"FFmpegDepthPipeReader: expected {expected} bytes, got {len(buf)}")
 
-        arr = np.frombuffer(buf, dtype=np.uint16).reshape(
-            n, self.out_h, self.out_w, 1
-        )
+        arr = np.frombuffer(buf, dtype=np.uint16).reshape(n, self.out_h, self.out_w, 1)
         arr = self._maybe_apply_shift(arr)
         self._next_index = first + n
         return _NumpyBatch(arr.copy())
@@ -846,39 +801,22 @@ class _ResizingDepthReader:
         if in_w == self._out_w and in_h == self._out_h:
             return _NumpyBatch(arr)
 
-        interp = (
-            cv2.INTER_LINEAR
-            if (self._out_w > in_w or self._out_h > in_h)
-            else cv2.INTER_AREA
-        )
+        interp = cv2.INTER_LINEAR if (self._out_w > in_w or self._out_h > in_h) else cv2.INTER_AREA
 
         if arr.ndim == 4:
-            out = np.empty(
-                (arr.shape[0], self._out_h, self._out_w, arr.shape[3]),
-                dtype=arr.dtype,
-            )
+            out = np.empty((arr.shape[0], self._out_h, self._out_w, arr.shape[3]), dtype=arr.dtype)
             for i in range(arr.shape[0]):
-                out[i] = cv2.resize(
-                    arr[i], (self._out_w, self._out_h), interpolation=interp
-                )
+                out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
         else:
-            out = np.empty(
-                (arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype
-            )
+            out = np.empty((arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype)
             for i in range(arr.shape[0]):
-                out[i] = cv2.resize(
-                    arr[i], (self._out_w, self._out_h), interpolation=interp
-                )
+                out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
 
         return _NumpyBatch(out)
 
 
 def load_pre_rendered_depth(
-    depth_map_path: str,
-    process_length: int,
-    target_height: int,
-    target_width: int,
-    match_resolution_to_target: bool,
+    depth_map_path: str, process_length: int, target_height: int, target_width: int, match_resolution_to_target: bool
 ) -> Tuple[Any, int, int, int, Optional[dict]]:
     """Initialize a reader for chunked depth map reading.
 
@@ -890,7 +828,7 @@ def load_pre_rendered_depth(
         process_length: Number of frames to process (-1 for all)
         target_height: Target height for output frames
         target_width: Target width for output frames
-        match_resolution_to_target: Whether to resize to target resolution
+    match_resolution_to_target: Whether to resize to target resolution
 
     Returns:
         Tuple of (depth_reader, total_depth_frames_to_process,
@@ -900,6 +838,12 @@ def load_pre_rendered_depth(
         NotImplementedError: If NPZ format is encountered
         ValueError: If unsupported format is encountered
     """
+    # Handle process_length that might be passed as string
+    try:
+        process_length = int(process_length) if process_length not in (None, "", "N/A") else -1
+    except (ValueError, TypeError):
+        process_length = -1
+
     # Import here to avoid circular dependency
     from dependency.stereocrafter_util import get_video_stream_info
 
@@ -923,19 +867,19 @@ def load_pre_rendered_depth(
             if isinstance(depth_stream_info, dict):
                 nb = depth_stream_info.get("nb_frames")
                 if nb in (None, "", "N/A"):
-                    nb = depth_stream_info.get("num_frames") or depth_stream_info.get(
-                        "nb_read_frames"
-                    )
+                    nb = depth_stream_info.get("num_frames") or depth_stream_info.get("nb_read_frames")
+            # Handle string inputs like "N/A"
             if nb not in (None, "", "N/A"):
-                total_depth_frames_available = int(float(nb))
-            else:
+                try:
+                    total_depth_frames_available = int(float(nb))
+                except (ValueError, TypeError):
+                    total_depth_frames_available = 0
+            if total_depth_frames_available <= 0:
                 _tmp = VideoReader(depth_map_path, ctx=cpu(0))
                 total_depth_frames_available = len(_tmp)
                 del _tmp
         except Exception as e:
-            logger.warning(
-                f"Could not determine depth frame count for '{depth_map_path}': {e}"
-            )
+            logger.warning(f"Could not determine depth frame count for '{depth_map_path}': {e}")
 
         total_depth_frames_to_process = total_depth_frames_available
         if process_length != -1 and process_length < total_depth_frames_available:
@@ -953,24 +897,16 @@ def load_pre_rendered_depth(
             )
         else:
             # 8-bit: decode at native res with Decord
-            depth_reader = VideoReader(
-                depth_map_path, ctx=cpu(0)
-            )  # decode at native res
+            depth_reader = VideoReader(depth_map_path, ctx=cpu(0))  # decode at native res
 
             first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
             actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
 
             if match_resolution_to_target and (
-                actual_depth_width != target_width
-                or actual_depth_height != target_height
+                actual_depth_width != target_width or actual_depth_height != target_height
             ):
-                depth_reader = _ResizingDepthReader(
-                    depth_reader, out_w=target_width, out_h=target_height
-                )
-                actual_depth_height, actual_depth_width = (
-                    int(target_height),
-                    int(target_width),
-                )
+                depth_reader = _ResizingDepthReader(depth_reader, out_w=target_width, out_h=target_height)
+                actual_depth_height, actual_depth_width = (int(target_height), int(target_width))
 
         first_depth_frame_shape = depth_reader.get_batch([0]).asnumpy().shape
         actual_depth_height, actual_depth_width = first_depth_frame_shape[1:3]
@@ -983,22 +919,13 @@ def load_pre_rendered_depth(
             f"bit_depth={bit_depth}, pix_fmt='{pix_fmt}'."
         )
 
-        return (
-            depth_reader,
-            total_depth_frames_to_process,
-            actual_depth_height,
-            actual_depth_width,
-            depth_stream_info,
-        )
+        return (depth_reader, total_depth_frames_to_process, actual_depth_height, actual_depth_width, depth_stream_info)
 
     elif depth_map_path.lower().endswith(".npz"):
         logger.error(
-            "NPZ support is temporarily disabled with disk chunking refactor. "
-            "Please convert NPZ to MP4 depth video."
+            "NPZ support is temporarily disabled with disk chunking refactor. Please convert NPZ to MP4 depth video."
         )
-        raise NotImplementedError(
-            "NPZ depth map loading is not yet supported with disk chunking."
-        )
+        raise NotImplementedError("NPZ depth map loading is not yet supported with disk chunking.")
     else:
         raise ValueError(
             f"Unsupported depth map format: {os.path.basename(depth_map_path)}. "

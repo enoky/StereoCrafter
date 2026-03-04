@@ -39,9 +39,7 @@ class VideoIO:
     """Video input/output operations for video processing."""
 
     @staticmethod
-    def read_video_info(
-        video_path: str,
-    ) -> Tuple[int, int, int, float]:
+    def read_video_info(video_path: str) -> Tuple[int, int, int, float]:
         """Read video information without loading frames.
 
         Args:
@@ -57,17 +55,12 @@ class VideoIO:
         height, width = first_frame.shape[1:3]
         fps = float(reader.get_avg_fps())
 
-        logger.debug(
-            f"==> Video info: {total_frames} frames, {width}x{height}, {fps} fps"
-        )
+        logger.debug(f"==> Video info: {total_frames} frames, {width}x{height}, {fps} fps")
 
         return total_frames, height, width, fps
 
     @staticmethod
-    def read_frame(
-        reader: VideoReader,
-        index: int,
-    ) -> np.ndarray:
+    def read_frame(reader: VideoReader, index: int) -> np.ndarray:
         """Read a single frame from a video reader.
 
         Args:
@@ -80,10 +73,7 @@ class VideoIO:
         return reader.get_batch([index]).asnumpy()[0]
 
     @staticmethod
-    def read_frames_batch(
-        reader: VideoReader,
-        indices: list,
-    ) -> np.ndarray:
+    def read_frames_batch(reader: VideoReader, indices: list) -> np.ndarray:
         """Read multiple frames from a video reader.
 
         Args:
@@ -96,15 +86,23 @@ class VideoIO:
         return reader.get_batch(indices).asnumpy()
 
 
-
 class FFmpegRGBPipeReader:
     """
     Sequential RGB frame reader backed by an FFmpeg pipe (rawvideo).
     Designed for render-time usage where get_batch() is called with
     increasing frame indices (typically contiguous batches).
     """
-    def __init__(self, video_path: str, width: int, height: int, fps: float, total_frames: int,
-                 in_range: str = "tv", in_matrix: str = "bt709"):
+
+    def __init__(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        total_frames: int,
+        in_range: str = "tv",
+        in_matrix: str = "bt709",
+    ):
         self.video_path = video_path
         self.width = int(width)
         self.height = int(height)
@@ -138,10 +136,7 @@ class FFmpegRGBPipeReader:
             f"in_color_matrix={self.in_matrix}:out_color_matrix={self.in_matrix},"
             "format=rgb24"
         )
-        vf_fallback = (
-            f"scale={self.width}:{self.height}:flags=bicubic,"
-            "format=rgb24"
-        )
+        vf_fallback = f"scale={self.width}:{self.height}:flags=bicubic,format=rgb24"
         vf = vf_fallback if self._force_fallback else vf_strict
         args += ["-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-vsync", "0", "-"]
         return args
@@ -167,7 +162,6 @@ class FFmpegRGBPipeReader:
     def get_batch(self, indices):
         if not indices:
             return _NumpyBatch(np.empty((0, self.height, self.width, 3), dtype=np.uint8))
-
 
         try:
             # Expect indices to be increasing most of the time; if not, restart.
@@ -236,15 +230,23 @@ class FFmpegRGBPipeReader:
             raise
 
 
-
 class FFmpegRGBSingleFrameReader:
     """
     Random-access RGB reader for preview usage.
     Each get_batch([idx]) spawns a small FFmpeg decode for that frame.
     Slower than Decord, but matches FFmpeg's YUV->RGB conversion.
     """
-    def __init__(self, video_path: str, width: int, height: int, fps: float, total_frames: int,
-                 in_range: str = "tv", in_matrix: str = "bt709"):
+
+    def __init__(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        total_frames: int,
+        in_range: str = "tv",
+        in_matrix: str = "bt709",
+    ):
         self.video_path = video_path
         self.width = int(width)
         self.height = int(height)
@@ -276,11 +278,24 @@ class FFmpegRGBSingleFrameReader:
 
         def _decode_one(idx: int, vf: str) -> tuple[bytes, str, int]:
             cmd = [
-                "ffmpeg", "-v", "error", "-nostdin",
-                "-i", self.video_path, "-an", "-sn", "-dn",
-                "-vf", vf,
-                "-frames:v", "1",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"
+                "ffmpeg",
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                self.video_path,
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                vf,
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             raw = b""
@@ -322,11 +337,7 @@ class FFmpegRGBSingleFrameReader:
                 f"in_color_matrix={self.in_matrix}:out_color_matrix={self.in_matrix},"
                 "format=rgb24"
             )
-            vf_fallback = (
-                f"select='eq(n\\,{idx})',"
-                f"scale={self.width}:{self.height}:flags=bicubic,"
-                "format=rgb24"
-            )
+            vf_fallback = f"select='eq(n\\,{idx})',scale={self.width}:{self.height}:flags=bicubic,format=rgb24"
 
             raw, err, rc = _decode_one(idx, vf_strict)
             if not raw or len(raw) < self._frame_size:
@@ -341,7 +352,6 @@ class FFmpegRGBSingleFrameReader:
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
             frames[j] = frame
-
 
         return _NumpyBatch(frames)
 
@@ -373,16 +383,23 @@ def read_video_frames(
     Raises:
         NotImplementedError: If dataset is not 'open'
     """
+    # Handle process_length that might be passed as string
+    try:
+        process_length = int(process_length) if process_length not in (None, "", "N/A") else -1
+    except (ValueError, TypeError):
+        process_length = -1
+
+    logger.debug(f"read_video_frames: process_length = {process_length} (type: {type(process_length)})")
     if dataset == "open":
         logger.debug(f"==> Initializing VideoReader for: {video_path}")
-        vid_info_only = VideoReader(
-            video_path, ctx=cpu(0)
-        )  # Use separate reader for info
+        vid_info_only = VideoReader(video_path, ctx=cpu(0))  # Use separate reader for info
         original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
-        total_frames_original = len(vid_info_only)
+        try:
+            total_frames_original = int(len(vid_info_only)) if len(vid_info_only) not in (None, "", "N/A") else 0
+        except (ValueError, TypeError):
+            total_frames_original = 0
         logger.debug(
-            f"==> Original video shape: {total_frames_original} frames, "
-            f"{original_height}x{original_width} per frame"
+            f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame"
         )
 
         height_for_reader = original_height
@@ -391,23 +408,15 @@ def read_video_frames(
         if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
             height_for_reader = pre_res_height
             width_for_reader = pre_res_width
-            logger.debug(
-                f"==> Pre-processing resolution set to: "
-                f"{width_for_reader}x{height_for_reader}"
-            )
+            logger.debug(f"==> Pre-processing resolution set to: {width_for_reader}x{height_for_reader}")
         else:
-            logger.debug(
-                f"==> Using original video resolution for reading: "
-                f"{width_for_reader}x{height_for_reader}"
-            )
+            logger.debug(f"==> Using original video resolution for reading: {width_for_reader}x{height_for_reader}")
 
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
 
     # decord automatically resizes if width/height are passed to VideoReader
-    video_reader = VideoReader(
-        video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader
-    )
+    video_reader = VideoReader(video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader)
 
     # Verify the actual shape after Decord processing, using the first frame
     first_frame_shape = video_reader.get_batch([0]).shape
@@ -415,9 +424,18 @@ def read_video_frames(
 
     fps = float(video_reader.get_avg_fps())  # Use actual FPS from the reader
 
-    total_frames_available = len(video_reader)
+    # Handle case where len(video_reader) might return a string
+    try:
+        total_frames_available_raw = len(video_reader)
+        if isinstance(total_frames_available_raw, int) and total_frames_available_raw > 0:
+            total_frames_available = total_frames_available_raw
+        else:
+            total_frames_available = 0
+    except (ValueError, TypeError):
+        total_frames_available = 0
+
     total_frames_to_process = total_frames_available  # Use available frames directly
-    if process_length != -1 and process_length < total_frames_available:
+    if total_frames_available > 0 and process_length != -1 and process_length < total_frames_available:
         total_frames_to_process = process_length
 
     logger.debug(
@@ -429,9 +447,7 @@ def read_video_frames(
     # Import here to avoid circular dependency
     from dependency.stereocrafter_util import get_video_stream_info
 
-    video_stream_info = get_video_stream_info(
-        video_path
-    )  # Get stream info for FFmpeg later
+    video_stream_info = get_video_stream_info(video_path)  # Get stream info for FFmpeg later
 
     # If strict FFmpeg decode is requested, swap in an FFmpeg-backed reader for frame fetch.
     # This keeps decode/colorspace conversion consistent across preview + renders for problem clips.

@@ -16,10 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from decord import VideoReader, cpu
 
-from dependency.stereocrafter_util import (
-    get_video_stream_info,
-    release_cuda_memory,
-)
+from dependency.stereocrafter_util import get_video_stream_info, release_cuda_memory
 from .depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
@@ -229,13 +226,7 @@ class BatchProcessor:
     processing tasks (Full/Low resolution) per video.
     """
 
-    def __init__(
-        self,
-        progress_queue: queue.Queue,
-        stop_event: threading.Event,
-
-        sidecar_manager: Optional[Any] = None,
-    ):
+    def __init__(self, progress_queue: queue.Queue, stop_event: threading.Event, sidecar_manager: Optional[Any] = None):
         """Initialize batch processor.
 
         Args:
@@ -250,9 +241,7 @@ class BatchProcessor:
         self.sidecar_manager = sidecar_manager
         self.logger = logging.getLogger(__name__)
 
-    def setup_batch_processing(
-        self, settings: ProcessingSettings
-    ) -> BatchSetupResult:
+    def setup_batch_processing(self, settings: ProcessingSettings) -> BatchSetupResult:
         """Setup batch processing, validate inputs, and determine mode.
 
         Handles input path validation, mode determination (single file vs batch),
@@ -278,9 +267,7 @@ class BatchProcessor:
         if is_source_file and is_depth_file:
             # Single-file mode
             result.is_single_file_mode = True
-            self.logger.debug(
-                "==> Running in single file mode. Files will not be moved to 'finished' folders."
-            )
+            self.logger.debug("==> Running in single file mode. Files will not be moved to 'finished' folders.")
             result.input_videos.append(input_source)
             os.makedirs(output_dir, exist_ok=True)
 
@@ -295,9 +282,7 @@ class BatchProcessor:
                 os.makedirs(result.finished_depth_folder, exist_ok=True)
                 self.logger.debug("Finished folders enabled for batch mode.")
             else:
-                self.logger.debug(
-                    "Finished folders DISABLED by user setting. Files will remain in input folders."
-                )
+                self.logger.debug("Finished folders DISABLED by user setting. Files will remain in input folders.")
 
             os.makedirs(output_dir, exist_ok=True)
 
@@ -408,15 +393,13 @@ class BatchProcessor:
             self.progress_queue.put(("total", total_tasks))
 
             # Initialize RenderProcessor
-            renderer = RenderProcessor(
-                stop_event=self.stop_event,
-                progress_queue=self.progress_queue,
-            )
+            renderer = RenderProcessor(stop_event=self.stop_event, progress_queue=self.progress_queue)
 
             # Process each video
             task_counter = 0
             for vid_path in input_videos:
-                if self.stop_event.is_set(): break
+                if self.stop_event.is_set():
+                    break
 
                 tasks_processed = self._process_single_video_orchestration(
                     video_path=vid_path,
@@ -444,7 +427,11 @@ class BatchProcessor:
     ) -> int:
         """Handles the full processing lifecycle for a single video."""
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
+        video_name_out = (
+            f"{video_name}{getattr(settings, 'output_name_suffix', '')}"
+            if getattr(settings, "output_name_suffix", "")
+            else video_name
+        )
         self.logger.info(f"==> Processing Video: {video_name}")
         self.progress_queue.put(("update_info", {"filename": video_name}))
 
@@ -463,10 +450,11 @@ class BatchProcessor:
         tasks = self.get_defined_tasks(settings)
         processed_count = 0
         for task in tasks:
-            if self.stop_event.is_set(): break
-            
+            if self.stop_event.is_set():
+                break
+
             self.progress_queue.put(("status", f"Processing {task.name} for {video_name}"))
-            
+
             # Initialize Readers for this task/resolution
             readers = self._initialize_readers(video_path, vid_settings["actual_depth_map_path"], settings, task)
             if not readers:
@@ -490,7 +478,9 @@ class BatchProcessor:
                 depth_map_reader=readers["depth"],
                 total_frames_to_process=readers["total_frames"],
                 processed_fps=readers["fps"],
-                output_video_path_base=os.path.join(settings.output_splatted, task.output_subdir, f"{video_name_out}.mp4"),
+                output_video_path_base=os.path.join(
+                    settings.output_splatted, task.output_subdir, f"{video_name_out}.mp4"
+                ),
                 target_output_height=readers["target_h"],
                 target_output_width=readers["target_w"],
                 max_disp=vid_settings["max_disparity_percentage"],
@@ -500,7 +490,9 @@ class BatchProcessor:
                 video_stream_info=readers["source_info"],
                 input_bias=vid_settings["input_bias"],
                 assume_raw_input=not vid_settings["enable_global_norm"],
-                global_depth_min=vid_settings.get("global_min", 0.0), # Will handle normalization inside renderer if needed
+                global_depth_min=vid_settings.get(
+                    "global_min", 0.0
+                ),  # Will handle normalization inside renderer if needed
                 global_depth_max=vid_settings.get("global_max", 1.0),
                 depth_stream_info=readers["depth_info"],
                 user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
@@ -528,12 +520,18 @@ class BatchProcessor:
 
         return len(tasks)
 
-    def _get_video_specific_settings(self, video_path: str, settings: ProcessingSettings, is_single_file_mode: bool) -> dict:
+    def _get_video_specific_settings(
+        self, video_path: str, settings: ProcessingSettings, is_single_file_mode: bool
+    ) -> dict:
         """Resolve settings for a specific video, merging sidecar and GUI defaults."""
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
+        video_name_out = (
+            f"{video_name}{getattr(settings, 'output_name_suffix', '')}"
+            if getattr(settings, "output_name_suffix", "")
+            else video_name
+        )
         sidecar_path = os.path.join(settings.sidecar_folder, f"{video_name}_depth{settings.sidecar_ext}")
-        
+
         sidecar_data = {}
         if self.sidecar_manager and os.path.exists(sidecar_path):
             sidecar_data = self.sidecar_manager.load_sidecar_data(sidecar_path) or {}
@@ -549,40 +547,60 @@ class BatchProcessor:
             "convergence_plane": sidecar_data.get("convergence_plane", settings.zero_disparity_anchor),
             "max_disparity_percentage": sidecar_data.get("max_disparity", settings.max_disp),
             "input_bias": sidecar_data.get("input_bias", 0.0),
-            "depth_gamma": sidecar_data.get("gamma", settings.depth_gamma) if settings.enable_sidecar_gamma else settings.depth_gamma,
-            "depth_dilate_size_x": sidecar_data.get("depth_dilate_size_x", settings.depth_dilate_size_x) if settings.enable_sidecar_blur_dilate else settings.depth_dilate_size_x,
-            "depth_dilate_size_y": sidecar_data.get("depth_dilate_size_y", settings.depth_dilate_size_y) if settings.enable_sidecar_blur_dilate else settings.depth_dilate_size_y,
-            "depth_blur_size_x": sidecar_data.get("depth_blur_size_x", settings.depth_blur_size_x) if settings.enable_sidecar_blur_dilate else settings.depth_blur_size_x,
-            "depth_blur_size_y": sidecar_data.get("depth_blur_size_y", settings.depth_blur_size_y) if settings.enable_sidecar_blur_dilate else settings.depth_blur_size_y,
+            "depth_gamma": sidecar_data.get("gamma", settings.depth_gamma)
+            if settings.enable_sidecar_gamma
+            else settings.depth_gamma,
+            "depth_dilate_size_x": sidecar_data.get("depth_dilate_size_x", settings.depth_dilate_size_x)
+            if settings.enable_sidecar_blur_dilate
+            else settings.depth_dilate_size_x,
+            "depth_dilate_size_y": sidecar_data.get("depth_dilate_size_y", settings.depth_dilate_size_y)
+            if settings.enable_sidecar_blur_dilate
+            else settings.depth_dilate_size_y,
+            "depth_blur_size_x": sidecar_data.get("depth_blur_size_x", settings.depth_blur_size_x)
+            if settings.enable_sidecar_blur_dilate
+            else settings.depth_blur_size_x,
+            "depth_blur_size_y": sidecar_data.get("depth_blur_size_y", settings.depth_blur_size_y)
+            if settings.enable_sidecar_blur_dilate
+            else settings.depth_blur_size_y,
             "depth_dilate_left": sidecar_data.get("depth_dilate_left", settings.depth_dilate_left),
             "depth_blur_left": sidecar_data.get("depth_blur_left", settings.depth_blur_left),
             "depth_blur_left_mix": sidecar_data.get("depth_blur_left_mix", settings.depth_blur_left_mix),
             "anchor_source": "Sidecar" if "convergence_plane" in sidecar_data else "GUI",
-            "enable_global_norm": settings.enable_global_norm and ("convergence_plane" not in sidecar_data), # Policy
+            "enable_global_norm": settings.enable_global_norm and ("convergence_plane" not in sidecar_data),  # Policy
         }
         return res
 
-    def _resolve_depth_path(self, video_path: str, settings: ProcessingSettings, sidecar_data: dict, is_single_file: bool) -> Optional[str]:
+    def _resolve_depth_path(
+        self, video_path: str, settings: ProcessingSettings, sidecar_data: dict, is_single_file: bool
+    ) -> Optional[str]:
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_name_out = f"{video_name}{getattr(settings, 'output_name_suffix', '')}" if getattr(settings, 'output_name_suffix', '') else video_name
+        video_name_out = (
+            f"{video_name}{getattr(settings, 'output_name_suffix', '')}"
+            if getattr(settings, "output_name_suffix", "")
+            else video_name
+        )
         if is_single_file:
             return settings.input_depth_maps if os.path.isfile(settings.input_depth_maps) else None
-        
+
         base_folder = settings.input_depth_maps
         if settings.multi_map:
             # Sidecar check
             selected = sidecar_data.get("selected_depth_map") or settings.selected_depth_map
             if selected:
                 candidate = os.path.join(base_folder, selected, f"{video_name}_depth.mp4")
-                if os.path.exists(candidate): return candidate
+                if os.path.exists(candidate):
+                    return candidate
                 candidate = os.path.join(base_folder, selected, f"{video_name}_depth.npz")
-                if os.path.exists(candidate): return candidate
-        
+                if os.path.exists(candidate):
+                    return candidate
+
         # Default check
         c_mp4 = os.path.join(base_folder, f"{video_name}_depth.mp4")
-        if os.path.exists(c_mp4): return c_mp4
+        if os.path.exists(c_mp4):
+            return c_mp4
         c_npz = os.path.join(base_folder, f"{video_name}_depth.npz")
-        if os.path.exists(c_npz): return c_npz
+        if os.path.exists(c_npz):
+            return c_npz
         return None
 
     def _handle_auto_convergence(self, video_path: str, depth_path: str, settings: ProcessingSettings) -> float:
@@ -590,35 +608,66 @@ class BatchProcessor:
         # In actual implementation, initialize ConvergenceEstimatorWrapper and call estimate_convergence
         return settings.zero_disparity_anchor
 
-    def _initialize_readers(self, video_path: str, depth_path: str, settings: ProcessingSettings, task: ProcessingTask) -> Optional[dict]:
+    def _initialize_readers(
+        self, video_path: str, depth_path: str, settings: ProcessingSettings, task: ProcessingTask
+    ) -> Optional[dict]:
         try:
             source, fps, orig_h, orig_w, target_h, target_w, info, total = read_video_frames(
-                video_path, settings.process_length, set_pre_res=task.set_pre_res,
-                pre_res_width=task.target_width, pre_res_height=task.target_height,
-                strict_ffmpeg_decode=settings.strict_ffmpeg_decode
+                video_path,
+                settings.process_length,
+                set_pre_res=task.set_pre_res,
+                pre_res_width=task.target_width,
+                pre_res_height=task.target_height,
+                strict_ffmpeg_decode=settings.strict_ffmpeg_decode,
             )
-            
+
             # Depth reader setup
-            depth_target_h, depth_target_w = (orig_h, orig_w) if (task.is_low_res and not settings.skip_lowres_preproc) else (target_h, target_w)
-            depth_match = True if task.is_low_res else settings.match_depth_res
-            
-            d_reader, d_total, d_h, d_w, d_info = load_pre_rendered_depth(
-                depth_path, process_length=settings.process_length,
-                target_height=depth_target_h, target_width=depth_target_w,
-                match_resolution_to_target=depth_match
+            depth_target_h, depth_target_w = (
+                (orig_h, orig_w) if (task.is_low_res and not settings.skip_lowres_preproc) else (target_h, target_w)
             )
-            
-            if total != d_total:
-                self.logger.error("Frame count mismatch")
+            depth_match = True if task.is_low_res else settings.match_depth_res
+
+            try:
+                d_reader, d_total, d_h, d_w, d_info = load_pre_rendered_depth(
+                    depth_path,
+                    process_length=settings.process_length,
+                    target_height=depth_target_h,
+                    target_width=depth_target_w,
+                    match_resolution_to_target=depth_match,
+                )
+            except Exception as e:
+                self.logger.error(f"load_pre_rendered_depth failed: {e}")
+                raise
+
+            # Handle case where frame counts might be strings or None
+            try:
+                total_val = int(total) if total not in (None, "", "N/A") else 0
+                d_total_val = int(d_total) if d_total not in (None, "", "N/A") else 0
+            except (ValueError, TypeError):
+                total_val = 0
+                d_total_val = 0
+
+            if total_val != d_total_val and total_val > 0 and d_total_val > 0:
+                self.logger.error(f"Frame count mismatch: source={total_val}, depth={d_total_val}")
                 return None
-                
+
             return {
-                "source": source, "depth": d_reader, "fps": fps, "target_h": target_h, "target_w": target_w,
-                "source_info": info, "depth_info": d_info, "total_frames": total,
-                "orig_h": orig_h, "orig_w": orig_w
+                "source": source,
+                "depth": d_reader,
+                "fps": fps,
+                "target_h": target_h,
+                "target_w": target_w,
+                "source_info": info,
+                "depth_info": d_info,
+                "total_frames": total,
+                "orig_h": orig_h,
+                "orig_w": orig_w,
             }
         except Exception as e:
+            import traceback
+
             self.logger.error(f"Reader init error: {e}")
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
 
     def validate_settings(self, settings: ProcessingSettings) -> Tuple[bool, str]:
@@ -722,15 +771,11 @@ class BatchProcessor:
                     pix_fmt=pix_fmt,
                 )
             else:
-                raw_reader = VideoReader(
-                    depth_map_path, ctx=cpu(0), width=actual_width, height=actual_height
-                )
+                raw_reader = VideoReader(depth_map_path, ctx=cpu(0), width=actual_width, height=actual_height)
 
             if len(raw_reader) > 0:
                 _, max_content_value = compute_global_depth_stats(
-                    depth_map_reader=raw_reader,
-                    total_frames=total_frames,
-                    chunk_size=batch_size,
+                    depth_map_reader=raw_reader, total_frames=total_frames, chunk_size=batch_size
                 )
                 self.logger.debug(f"Max content depth scanned: {max_content_value:.3f}.")
             else:
@@ -749,9 +794,7 @@ class BatchProcessor:
 
         # Second scan: Global normalization (if enabled)
         if not assume_raw_mode:
-            self.logger.info(
-                "==> Global Depth Normalization selected. Starting global depth stats pre-pass."
-            )
+            self.logger.info("==> Global Depth Normalization selected. Starting global depth stats pre-pass.")
 
             raw_reader = None
             try:
@@ -769,22 +812,13 @@ class BatchProcessor:
                         pix_fmt=pix_fmt,
                     )
                 else:
-                    raw_reader = VideoReader(
-                        depth_map_path,
-                        ctx=cpu(0),
-                        width=actual_width,
-                        height=actual_height,
-                    )
+                    raw_reader = VideoReader(depth_map_path, ctx=cpu(0), width=actual_width, height=actual_height)
 
                 if len(raw_reader) > 0:
                     global_min, global_max = compute_global_depth_stats(
-                        depth_map_reader=raw_reader,
-                        total_frames=total_frames,
-                        chunk_size=batch_size,
+                        depth_map_reader=raw_reader, total_frames=total_frames, chunk_size=batch_size
                     )
-                    self.logger.debug(
-                        "Successfully computed global stats from RAW reader."
-                    )
+                    self.logger.debug("Successfully computed global stats from RAW reader.")
                 else:
                     self.logger.error("RAW depth reader has no frames.")
             except Exception as e:
@@ -800,9 +834,7 @@ class BatchProcessor:
                     del raw_reader
                     gc.collect()
         else:
-            self.logger.debug(
-                "==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass."
-            )
+            self.logger.debug("==> No Normalization (Assume Raw 0-1 Input) selected. Skipping global stats pre-pass.")
 
             # Determine scaling factor for raw input mode
             if max_content_value <= 256.0 and max_content_value > 1.0:
@@ -811,9 +843,7 @@ class BatchProcessor:
                 global_max = 1023.0
             else:
                 global_max = 1023.0
-                self.logger.warning(
-                    f"Max content value is unusual ({max_content_value:.2f}). Using fallback 1023.0."
-                )
+                self.logger.warning(f"Max content value is unusual ({max_content_value:.2f}). Using fallback 1023.0.")
             global_min = 0.0
 
         return assume_raw_mode, global_min, global_max, max_content_value

@@ -33,11 +33,7 @@ logger = logging.getLogger(__name__)
 class RenderProcessor:
     """Handles the core splatting render loop for a single video task."""
 
-    def __init__(
-        self,
-        stop_event: threading.Event,
-        progress_queue: queue.Queue,
-    ):
+    def __init__(self, stop_event: threading.Event, progress_queue: queue.Queue):
         """Initialize render processor.
 
         Args:
@@ -209,19 +205,22 @@ class RenderProcessor:
                 if ffmpeg_process is None:
                     logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
                     return False
-            
+
             self._compare_encoding_flags(ffmpeg_process, task_name)
 
         max_expected_raw_value = self._get_max_expected_raw_depth(depth_stream_info)
-        logger.debug(f"[DEPTH] Max expected raw value: {max_expected_raw_value}, assume_raw_input: {assume_raw_input}, global_depth_min: {global_depth_min:.2f}, global_depth_max: {global_depth_max:.2f}")
-        
+        logger.debug(
+            f"[DEPTH] Max expected raw value: {max_expected_raw_value}, assume_raw_input: {assume_raw_input}, global_depth_min: {global_depth_min:.2f}, global_depth_max: {global_depth_max:.2f}"
+        )
+
         tv_disp_comp = 1.0
         if assume_raw_input and depth_stream_info and max_expected_raw_value > 256.0:
             if str(depth_stream_info.get("color_range", "")).lower() == "tv":
                 from core.splatting.depth_processing import DEPTH_VIS_TV10_WHITE_NORM, DEPTH_VIS_TV10_BLACK_NORM
+
                 tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
                 logger.debug(f"[DEPTH] TV range compensation enabled: {tv_disp_comp:.3f}")
-        
+
         frame_count = 0
         encoding_successful = True
 
@@ -233,8 +232,25 @@ class RenderProcessor:
             )
 
             for i in frame_index_iter:
-                if self.stop_event.is_set() or (ffmpeg_process is not None and ffmpeg_process.poll() is not None) or (use_dnxhr_split and splat_process is not None and splat_process.poll() is not None):
+                if (
+                    self.stop_event.is_set()
+                    or (ffmpeg_process is not None and ffmpeg_process.poll() is not None)
+                    or (use_dnxhr_split and splat_process is not None and splat_process.poll() is not None)
+                ):
                     break
+
+                # Ensure total_frames_to_process and batch_size are ints
+                if not isinstance(total_frames_to_process, int):
+                    try:
+                        total_frames_to_process = int(total_frames_to_process)
+                    except (ValueError, TypeError):
+                        total_frames_to_process = 0
+
+                if not isinstance(batch_size, int):
+                    try:
+                        batch_size = int(batch_size)
+                    except (ValueError, TypeError):
+                        batch_size = 1
 
                 batch_indices = list(range(i, min(i + batch_size, total_frames_to_process)))
                 if not batch_indices:
@@ -249,16 +265,18 @@ class RenderProcessor:
                 # occur at the correct target aspect ratio, matching the GUI previewer.
                 video_h, video_w = batch_video_numpy.shape[1], batch_video_numpy.shape[2]
                 depth_h, depth_w = batch_depth_numpy_raw.shape[1], batch_depth_numpy_raw.shape[2]
-                
+
                 if depth_h != video_h or depth_w != video_w:
-                    logger.debug(f"Resizing depth from {depth_w}x{depth_h} to match video {video_w}x{video_h} for aspect-ratio parity.")
+                    logger.debug(
+                        f"Resizing depth from {depth_w}x{depth_h} to match video {video_w}x{video_h} for aspect-ratio parity."
+                    )
                     interp = cv2.INTER_AREA if (video_w < depth_w and video_h < depth_h) else cv2.INTER_LINEAR
-                    resized_depth = np.empty((batch_depth_numpy_raw.shape[0], video_h, video_w), dtype=batch_depth_numpy_raw.dtype)
+                    resized_depth = np.empty(
+                        (batch_depth_numpy_raw.shape[0], video_h, video_w), dtype=batch_depth_numpy_raw.dtype
+                    )
                     for idx in range(batch_depth_numpy_raw.shape[0]):
                         resized_depth[idx] = cv2.resize(
-                            batch_depth_numpy_raw[idx],
-                            (video_w, video_h),
-                            interpolation=interp
+                            batch_depth_numpy_raw[idx], (video_w, video_h), interpolation=interp
                         )
                     batch_depth_numpy_raw = resized_depth
 
@@ -273,13 +291,15 @@ class RenderProcessor:
                     depth_gamma=depth_gamma,
                     debug_task_name="Render",
                 )
-                
-                logger.debug(f"[DEPTH] After normalization and gamma: min={batch_depth_normalized.min():.4f}, max={batch_depth_normalized.max():.4f}")
-                
+
+                logger.debug(
+                    f"[DEPTH] After normalization and gamma: min={batch_depth_normalized.min():.4f}, max={batch_depth_normalized.max():.4f}"
+                )
+
                 # Convert back to "raw" format for process_depth_batch (which expects raw-like values)
                 # Scale back to max_raw_value range so dilation/blur work correctly
                 batch_depth_for_processing = batch_depth_normalized * max_expected_raw_value
-                
+
                 # Add channel dimension for process_depth_batch
                 if batch_depth_for_processing.ndim == 3:
                     batch_depth_for_processing = batch_depth_for_processing[..., None]
@@ -298,7 +318,7 @@ class RenderProcessor:
                     depth_blur_left_mix=depth_blur_left_mix,
                     skip_preprocessing=skip_lowres_preproc and is_low_res_task,
                 )
-                
+
                 # Normalize back to 0-1 after processing
                 batch_depth_numpy_float = batch_depth_processed / max(max_expected_raw_value, 1.0)
                 batch_depth_numpy_float = np.clip(batch_depth_numpy_float, 0.0, 1.0)
@@ -328,8 +348,10 @@ class RenderProcessor:
                 frame_count += len(batch_indices)
                 self.progress_queue.put(("processed", frame_count))
                 if not is_test_mode:
-                    draw_progress_bar(frame_count, total_frames_to_process, suffix=f"{task_name} Batch {i//batch_size}")
-                
+                    draw_progress_bar(
+                        frame_count, total_frames_to_process, suffix=f"{task_name} Batch {i // batch_size}"
+                    )
+
                 # Cleanup batch
                 del batch_video_numpy, batch_depth_numpy_raw, batch_depth_numpy_float, batch_processed_frames
                 release_cuda_memory()
@@ -344,21 +366,22 @@ class RenderProcessor:
                     ffmpeg_process.wait(timeout=30)
                 except Exception as e:
                     logger.warning(f"Error closing FFmpeg: {e}")
-            
+
             if use_dnxhr_split and splat_process:
                 try:
                     splat_process.stdin.close()
                     splat_process.wait(timeout=30)
                 except Exception as e:
                     logger.warning(f"Error closing DNxHR pipe: {e}")
-            
+
             del stereo_projector
             release_cuda_memory()
 
         return encoding_successful
 
     def _log_color_metadata(self, info: Optional[dict], task_name: str):
-        if not info: return
+        if not info:
+            return
         try:
             logger.debug(
                 f"[COLOR_META][{task_name}] input ffprobe: "
@@ -366,7 +389,8 @@ class RenderProcessor:
                 f"primaries={info.get('color_primaries')}, trc={info.get('transfer_characteristics')}, "
                 f"matrix={info.get('color_space')}"
             )
-        except Exception: pass
+        except Exception:
+            pass
 
     def _get_encode_stream_info(self, source_info: Optional[dict], mode: str) -> dict:
         info = dict(source_info) if source_info else {}
@@ -376,30 +400,56 @@ class RenderProcessor:
             "color_space": "bt709",
             "color_range": "tv",
         }
-        
+
         if mode == "Auto":
-            for k, v in defaults.items(): info.setdefault(k, v)
+            for k, v in defaults.items():
+                info.setdefault(k, v)
         elif mode in ("BT.709", "BT.709 L"):
             info.update(defaults)
         elif mode == "BT.709 F":
             info.update(defaults)
             info["color_range"] = "pc"
         elif mode in ("BT.2020", "BT.2020 PQ"):
-            info.update({"color_primaries": "bt2020", "transfer_characteristics": "smpte2084", "color_space": "bt2020nc", "color_range": "tv"})
+            info.update(
+                {
+                    "color_primaries": "bt2020",
+                    "transfer_characteristics": "smpte2084",
+                    "color_space": "bt2020nc",
+                    "color_range": "tv",
+                }
+            )
         elif mode == "BT.2020 HLG":
-            info.update({"color_primaries": "bt2020", "transfer_characteristics": "arib-std-b67", "color_space": "bt2020nc", "color_range": "tv"})
+            info.update(
+                {
+                    "color_primaries": "bt2020",
+                    "transfer_characteristics": "arib-std-b67",
+                    "color_space": "bt2020nc",
+                    "color_range": "tv",
+                }
+            )
         else:
-            for k, v in defaults.items(): info.setdefault(k, v)
+            for k, v in defaults.items():
+                info.setdefault(k, v)
         return info
 
     def _compare_encoding_flags(self, process: Any, task_name: str):
         try:
             flags = getattr(process, "sc_encode_flags", None)
-            if not flags: return
-            subset_keys = ["enc_codec", "enc_pix_fmt", "enc_profile", "enc_color_primaries", "enc_color_trc", "enc_colorspace", "quality_mode", "quality_value"]
+            if not flags:
+                return
+            subset_keys = [
+                "enc_codec",
+                "enc_pix_fmt",
+                "enc_profile",
+                "enc_color_primaries",
+                "enc_color_trc",
+                "enc_colorspace",
+                "quality_mode",
+                "quality_value",
+            ]
             subset = {k: flags.get(k) for k in subset_keys}
             self._color_encode_flags[task_name] = subset
-            
+
             other_name = "HiRes" if task_name == "LowRes" else "LowRes"
             if other_name in self._color_encode_flags:
                 other = self._color_encode_flags[other_name]
@@ -408,14 +458,15 @@ class RenderProcessor:
                     logger.warning(f"[COLOR_META] Encoding flags differ ({other_name} vs {task_name}): {diffs}")
                 else:
                     logger.debug(f"[COLOR_META] Encoding flags match between {other_name} and {task_name}.")
-        except Exception: pass
+        except Exception:
+            pass
 
     def _get_max_expected_raw_depth(self, info: Optional[dict]) -> float:
         pix_fmt = str(info.get("pix_fmt", "")).lower() if info else ""
         profile = str(info.get("profile", "")).lower() if info else ""
-        
+
         logger.debug(f"[DEPTH] Detecting bit depth: pix_fmt='{pix_fmt}', profile='{profile}'")
-        
+
         # 1. Check for High-Bit Formats
         if "16" in pix_fmt or "gray16" in pix_fmt:
             return 65535.0
@@ -423,17 +474,17 @@ class RenderProcessor:
             return 4095.0
         if "10" in pix_fmt or "main10" in profile or "gray10" in pix_fmt:
             return 1023.0
-            
+
         # 2. Check for Float
         if "float" in pix_fmt or "f32" in pix_fmt:
             return 1.0
-            
+
         # 3. Default to 8-bit Range (255.0) for everything else (yuv420p, nv12, gray, etc.)
         # This is safer than 1.0 as it prevents "washed out/white" depth maps if detection is slightly off.
         if pix_fmt:
             logger.debug(f"[DEPTH] Defaulting to 8-bit (255.0) for pix_fmt='{pix_fmt}'")
             return 255.0
-            
+
         return 255.0
 
     def _process_gpu_splatting(
@@ -449,31 +500,31 @@ class RenderProcessor:
         tv_disp_comp: float = 1.0,
     ) -> List[np.ndarray]:
         """Process GPU splatting on normalized depth maps.
-        
+
         Args:
             batch_depth_numpy_float: Pre-normalized depth in range [0, 1]
         """
         # CRITICAL: Ensure depth matches video resolution before GPU processing
         # batch_video_numpy: [B, H, W, 3]
         # batch_depth_numpy_float: [B, H', W'] - already normalized to [0, 1]
-        
+
         video_h, video_w = batch_video_numpy.shape[1], batch_video_numpy.shape[2]
-        
+
         # Handle depth shape - ensure it's [B, H, W]
         if batch_depth_numpy_float.ndim == 4:
             if batch_depth_numpy_float.shape[-1] == 1:
                 batch_depth_numpy_float = batch_depth_numpy_float.squeeze(-1)
             elif batch_depth_numpy_float.shape[-1] == 3:
                 batch_depth_numpy_float = batch_depth_numpy_float[..., 0]
-        
+
         # Depth is already resized to video dimensions at the start of the render loop.
-        
+
         # Move to GPU
         source_tensor = torch.from_numpy(batch_video_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
         depth_tensor = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).float().cuda()
 
         from core.splatting.forward_warp import execute_forward_warp
-        
+
         right_eye_raw, occlusion_mask = execute_forward_warp(
             stereo_projector=stereo_projector,
             source_tensor=source_tensor,
@@ -485,8 +536,7 @@ class RenderProcessor:
             tv_disp_comp=tv_disp_comp,
             debug_task_name="Render",
         )
-        
-        
+
         # CPU conversion
         left_cpu = source_tensor.cpu().numpy()
         right_cpu = right_eye_raw.cpu().numpy()
@@ -495,14 +545,15 @@ class RenderProcessor:
 
         results = []
         for j in range(len(batch_video_numpy)):
-            results.append({
-                "left": np.clip(left_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
-                "right": np.clip(right_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
-                "occlusion": np.clip(occl_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
-                "depth": np.clip(depth_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
-            })
+            results.append(
+                {
+                    "left": np.clip(left_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                    "right": np.clip(right_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                    "occlusion": np.clip(occl_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                    "depth": np.clip(depth_cpu[j].transpose(1, 2, 0), 0.0, 1.0),
+                }
+            )
         return results
-
 
     def _handle_diagnostic_capture(self, batch_results: List[dict], dual_output: bool, task_name: str):
         # In test mode, we usually only have one frame
@@ -541,11 +592,11 @@ class RenderProcessor:
 
     def _construct_grid(self, res: dict, dual_output: bool) -> np.ndarray:
         """Construct output grid for encoding.
-        
+
         dual_output=True: [occlusion_mask | right_eye] (2-panel)
         dual_output=False: [left_eye | depth_vis]
                            [occlusion_mask | right_eye] (4-panel)
-        
+
         Returns float32 array in range [0, 1]
         """
         # Convert uint8 back to float for grid assembly
@@ -554,13 +605,13 @@ class RenderProcessor:
         right = res["right"]
         occlusion = res["occlusion"]
         depth = res["depth"]
-        
+
         # Ensure all are 3-channel
         if occlusion.ndim == 2 or (occlusion.ndim == 3 and occlusion.shape[-1] == 1):
             occlusion = np.stack([occlusion.squeeze()] * 3, axis=-1)
         if depth.ndim == 2 or (depth.ndim == 3 and depth.shape[-1] == 1):
             depth = np.stack([depth.squeeze()] * 3, axis=-1)
-        
+
         if dual_output:
             # 2-panel: occlusion on left, warped right eye on right
             return np.concatenate([occlusion, right], axis=1)
@@ -569,4 +620,3 @@ class RenderProcessor:
             top_row = np.concatenate([left, depth], axis=1)
             bot_row = np.concatenate([occlusion, right], axis=1)
             return np.concatenate([top_row, bot_row], axis=0)
-
