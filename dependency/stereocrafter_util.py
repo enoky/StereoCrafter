@@ -878,40 +878,38 @@ def custom_blur(
     return torch.stack(processed_frames).to(tensor.device)
 
 
+_CUDA_CHECK_CACHE = None
+
+
 def check_cuda_availability():
     """
     Checks if CUDA is available via PyTorch and if nvidia-smi can run.
     Sets the global CUDA_AVAILABLE flag.
     """
-    global CUDA_AVAILABLE
+    global CUDA_AVAILABLE, _CUDA_CHECK_CACHE
+    if _CUDA_CHECK_CACHE is not None:
+        return _CUDA_CHECK_CACHE
+
     if torch.cuda.is_available():
         logger.info("PyTorch reports CUDA is available.")
         try:
             # Further check with nvidia-smi for robustness
-            subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding="utf-8")
+            subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=2, encoding="utf-8")
             logger.debug("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
             CUDA_AVAILABLE = True
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             logger.warning(
-                "nvidia-smi not found. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report."
+                "nvidia-smi not found or failed. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report."
             )
             CUDA_AVAILABLE = True  # Rely on PyTorch if nvidia-smi not found
-        except subprocess.CalledProcessError:
-            logger.warning(
-                "nvidia-smi failed. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report."
-            )
-            CUDA_AVAILABLE = True  # Rely on PyTorch if nvidia-smi fails
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "nvidia-smi check timed out. CUDA is reported by PyTorch but NVENC availability cannot be fully confirmed. Proceeding with PyTorch's report."
-            )
-            CUDA_AVAILABLE = True  # Rely on PyTorch if nvidia-smi times out
         except Exception as e:
             logger.error(f"Unexpected error during nvidia-smi check: {e}. Relying on PyTorch's report for CUDA.")
             CUDA_AVAILABLE = True  # Rely on PyTorch as a fallback
     else:
         logger.info("PyTorch reports CUDA is NOT available. NVENC will not be used.")
         CUDA_AVAILABLE = False
+
+    _CUDA_CHECK_CACHE = CUDA_AVAILABLE
     return CUDA_AVAILABLE
 
 
@@ -1179,6 +1177,10 @@ def encode_frames_to_mp4(
     return True
 
 
+_FFPROBE_AVAILABLE = None  # Global cache for ffprobe availability check
+_VIDEO_INFO_CACHE = {}  # Global cache for video metadata to avoid redundant ffprobe calls
+
+
 def get_video_stream_info(video_path: str) -> Optional[dict]:
     """
     Extracts comprehensive video stream metadata using ffprobe.
@@ -1187,6 +1189,15 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     Requires ffprobe to be installed and in your system PATH.
     This function *does not* show messageboxes; the caller should handle errors.
     """
+    global _FFPROBE_AVAILABLE, _VIDEO_INFO_CACHE
+
+    if not video_path:
+        return None
+
+    # Check cache first
+    if video_path in _VIDEO_INFO_CACHE:
+        return _VIDEO_INFO_CACHE[video_path]
+
     cmd = [
         "ffprobe",
         "-v",
@@ -1194,7 +1205,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         "-select_streams",
         "v:0",  # Select the first video stream
         "-show_entries",
-        "stream=codec_name,profile,pix_fmt,color_range,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+        "stream=width,height,codec_name,profile,pix_fmt,color_range,color_primaries,transfer_characteristics,color_space,r_frame_rate",
         "-show_entries",
         "side_data=mastering_display_metadata,max_content_light_level",  # ADDED entries
         "-of",
@@ -1202,29 +1213,27 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         video_path,
     ]
 
-    try:
-        # Check if ffprobe is available without showing a messagebox
-        subprocess.run(
-            ["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding="utf-8", timeout=10
-        )
-    except FileNotFoundError:
-        logger.error("ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
-        return None
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error running ffprobe check: {e.stderr}")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("ffprobe check timed out.")
+    # Optimized ffprobe availability check (only once per session)
+    if _FFPROBE_AVAILABLE is None:
+        try:
+            subprocess.run(
+                ["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding="utf-8", timeout=5
+            )
+            _FFPROBE_AVAILABLE = True
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            _FFPROBE_AVAILABLE = False
+            logger.error("ffprobe not found or failed. Please ensure FFmpeg is installed and in your system PATH.")
+            return None
+
+    if not _FFPROBE_AVAILABLE:
         return None
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", timeout=500)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", timeout=10)
         try:
             data = json.loads(result.stdout)
-        except json.JSONDecodeError as e:
-            # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-            # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
-            # "Expecting ',' delimiter: line 13 column 40 (char 229)"
+        except json.JSONDecodeError:
+            # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing ","
             repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r"\1,\2\3", result.stdout)
             data = json.loads(repaired)
 
@@ -1233,6 +1242,8 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             s = data["streams"][0]
             # Common video stream properties
             for key in [
+                "width",
+                "height",
                 "codec_name",
                 "profile",
                 "pix_fmt",
@@ -1245,14 +1256,13 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
                 if key in s:
                     stream_info[key] = s[key]
 
-            # HDR mastering display and CLL metadata (often in side_data_list, but sometimes also directly in stream)
-            # Prioritize stream-level if available, otherwise check side_data_list
+            # HDR mastering display and CLL metadata
             if "mastering_display_metadata" in s:
                 stream_info["mastering_display_metadata"] = s["mastering_display_metadata"]
             if "max_content_light_level" in s:
                 stream_info["max_content_light_level"] = s["max_content_light_level"]
 
-        # Check side_data_list if stream-level properties weren't found or for additional data
+        # Check side_data_list
         if "side_data_list" in data:
             for sd in data["side_data_list"]:
                 if "mastering_display_metadata" in sd and "mastering_display_metadata" not in stream_info:
@@ -1262,7 +1272,12 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
 
         # Filter out empty strings/None/N/A values
         filtered_info = {k: v for k, v in stream_info.items() if v and v not in ["N/A", "und", "unknown"]}
-        return filtered_info if filtered_info else None
+
+        # Save to cache before returning
+        if filtered_info:
+            _VIDEO_INFO_CACHE[video_path] = filtered_info
+            return filtered_info
+        return None
 
     except subprocess.CalledProcessError as e:
         logger.error(f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}")
@@ -1272,7 +1287,6 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.error(f"Raw ffprobe stdout: {result.stdout}")
         return None
     except Exception as e:
         logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)

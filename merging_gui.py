@@ -2195,9 +2195,12 @@ class MergingGUI(ThemedTk):
             self.preview_blended_right_tensor = blended_frame.squeeze(0).cpu()
 
             # 5. Convert to PIL Image for returning
-            final_frame_cpu = final_frame_4d.cpu()
-            pil_img = Image.fromarray((final_frame_cpu.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+            # OPTIMIZATION: Scale and cast to uint8 on GPU (if available) before transferring to CPU.
+            final_uint8 = (final_frame_4d[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)
+            final_np = final_uint8.cpu().numpy()
+            pil_img = Image.fromarray(final_np)
             return pil_img
+
         except Exception as e:
             logger.error(f"Error in preview processing callback: {e}", exc_info=True)
             return None

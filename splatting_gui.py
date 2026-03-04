@@ -104,7 +104,18 @@ from core.splatting import (
     AnalysisService,
     ConvergenceCache,
 )
-from core.splatting.depth_processing import DEPTH_VIS_TV10_BLACK_NORM, DEPTH_VIS_TV10_WHITE_NORM, _infer_depth_bit_depth
+from core.splatting.depth_processing import (
+    compute_global_depth_stats,
+    load_pre_rendered_depth,
+    FFmpegDepthPipeReader,
+    DEPTH_VIS_TV10_BLACK_NORM,
+    DEPTH_VIS_TV10_WHITE_NORM,
+    _infer_depth_bit_depth,
+    normalize_and_gamma_depth,
+    process_depth_batch,
+)
+from core.splatting.forward_warp import execute_forward_warp
+
 from core.splatting.config_manager import ConfigManager
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
@@ -216,8 +227,10 @@ class SplatterGUI(ThemedTk):
         self.slider_label_updaters = []
         self.set_convergence_value_programmatically = None
         self._gn_warning_shown: bool = False
+        self._suppress_buffer_invalidation: bool = False
 
         # --- SBS preview (separate window; preview-only) ---
+
         self.sbs_window_obj = None  # Reusable window object
         self._sbs_dp_signature = None
         self._sbs_dp_total_max_seen = None
@@ -731,6 +744,8 @@ class SplatterGUI(ThemedTk):
         """Add traces to invalidate preview buffer when processing parameters change."""
 
         def _invalidate_buffer(*args):
+            if self._suppress_buffer_invalidation:
+                return
             if hasattr(self, "previewer") and self.previewer is not None:
                 self.previewer.invalidate_frame_buffer()
 
@@ -2793,18 +2808,14 @@ class SplatterGUI(ThemedTk):
             return fallback_anchor, fallback_anchor
 
     def exit_app(self):
-        """Handles application exit, including stopping the processing thread."""
-        self._save_config()
         self.stop_event.set()
-        if self.processing_thread and self.processing_thread.is_alive():
-            logger.info("==> Waiting for processing thread to finish...")
-            # --- NEW: Cleanup previewer resources ---
-            if hasattr(self, "previewer"):
-                self.previewer.cleanup()
-            self.processing_thread.join(timeout=5.0)
-            if self.processing_thread.is_alive():
-                logger.debug("==> Thread did not terminate gracefully within timeout.")
-        release_cuda_memory()
+        self._save_config()
+        if hasattr(self, "_preview_stereo_projector") and self._preview_stereo_projector is not None:
+            del self._preview_stereo_projector
+            self._preview_stereo_projector = None
+            release_cuda_memory()
+        if self.previewer:
+            self.previewer.cleanup()
         self.destroy()
 
     def _find_preview_sources_callback(self) -> list:
@@ -3648,7 +3659,7 @@ class SplatterGUI(ThemedTk):
         # Cache miss, run the calculation (using the existing run_preview_auto_converge logic)
         self.run_preview_auto_converge(force_run=True)
 
-    def on_slider_release(self, event=None):
+    def on_slider_release(self, event=None, immediate: bool = False):
         """Called when a slider is released. Updates the preview with DEBOUNCING."""
         # 1. Stop any current wigglegram animation immediately for responsiveness
         if hasattr(self, "previewer"):
@@ -3659,10 +3670,13 @@ class SplatterGUI(ThemedTk):
             self.after_cancel(self._preview_debounce_timer)
             self._preview_debounce_timer = None
 
-        # 3. Start a new timer.
-        # 350ms is a good "norm" for responsiveness vs. stability.
-        # If you click 10 times quickly, this only fires after the 10th click.
-        self._preview_debounce_timer = self.after(350, self._perform_delayed_preview_update)
+        if immediate:
+            self._perform_delayed_preview_update()
+        else:
+            # 3. Start a new timer.
+            # 350ms is a good "norm" for responsiveness vs. stability.
+            # If you click 10 times quickly, this only fires after the 10th click.
+            self._preview_debounce_timer = self.after(350, self._perform_delayed_preview_update)
 
     def _perform_delayed_preview_update(self):
         """Actually triggers the heavy preview processing once the delay expires."""
@@ -3713,8 +3727,6 @@ class SplatterGUI(ThemedTk):
         except Exception:
             mix_f = 0.5
 
-        from core.splatting.depth_processing import process_depth_batch
-
         return process_depth_batch(
             batch_depth_numpy_raw=batch_depth_numpy_raw,
             depth_gamma=depth_gamma,
@@ -3734,6 +3746,9 @@ class SplatterGUI(ThemedTk):
         """
         Callback for VideoPreviewer. Performs splatting on a single frame for preview.
         """
+        import time
+
+        t_start = time.perf_counter()
         # NOTE: Do not clear the 'Current Processing Information' panel on every preview render.
         # Clearing here caused filename/task info to briefly appear and then reset to N/A each time the preview updates.
 
@@ -3763,6 +3778,8 @@ class SplatterGUI(ThemedTk):
         # Determine the target resolution for the preview tensor
         W_orig = left_eye_tensor.shape[3]
         H_orig = left_eye_tensor.shape[2]
+
+        t_setup = time.perf_counter()
 
         # ----------------------------------------------------------------------
         # NEW SIDECAR LOGIC FOR PREVIEW
@@ -3829,8 +3846,19 @@ class SplatterGUI(ThemedTk):
         else:
             left_eye_tensor_resized = left_eye_tensor.cuda()  # Use original res
 
+        t_resize_rgb = time.perf_counter()
+
         logger.debug(f"Preview Params: {params}")
         logger.debug(f"Target Resolution: {W_target}x{H_target} (Low-Res: {is_low_res_preview})")
+
+        # Determine if we should skip pre-processing for low-res
+        skip_preprocessing = False
+        if (
+            is_low_res_preview
+            and getattr(self, "skip_lowres_preproc_var", None) is not None
+            and self.skip_lowres_preproc_var.get()
+        ):
+            skip_preprocessing = True
 
         # --- Process Depth Frame ---
         depth_numpy_raw = depth_tensor_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -3843,6 +3871,11 @@ class SplatterGUI(ThemedTk):
         # - Low-res preview: pre-proc at clip resolution, then downscale to low-res AFTER pre-proc.
         #   This matches the low-res render ordering and avoids the "extra thick" low-res preview look.
         W_preproc, H_preproc = (W_orig, H_orig)
+
+        # OPTIMIZATION: If skipping pre-processing, we can resize directly to target resolution
+        if skip_preprocessing:
+            W_preproc, H_preproc = (W_target, H_target)
+
         if depth_numpy_raw.ndim == 2:
             depth_numpy_raw = depth_numpy_raw[:, :, None]
         if depth_numpy_raw.shape[0] != H_preproc or depth_numpy_raw.shape[1] != W_preproc:
@@ -3862,6 +3895,8 @@ class SplatterGUI(ThemedTk):
                     f"Preview depth resize (pre-proc) failed: {e}. Continuing with raw depth resolution.", exc_info=True
                 )
 
+        t_resize_depth = time.perf_counter()
+
         # 1. DETERMINE MAX CONTENT VALUE FOR THE FRAME (for AutoGain scaling)
         # We need the max *raw* value of the depth frame content
         max_raw_content_value = depth_numpy_raw.max()
@@ -3877,6 +3912,7 @@ class SplatterGUI(ThemedTk):
             sidecar_folder = self._get_sidecar_base_folder()
             depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
             sidecar_ext = self.APP_CONFIG_DEFAULTS["SIDECAR_EXT"]
+
             json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
             sidecar_exists = os.path.exists(json_sidecar_path)
 
@@ -3946,7 +3982,6 @@ class SplatterGUI(ThemedTk):
         # logger.debug(f"Preview: BitDepth={depth_bits}, RawMax={max_val_in_frame:.1f}, Dtype={depth_numpy_raw.dtype}, GN={enable_global_norm}. Scaling Base: {final_scaling_factor:.1f}")
 
         # --- UNIFICATION STEP: Match Render Scaling Logic ---
-        from core.splatting.depth_processing import normalize_and_gamma_depth
 
         # Render engine passes global_depth_max=1.0 for assume_raw_input=True
         # because the input is expected to be scaled by max_expected_raw_value inside normalize_and_gamma.
@@ -4012,6 +4047,8 @@ class SplatterGUI(ThemedTk):
             f"Final normalized depth shape: {depth_normalized.shape}, range: [{depth_normalized.min():.2f}, {depth_normalized.max():.2f}]"
         )
 
+        t_norm = time.perf_counter()
+
         # Send depth min/max to previewer for display in Depth Map mode
         if preview_source in ("Depth Map", "Depth Map (Color)"):
             if hasattr(self, "previewer") and self.previewer is not None:
@@ -4019,8 +4056,11 @@ class SplatterGUI(ThemedTk):
                 raw_max = float(depth_numpy_raw.max())
                 self.previewer.set_depth_minmax(raw_min, raw_max)
 
-        # --- Perform Splatting ---
-        stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+        # Cache the stereo projector for preview
+        if not hasattr(self, "_preview_stereo_projector") or self._preview_stereo_projector is None:
+            self._preview_stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
+        stereo_projector = self._preview_stereo_projector
+
         # Ensure depth map is resized to the target resolution (low-res or original)
         disp_map_tensor = torch.from_numpy(depth_normalized).unsqueeze(0).unsqueeze(0).float().cuda()
 
@@ -4122,7 +4162,7 @@ class SplatterGUI(ThemedTk):
         except Exception:
             pass
 
-        from core.splatting.forward_warp import execute_forward_warp
+        t_metrics = time.perf_counter()
 
         right_eye_tensor_raw, occlusion_mask = execute_forward_warp(
             stereo_projector=stereo_projector,
@@ -4135,6 +4175,8 @@ class SplatterGUI(ThemedTk):
             tv_disp_comp=tv_disp_comp,
             debug_task_name="Preview",
         )
+
+        t_warp = time.perf_counter()
 
         right_eye_tensor = right_eye_tensor_raw
 
@@ -4156,9 +4198,9 @@ class SplatterGUI(ThemedTk):
                 right_eye_tensor[:, :, :, -r_px:] = 0.0
 
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
-            final_tensor = right_eye_tensor.cpu()
+            final_tensor = right_eye_tensor
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
-            final_tensor = occlusion_mask.repeat(1, 3, 1, 1).cpu()
+            final_tensor = occlusion_mask.repeat(1, 3, 1, 1)
 
         elif preview_source == "Depth Map":
             # Direct grayscale view (visualization-only TV-range expansion for 10-bit depth, when tagged 'tv')
@@ -4211,55 +4253,93 @@ class SplatterGUI(ThemedTk):
             vis_rgb = cv2.cvtColor(vis_color, cv2.COLOR_BGR2RGB)
             final_tensor = torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
 
-        elif preview_source == "Original (Left Eye)":
-            # Use the resized or original left eye depending on the low-res flag
-            final_tensor = left_eye_tensor_resized.cpu()
         elif preview_source == "Anaglyph 3D":
-            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-                np.uint8
-            )
-            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            left_gray_np = cv2.cvtColor(left_np_anaglyph, cv2.COLOR_RGB2GRAY)
-            anaglyph_np = right_np_anaglyph.copy()
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY)
+            anaglyph_np = right_np.copy()
             anaglyph_np[:, :, 0] = left_gray_np
-            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
         elif preview_source == "Dubois Anaglyph":
-            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-                np.uint8
-            )
-            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            anaglyph_np = apply_dubois_anaglyph(left_np_anaglyph, right_np_anaglyph)
-            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = apply_dubois_anaglyph(left_np, right_np)
+            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
         elif preview_source == "Optimized Anaglyph":
-            left_np_anaglyph = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-                np.uint8
-            )
-            right_np_anaglyph = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            anaglyph_np = apply_optimized_anaglyph(left_np_anaglyph, right_np_anaglyph)
-            final_tensor = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            anaglyph_np = apply_optimized_anaglyph(left_np, right_np)
+            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+
         elif preview_source == "Wigglegram":
-            # Pass the resized left eye and the splatted right eye
-            self.previewer._start_wigglegram_animation(left_eye_tensor_resized.cpu(), right_eye_tensor.cpu())
+            self.previewer._start_wigglegram_animation(left_eye_tensor_resized, right_eye_tensor)
             return None
+
+        # --- SBS Window Update ---
+        if hasattr(self, "sbs_enabled_var") and self.sbs_enabled_var.get():
+            # If flip is enabled, the eyes are effectively swapped in flipped space
+            if params.get("flip_horizontal"):
+                # Un-flip both and swap
+                sbs_left = torch.flip(right_eye_tensor, dims=[3])
+                sbs_right = torch.flip(left_eye_tensor_resized, dims=[3])
+            else:
+                sbs_left = left_eye_tensor_resized
+                sbs_right = right_eye_tensor
+
+            # Update window
+            if self.sbs_window_obj and self.sbs_window_obj.exists():
+                self.sbs_window_obj.update_frame(sbs_left, sbs_right, overlays_callback=self._draw_sbs_overlays)
+
+            # Cache for fast playback
+            if hasattr(self.previewer, "cache_sbs_frame"):
+                try:
+                    # Convert to uint8 numpy for compact storage
+                    l_np = (sbs_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    r_np = (sbs_right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    frame_idx = int(self.previewer.frame_scrubber_var.get())
+                    self.previewer.cache_sbs_frame(frame_idx, l_np, r_np)
+                except Exception as e:
+                    logger.debug(f"SBS Caching failed: {e}")
+
+        # --- End SBS Update ---
+
         else:
-            final_tensor = right_eye_tensor.cpu()
+            final_tensor = left_eye_tensor_resized.cpu()
 
-        # Cache the SBS frame data for fast playback
-        frame_idx = int(self.previewer.frame_scrubber_var.get())
-        left_np_cache = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        right_np_cache = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        self.previewer.cache_sbs_frame(frame_idx, left_np_cache, right_np_cache)
+        t_finish = time.perf_counter()
 
-        # Update the SBS preview window if enabled.
-        # This sends Left=Original, Right=Full Splat (from right_eye_tensor).
-        if getattr(self, "sbs_enabled_var", None) is not None and self.sbs_enabled_var.get():
-            self._update_sbs_preview_window(left_eye_tensor_resized, right_eye_tensor)
+        # 5. Final transfer to CPU and PIL conversion
+        t_cpu_start = time.perf_counter()
 
-        pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
+        # OPTIMIZATION: Scale and cast to uint8 on GPU BEFORE transferring to CPU.
+        # This reduces transfer bandwidth by 4x and moves the math to the GPU.
+        final_uint8_gpu = (final_tensor[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)
+        final_np = final_uint8_gpu.cpu().numpy()
 
-        del stereo_projector, disp_map_tensor, right_eye_tensor_raw, occlusion_mask
-        release_cuda_memory()
-        logger.debug("--- Finished Preview Processing Callback ---")
+        t_cpu_end = time.perf_counter()
+
+        # Cleanup tensors explicitly
+        del left_eye_tensor_resized, right_eye_tensor, disp_map_tensor, occlusion_mask
+        if "right_eye_tensor_raw" in locals():
+            del right_eye_tensor_raw
+        del final_uint8_gpu
+
+        pil_img = Image.fromarray(final_np)
+
+        t_all_finish = time.perf_counter()
+
+        logger.info(
+            f"[TIMER] Preview: Total={t_all_finish - t_start:.3f}s | "
+            f"Setup={t_setup - t_start:.3f}s | "
+            f"Resize={t_resize_depth - t_setup:.3f}s | "
+            f"Norm={t_norm - t_resize_depth:.3f}s | "
+            f"Metrics={t_metrics - t_norm:.3f}s | "
+            f"Warp={t_warp - t_metrics:.3f}s | "
+            f"CPU_Xfer={t_cpu_end - t_cpu_start:.3f}s | "
+            f"PIL={t_all_finish - t_cpu_end:.3f}s"
+        )
         return pil_img
 
     def reset_to_defaults(self):
@@ -6271,60 +6351,65 @@ class SplatterGUI(ThemedTk):
         logger.info(f"Updating sliders from sidecar: {os.path.basename(json_sidecar_path)}")
 
         # 3. Bulk sync to GUI vars
-        self.sidecar_manager.sync_to_gui(sidecar_config, self.__dict__, mapping=self.GUI_SIDECAR_VAR_MAP)
-
-        # Ensure flip horizontal is in sync with the previewer
-        if hasattr(self, "previewer") and self.previewer:
-            self.previewer.flip_horizontal = self.flip_horizontal_var.get()
-
-        # 4. Handle Programmatic Updates (sliders with coupled logic)
-        # Convergence
-        conv_val = sidecar_config.get("convergence_plane", self.zero_disparity_anchor_var.get())
-        if self.set_convergence_value_programmatically:
-            self.set_convergence_value_programmatically(conv_val)
-
-        # 5. Seed preview Overlay metrics
+        self._suppress_buffer_invalidation = True
         try:
-            disp_val = sidecar_config.get("max_disparity", self.max_disp_var.get())
-            gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
-            dp_seed = sidecar_config.get("dp_total_max_true") or sidecar_config.get("dp_total_max_est")
-            if (
-                dp_seed is not None
-                and getattr(self, "previewer", None)
-                and hasattr(self.previewer, "set_depth_pop_max_estimate")
-            ):
-                sig = self._dp_total_signature(depth_map_path, conv_val, disp_val, gamma_val)
-                self.previewer.set_depth_pop_max_estimate(float(dp_seed), sig)
-        except Exception:
-            pass
+            self.sidecar_manager.sync_to_gui(sidecar_config, self.__dict__, mapping=self.GUI_SIDECAR_VAR_MAP)
 
-        # 6. Border Geometry (Left/Right -> Width/Bias)
-        left_b = sidecar_config.get("left_border", 0.0)
-        right_b = sidecar_config.get("right_border", 0.0)
-        w, b = self.sidecar_manager.calculate_width_bias_from_borders(left_b, right_b)
+            # Ensure flip horizontal is in sync with the previewer
+            if hasattr(self, "previewer") and self.previewer:
+                self.previewer.flip_horizontal = self.flip_horizontal_var.get()
 
-        self.border_width_var.set(f"{w:.2f}")
-        self.border_bias_var.set(f"{b:.2f}")
+            # 4. Handle Programmatic Updates (sliders with coupled logic)
 
-        if self.set_border_width_programmatically:
-            self.set_border_width_programmatically(w)
-        if self.set_border_bias_programmatically:
-            self.set_border_bias_programmatically(b)
+            # Convergence
+            conv_val = sidecar_config.get("convergence_plane", self.zero_disparity_anchor_var.get())
+            if self.set_convergence_value_programmatically:
+                self.set_convergence_value_programmatically(conv_val)
 
-        # 7. Post-update cleanup
-        self._on_border_mode_change()
-        if hasattr(self, "slider_label_updaters"):
-            for updater in self.slider_label_updaters:
-                updater()
+            # 5. Seed preview Overlay metrics
+            try:
+                disp_val = sidecar_config.get("max_disparity", self.max_disp_var.get())
+                gamma_val = sidecar_config.get("gamma", self.depth_gamma_var.get())
+                dp_seed = sidecar_config.get("dp_total_max_true") or sidecar_config.get("dp_total_max_est")
+                if (
+                    dp_seed is not None
+                    and getattr(self, "previewer", None)
+                    and hasattr(self.previewer, "set_depth_pop_max_estimate")
+                ):
+                    sig = self._dp_total_signature(depth_map_path, conv_val, disp_val, gamma_val)
+                    self.previewer.set_depth_pop_max_estimate(float(dp_seed), sig)
+            except Exception:
+                pass
 
-        # Resync processing queue
-        if hasattr(self.previewer, "video_list") and hasattr(self, "resolution_output_list"):
-            for i, video_entry in enumerate(self.previewer.video_list):
-                if i < len(self.resolution_output_list):
-                    self.resolution_output_list[i].depth_map = video_entry.get("depth_map", None)
+            # 6. Border Geometry (Left/Right -> Width/Bias)
+            left_b = sidecar_config.get("left_border", 0.0)
+            right_b = sidecar_config.get("right_border", 0.0)
+            w, b = self.sidecar_manager.calculate_width_bias_from_borders(left_b, right_b)
+
+            self.border_width_var.set(f"{w:.2f}")
+            self.border_bias_var.set(f"{b:.2f}")
+
+            if self.set_border_width_programmatically:
+                self.set_border_width_programmatically(w)
+            if self.set_border_bias_programmatically:
+                self.set_border_bias_programmatically(b)
+
+            # 7. Post-update cleanup
+            self._on_border_mode_change()
+            if hasattr(self, "slider_label_updaters"):
+                for updater in self.slider_label_updaters:
+                    updater()
+
+            # Resync processing queue
+            if hasattr(self.previewer, "video_list") and hasattr(self, "resolution_output_list"):
+                for i, video_entry in enumerate(self.previewer.video_list):
+                    if i < len(self.resolution_output_list):
+                        self.resolution_output_list[i].depth_map = video_entry.get("depth_map", None)
+        finally:
+            self._suppress_buffer_invalidation = False
 
         # Refresh preview
-        self.on_slider_release(None)
+        self.on_slider_release(None, immediate=True)
 
     def _update_sidecar_button_text(self):
         """Checks if a sidecar exists for the current preview video and updates the button text."""

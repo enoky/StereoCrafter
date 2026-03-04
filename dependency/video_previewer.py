@@ -614,6 +614,7 @@ class VideoPreviewer(ttk.Frame):
             # Subsequent presses: just refresh the preview without rescanning
             if self.video_list and self.current_video_index >= 0:
                 self._load_preview_by_index(self.current_video_index)
+
             elif self.find_sources_callback:
                 # Fallback: if video_list is empty, do a full scan
                 self.load_video_list(find_sources_callback=self.find_sources_callback)
@@ -954,21 +955,39 @@ class VideoPreviewer(ttk.Frame):
         self.current_video_index = target_index  # Use the recalled or default index
         self._load_preview_by_index(self.current_video_index)
 
-    def _load_preview_by_index(self, index: int):
-        """Loads a specific video from the preview list by its index."""
-        self._clear_preview_resources()
+    def _load_preview_by_index(self, index: int, force_reload: bool = False):
+        """Loads a specific video from the preview list by its index.
 
+        Args:
+            index: The index of the video to load
+            force_reload: If True, closes existing readers and re-opens them
+        """
         if not (0 <= index < len(self.video_list)):
+            self._clear_preview_resources()
             self.last_loaded_video_path = None
             return
 
-        self.current_video_index = index
-        self._update_nav_controls()
-
         source_paths = self.video_list[index]
-        base_name = os.path.basename(next(iter(source_paths.values())))
-
         main_source_path = source_paths.get("source_video", None)
+
+        # Determine if we actually need to reload readers
+        is_same_video = main_source_path == self.last_loaded_video_path
+        needs_reload = force_reload or not is_same_video or not self.source_readers
+
+        if needs_reload:
+            self._clear_preview_resources()
+            self.current_video_index = index
+            initial_frame = 0 if not is_same_video else self.last_loaded_frame_index
+            self.last_loaded_video_path = main_source_path
+        else:
+            # Same video, just ensure index is correct
+            self.current_video_index = index
+            self._update_nav_controls()
+            self.update_preview()
+            return
+
+        self._update_nav_controls()
+        base_name = os.path.basename(next(iter(source_paths.values())))
 
         # Check if source exists but depth map is missing
         depth_map_path = source_paths.get("depth_map", None)
@@ -999,9 +1018,12 @@ class VideoPreviewer(ttk.Frame):
         self.last_loaded_video_path = main_source_path
 
         self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
-        self.parent.update_idletasks()
+        # self.parent.update_idletasks() # REMOVED: slow
 
         try:
+            import time
+
+            t_load_start = time.perf_counter()
             # Initialize VideoReader for each source path
             num_frames = -1
             for key, path in source_paths.items():
@@ -1015,6 +1037,7 @@ class VideoPreviewer(ttk.Frame):
                 # --- END MODIFIED ---
 
                 try:
+                    t0 = time.perf_counter()
                     # Use FFmpeg-based reader for the source video when Strict FFmpeg decode is enabled.
                     use_strict = False
                     try:
@@ -1028,8 +1051,22 @@ class VideoPreviewer(ttk.Frame):
                         # Match render-time strict decode defaults (BT.709 Limited unless stream tags indicate otherwise)
                         in_range = "tv"
                         in_matrix = "bt709"
+                        v_width = 0
+                        v_height = 0
+                        v_fps = 0.0
+
                         try:
                             sinfo = get_video_stream_info(path) or {}
+                            v_width = int(sinfo.get("width", 0))
+                            v_height = int(sinfo.get("height", 0))
+
+                            # Parse frame rate "num/den"
+                            fr_str = sinfo.get("r_frame_rate", "0/1")
+                            if "/" in fr_str:
+                                n, d = fr_str.split("/")
+                                if float(d) != 0:
+                                    v_fps = float(n) / float(d)
+
                             cr = str(sinfo.get("color_range") or sinfo.get("range") or "").lower()
                             if cr in ("pc", "full", "jpeg"):
                                 in_range = "pc"
@@ -1046,27 +1083,43 @@ class VideoPreviewer(ttk.Frame):
 
                         # Use a Decord reader once to get fps/frames (fast) then decode the selected frame via FFmpeg
                         info_reader = VideoReader(path, ctx=cpu(0))
+                        v_width = int(info_reader[0].shape[1])
+                        v_height = int(info_reader[0].shape[0])
+                        v_fps = float(info_reader.get_avg_fps())
+                        v_frames = len(info_reader)
+
                         reader = FFmpegRGBSingleFrameReader(
                             path,
-                            width=int(info_reader[0].shape[1]),
-                            height=int(info_reader[0].shape[0]),
-                            fps=float(info_reader.get_avg_fps()),
-                            total_frames=len(info_reader),
+                            width=v_width,
+                            height=v_height,
+                            fps=v_fps,
+                            total_frames=v_frames,
                             in_range=in_range,
                             in_matrix=in_matrix,
                         )
+
                     else:
                         reader = VideoReader(path, ctx=cpu(0))
+
+                    t1 = time.perf_counter()
+                    logger.debug(f"Previewer: VideoReader init for '{key}' took {t1 - t0:.3f}s")
+
+                    reader_len = len(reader)
                     if num_frames == -1:
-                        num_frames = len(reader)
-                    elif num_frames != len(reader):
-                        raise ValueError(f"Frame count mismatch between sources for {base_name}")
+                        num_frames = reader_len
+                    elif num_frames != reader_len:
+                        logger.warning(
+                            f"Previewer: Frame count mismatch for '{key}' ({reader_len} vs {num_frames}). "
+                            f"Using minimum length."
+                        )
+                        num_frames = min(num_frames, reader_len)
                     self.source_readers[key] = reader
+
                 except Exception as e:
                     self.source_readers[key] = None
                     logger.error(f"Failed to open reader for source '{key}' at path '{path}': {e}", exc_info=True)
                     # If the main sources fail, we should stop trying to load
-                    if key in ["inpainted", "splatted"]:
+                    if key in ["inpainted", "splatted", "source_video", "depth_map"]:
                         raise ValueError(f"Critical source file '{key}' failed to load: {e}")
 
             # Depth-map stream probe (bit depth) - cached per clip
@@ -1079,7 +1132,11 @@ class VideoPreviewer(ttk.Frame):
 
             if self._depth_path and os.path.exists(self._depth_path):
                 try:
+                    t_probe0 = time.perf_counter()
                     depth_info = get_video_stream_info(self._depth_path)
+                    t_probe1 = time.perf_counter()
+                    logger.debug(f"Previewer: Depth probe took {t_probe1 - t_probe0:.3f}s")
+
                     pix = str((depth_info or {}).get("pix_fmt", "")).lower()
                     profile = str((depth_info or {}).get("profile", "")).lower()
 
@@ -1101,10 +1158,26 @@ class VideoPreviewer(ttk.Frame):
             depth_reader = self.source_readers.get("depth_map")
             if depth_reader:
                 try:
-                    _df0 = depth_reader.get_batch([0]).asnumpy()
-                    self._depth_native_h, self._depth_native_w = _df0.shape[1:3]
-                except Exception:
-                    pass
+                    t_batch0 = time.perf_counter()
+
+                    # Try to get native dimensions from cached metadata first
+                    sinfo = get_video_stream_info(self._depth_path) if self._depth_path else None
+                    if sinfo and int(sinfo.get("width", 0)) > 0:
+                        self._depth_native_w = int(sinfo.get("width"))
+                        self._depth_native_h = int(sinfo.get("height"))
+                        logger.debug(
+                            f"Previewer: Depth native size from metadata: {self._depth_native_w}x{self._depth_native_h}"
+                        )
+                    else:
+                        # Fallback to Decord decode
+                        _df0 = depth_reader.get_batch([0]).asnumpy()
+                        self._depth_native_h, self._depth_native_w = _df0.shape[1:3]
+                        logger.debug("Previewer: Depth native size from fallback decode.")
+
+                    t_batch1 = time.perf_counter()
+                    logger.debug(f"Previewer: Depth native size check took {t_batch1 - t_batch0:.3f}s")
+                except Exception as e:
+                    logger.debug(f"Previewer: Depth native size check failed: {e}")
 
             # Configure the scrubber
             self.frame_scrubber.config(to=num_frames - 1)
@@ -1114,10 +1187,27 @@ class VideoPreviewer(ttk.Frame):
             if self.update_clip_callback:
                 self.update_clip_callback()
 
+            t_total_load = time.perf_counter()
+            logger.info(f"Previewer: Total video load took {t_total_load - t_load_start:.3f}s")
+
             if self.parent and hasattr(self.parent, "update_gui_from_sidecar"):
                 self.parent.update_gui_from_sidecar(source_paths.get("depth_map"))
 
-            self.update_preview()
+                # Check if the parent's sidecar update already triggered a preview update.
+                # In splatting_gui, it does this via on_slider_release(None).
+                # If 'Update Sliders' is OFF, update_gui_from_sidecar returns early without refreshing.
+                update_sliders_on = True
+                if hasattr(self.parent, "update_slider_from_sidecar_var"):
+                    update_sliders_on = bool(self.parent.update_slider_from_sidecar_var.get())
+
+                if update_sliders_on:
+                    # Parent already called update_preview (via on_slider_release).
+                    # Calling it again here is redundant and slow.
+                    logger.debug("Previewer: Skipping redundant update_preview after sidecar load.")
+                else:
+                    self.update_preview()
+            else:
+                self.update_preview()
 
         except Exception as e:
             messagebox.showerror("Preview Load Error", f"Failed to load files for preview:\n\n{e}")
@@ -1385,8 +1475,8 @@ class VideoPreviewer(ttk.Frame):
             logger.warning("Previewer: get_params_callback not provided. Using stale parameters.")
 
         self._stop_wigglegram_animation()
-        self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
-        self.parent.update_idletasks()
+        # self.load_preview_button.config(text="LOADING...", style="Loading.TButton")
+        # self.parent.update_idletasks() # REMOVED: too slow for hot path
 
         try:
             frame_idx = int(self.frame_scrubber_var.get())
@@ -1404,21 +1494,32 @@ class VideoPreviewer(ttk.Frame):
                 if cached_display is not None:
                     self.pil_image_for_preview = cached_display
                     frame_was_cached = True
+                    logger.debug(f"Previewer: [CACHE HIT] Display frame {frame_idx}")
                 else:
                     # Try cached raw frame
                     cached_frame = self._frame_buffer.get_cached_frame(frame_idx)
                     if cached_frame is not None:
                         self.pil_image_for_preview = cached_frame
                         frame_was_cached = True
+                        logger.debug(f"Previewer: [CACHE HIT] Raw frame {frame_idx}")
                     else:
                         # Process the frame
+                        logger.debug(f"Previewer: [CACHE MISS] Processing frame {frame_idx}")
+                        t_p_start = time.perf_counter()
                         self.pil_image_for_preview = self._process_frame_for_preview(frame_idx, source_frames={})
+                        t_p_end = time.perf_counter()
+                        logger.debug(f"Previewer: Frame processing took {t_p_end - t_p_start:.3f}s")
                         # Cache the processed frame
                         if self.pil_image_for_preview is not None:
                             self._frame_buffer.cache_frame(frame_idx, self.pil_image_for_preview)
+
             else:
                 # No buffer, process normally
+                logger.debug(f"Previewer: [NO BUFFER] Processing frame {frame_idx}")
+                t_p_start = time.perf_counter()
                 self.pil_image_for_preview = self._process_frame_for_preview(frame_idx, source_frames={})
+                t_p_end = time.perf_counter()
+                logger.debug(f"Previewer: Frame processing took {t_p_end - t_p_start:.3f}s")
 
             # If the callback returned None, check if it was because a wigglegram was started.
             # If not, then it's a genuine error.
@@ -1448,9 +1549,10 @@ class VideoPreviewer(ttk.Frame):
                 new_width = int(display_image.width * scale_factor)
                 new_height = int(display_image.height * scale_factor)
 
-                # Use Image.resize to handle both scaling up and scaling down
-                display_image = display_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                # Use BICUBIC instead of LANCZOS for better real-time performance
+                display_image = display_image.resize((new_width, new_height), Image.Resampling.BICUBIC)
                 logger.debug(f"Preview scaled by {scale_percent_str} to {new_width}x{new_height}.")
+
             # --- END MODIFIED ---
 
             # Preview-only crosshair/bullseye overlay (drawn onto the preview image so it always shows)
@@ -1607,7 +1709,7 @@ class VideoPreviewer(ttk.Frame):
             logger.error(f"Error updating preview: {e}", exc_info=True)
             self.preview_label.config(image=None, text=f"Error:\n{e}")
         finally:
-            release_cuda_memory()
+            # release_cuda_memory() # REMOVED: too slow for hot path (contains gc.collect)
             self.load_preview_button.config(text="Load/Refresh List", style="CompactAction.TButton")
 
     def _process_frame_for_preview(self, frame_idx: int, source_frames: dict) -> Image.Image:
