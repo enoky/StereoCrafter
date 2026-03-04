@@ -25,6 +25,8 @@ These settings determine the resolution at which the splatting process will occu
   - **Width / Height:** The target width and height for the low-resolution output.
   - **Batch Size:** The number of frames to process simultaneously for the low-resolution output.
 - **Dual Output Only:** If checked, will generate dual panel (Right Eye Inpaint + Occlusion Mask) for inpainting. Unchecked will generate quad panel (Left, Depth, Occlusion, Right) for debugging or manual blending.
+- **Flip Horizontal:** Horizontally flips both the source video and depth map. This is useful for scenes where movement is primarily left-to-right, as the inpainting model is optimized for right-side holes. The **Merging GUI** will automatically flip the result back to its original orientation during the final assembly.
+
 
 ### 3. Splatting & Output Settings
 

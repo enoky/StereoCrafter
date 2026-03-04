@@ -73,6 +73,7 @@ class RenderProcessor:
         depth_dilate_left: float = 0.0,
         depth_blur_left: float = 0.0,
         depth_blur_left_mix: float = 0.5,
+        flip_horizontal: bool = False,
         skip_lowres_preproc: bool = False,
         color_tags_mode: str = "Auto",
         encoding_options: Optional[dict] = None,
@@ -259,6 +260,10 @@ class RenderProcessor:
                 # 1. Fetch frames
                 batch_video_numpy = input_video_reader.get_batch(batch_indices).asnumpy()
                 batch_depth_numpy_raw = depth_map_reader.get_batch(batch_indices).asnumpy()
+
+                if flip_horizontal:
+                    batch_video_numpy = np.flip(batch_video_numpy, axis=2)
+                    batch_depth_numpy_raw = np.flip(batch_depth_numpy_raw, axis=2)
 
                 # --- NEW: Aspect Ratio Parity ---
                 # Immediate resize to ensure all following steps (normalization, dilation, blur)

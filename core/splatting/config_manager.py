@@ -41,6 +41,7 @@ SPLATTER_DEFAULT_CONFIG = {
     "crosshair_white": False,
     "crosshair_multi": False,
     "depth_pop_enabled": False,
+    "flip_horizontal": False,
     "auto_convergence_mode": "Off",
     "depth_gamma": "1.0",
     "depth_dilate_size_x": "3",
@@ -81,8 +82,7 @@ SPLATTER_DEFAULT_CONFIG = {
 
 
 def load_config(
-    config_filename: str = "config_splat.splatcfg",
-    defaults: Optional[Dict[str, Any]] = None,
+    config_filename: str = "config_splat.splatcfg", defaults: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """Load configuration from a JSON file with defaults.
 
@@ -94,7 +94,7 @@ def load_config(
         Dictionary containing configuration values
     """
     config = dict(defaults) if defaults else {}
-    
+
     if not os.path.exists(config_filename):
         logger.debug(f"Config file not found: {config_filename}. Using defaults.")
         return config
@@ -102,15 +102,15 @@ def load_config(
     try:
         with open(config_filename, "r") as f:
             loaded_config = json.load(f)
-        
+
         # Apply loaded values, preserving structure
         config.update(loaded_config)
-        
+
         # Handle backward compatibility for specific keys
         _apply_backward_compat(config)
-        
+
         logger.info(f"Loaded config from: {config_filename}")
-        
+
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse config file {config_filename}: {e}")
     except Exception as e:
@@ -119,10 +119,7 @@ def load_config(
     return config
 
 
-def save_config(
-    config: Dict[str, Any],
-    config_filename: str = "config_splat.splatcfg",
-) -> bool:
+def save_config(config: Dict[str, Any], config_filename: str = "config_splat.splatcfg") -> bool:
     """Save configuration to a JSON file.
 
     Args:
@@ -142,10 +139,7 @@ def save_config(
         return False
 
 
-def load_settings_from_file(
-    filename: str,
-    tk_vars: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def load_settings_from_file(filename: str, tk_vars: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Load settings from a user-selected JSON file.
 
     Args:
@@ -158,7 +152,7 @@ def load_settings_from_file(
     try:
         with open(filename, "r") as f:
             loaded_config = json.load(f)
-        
+
         # Apply to tkinter variables if provided
         if tk_vars:
             for config_key, config_value in loaded_config.items():
@@ -166,19 +160,16 @@ def load_settings_from_file(
                 if tk_var_attr_name in tk_vars:
                     tk_var = tk_vars[tk_var_attr_name]
                     _set_tk_var(tk_var, config_value)
-        
+
         logger.info(f"Loaded settings from: {filename}")
         return loaded_config
-        
+
     except Exception as e:
         logger.error(f"Failed to load settings from {filename}: {e}")
         return {}
 
 
-def save_settings_to_file(
-    config: Dict[str, Any],
-    filename: str,
-) -> bool:
+def save_settings_to_file(config: Dict[str, Any], filename: str) -> bool:
     """Save settings to a user-selected JSON file.
 
     Args:
@@ -198,10 +189,7 @@ def save_settings_to_file(
         return False
 
 
-def get_current_config(
-    tk_vars: Dict[str, Any],
-    defaults: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def get_current_config(tk_vars: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Extract current configuration from tkinter variables.
 
     Args:
@@ -212,19 +200,16 @@ def get_current_config(
         Dictionary of current configuration values
     """
     config = dict(defaults) if defaults else {}
-    
+
     for key, var in tk_vars.items():
         if key.endswith("_var"):
             config_key = key[:-4]  # Remove "_var" suffix
             config[config_key] = _get_tk_var_value(var)
-    
+
     return config
 
 
-def reset_to_defaults(
-    tk_vars: Dict[str, Any],
-    defaults: Optional[Dict[str, Any]] = None,
-) -> None:
+def reset_to_defaults(tk_vars: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> None:
     """Reset tkinter variables to their default values.
 
     Args:
@@ -273,7 +258,7 @@ def _get_tk_var_value(var) -> Any:
         The value of the variable
     """
     import tkinter as tk
-    
+
     if isinstance(var, tk.BooleanVar):
         return bool(var.get())
     elif isinstance(var, tk.IntVar):
@@ -292,7 +277,7 @@ def _set_tk_var(var, value: Any) -> None:
         value: Value to set
     """
     import tkinter as tk
-    
+
     if isinstance(var, tk.BooleanVar):
         var.set(bool(value))
     elif isinstance(var, (tk.IntVar, tk.DoubleVar)):
@@ -312,11 +297,7 @@ class ConfigManager:
         config_filename: Name of the default config file
     """
 
-    def __init__(
-        self,
-        defaults: Optional[Dict[str, Any]] = None,
-        config_filename: str = "config_splat.splatcfg",
-    ):
+    def __init__(self, defaults: Optional[Dict[str, Any]] = None, config_filename: str = "config_splat.splatcfg"):
         """Initialize the configuration manager.
 
         Args:
@@ -326,7 +307,7 @@ class ConfigManager:
         self.defaults = defaults or SPLATTER_DEFAULT_CONFIG
         self.config_filename = config_filename
         self.config = {}
-        
+
     def load(self) -> Dict[str, Any]:
         """Load configuration from file.
 
@@ -335,7 +316,7 @@ class ConfigManager:
         """
         self.config = load_config(self.config_filename, self.defaults)
         return self.config
-    
+
     def save(self) -> bool:
         """Save current configuration to file.
 
@@ -343,7 +324,7 @@ class ConfigManager:
             True if successful
         """
         return save_config(self.config, self.config_filename)
-    
+
     def get(self, key: str, default: Any = None) -> Any:
         """Get a configuration value.
 
@@ -355,7 +336,7 @@ class ConfigManager:
             Configuration value or default
         """
         return self.config.get(key, default)
-    
+
     def set(self, key: str, value: Any) -> None:
         """Set a configuration value.
 
@@ -364,7 +345,7 @@ class ConfigManager:
             value: Value to set
         """
         self.config[key] = value
-    
+
     def sync_to_tk_vars(self, tk_vars: Dict[str, Any]) -> None:
         """Synchronize configuration to tkinter variables.
 
@@ -375,7 +356,7 @@ class ConfigManager:
             tk_var_attr_name = config_key + "_var"
             if tk_var_attr_name in tk_vars:
                 _set_tk_var(tk_vars[tk_var_attr_name], config_value)
-    
+
     def sync_from_tk_vars(self, tk_vars: Dict[str, Any]) -> None:
         """Synchronize configuration from tkinter variables.
 

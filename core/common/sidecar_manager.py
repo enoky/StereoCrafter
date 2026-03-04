@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+
 class SidecarConfigManager:
     """Handles reading, writing, and merging of stereocrafter sidecar files."""
 
@@ -31,6 +32,7 @@ class SidecarConfigManager:
         "border_mode": (str, None),
         "auto_border_L": (float, None),
         "auto_border_R": (float, None),
+        "flip_horizontal": (bool, False),
     }
 
     def _get_defaults(self) -> dict:
@@ -124,7 +126,9 @@ class SidecarConfigManager:
         depth_map_basename = os.path.splitext(os.path.basename(depth_map_path))[0]
         return os.path.join(sidecar_folder, f"{depth_map_basename}{extension}")
 
-    def sync_to_gui(self, sidecar_data: Dict[str, Any], tk_vars: Dict[str, Any], mapping: Optional[Dict[str, str]] = None) -> None:
+    def sync_to_gui(
+        self, sidecar_data: Dict[str, Any], tk_vars: Dict[str, Any], mapping: Optional[Dict[str, str]] = None
+    ) -> None:
         """Updates tkinter variables from sidecar data using the key map or a custom mapping."""
         for key, val in sidecar_data.items():
             attr_name = mapping.get(key, f"{key}_var") if mapping else f"{key}_var"
@@ -177,6 +181,7 @@ class SidecarConfigManager:
             b = 0.0
         return w, b
 
+
 def find_sidecar_file(base_path: str) -> Optional[str]:
     """Looks for a sidecar JSON file next to the video file."""
     sidecar_path = f"{os.path.splitext(base_path)[0]}.fssidecar"
@@ -186,6 +191,7 @@ def find_sidecar_file(base_path: str) -> Optional[str]:
     if os.path.exists(json_path):
         return json_path
     return None
+
 
 def find_sidecar_in_folder(folder: str, core_name: str) -> Optional[str]:
     """Looks for a sidecar file in a specific folder."""
@@ -197,11 +203,9 @@ def find_sidecar_in_folder(folder: str, core_name: str) -> Optional[str]:
         return json_path
     return None
 
+
 def read_clip_sidecar(
-    sidecar_manager: SidecarConfigManager,
-    video_path: str,
-    core_name: str,
-    search_folders: Optional[List[str]] = None,
+    sidecar_manager: SidecarConfigManager, video_path: str, core_name: str, search_folders: Optional[List[str]] = None
 ) -> dict:
     """Reads the sidecar file for a clip, checking multiple locations."""
     if search_folders:
@@ -215,6 +219,7 @@ def read_clip_sidecar(
         return sidecar_manager.load_sidecar_data(sidecar_path)
 
     return sidecar_manager._get_defaults()
+
 
 def find_video_by_core_name(folder: str, core_name: str) -> Optional[str]:
     """Scans a folder for a file matching the core_name with any common video extension."""

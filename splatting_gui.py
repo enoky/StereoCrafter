@@ -86,7 +86,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-04.1"
+GUI_VERSION = "26-03-04.3"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -149,7 +149,9 @@ class SplatterGUI(ThemedTk):
         "BORDER_MODE": "Off",
         "AUTO_BORDER_L": "0.0",
         "AUTO_BORDER_R": "0.0",
+        "FLIP_HORIZONTAL": False,
     }
+
     # ---------------------------------------
     # Maps Sidecar JSON Key to the internal variable key (used in APP_CONFIG_DEFAULTS)
     SIDECAR_KEY_MAP = {
@@ -171,6 +173,7 @@ class SplatterGUI(ThemedTk):
         "border_mode": "BORDER_MODE",
         "auto_border_L": "AUTO_BORDER_L",
         "auto_border_R": "AUTO_BORDER_R",
+        "flip_horizontal": "FLIP_HORIZONTAL",
     }
 
     # Maps Sidecar JSON Key to the actual tkinter variable attribute name
@@ -178,6 +181,7 @@ class SplatterGUI(ThemedTk):
         "convergence_plane": "zero_disparity_anchor_var",
         "max_disparity": "max_disp_var",
         "gamma": "depth_gamma_var",
+        "flip_horizontal": "flip_horizontal_var",
     }
     MOVE_TO_FINISHED_ENABLED = True
     # ---------------------------------------
@@ -294,6 +298,7 @@ class SplatterGUI(ThemedTk):
         self.crosshair_white_var = tk.BooleanVar(value=False)
         self.crosshair_multi_var = tk.BooleanVar(value=False)
         self.depth_pop_enabled_var = tk.BooleanVar(value=False)
+        self.flip_horizontal_var = tk.BooleanVar(value=False)
         self.sbs_enabled_var = tk.BooleanVar(value=False)
         self.auto_convergence_mode_var = tk.StringVar(value="Off")
         self.depth_gamma_var = tk.StringVar(value=defaults["DEPTH_GAMMA"])
@@ -1924,6 +1929,7 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.entry_low_res_batch_size, "low_res_batch_size")
 
         # Tests (mutually exclusive)
+
         self.splat_test_var = tk.BooleanVar(value=False)
         self.map_test_var = tk.BooleanVar(value=False)
 
@@ -2387,6 +2393,22 @@ class SplatterGUI(ThemedTk):
         )
         self.sbs_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.sbs_checkbox, "sbs_preview")
+
+        self.flip_horizontal_checkbox = ttk.Checkbutton(
+            checkbox_row,
+            text="Flip",
+            variable=self.flip_horizontal_var,
+            takefocus=False,
+            command=lambda: (
+                self.previewer.set_flip_horizontal(self.flip_horizontal_var.get())
+                if getattr(self, "previewer", None)
+                else None,
+                self._auto_save_current_sidecar(),
+            ),
+        )
+
+        self.flip_horizontal_checkbox.pack(side="left", padx=(24, 0))
+        self._create_hover_tooltip(self.flip_horizontal_checkbox, "flip_horizontal")
 
         all_settings_row += 1
 
@@ -2982,6 +3004,7 @@ class SplatterGUI(ThemedTk):
                 "preview_source": self.preview_source_var.get(),
                 "strict_ffmpeg_decode": bool(self.strict_ffmpeg_decode_var.get()),
                 "enable_global_norm": self.enable_global_norm_var.get(),
+                "flip_horizontal": self.flip_horizontal_var.get(),
             }
 
             # Resolve Border Percentages based on Mode
@@ -3734,6 +3757,7 @@ class SplatterGUI(ThemedTk):
             return None
 
         preview_source = self.preview_source_var.get()
+
         is_low_res_preview = preview_source in ["Splat Result(Low)", "Occlusion Mask(Low)"]
 
         # Determine the target resolution for the preview tensor
@@ -6238,6 +6262,10 @@ class SplatterGUI(ThemedTk):
 
         # 3. Bulk sync to GUI vars
         self.sidecar_manager.sync_to_gui(sidecar_config, self.__dict__, mapping=self.GUI_SIDECAR_VAR_MAP)
+
+        # Ensure flip horizontal is in sync with the previewer
+        if hasattr(self, "previewer") and self.previewer:
+            self.previewer.flip_horizontal = self.flip_horizontal_var.get()
 
         # 4. Handle Programmatic Updates (sliders with coupled logic)
         # Convergence

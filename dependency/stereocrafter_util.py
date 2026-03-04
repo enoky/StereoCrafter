@@ -18,21 +18,24 @@ import re
 
 VERSION = "26-02-26.2"
 
+
 def dump_debug_tensor(tensor_or_numpy, stage_name: str, session_id: str):
     import logging
+
     # Force enabled for this debug session
     # if not logging.getLogger().isEnabledFor(logging.DEBUG):
     #     return
     import os, cv2, numpy as np
     import torch
+
     base_dir = os.path.join("debug_dumps", session_id)
     os.makedirs(base_dir, exist_ok=True)
-    
+
     if isinstance(tensor_or_numpy, torch.Tensor):
         t = tensor_or_numpy.detach().cpu().numpy()
     else:
         t = np.copy(tensor_or_numpy)
-        
+
     while t.ndim > 4:
         t = t[0]
     if t.ndim == 4:
@@ -45,12 +48,12 @@ def dump_debug_tensor(tensor_or_numpy, stage_name: str, session_id: str):
         elif t.shape[-1] != 1 and t.shape[-1] != 3:
             # likely [Batch, H, W]
             t = t[0]
-        
+
     # If it's a depth map with high values (10-bit or 16-bit), normalize for view
     # Convert to float for safe math
     t_float = t.astype(np.float32)
     max_val = float(t_float.max())
-    
+
     if max_val > 1.1:
         if max_val <= 256.0:
             t_out = t_float
@@ -63,50 +66,47 @@ def dump_debug_tensor(tensor_or_numpy, stage_name: str, session_id: str):
     else:
         # 0.0-1.0 range
         t_out = t_float * 255.0
-        
+
     t_final = np.clip(t_out, 0, 255).astype(np.uint8)
-    
+
     if t_final.ndim == 3 and t_final.shape[-1] == 3:
         t_final = cv2.cvtColor(t_final, cv2.COLOR_RGB2BGR)
-        
+
     cv2.imwrite(os.path.join(base_dir, f"{stage_name}.png"), t_final)
 
 
 def log_debug_args(args_dict: dict, function_name: str, session_id: str):
     import os, json
+
     base_dir = os.path.join("debug_dumps", session_id)
     os.makedirs(base_dir, exist_ok=True)
-    
+
     # Filter for JSON serializable types
     serializable_args = {}
     for k, v in args_dict.items():
-        if hasattr(v, "shape"): # Tensors/Numpy
+        if hasattr(v, "shape"):  # Tensors/Numpy
             serializable_args[k] = f"Tensor/Array {list(v.shape)} {v.dtype}"
         elif isinstance(v, (str, int, float, bool)) or v is None:
             serializable_args[k] = v
         else:
             serializable_args[k] = str(v)
 
-            
     log_file = os.path.join(base_dir, f"{function_name}_args.json")
-    # Append or overwrite? Overwrite for now to match the PNG behavior if user prefers, 
+    # Append or overwrite? Overwrite for now to match the PNG behavior if user prefers,
     # but maybe separate files for Preview vs Render based on a key?
     # Let's use the task_name as part of the filename if available in args.
     task_name = args_dict.get("debug_task_name", "generic")
     filename = f"{function_name}_{task_name}_args.json"
-    
+
     with open(os.path.join(base_dir, filename), "w") as f:
         json.dump(serializable_args, f, indent=4)
-
 
 
 # --- Configure Logging ---
 # Only configure basic logging if no handlers are already set up.
 # This prevents duplicate log messages if a calling script configures logging independently.
 if not logging.root.handlers:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
     # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
@@ -174,14 +174,8 @@ class Tooltip:
         self.enter_id = self.widget.after(self.show_delay, self._display_tooltip)
 
 
-
-
-
 def apply_borders_to_frames(
-    left_border_pct: float,
-    right_border_pct: float,
-    original_left: torch.Tensor,
-    blended_right: torch.Tensor,
+    left_border_pct: float, right_border_pct: float, original_left: torch.Tensor, blended_right: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply borders to the left and right eye frames by zeroing out border pixels.
@@ -225,9 +219,7 @@ def apply_borders_to_frames(
     if right_px < 0:
         right_px = 0
     if left_px >= W or right_px >= W:
-        logger.warning(
-            f"Borders too large (left={left_px}, right={right_px}) for width={W}. Skipping."
-        )
+        logger.warning(f"Borders too large (left={left_px}, right={right_px}) for width={W}. Skipping.")
         return original_left, blended_right
 
     # Create copies to avoid modifying originals
@@ -247,9 +239,7 @@ def apply_borders_to_frames(
     return left_with_border, right_with_border
 
 
-def apply_color_transfer(
-    source_frame: torch.Tensor, target_frame: torch.Tensor
-) -> torch.Tensor:
+def apply_color_transfer(source_frame: torch.Tensor, target_frame: torch.Tensor) -> torch.Tensor:
     """
     Transfers the color statistics from the source_frame to the target_frame using LAB color space.
     Expects source_frame and target_frame in [C, H, W] float [0, 1] format on CPU.
@@ -258,12 +248,8 @@ def apply_color_transfer(
     try:
         # Ensure tensors are on CPU and convert to numpy arrays in HWC format
         # --- FIX: Squeeze the batch dimension if it exists ---
-        source_for_permute = (
-            source_frame.squeeze(0) if source_frame.dim() == 4 else source_frame
-        )
-        target_for_permute = (
-            target_frame.squeeze(0) if target_frame.dim() == 4 else target_frame
-        )
+        source_for_permute = source_frame.squeeze(0) if source_frame.dim() == 4 else source_frame
+        target_for_permute = target_frame.squeeze(0) if target_frame.dim() == 4 else target_frame
 
         source_np = source_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
         target_np = target_for_permute.permute(1, 2, 0).numpy()  # [H, W, C]
@@ -291,24 +277,19 @@ def apply_color_transfer(
 
         target_lab_float = target_lab.astype(np.float32)
         for i in range(3):  # For L, A, B channels
-            target_lab_float[:, :, i] = (
-                target_lab_float[:, :, i] - tgt_mean[i]
-            ) / tgt_std[i] * src_std[i] + src_mean[i]
+            target_lab_float[:, :, i] = (target_lab_float[:, :, i] - tgt_mean[i]) / tgt_std[i] * src_std[i] + src_mean[
+                i
+            ]
 
         adjusted_lab_uint8 = np.clip(target_lab_float, 0, 255).astype(np.uint8)
         adjusted_rgb = cv2.cvtColor(adjusted_lab_uint8, cv2.COLOR_LAB2RGB)
         return torch.from_numpy(adjusted_rgb).permute(2, 0, 1).float() / 255.0
     except Exception as e:
-        logger.error(
-            f"Error during color transfer: {e}. Returning original target frame.",
-            exc_info=True,
-        )
+        logger.error(f"Error during color transfer: {e}. Returning original target frame.", exc_info=True)
         return target_frame
 
 
-def apply_dubois_anaglyph(
-    left_rgb_np: np.ndarray, right_rgb_np: np.ndarray
-) -> np.ndarray:
+def apply_dubois_anaglyph(left_rgb_np: np.ndarray, right_rgb_np: np.ndarray) -> np.ndarray:
     """
     Apply Dubois least-squares anaglyph transformation.
     Expects input as HWC NumPy arrays (uint8, 0-255).
@@ -349,9 +330,7 @@ def apply_dubois_anaglyph(
     return (anaglyph_rgb * 255.0).astype(np.uint8)
 
 
-def apply_optimized_anaglyph(
-    left_rgb_np: np.ndarray, right_rgb_np: np.ndarray
-) -> np.ndarray:
+def apply_optimized_anaglyph(left_rgb_np: np.ndarray, right_rgb_np: np.ndarray) -> np.ndarray:
     """
     Apply Optimized Half-Color (minimal ghosting) anaglyph transformation.
     Expects input as HWC NumPy arrays (uint8, 0-255).
@@ -458,12 +437,7 @@ def create_single_slider_with_label_updater(
         update_label_only(actual_val)
 
     slider = ttk.Scale(
-        parent,
-        from_=0,
-        to=total_steps,
-        variable=internal_int_var,
-        orient="horizontal",
-        command=on_slider_move,
+        parent, from_=0, to=total_steps, variable=internal_int_var, orient="horizontal", command=on_slider_move
     )
     slider.grid(row=row, column=1, sticky="ew", padx=2)
 
@@ -551,9 +525,7 @@ def create_single_slider_with_label_updater(
             _pad = DEFAULT_TICK_TRACK_PAD_PCT
             _pad = max(0.0, min(0.49, float(_pad)))
             if total_steps:
-                _relx = _pad + (_default_notch / float(total_steps)) * (
-                    1.0 - 2.0 * _pad
-                )
+                _relx = _pad + (_default_notch / float(total_steps)) * (1.0 - 2.0 * _pad)
             else:
                 _relx = 0.0
             _relx = max(0.0, min(1.0, _relx))
@@ -701,18 +673,12 @@ def custom_dilate(
 
     for t in range(tensor_cpu.shape[0]):
         frame_float = tensor_cpu[t].numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
         effective_max_value = max(max_content_value, 1e-5)
 
         # MODIFIED: Use uint16 (65535) instead of uint8 (255)
         src_img = np.ascontiguousarray(
-            np.clip((frame_2d_raw / effective_max_value) * 65535, 0, 65535).astype(
-                np.uint16
-            )
+            np.clip((frame_2d_raw / effective_max_value) * 65535, 0, 65535).astype(np.uint16)
         )
 
         def do_op(k_w, k_h, img):
@@ -727,19 +693,13 @@ def custom_dilate(
         if is_x_int and is_y_int:
             final_float = do_op(kx_low, ky_low, src_img)
         elif not is_x_int and is_y_int:
-            final_float = (1.0 - tx) * do_op(kx_low, ky_low, src_img) + tx * do_op(
-                kx_high, ky_low, src_img
-            )
+            final_float = (1.0 - tx) * do_op(kx_low, ky_low, src_img) + tx * do_op(kx_high, ky_low, src_img)
         elif is_x_int and not is_y_int:
-            final_float = (1.0 - ty) * do_op(kx_low, ky_low, src_img) + ty * do_op(
-                kx_low, ky_high, src_img
-            )
+            final_float = (1.0 - ty) * do_op(kx_low, ky_low, src_img) + ty * do_op(kx_low, ky_high, src_img)
         else:
             r11, r12 = do_op(kx_low, ky_low, src_img), do_op(kx_low, ky_high, src_img)
             r21, r22 = do_op(kx_high, ky_low, src_img), do_op(kx_high, ky_high, src_img)
-            final_float = (1.0 - tx) * ((1.0 - ty) * r11 + ty * r12) + tx * (
-                (1.0 - ty) * r21 + ty * r22
-            )
+            final_float = (1.0 - tx) * ((1.0 - ty) * r11 + ty * r12) + tx * ((1.0 - ty) * r21 + ty * r22)
 
         # MODIFIED: Rescale back using 65535.0
         processed_raw = (final_float / 65535.0) * effective_max_value
@@ -749,10 +709,7 @@ def custom_dilate(
 
 
 def custom_dilate_left(
-    tensor: torch.Tensor,
-    kernel_size: float,
-    use_gpu: bool = False,
-    max_content_value: float = 1.0,
+    tensor: torch.Tensor, kernel_size: float, use_gpu: bool = False, max_content_value: float = 1.0
 ) -> torch.Tensor:
     """
     Directional (one-sided) 16-bit fractional dilation to the LEFT (negative X direction in image space).
@@ -806,26 +763,16 @@ def custom_dilate_left(
         anchor = (0, 0)
 
         if is_erosion:
-            return cv2.erode(src_img, kernel, anchor=anchor, iterations=1).astype(
-                np.float32
-            )
-        return cv2.dilate(src_img, kernel, anchor=anchor, iterations=1).astype(
-            np.float32
-        )
+            return cv2.erode(src_img, kernel, anchor=anchor, iterations=1).astype(np.float32)
+        return cv2.dilate(src_img, kernel, anchor=anchor, iterations=1).astype(np.float32)
 
     processed_frames = []
     for t_idx in range(tensor.shape[0]):
         frame_float = tensor[t_idx].cpu().numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
 
         frame_norm_2d = frame_2d_raw / effective_max_value
-        frame_cv_uint16 = np.ascontiguousarray(
-            np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16)
-        )
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
 
         src = frame_cv_uint16.astype(np.float32)
 
@@ -885,20 +832,14 @@ def custom_blur_left_masked(
     if not bool(changed.any().item()):
         return tensor_after
 
-    blurred = custom_blur(
-        tensor_after, k, k, use_gpu=use_gpu, max_content_value=max_content_value
-    )
+    blurred = custom_blur(tensor_after, k, k, use_gpu=use_gpu, max_content_value=max_content_value)
 
     # Apply only where changed; elsewhere keep tensor_after.
     return torch.where(changed, blurred, tensor_after)
 
 
 def custom_blur(
-    tensor: torch.Tensor,
-    kernel_size_x: int,
-    kernel_size_y: int,
-    use_gpu: bool = True,
-    max_content_value: float = 1.0,
+    tensor: torch.Tensor, kernel_size_x: int, kernel_size_y: int, use_gpu: bool = True, max_content_value: float = 1.0
 ) -> torch.Tensor:
     """
     Applies 16-bit Gaussian blur to prevent banding and maintain gamma accuracy.
@@ -917,18 +858,12 @@ def custom_blur(
     processed_frames = []
     for t in range(tensor.shape[0]):
         frame_float = tensor[t].cpu().numpy()
-        frame_2d_raw = (
-            frame_float[0]
-            if frame_float.shape[0] == 1
-            else np.transpose(frame_float, (1, 2, 0))
-        )
+        frame_2d_raw = frame_float[0] if frame_float.shape[0] == 1 else np.transpose(frame_float, (1, 2, 0))
         effective_max_value = max(max_content_value, 1e-5)
 
         # MODIFIED: Scale to 65535 for uint16 processing
         frame_norm_2d = frame_2d_raw / effective_max_value
-        frame_cv_uint16 = np.ascontiguousarray(
-            np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16)
-        )
+        frame_cv_uint16 = np.ascontiguousarray(np.clip(frame_norm_2d * 65535, 0, 65535).astype(np.uint16))
 
         # Apply Blur directly to 16-bit buffer
         processed_cv_uint16 = cv2.GaussianBlur(frame_cv_uint16, (k_x, k_y), 0)
@@ -953,16 +888,8 @@ def check_cuda_availability():
         logger.info("PyTorch reports CUDA is available.")
         try:
             # Further check with nvidia-smi for robustness
-            subprocess.run(
-                ["nvidia-smi"],
-                capture_output=True,
-                check=True,
-                timeout=5,
-                encoding="utf-8",
-            )
-            logger.debug(
-                "CUDA detected (nvidia-smi also ran successfully). NVENC can be used."
-            )
+            subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=5, encoding="utf-8")
+            logger.debug("CUDA detected (nvidia-smi also ran successfully). NVENC can be used.")
             CUDA_AVAILABLE = True
         except FileNotFoundError:
             logger.warning(
@@ -980,9 +907,7 @@ def check_cuda_availability():
             )
             CUDA_AVAILABLE = True  # Rely on PyTorch if nvidia-smi times out
         except Exception as e:
-            logger.error(
-                f"Unexpected error during nvidia-smi check: {e}. Relying on PyTorch's report for CUDA."
-            )
+            logger.error(f"Unexpected error during nvidia-smi check: {e}. Relying on PyTorch's report for CUDA.")
             CUDA_AVAILABLE = True  # Rely on PyTorch as a fallback
     else:
         logger.info("PyTorch reports CUDA is NOT available. NVENC will not be used.")
@@ -1032,16 +957,12 @@ def encode_frames_to_mp4(
     Returns True on success, False on failure or stop.
     """
     if total_output_frames == 0:
-        logger.warning(
-            f"No frames to encode for {os.path.basename(final_output_mp4_path)}. Skipping encoding."
-        )
+        logger.warning(f"No frames to encode for {os.path.basename(final_output_mp4_path)}. Skipping encoding.")
         if os.path.exists(temp_png_dir):
             shutil.rmtree(temp_png_dir)
         return False
 
-    logger.debug(
-        f"Starting FFmpeg encoding from PNG sequence to {os.path.basename(final_output_mp4_path)}"
-    )
+    logger.debug(f"Starting FFmpeg encoding from PNG sequence to {os.path.basename(final_output_mp4_path)}")
     logger.debug(f"Input PNG directory: {temp_png_dir}")
 
     ffmpeg_cmd = [
@@ -1064,24 +985,26 @@ def encode_frames_to_mp4(
     x265_params = []  # For specific x265 parameters
 
     nvenc_preset = "medium"  # Default NVENC preset (e.g., fast, medium, slow, quality)
-    default_nvenc_cq = (
-        "23"  # Constant Quality value for NVENC (lower is better quality)
-    )
+    default_nvenc_cq = "23"  # Constant Quality value for NVENC (lower is better quality)
+
+    # Ensure user_output_crf is an integer if provided as string
+    if user_output_crf is not None:
+        try:
+            user_output_crf = int(user_output_crf)
+        except (ValueError, TypeError):
+            user_output_crf = None
 
     # NEW: Apply user-specified CRF if provided
     if user_output_crf is not None and user_output_crf >= 0:
         logger.debug(f"Using user-specified output CRF: {user_output_crf}")
+
         default_cpu_crf = str(user_output_crf)
-        default_nvenc_cq = str(
-            user_output_crf
-        )  # Assume user CRF applies to NVENC CQ as well for simplicity
+        default_nvenc_cq = str(user_output_crf)  # Assume user CRF applies to NVENC CQ as well for simplicity
     else:
         logger.debug("Using auto-determined output CRF.")
 
     is_hdr_source = False
-    original_codec_name = (
-        video_stream_info.get("codec_name") if video_stream_info else None
-    )
+    original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
     original_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
 
     if video_stream_info:
@@ -1094,11 +1017,7 @@ def encode_frames_to_mp4(
 
     is_original_10bit_or_higher = False
     if original_pix_fmt:
-        if (
-            "10" in original_pix_fmt
-            or "12" in original_pix_fmt
-            or "16" in original_pix_fmt
-        ):
+        if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
             is_original_10bit_or_higher = True
 
     if is_hdr_source:
@@ -1108,22 +1027,14 @@ def encode_frames_to_mp4(
             logger.debug("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = (
-                "28"  # For CPU x265 (HDR often needs higher CRF to look "good")
-            )
+            default_cpu_crf = "28"  # For CPU x265 (HDR often needs higher CRF to look "good")
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
-            x265_params.append(
-                f"master-display={video_stream_info['mastering_display_metadata']}"
-            )
+            x265_params.append(f"master-display={video_stream_info['mastering_display_metadata']}")
         if video_stream_info.get("max_content_light_level"):
-            x265_params.append(
-                f"max-cll={video_stream_info['max_content_light_level']}"
-            )
+            x265_params.append(f"max-cll={video_stream_info['max_content_light_level']}")
     elif is_original_10bit_or_higher and original_codec_name in ("hevc", "prores", "dnxhd", "dnxhr"):
-        logger.debug(
-            "Detected SDR 10-bit HEVC source. Targeting HEVC 10-bit SDR output."
-        )
+        logger.debug("Detected SDR 10-bit HEVC source. Targeting HEVC 10-bit SDR output.")
         output_codec = "libx265"
         if CUDA_AVAILABLE:
             output_codec = "hevc_nvenc"
@@ -1133,9 +1044,7 @@ def encode_frames_to_mp4(
             default_cpu_crf = "24"  # For CPU x265 (SDR 10-bit)
         output_profile = "main10"
     else:  # Default to H.264 8-bit, or if no info
-        logger.debug(
-            "Detected SDR (8-bit H.264 or other) source or no specific info. Targeting H.264 8-bit."
-        )
+        logger.debug("Detected SDR (8-bit H.264 or other) source or no specific info. Targeting H.264 8-bit.")
         output_codec = "libx264"
         if CUDA_AVAILABLE:
             output_codec = "h264_nvenc"
@@ -1165,13 +1074,9 @@ def encode_frames_to_mp4(
     # Add general color flags if present in source info
     if video_stream_info:
         if video_stream_info.get("color_primaries"):
-            ffmpeg_cmd.extend(
-                ["-color_primaries", video_stream_info["color_primaries"]]
-            )
+            ffmpeg_cmd.extend(["-color_primaries", video_stream_info["color_primaries"]])
         if video_stream_info.get("transfer_characteristics"):
-            ffmpeg_cmd.extend(
-                ["-color_trc", video_stream_info["transfer_characteristics"]]
-            )
+            ffmpeg_cmd.extend(["-color_trc", video_stream_info["transfer_characteristics"]])
         if video_stream_info.get("color_space"):
             ffmpeg_cmd.extend(["-colorspace", video_stream_info["color_space"]])
         # Ensure color range metadata is tagged when available (metadata-only)
@@ -1203,30 +1108,18 @@ def encode_frames_to_mp4(
 
     try:
         process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
+            ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8"
         )
 
         # --- NEW: Start threads to read stdout and stderr to prevent deadlock ---
-        stdout_thread = threading.Thread(
-            target=_read_ffmpeg_output,
-            args=(process.stdout, logging.DEBUG),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_read_ffmpeg_output, args=(process.stderr, logging.INFO), daemon=True
-        )
+        stdout_thread = threading.Thread(target=_read_ffmpeg_output, args=(process.stdout, logging.DEBUG), daemon=True)
+        stderr_thread = threading.Thread(target=_read_ffmpeg_output, args=(process.stderr, logging.INFO), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
 
         while process.poll() is None:  # While process is still running
             if stop_event and stop_event.is_set():
-                logger.warning(
-                    f"FFmpeg encoding stopped by user for {os.path.basename(final_output_mp4_path)}."
-                )
+                logger.warning(f"FFmpeg encoding stopped by user for {os.path.basename(final_output_mp4_path)}.")
                 process.terminate()  # or process.kill()
                 process.wait(timeout=5)
                 return False
@@ -1246,19 +1139,13 @@ def encode_frames_to_mp4(
             logger.debug(f"Successfully encoded video to {final_output_mp4_path}")
 
     except FileNotFoundError:
-        logger.error(
-            "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH."
-        )
+        logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
         return False
     except subprocess.CalledProcessError as e:
-        logger.error(
-            f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)}: {e.stderr}\n{e.stdout}"
-        )
+        logger.error(f"FFmpeg encoding failed for {os.path.basename(final_output_mp4_path)}: {e.stderr}\n{e.stdout}")
         return False
     except subprocess.TimeoutExpired as e:
-        logger.error(
-            f"FFmpeg encoding timed out for {os.path.basename(final_output_mp4_path)}: {e.stderr}"
-        )
+        logger.error(f"FFmpeg encoding timed out for {os.path.basename(final_output_mp4_path)}: {e.stderr}")
         process.kill()
         process.wait()  # Ensure the process is cleaned up
         return False
@@ -1275,23 +1162,17 @@ def encode_frames_to_mp4(
                 shutil.rmtree(temp_png_dir)
                 logger.debug(f"Cleaned up temporary directory: {temp_png_dir}")
             except Exception as e:
-                logger.error(
-                    f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}"
-                )
+                logger.error(f"Error cleaning up temporary PNG directory {temp_png_dir}: {e}")
 
     # Write sidecar JSON if data is provided
     if sidecar_json_data:
-        output_sidecar_path = (
-            f"{os.path.splitext(final_output_mp4_path)[0]}{output_sidecar_ext}"
-        )
+        output_sidecar_path = f"{os.path.splitext(final_output_mp4_path)[0]}{output_sidecar_ext}"
         try:
             with open(output_sidecar_path, "w", encoding="utf-8") as f:
                 json.dump(sidecar_json_data, f, indent=4)
             logger.info(f"Created output sidecar file: {output_sidecar_path}")
         except Exception as e:
-            logger.error(
-                f"Error creating output sidecar file '{output_sidecar_path}': {e}"
-            )
+            logger.error(f"Error creating output sidecar file '{output_sidecar_path}': {e}")
             # This is not a critical error for video encoding, so don't return False here.
 
     logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
@@ -1324,17 +1205,10 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     try:
         # Check if ffprobe is available without showing a messagebox
         subprocess.run(
-            ["ffprobe", "-version"],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=10,
+            ["ffprobe", "-version"], check=True, capture_output=True, text=True, encoding="utf-8", timeout=10
         )
     except FileNotFoundError:
-        logger.error(
-            "ffprobe not found. Please ensure FFmpeg is installed and in your system PATH."
-        )
+        logger.error("ffprobe not found. Please ensure FFmpeg is installed and in your system PATH.")
         return None
     except subprocess.CalledProcessError as e:
         logger.error(f"Error running ffprobe check: {e.stderr}")
@@ -1344,25 +1218,14 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            timeout=500,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8", timeout=500)
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as e:
             # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
             # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
             # "Expecting ',' delimiter: line 13 column 40 (char 229)"
-            repaired = re.sub(
-                r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)',
-                r"\1,\2\3",
-                result.stdout,
-            )
+            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r"\1,\2\3", result.stdout)
             data = json.loads(repaired)
 
         stream_info = {}
@@ -1385,42 +1248,24 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             # HDR mastering display and CLL metadata (often in side_data_list, but sometimes also directly in stream)
             # Prioritize stream-level if available, otherwise check side_data_list
             if "mastering_display_metadata" in s:
-                stream_info["mastering_display_metadata"] = s[
-                    "mastering_display_metadata"
-                ]
+                stream_info["mastering_display_metadata"] = s["mastering_display_metadata"]
             if "max_content_light_level" in s:
                 stream_info["max_content_light_level"] = s["max_content_light_level"]
 
         # Check side_data_list if stream-level properties weren't found or for additional data
         if "side_data_list" in data:
             for sd in data["side_data_list"]:
-                if (
-                    "mastering_display_metadata" in sd
-                    and "mastering_display_metadata" not in stream_info
-                ):
-                    stream_info["mastering_display_metadata"] = sd[
-                        "mastering_display_metadata"
-                    ]
-                if (
-                    "max_content_light_level" in sd
-                    and "max_content_light_level" not in stream_info
-                ):
-                    stream_info["max_content_light_level"] = sd[
-                        "max_content_light_level"
-                    ]
+                if "mastering_display_metadata" in sd and "mastering_display_metadata" not in stream_info:
+                    stream_info["mastering_display_metadata"] = sd["mastering_display_metadata"]
+                if "max_content_light_level" in sd and "max_content_light_level" not in stream_info:
+                    stream_info["max_content_light_level"] = sd["max_content_light_level"]
 
         # Filter out empty strings/None/N/A values
-        filtered_info = {
-            k: v
-            for k, v in stream_info.items()
-            if v and v not in ["N/A", "und", "unknown"]
-        }
+        filtered_info = {k: v for k, v in stream_info.items() if v and v not in ["N/A", "und", "unknown"]}
         return filtered_info if filtered_info else None
 
     except subprocess.CalledProcessError as e:
-        logger.error(
-            f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}"
-        )
+        logger.error(f"ffprobe failed for {video_path} (return code {e.returncode}):\n{e.stderr}")
         return None
     except subprocess.TimeoutExpired:
         logger.error(f"ffprobe timed out for {video_path}.")
@@ -1430,10 +1275,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         logger.error(f"Raw ffprobe stdout: {result.stdout}")
         return None
     except Exception as e:
-        logger.error(
-            f"An unexpected error occurred with ffprobe for {video_path}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"An unexpected error occurred with ffprobe for {video_path}: {e}", exc_info=True)
         return None
 
 
@@ -1446,9 +1288,7 @@ def release_cuda_memory():
         gc.collect()
         logger.debug("Python garbage collector invoked.")
     except Exception as e:
-        logger.error(
-            f"Error releasing VRAM or during garbage collection: {e}", exc_info=True
-        )
+        logger.error(f"Error releasing VRAM or during garbage collection: {e}", exc_info=True)
 
 
 def read_video_frames_decord(
@@ -1478,39 +1318,20 @@ def read_video_frames_decord(
     height_for_decord = original_height
     width_for_decord = original_width
 
-    if (
-        set_res_width is not None
-        and set_res_width > 0
-        and set_res_height is not None
-        and set_res_height > 0
-    ):
+    if set_res_width is not None and set_res_width > 0 and set_res_height is not None and set_res_height > 0:
         height_for_decord = set_res_height
         width_for_decord = set_res_width
-        logger.info(
-            f"Targeting specific resolution for decord: {width_for_decord}x{height_for_decord}"
-        )
+        logger.info(f"Targeting specific resolution for decord: {width_for_decord}x{height_for_decord}")
     else:
-        logger.info(
-            f"Using original video resolution for decord: {original_width}x{original_height}"
-        )
+        logger.info(f"Using original video resolution for decord: {original_width}x{original_height}")
 
     # Initialize VideoReader with potential target resolution
-    vid_reader = VideoReader(
-        video_path, ctx=decord_ctx, width=width_for_decord, height=height_for_decord
-    )
+    vid_reader = VideoReader(video_path, ctx=decord_ctx, width=width_for_decord, height=height_for_decord)
     num_total_frames = len(vid_reader)
 
     if num_total_frames == 0:
         logger.warning(f"No frames found in {video_path}.")
-        return (
-            np.empty((0, 0, 0, 0), dtype=np.float32),
-            0.0,
-            original_height,
-            original_width,
-            0,
-            0,
-            video_stream_info,
-        )
+        return (np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info)
 
     # Determine FPS: Use ffprobe's r_frame_rate if reliable, otherwise decord's avg_fps, or target_fps
     actual_output_fps = 0.0
@@ -1521,52 +1342,30 @@ def read_video_frames_decord(
         try:
             r_frame_rate_str = video_stream_info["r_frame_rate"].split("/")
             if len(r_frame_rate_str) == 2:
-                actual_output_fps = float(r_frame_rate_str[0]) / float(
-                    r_frame_rate_str[1]
-                )
+                actual_output_fps = float(r_frame_rate_str[0]) / float(r_frame_rate_str[1])
             else:
                 actual_output_fps = float(r_frame_rate_str[0])
-            logger.info(
-                f"Using ffprobe FPS: {actual_output_fps:.2f} for {os.path.basename(video_path)}"
-            )
+            logger.info(f"Using ffprobe FPS: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
         except (ValueError, ZeroDivisionError):
             actual_output_fps = vid_reader.get_avg_fps()
-            logger.warning(
-                f"Failed to parse ffprobe FPS. Falling back to Decord avg_fps: {actual_output_fps:.2f}"
-            )
+            logger.warning(f"Failed to parse ffprobe FPS. Falling back to Decord avg_fps: {actual_output_fps:.2f}")
     else:
         actual_output_fps = vid_reader.get_avg_fps()
-        logger.info(
-            f"Using Decord avg_fps: {actual_output_fps:.2f} for {os.path.basename(video_path)}"
-        )
+        logger.info(f"Using Decord avg_fps: {actual_output_fps:.2f} for {os.path.basename(video_path)}")
 
     stride = max(round(vid_reader.get_avg_fps() / actual_output_fps), 1)
     frames_idx = list(range(0, num_total_frames, stride))
 
     if process_length != -1 and process_length < len(frames_idx):
         frames_idx = frames_idx[:process_length]
-        logger.info(
-            f"Limiting to {len(frames_idx)} frames based on process_length parameter."
-        )
+        logger.info(f"Limiting to {len(frames_idx)} frames based on process_length parameter.")
 
     if not frames_idx:
-        logger.warning(
-            "No frames selected for processing after stride and process_length filters."
-        )
-        return (
-            np.empty((0, 0, 0, 0), dtype=np.float32),
-            0.0,
-            original_height,
-            original_width,
-            0,
-            0,
-            video_stream_info,
-        )
+        logger.warning("No frames selected for processing after stride and process_length filters.")
+        return (np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height, original_width, 0, 0, video_stream_info)
 
     frames_batch = vid_reader.get_batch(frames_idx)
-    frames_numpy = (
-        frames_batch.asnumpy().astype("float32") / 255.0
-    )  # Normalize to 0-1 float32
+    frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0  # Normalize to 0-1 float32
 
     # Get actual processed height/width after Decord (might differ from target if source is smaller)
     actual_processed_height, actual_processed_width = frames_numpy.shape[1:3]
@@ -1614,9 +1413,7 @@ def start_ffmpeg_pipe_process(
 
     Returns the Popen object on success, None on failure.
     """
-    logger.debug(
-        f"Starting FFmpeg pipe process for {os.path.basename(final_output_mp4_path)}"
-    )
+    logger.debug(f"Starting FFmpeg pipe process for {os.path.basename(final_output_mp4_path)}")
 
     # --- NEW: Padding Logic ---
     vf_options = []
@@ -1626,11 +1423,7 @@ def start_ffmpeg_pipe_process(
     if pad_to_16_9:
         # --- FIX: Calculate padding based on single-eye width ---
         # Determine the width of a single eye based on the output format
-        if output_format_str in [
-            "Full SBS (Left-Right)",
-            "Full SBS Cross-eye (Right-Left)",
-            "Double SBS",
-        ]:
+        if output_format_str in ["Full SBS (Left-Right)", "Full SBS Cross-eye (Right-Left)", "Double SBS"]:
             single_eye_width = content_width // 2
         else:  # Half SBS, Anaglyph, Right-Eye Only
             single_eye_width = content_width
@@ -1644,9 +1437,7 @@ def start_ffmpeg_pipe_process(
         if target_16_9_height > content_height:
             output_height = target_16_9_height
             # The output width for padding is always the full content width
-            vf_options.append(
-                f"pad=w={output_width}:h={output_height}:x=0:y=(oh-ih)/2:color=black"
-            )
+            vf_options.append(f"pad=w={output_width}:h={output_height}:x=0:y=(oh-ih)/2:color=black")
             logger.debug(
                 f"Padding enabled. Content: {content_width}x{content_height}, Container: {output_width}x{output_height}"
             )
@@ -1681,34 +1472,35 @@ def start_ffmpeg_pipe_process(
     nvenc_preset = "medium"
     default_nvenc_cq = "23"
 
+    # Ensure user_output_crf is an integer if provided as string
+    if user_output_crf is not None:
+        try:
+            user_output_crf = int(user_output_crf)
+        except (ValueError, TypeError):
+            user_output_crf = None
+
     if user_output_crf is not None and user_output_crf >= 0:
         logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
+
         default_cpu_crf = str(user_output_crf)
         default_nvenc_cq = str(user_output_crf)
     else:
         logger.debug("Using auto-determined output CRF.")
 
     is_hdr_source = False
-    original_codec_name = (
-        video_stream_info.get("codec_name") if video_stream_info else None
-    )
+    original_codec_name = video_stream_info.get("codec_name") if video_stream_info else None
     original_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
 
     if video_stream_info:
-        if (
-            video_stream_info.get("color_primaries") == "bt2020"
-            and video_stream_info.get("transfer_characteristics") in ("smpte2084", "arib-std-b67")
-        ):
+        if video_stream_info.get("color_primaries") == "bt2020" and video_stream_info.get(
+            "transfer_characteristics"
+        ) in ("smpte2084", "arib-std-b67"):
             is_hdr_source = True
             logger.debug("Detected HDR source (PQ or HLG). Targeting HEVC 10-bit HDR output.")
 
     is_original_10bit_or_higher = False
     if original_pix_fmt:
-        if (
-            "10" in original_pix_fmt
-            or "12" in original_pix_fmt
-            or "16" in original_pix_fmt
-        ):
+        if "10" in original_pix_fmt or "12" in original_pix_fmt or "16" in original_pix_fmt:
             is_original_10bit_or_higher = True
 
     if is_hdr_source:
@@ -1720,13 +1512,9 @@ def start_ffmpeg_pipe_process(
             default_cpu_crf = "28"
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
-            x265_params.append(
-                f"master-display={video_stream_info['mastering_display_metadata']}"
-            )
+            x265_params.append(f"master-display={video_stream_info['mastering_display_metadata']}")
         if video_stream_info.get("max_content_light_level"):
-            x265_params.append(
-                f"max-cll={video_stream_info['max_content_light_level']}"
-            )
+            x265_params.append(f"max-cll={video_stream_info['max_content_light_level']}")
     elif is_original_10bit_or_higher and original_codec_name in ("hevc", "prores", "dnxhd", "dnxhr"):
         output_codec = "libx265"
         if CUDA_AVAILABLE:
@@ -1805,18 +1593,33 @@ def start_ffmpeg_pipe_process(
     if t_raw not in ("", "auto", "none"):
         if output_codec == "libx264":
             x264_map = {
-                "film": "film", "animation": "animation", "grain": "grain",
-                "still image": "stillimage", "stillimage": "stillimage",
-                "psnr": "psnr", "ssim": "ssim",
-                "fast decode": "fastdecode", "fastdecode": "fastdecode", "fast-decode": "fastdecode",
-                "zero latency": "zerolatency", "zerolatency": "zerolatency", "zero-latency": "zerolatency",
+                "film": "film",
+                "animation": "animation",
+                "grain": "grain",
+                "still image": "stillimage",
+                "stillimage": "stillimage",
+                "psnr": "psnr",
+                "ssim": "ssim",
+                "fast decode": "fastdecode",
+                "fastdecode": "fastdecode",
+                "fast-decode": "fastdecode",
+                "zero latency": "zerolatency",
+                "zerolatency": "zerolatency",
+                "zero-latency": "zerolatency",
             }
             cpu_tune = x264_map.get(t_raw, None)
         elif output_codec == "libx265":
             x265_map = {
-                "grain": "grain", "animation": "animation", "psnr": "psnr", "ssim": "ssim",
-                "fast decode": "fast-decode", "fastdecode": "fast-decode", "fast-decode": "fast-decode",
-                "zero latency": "zero-latency", "zerolatency": "zero-latency", "zero-latency": "zero-latency",
+                "grain": "grain",
+                "animation": "animation",
+                "psnr": "psnr",
+                "ssim": "ssim",
+                "fast decode": "fast-decode",
+                "fastdecode": "fast-decode",
+                "fast-decode": "fast-decode",
+                "zero latency": "zero-latency",
+                "zerolatency": "zero-latency",
+                "zero-latency": "zero-latency",
             }
             cpu_tune = x265_map.get(t_raw, None)
 
@@ -1863,35 +1666,19 @@ def start_ffmpeg_pipe_process(
     # --- MODIFIED: Add default color space tags for robustness ---
     # Use a dictionary's .get() with a default value to prevent errors if tags are missing.
     # The most common standard for SDR HD video is BT.709.
-    color_primaries = (
-        video_stream_info.get("color_primaries", "bt709")
-        if video_stream_info is not None
-        else "bt709"
-    )
+    color_primaries = video_stream_info.get("color_primaries", "bt709") if video_stream_info is not None else "bt709"
     transfer_characteristics = (
-        video_stream_info.get("transfer_characteristics", "bt709")
-        if video_stream_info is not None
-        else "bt709"
+        video_stream_info.get("transfer_characteristics", "bt709") if video_stream_info is not None else "bt709"
     )
-    color_space = (
-        video_stream_info.get("color_space", "bt709")
-        if video_stream_info is not None
-        else "bt709"
-    )
+    color_space = video_stream_info.get("color_space", "bt709") if video_stream_info is not None else "bt709"
 
     # --- DEBUG: Dump ffprobe-derived color metadata + encoding flags (Hi/Lo parity checks) ---
     # Non-invasive: only logs + tags the spawned process with a dict.
     try:
         src_pix_fmt = video_stream_info.get("pix_fmt") if video_stream_info else None
         src_range = video_stream_info.get("color_range") if video_stream_info else None
-        src_prim = (
-            video_stream_info.get("color_primaries") if video_stream_info else None
-        )
-        src_trc = (
-            video_stream_info.get("transfer_characteristics")
-            if video_stream_info
-            else None
-        )
+        src_prim = video_stream_info.get("color_primaries") if video_stream_info else None
+        src_trc = video_stream_info.get("transfer_characteristics") if video_stream_info else None
         src_matrix = video_stream_info.get("color_space") if video_stream_info else None
     except Exception:
         src_pix_fmt = src_range = src_prim = src_trc = src_matrix = None
@@ -1946,44 +1733,29 @@ def start_ffmpeg_pipe_process(
     logger.debug(f"FFmpeg pipe command: {' '.join(ffmpeg_cmd)}")
 
     try:
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             process.sc_encode_flags = sc_encode_flags  # type: ignore[attr-defined]
         except Exception:
             pass
         return process
     except FileNotFoundError:
-        logger.error(
-            "FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH."
-        )
+        logger.error("FFmpeg not found. Please ensure FFmpeg is installed and in your system PATH.")
         return None
     except Exception as e:
         logger.error(f"Failed to start FFmpeg pipe process: {e}", exc_info=True)
         return None
 
+
 def start_ffmpeg_pipe_process_dnxhr(
-    content_width: int,
-    content_height: int,
-    final_output_mov_path: str,
-    fps: float,
-    dnxhr_profile: str = "HQX",
+    content_width: int, content_height: int, final_output_mov_path: str, fps: float, dnxhr_profile: str = "HQX"
 ) -> Optional[subprocess.Popen]:
     """
     Starts an FFmpeg pipe process for DNxHR (Resolve-friendly intermediate).
     Input: raw 16-bit BGR frames via stdin (bgr48le).
     Output: .mov DNxHR (default HQX 10-bit 4:2:2).
     """
-    profile_map = {
-        "SQ": "dnxhr_sq",
-        "HQ": "dnxhr_hq",
-        "HQX": "dnxhr_hqx",
-        "444": "dnxhr_444",
-    }
+    profile_map = {"SQ": "dnxhr_sq", "HQ": "dnxhr_hq", "HQX": "dnxhr_hqx", "444": "dnxhr_444"}
     prof_key = (dnxhr_profile or "HQX").strip().upper()
     # Accept friendly labels like "HQX (10-bit 4:2:2)"
     try:
@@ -2030,18 +1802,9 @@ def start_ffmpeg_pipe_process_dnxhr(
 
     logger.debug(f"Starting DNxHR pipe: {' '.join(ffmpeg_cmd)}")
     try:
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            process.sc_encode_flags = {
-                "codec": "dnxhd",
-                "profile": ff_prof,
-                "pix_fmt": out_pix_fmt,
-            }  # type: ignore[attr-defined]
+            process.sc_encode_flags = {"codec": "dnxhd", "profile": ff_prof, "pix_fmt": out_pix_fmt}  # type: ignore[attr-defined]
         except Exception:
             pass
         return process
@@ -2052,6 +1815,7 @@ def start_ffmpeg_pipe_process_dnxhr(
         logger.error(f"Failed to start DNxHR pipe: {e}", exc_info=True)
         return None
 
+
 # --- Sidecar Management (Proxies for core.common.sidecar_manager) ---
 # Moved to end of file to break circular imports between core and util
 from core.common.sidecar_manager import (
@@ -2059,5 +1823,5 @@ from core.common.sidecar_manager import (
     find_sidecar_file,
     find_sidecar_in_folder,
     read_clip_sidecar,
-    find_video_by_core_name
+    find_video_by_core_name,
 )

@@ -151,6 +151,7 @@ class VideoPreviewer(ttk.Frame):
         self._dp_total_max_seen = None
         self._dp_total_max_video_index = None
         self._dp_signature = None
+        self.flip_horizontal = False  # Flip preview horizontally
 
         self._create_widgets()
 
@@ -1637,6 +1638,15 @@ class VideoPreviewer(ttk.Frame):
                 else:
                     frame_np = reader.get_batch([frame_idx]).asnumpy()
                     frame_tensor = torch.from_numpy(frame_np).permute(0, 3, 1, 2).float() / 255.0
+
+                # Apply early flip if enabled (check params first, then internal attribute)
+                flip_enabled = self.current_params.get("flip_horizontal")
+                if flip_enabled is None:
+                    flip_enabled = getattr(self, "flip_horizontal", False)
+
+                if flip_enabled:
+                    frame_tensor = torch.flip(frame_tensor, dims=[3])
+
                 source_frames[key] = frame_tensor  # Keep batch dim: [1, C, H, W]
 
         # Call the user-provided processing function
@@ -1932,6 +1942,12 @@ class VideoPreviewer(ttk.Frame):
             self.update_preview()
         except Exception:
             pass
+
+    def set_flip_horizontal(self, enabled: bool):
+        """Enable or disable horizontal flipping of the preview."""
+        if self.flip_horizontal != enabled:
+            self.flip_horizontal = enabled
+            self.update_preview()
 
     def set_depth_pop_metrics(
         self, depth_pct: Optional[float], pop_pct: Optional[float], signature: Optional[str] = None

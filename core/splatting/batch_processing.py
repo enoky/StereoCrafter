@@ -105,7 +105,9 @@ class ProcessingSettings:
     low_res_height: int = 1080
     low_res_batch_size: int = 50
     dual_output: bool = False
+    flip_horizontal: bool = False
     strict_ffmpeg_decode: bool = False
+
     output_name_suffix: str = ""
     zero_disparity_anchor: float = 0.5
     enable_global_norm: bool = False
@@ -505,6 +507,7 @@ class BatchProcessor:
                 depth_dilate_left=vid_settings["depth_dilate_left"],
                 depth_blur_left=vid_settings["depth_blur_left"],
                 depth_blur_left_mix=vid_settings["depth_blur_left_mix"],
+                flip_horizontal=vid_settings["flip_horizontal"],
                 skip_lowres_preproc=settings.skip_lowres_preproc,
                 color_tags_mode=settings.color_tags_mode,
                 encoding_options=encoding_options,
@@ -565,6 +568,7 @@ class BatchProcessor:
             "depth_dilate_left": sidecar_data.get("depth_dilate_left", settings.depth_dilate_left),
             "depth_blur_left": sidecar_data.get("depth_blur_left", settings.depth_blur_left),
             "depth_blur_left_mix": sidecar_data.get("depth_blur_left_mix", settings.depth_blur_left_mix),
+            "flip_horizontal": sidecar_data.get("flip_horizontal", settings.flip_horizontal),
             "anchor_source": "Sidecar" if "convergence_plane" in sidecar_data else "GUI",
             "enable_global_norm": settings.enable_global_norm and ("convergence_plane" not in sidecar_data),  # Policy
         }
