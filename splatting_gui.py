@@ -86,7 +86,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from dependency.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-02.1"
+GUI_VERSION = "26-03-04.1"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import

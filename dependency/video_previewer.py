@@ -26,7 +26,7 @@ except Exception:
 # Import release_cuda_memory from the util module
 from .stereocrafter_util import Tooltip, logger, release_cuda_memory, get_video_stream_info
 
-VERSION = "26-03-02.0"
+VERSION = "26-03-04.1"
 
 
 class VideoPreviewer(ttk.Frame):
