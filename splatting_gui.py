@@ -29,7 +29,7 @@ import math
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
 # not the depth values used for splatting.
-DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = False
+DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
 DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
 DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
 
