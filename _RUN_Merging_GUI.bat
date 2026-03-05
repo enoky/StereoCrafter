@@ -7,3 +7,4 @@ set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\libnvvp;%PATH%"
 
 call .venv\Scripts\activate.bat
 python merging_gui.py
+pause

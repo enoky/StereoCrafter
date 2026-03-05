@@ -33,11 +33,11 @@ def move_single_file(
         if os.path.exists(dest_path):
             os.remove(src_path)
             if logger:
-                logger.debug(f"Removed source file (destination exists): {os.path.basename(src_path)}")
+                logger.info(f"Removed source file (destination exists): {os.path.basename(src_path)}")
         else:
             shutil.move(src_path, finished_dir)
             if logger:
-                logger.debug(f"Moved {os.path.basename(src_path)} to {finished_dir}")
+                logger.info(f"Moved {os.path.basename(src_path)} to {finished_dir}")
 
         return True, None
     except PermissionError as e:
@@ -259,11 +259,11 @@ def restore_finished_files(
                 if os.path.exists(dest_path):
                     os.remove(src_path)
                     if logger:
-                        logger.debug(f"Removed duplicate from finished: {filename}")
+                        logger.info(f"Removed duplicate from finished: {filename}")
                 else:
                     shutil.move(src_path, input_folder)
                     if logger:
-                        logger.debug(f"Restored '{filename}' from finished to {input_folder}")
+                        logger.info(f"Restored '{filename}' from finished to {input_folder}")
                 restored_count += 1
             except Exception as e:
                 error_msg = str(e)

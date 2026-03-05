@@ -44,6 +44,21 @@ class RenderProcessor:
         self.progress_queue = progress_queue
         self._color_encode_flags = {}
 
+    def _read_ffmpeg_output(self, pipe, log_level):
+        """Helper method to read FFmpeg's output without blocking."""
+        try:
+            # Use iter to read line by line
+            for line in iter(pipe.readline, b""):  # Read bytes until an empty byte string
+                if line:
+                    # Decode bytes to string for logging, ignoring potential decoding errors
+                    msg = line.decode("utf-8", errors="ignore").strip()
+                    logger.log(log_level, f"FFmpeg: {msg}")
+        except Exception as e:
+            logger.error(f"Error reading FFmpeg pipe: {e}")
+        finally:
+            if pipe:
+                pipe.close()
+
     def render_video(
         self,
         input_video_reader: VideoReader,
@@ -131,7 +146,8 @@ class RenderProcessor:
         grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
         suffix = "_splatted2" if dual_output else "_splatted4"
         res_suffix = f"_{width}"
-        final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
+        final_output_video_path = os.path.normpath(f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4")
+        logger.info(f"==> Target Output Path: {final_output_video_path}")
 
         task_name = "LowRes" if is_low_res_task else "HiRes"
         self._log_color_metadata(video_stream_info, task_name)
@@ -206,6 +222,17 @@ class RenderProcessor:
                 if ffmpeg_process is None:
                     logger.error("Failed to start FFmpeg pipe. Aborting splatting task.")
                     return False
+
+            # --- NEW: Start threads to read FFmpeg output to prevent deadlock ---
+            if ffmpeg_process:
+                stdout_thread = threading.Thread(
+                    target=self._read_ffmpeg_output, args=(ffmpeg_process.stdout, logging.DEBUG), daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=self._read_ffmpeg_output, args=(ffmpeg_process.stderr, logging.INFO), daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
 
             self._compare_encoding_flags(ffmpeg_process, task_name)
 
@@ -374,18 +401,39 @@ class RenderProcessor:
                 try:
                     ffmpeg_process.stdin.close()
                     ffmpeg_process.wait(timeout=30)
+                    logger.info(f"FFmpeg process finished with return code {ffmpeg_process.returncode}")
+                    if ffmpeg_process.returncode != 0:
+                        encoding_successful = False
                 except Exception as e:
                     logger.warning(f"Error closing FFmpeg: {e}")
+                    encoding_successful = False
 
             if use_dnxhr_split and splat_process:
                 try:
                     splat_process.stdin.close()
                     splat_process.wait(timeout=30)
+                    if splat_process.returncode != 0:
+                        logger.error(f"DNxHR splat pipe failed with return code {splat_process.returncode}")
+                        encoding_successful = False
                 except Exception as e:
                     logger.warning(f"Error closing DNxHR pipe: {e}")
+                    encoding_successful = False
 
             del stereo_projector
             release_cuda_memory()
+
+        # --- Final Verification ---
+        if not is_test_mode and encoding_successful:
+            if os.path.exists(final_output_video_path):
+                file_size = os.path.getsize(final_output_video_path)
+                if file_size > 0:
+                    logger.debug(f"==> VERIFIED: Output file created successfully at {final_output_video_path} ({file_size / (1024*1024):.2f} MB)")
+                else:
+                    logger.error(f"==> ERROR: Output file exists but is EMPTY (0 bytes) at {final_output_video_path}")
+                    encoding_successful = False
+            else:
+                logger.error(f"==> ERROR: Output file was NOT FOUND at {final_output_video_path} despite FFmpeg returning 0.")
+                encoding_successful = False
 
         return encoding_successful
 
@@ -393,7 +441,7 @@ class RenderProcessor:
         if not info:
             return
         try:
-            logger.debug(
+            logger.info(
                 f"[COLOR_META][{task_name}] input ffprobe: "
                 f"pix_fmt={info.get('pix_fmt')}, range={info.get('color_range')}, "
                 f"primaries={info.get('color_primaries')}, trc={info.get('transfer_characteristics')}, "

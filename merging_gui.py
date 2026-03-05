@@ -17,119 +17,37 @@ import logging
 import time
 import queue
 from dependency.stereocrafter_util import (
-    Tooltip,
     logger,
     get_video_stream_info,
-    draw_progress_bar,
-    release_cuda_memory,
     set_util_logger_level,
     start_ffmpeg_pipe_process,
-    apply_color_transfer,
-    create_single_slider_with_label_updater,
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
     SidecarConfigManager,
     find_video_by_core_name,
     find_sidecar_file,
     read_clip_sidecar,
+)
+from core.common.gpu_utils import release_cuda_memory
+from core.common.cli_utils import draw_progress_bar
+from core.common.image_processing import (
+    apply_mask_dilation, 
+    apply_gaussian_blur, 
+    apply_shadow_blur,
+    apply_dubois_anaglyph_torch,
+    apply_optimized_anaglyph_torch,
+    apply_color_transfer,
+    apply_dubois_anaglyph,
+    apply_optimized_anaglyph,
     apply_borders_to_frames,
+)
+from core.ui.widgets import (
+    Tooltip,
+    create_single_slider_with_label_updater,
 )
 from dependency.video_previewer import VideoPreviewer
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
+from core.ui.theme_manager import ThemeManager
 
 GUI_VERSION = "26-03-04.3"
-
-
-# --- MASK PROCESSING FUNCTIONS (from test.py) ---
-def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
-    if kernel_size <= 0:
-        return mask
-    kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-
-    if use_gpu:
-        padding = kernel_val // 2
-        return F.max_pool2d(mask, kernel_size=kernel_val, stride=1, padding=padding)
-    else:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_val, kernel_val))
-        processed_frames = []
-        for t in range(mask.shape[0]):
-            frame_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            dilated_np = cv2.dilate(frame_np, kernel, iterations=1)
-            dilated_tensor = torch.from_numpy(dilated_np).float() / 255.0
-            processed_frames.append(dilated_tensor.unsqueeze(0))
-        return torch.stack(processed_frames).to(mask.device)
-
-
-def apply_gaussian_blur(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
-    if kernel_size <= 0:
-        return mask
-    kernel_val = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
-
-    if use_gpu:
-        sigma = kernel_val / 6.0
-        ax = torch.arange(-kernel_val // 2 + 1.0, kernel_val // 2 + 1.0, device=mask.device)
-        gauss = torch.exp(-(ax**2) / (2 * sigma**2))
-        kernel_1d = (gauss / gauss.sum()).view(1, 1, 1, kernel_val)
-        blurred_mask = F.conv2d(mask, kernel_1d, padding=(0, kernel_val // 2), groups=mask.shape[1])
-        blurred_mask = F.conv2d(
-            blurred_mask, kernel_1d.permute(0, 1, 3, 2), padding=(kernel_val // 2, 0), groups=mask.shape[1]
-        )
-        return torch.clamp(blurred_mask, 0.0, 1.0)
-    else:
-        processed_frames = []
-        for t in range(mask.shape[0]):
-            frame_np = (mask[t].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            blurred_np = cv2.GaussianBlur(frame_np, (kernel_val, kernel_val), 0)
-            blurred_tensor = torch.from_numpy(blurred_np).float() / 255.0
-            processed_frames.append(blurred_tensor.unsqueeze(0))
-        return torch.stack(processed_frames).to(mask.device)
-
-
-def apply_shadow_blur(
-    mask: torch.Tensor,
-    shift_per_step: int,
-    start_opacity: float,
-    opacity_decay_per_step: float,
-    min_opacity: float,
-    decay_gamma: float = 1.0,
-    use_gpu: bool = True,
-) -> torch.Tensor:
-    if shift_per_step <= 0:
-        return mask
-    # --- FIX: Prevent division by zero if opacity decay is zero ---
-    if opacity_decay_per_step <= 1e-6:  # Use a small epsilon for float comparison
-        return mask
-    # --- END FIX ---
-    num_steps = int((start_opacity - min_opacity) / opacity_decay_per_step) + 1
-    if num_steps <= 0:
-        return mask
-
-    if use_gpu:
-        canvas_mask = mask.clone()
-        stamp_source = mask.clone()
-        for i in range(num_steps):
-            t = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-            curved_t = t**decay_gamma
-            current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
-            total_shift = (i + 1) * shift_per_step
-            padded_stamp = F.pad(stamp_source, (total_shift, 0), "constant", 0)
-            shifted_stamp = padded_stamp[:, :, :, :-total_shift]
-            canvas_mask = torch.max(canvas_mask, shifted_stamp * current_opacity)
-        return canvas_mask
-    else:
-        processed_frames = []
-        for t in range(mask.shape[0]):
-            canvas_np = mask[t].squeeze(0).cpu().numpy()  # Process one frame at a time
-            stamp_source_np = canvas_np.copy()
-            for i in range(num_steps):
-                time_step = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-                curved_t = time_step**decay_gamma
-                current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
-                total_shift = (i + 1) * shift_per_step
-                shifted_stamp = np.roll(stamp_source_np, total_shift, axis=1)  # axis=1 for HxW
-                canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
-            processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
-        return torch.stack(processed_frames).to(mask.device)
 
 
 class MergingGUI(ThemedTk):
@@ -175,6 +93,11 @@ class MergingGUI(ThemedTk):
         self.is_processing = False
         self.cleanup_queue = queue.Queue()
 
+        self.current_filename_var = tk.StringVar(value="No video loaded")
+        self.current_resolution_var = tk.StringVar(value="N/A")
+        self.current_flip_status_var = tk.StringVar(value="N/A")
+        self.border_info_var = tk.StringVar(value="Borders: N/A")
+        self.status_label_var = tk.StringVar(value="Ready")
         self._is_startup = True  # Flag to prevent resizing during initialization
         self.preview_original_left_tensor = None
         self.preview_blended_right_tensor = None
@@ -230,6 +153,7 @@ class MergingGUI(ThemedTk):
         )
         self.debug_logging_var = tk.BooleanVar(value=self.app_config.get("debug_logging_enabled", False))
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
+        self.theme_manager = ThemeManager(dark_mode_var=self.dark_mode_var, config=self.app_config)
         self.batch_chunk_size_var = tk.StringVar(
             value=str(self.app_config.get("batch_chunk_size", self.APP_DEFAULTS["batch_chunk_size"]))
         )
@@ -333,33 +257,32 @@ class MergingGUI(ThemedTk):
             Tooltip(widget, self.help_data[help_key])
 
     def _apply_theme(self):
-        """Applies the selected theme (dark or light) to the GUI."""
-        if self.dark_mode_var.get():
-            bg_color, fg_color, entry_bg = "#2b2b2b", "white", "#3c3c3c"
-            self.style.theme_use("black")
-        else:
-            bg_color, fg_color, entry_bg = "#d9d9d9", "black", "#ffffff"
-            self.style.theme_use("clam")
+        """Applies the selected theme (dark or light) to the GUI using ThemeManager."""
+        if not hasattr(self, "theme_manager"):
+            return
 
-        self.configure(bg=bg_color)
-        self.style.configure("TFrame", background=bg_color)
-        self.style.configure("TLabel", background=bg_color, foreground=fg_color)
-        self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
-        self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
-        self.style.configure("TCheckbutton", background=bg_color, foreground=fg_color)
-        self.style.map("TCheckbutton", foreground=[("active", fg_color)], background=[("active", bg_color)])
-        self.style.configure("TEntry", fieldbackground=entry_bg, foreground=fg_color, insertcolor=fg_color)
-        # --- NEW: Add Combobox styling ---
-        self.style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", entry_bg)],
-            foreground=[("readonly", fg_color)],
-            selectbackground=[("readonly", entry_bg)],
-            selectforeground=[("readonly", fg_color)],
-        )
-        # Manually set the background for the previewer's canvas widget
+        # 1. Apply styles to ttk widgets and root window
+        self.theme_manager.apply_theme_to_style(self.style, root_window=self)
+
+        # 2. Apply theme to non-ttk widgets (Menu, Canvas, Labels)
+        colors = self.theme_manager.get_colors()
+
+        # Menus
+        if hasattr(self, "menubar"):
+            menus = []
+            if hasattr(self, "file_menu"):
+                menus.append(self.file_menu)
+            if hasattr(self, "help_menu"):
+                menus.append(self.help_menu)
+            self.theme_manager.apply_theme_to_menus(menus=menus, menubar=self.menubar)
+
+        # Previewer Canvas
         if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
-            self.previewer.preview_canvas.config(bg=bg_color, highlightthickness=0)
+            self.theme_manager.apply_theme_to_canvas(self.previewer.preview_canvas)
+
+        # 3. Apply compact/custom widget styles via ThemeManager
+        self.theme_manager.configure_compact_styles(self.style)
+        self.theme_manager.configure_progressbar_style(self.style)
 
         # --- FIX: Re-apply the custom loading button style after the theme changes ---
         # This ensures the red text color is not overridden by the theme's default button style.
@@ -607,6 +530,7 @@ class MergingGUI(ThemedTk):
             get_params_callback=self.get_current_settings,  # Pass the settings getter
             preview_size_var=self.preview_size_var,  # Pass the preview size variable
             resize_callback=self._adjust_window_height_for_content,  # Pass the resize callback
+            update_clip_callback=self._update_info_display,  # Update info panel
             help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
@@ -619,51 +543,16 @@ class MergingGUI(ThemedTk):
         # Pack the previewer right after the folder frame
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
 
+        # --- SLIDERS & INFO CONTAINER ---
+        middle_container = ttk.Frame(self)
+        middle_container.pack(fill="x", padx=10, pady=5)
+        middle_container.columnconfigure(0, weight=3)  # Sliders get more space
+        middle_container.columnconfigure(1, weight=1)  # Info panel
+
         # --- MASK PROCESSING PARAMETERS ---
-        param_frame = ttk.LabelFrame(self, text="Mask Processing Parameters", padding=10)
-        param_frame.pack(fill="x", padx=10, pady=5)
+        param_frame = ttk.LabelFrame(middle_container, text="Mask Processing Parameters", padding=10)
+        param_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         param_frame.grid_columnconfigure(1, weight=1)
-
-        # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
-        #     """Creates a slider, its value label, and all necessary event bindings."""
-        #     label = ttk.Label(parent, text=text)
-        #     label.grid(row=row, column=0, sticky="e", padx=5, pady=2)
-        #     slider = ttk.Scale(parent, from_=from_, to=to, variable=var, orient="horizontal")
-        #     slider.grid(row=row, column=1, sticky="ew", padx=5)
-        #     value_label = ttk.Label(parent, text="", width=5) # Start with empty text
-        #     value_label.grid(row=row, column=2, sticky="w", padx=5)
-
-        #     def update_label_and_preview(value_str: str) -> None:
-        #         """Updates the text label. Called by user interaction."""
-        #         value_label.config(text=f"{float(value_str):.{decimals}f}")
-
-        #     def set_value_and_update_label(new_value: float) -> None:
-        #         """Programmatically sets the slider's value and updates its label."""
-        #         var.set(new_value)
-        #         value_label.config(text=f"{new_value:.{decimals}f}")
-        #         logger.debug(f"new_value {new_value:.{decimals}f}")
-
-        #     slider.configure(command=update_label_and_preview)
-        #     slider.bind("<ButtonRelease-1>", self.on_slider_release)
-        #     self._create_hover_tooltip(label, text.lower().replace(":", "").replace(" ", "_").replace(".", ""))
-        #     self.slider_label_updaters.append(lambda: set_value_and_update_label(var.get())) # Add updater to list
-        #     self.widgets_to_disable.append(slider)
-
-        #     def on_trough_click(event):
-        #         """Handles clicks on the slider's trough for precise positioning."""
-        #         # Check if the click is on the trough to avoid interfering with handle drags
-        #         if 'trough' in slider.identify(event.x, event.y):
-        #             # --- FIX: Force the widget to update its size info before calculating ---
-        #             # This ensures winfo_width() is accurate, which is critical for fractional sliders.
-        #             slider.update_idletasks()
-        #             new_value = from_ + (to - from_) * (event.x / slider.winfo_width())
-        #             var.set(new_value) # Set the tk.Variable, which triggers the command and updates the UI
-        #             # --- FIX: Manually update the label's text after setting the variable ---
-        #             value_label.config(text=f"{new_value:.{decimals}f}")
-        #             self.on_slider_release(event) # Manually trigger preview update
-        #             return "break" # IMPORTANT: Prevents the default slider click behavior
-
-        #     slider.bind("<Button-1>", on_trough_click)
 
         create_single_slider_with_label_updater(
             self,
@@ -719,6 +608,27 @@ class MergingGUI(ThemedTk):
             decimals=2,
             step_size=0.01,
         )
+
+        # --- INFO FRAME ---
+        info_frame = ttk.LabelFrame(middle_container, text="Current Clip Info", padding=10)
+        info_frame.grid(row=0, column=1, sticky="nsew")
+
+        # Row 0: Filename
+        ttk.Label(info_frame, text="File:").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        ttk.Label(info_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
+
+        # Row 1: Resolution
+        ttk.Label(info_frame, text="Res:").grid(row=1, column=0, sticky="w", padx=(0, 5))
+        ttk.Label(info_frame, textvariable=self.current_resolution_var).grid(row=1, column=1, sticky="w")
+
+        # Row 2: Borders (Moved from Progress frame)
+        ttk.Label(info_frame, text="Borders:").grid(row=2, column=0, sticky="w", padx=(0, 5))
+        self.border_info_label = ttk.Label(info_frame, textvariable=self.border_info_var)
+        self.border_info_label.grid(row=2, column=1, sticky="w")
+
+        # Row 3: Flip Status
+        ttk.Label(info_frame, text="Flip:").grid(row=3, column=0, sticky="w", padx=(0, 5))
+        ttk.Label(info_frame, textvariable=self.current_flip_status_var).grid(row=3, column=1, sticky="w")
 
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
@@ -789,16 +699,22 @@ class MergingGUI(ThemedTk):
         # --- PROGRESS & BUTTONS ---
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, length=400, mode="determinate")
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            length=400,
+            mode="determinate",
+            style="Custom.Horizontal.TProgressbar",
+        )
         self.progress_bar.pack(fill="x")
+
+        # Current Filename
+        self.filename_label = ttk.Label(progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold"))
+        self.filename_label.pack(pady=(5, 0))
+
         self.status_label_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
         self.status_label.pack(pady=5)
-
-        # --- Border Info ---
-        self.border_info_var = tk.StringVar(value="Borders: N/A")
-        self.border_info_label = ttk.Label(progress_frame, textvariable=self.border_info_var)
-        self.border_info_label.pack(pady=2)
 
         buttons_frame = ttk.Frame(self, padding=10)
         buttons_frame.pack(fill="x")
@@ -908,6 +824,41 @@ class MergingGUI(ThemedTk):
             except tk.TclError:
                 # Widget might have been destroyed, ignore
                 pass
+
+    def _update_info_display(self):
+        """Updates the current filename display, resolution, flip status, and window title."""
+        if hasattr(self, "previewer") and self.previewer.video_list and self.previewer.current_video_index != -1:
+            source_dict = self.previewer.video_list[self.previewer.current_video_index]
+            inpainted_path = source_dict.get("inpainted", "")
+            filename = os.path.basename(inpainted_path)
+            
+            # Update Filename
+            self.current_filename_var.set(filename)
+            self.title(f"Stereocrafter Merging GUI {GUI_VERSION} - {filename}")
+            
+            # Update Resolution (from inpainted video)
+            try:
+                if inpainted_path and os.path.exists(inpainted_path):
+                    info = get_video_stream_info(inpainted_path)
+                    if info:
+                        w, h = info.get("width", "N/A"), info.get("height", "N/A")
+                        self.current_resolution_var.set(f"{w}x{h}")
+                    else:
+                        self.current_resolution_var.set("N/A")
+                else:
+                    self.current_resolution_var.set("N/A")
+            except Exception:
+                self.current_resolution_var.set("Error")
+
+            # Update Flip Status (from sidecar)
+            sidecar_data = source_dict.get("sidecar", {})
+            is_flipped = sidecar_data.get("flip_horizontal", False)
+            self.current_flip_status_var.set("Yes" if is_flipped else "No")
+        else:
+            self.current_filename_var.set("No video loaded")
+            self.current_resolution_var.set("N/A")
+            self.current_flip_status_var.set("N/A")
+            self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
 
     def update_status_label(self, message):
         self.status_label_var.set(message)
@@ -1554,6 +1505,7 @@ class MergingGUI(ThemedTk):
                         original_left = splatted_tensor[:, :, : H // 2, : W // 2]
                         mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
                         warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
+
                     mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
                     mask_gray_np = np.mean(mask_np, axis=3)
                     mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
@@ -1919,6 +1871,7 @@ class MergingGUI(ThemedTk):
             splatted2_matches = glob.glob(splatted2_pattern)
 
             source_dict = {
+                "source_video": inpainted_path,  # Primary key for VideoPreviewer
                 "inpainted": inpainted_path,
                 "splatted": None,
                 "original": None,
@@ -1967,95 +1920,81 @@ class MergingGUI(ThemedTk):
             if not params:
                 return None  # Exit if settings are invalid
             # --- END FIX ---
-            # 1. Extract tensors from the source_frames dict
+
+            # 1. Extract raw tensors from the source_frames dict
             inpainted_tensor_full = source_frames.get("inpainted")
-            splatted_tensor = source_frames.get("splatted")
+            splatted_tensor_raw = source_frames.get("splatted")
             original_tensor = source_frames.get("original")  # Will be None for quad input
 
-            if inpainted_tensor_full is None or splatted_tensor is None:
+            if inpainted_tensor_full is None or splatted_tensor_raw is None:
                 raise ValueError("Missing 'inpainted' or 'splatted' source for preview.")
 
-            # --- FIX: Determine input type based on metadata from the video list ---
+            # 2. Determine input type and metadata
             current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             is_sbs_input = current_source_metadata.get("is_sbs_input", False)
-            is_quad_input = current_source_metadata.get("is_quad_input", False)  # <--- GET NEW FLAG
-
-            # Get flip flag from sidecar for preview
+            is_quad_input = current_source_metadata.get("is_quad_input", False)
+            
+            # Get flip flag from sidecar
             sidecar_data = current_source_metadata.get("sidecar", {})
             flip_horizontal = sidecar_data.get("flip_horizontal", False)
-            # --- END FIX ---
 
-            # 2. Determine input types and extract frame parts
-            # Use the correct is_sbs_input flag to extract the right eye if the input is SBS
+            # Define the processing device based on the 'use_gpu' parameter
+            use_gpu = params.get("use_gpu", False) and torch.cuda.is_available()
+            device = "cuda" if use_gpu else "cpu"
+
+            # 3. Extract frame parts and move to device
+            # Extract Inpainted Right Eye
             inpainted = (
                 inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3] // 2 :]
                 if is_sbs_input
                 else inpainted_tensor_full
-            )
+            ).to(device)
 
-            # Extract parts from the splatted frame
+            splatted_tensor = splatted_tensor_raw.to(device)
             _, _, H, W = splatted_tensor.shape
 
-            # --- FIX: Use is_quad_input for reliable tensor extraction ---
-            if is_quad_input:  # Splatted4 (Original Left and Mask/Warped are all inside the splatted file)
+            if is_quad_input:
                 half_h, half_w = H // 2, W // 2
                 original_left = splatted_tensor[:, :, :half_h, :half_w]
                 depth_map_vis = splatted_tensor[:, :, :half_h, half_w:]
                 mask_raw = splatted_tensor[:, :, half_h:, :half_w]
                 right_eye_original = splatted_tensor[:, :, half_h:, half_w:]
-                is_dual_input = False  # For clarity
-            else:  # Splatted2 (Original Left is a separate file provided by original_tensor)
+                is_dual_input = False
+            else:
                 half_w = W // 2
                 mask_raw = splatted_tensor[:, :, :, :half_w]
                 right_eye_original = splatted_tensor[:, :, :, half_w:]
-                original_left = original_tensor
+                original_left = original_tensor.to(device) if original_tensor is not None else None
                 depth_map_vis = None
-                is_dual_input = True  # For clarity
+                is_dual_input = True
 
             # Configure preview source dropdown based on input type
             preview_options = [
                 "Blended Image",
                 "Original (Left Eye)",
                 "Warped (Right BG)",
-                "Inpainted Right Eye",  # <--- ADDED INPAINTED
+                "Inpainted Right Eye",
                 "Processed Mask",
                 "Anaglyph 3D",
-                "Dubois Anaglyph",  # <--- ADDED ANAGLYPH
-                "Optimized Anaglyph",  # <--- ADDED ANAGLYPH
+                "Dubois Anaglyph",
+                "Optimized Anaglyph",
                 "Wigglegram",
             ]
-            if not is_dual_input:  # Depth map is only in quad-splatted files
+            if not is_dual_input:
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
 
-            # Convert mask to grayscale
-            mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            mask_gray_np = np.mean(mask_frame_np, axis=2)
-            mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
-
-            # 3. Process the frames
-            # Define the processing device based on the 'use_gpu' parameter
-            use_gpu = params.get("use_gpu", False) and torch.cuda.is_available()
-            device = "cuda" if use_gpu else "cpu"
-
-            # Move tensors to the processing device
-            mask = mask.to(device)
-            inpainted = inpainted.to(device)
-            original_left = original_left.to(device)
-            right_eye_original = right_eye_original.to(device)
+            # Convert mask to grayscale ON DEVICE
+            mask = torch.mean(mask_raw, dim=1, keepdim=True)
 
             hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
+            
+            # --- Optimized Resizing ---
             if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
-                # Calculate aspect-ratio-correct dimensions for inpaint
                 target_aspect = hires_W / hires_H
                 inpaint_aspect = inpainted.shape[3] / inpainted.shape[2]
 
                 if abs(inpaint_aspect - target_aspect) > 0.01:
-                    # Aspect ratios differ - resize to fit within target while preserving aspect ratio
-                    logger.debug(
-                        f"Preview: Inpaint aspect ratio ({inpaint_aspect:.4f}) differs from target ({target_aspect:.4f}). "
-                        f"Resizing from {inpainted.shape[3]}x{inpainted.shape[2]} to fit {hires_W}x{hires_H}."
-                    )
                     if inpaint_aspect > target_aspect:
                         new_w = hires_W
                         new_h = int(round(hires_W / inpaint_aspect))
@@ -2064,142 +2003,110 @@ class MergingGUI(ThemedTk):
                         new_w = int(round(hires_H * inpaint_aspect))
                     inpainted = F.interpolate(inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False)
                     mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                    # Final resize to target dimensions
-                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
-                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
-                else:
-                    logger.debug(
-                        f"Upscaling preview frames from {inpainted.shape[3]}x{inpainted.shape[2]} to {hires_W}x{hires_H}"
-                    )
-                    inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
-                    mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
+                
+                # Final resize to target dimensions
+                inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
+                mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
 
-            # --- Process the mask (using a simplified chain from test.py) ---
-            processed_mask = mask.clone()  # No need to unsqueeze, it's already 4D
+            # ... (Mask processing) ...
+            processed_mask = mask.clone()
             if params.get("mask_binarize_threshold", -1.0) >= 0.0:
                 processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
+            
             if params.get("mask_dilate_kernel_size", 0) > 0:
                 processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
+            
             if params.get("mask_blur_kernel_size", 0) > 0:
                 processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
+            
             if params.get("shadow_shift", 0) > 0:
                 processed_mask = apply_shadow_blur(
                     processed_mask,
-                    params["shadow_shift"],
+                    int(params["shadow_shift"]),
                     params["shadow_start_opacity"],
                     params["shadow_opacity_decay"],
                     params["shadow_min_opacity"],
                     params["shadow_decay_gamma"],
                     use_gpu,
                 )
-            processed_mask = processed_mask.squeeze(0)  # Remove batch dim
 
+            # Color Transfer
             if params.get("enable_color_transfer", False):
                 if original_left is not None:
-                    logger.debug("Applying color transfer to preview frame...")
-                    inpainted = apply_color_transfer(original_left.cpu(), inpainted.cpu()).to(device)
+                    # Color transfer returns 3D, we must unsqueeze to keep it 4D
+                    inpainted = apply_color_transfer(original_left.cpu(), inpainted.cpu()).unsqueeze(0).to(device)
 
             blended_frame = right_eye_original * (1 - processed_mask) + inpainted * processed_mask
 
-            # --- NEW: Apply borders from sidecar ---
-            current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
-            clip_sidecar = current_source_metadata.get("sidecar", {})
-            left_border = clip_sidecar.get("left_border", 0.0)
-            right_border = clip_sidecar.get("right_border", 0.0)
-            logger.debug(f"Preview Borders: left={left_border}%, right={right_border}%")
-            if clip_sidecar:
-                self._update_border_info(left_border, right_border)
-            else:
-                self._clear_border_info()
-
+            # Borders
+            left_border = sidecar_data.get("left_border", 0.0)
+            right_border = sidecar_data.get("right_border", 0.0)
+            
             if self.add_borders_var.get() and (left_border > 0 or right_border > 0):
-                logger.debug(
-                    f"Preview: Before border - original_left shape={original_left.shape}, blended_frame shape={blended_frame.shape}"
-                )
-                original_left, blended_frame = apply_borders_to_frames(
-                    left_border, right_border, original_left, blended_frame
-                )
-                logger.debug(
-                    f"Preview: After border - original_left shape={original_left.shape}, blended_frame shape={blended_frame.shape}"
-                )
-            # --- END NEW ---
+                if original_left is not None:
+                    original_left, blended_frame = apply_borders_to_frames(
+                        left_border, right_border, original_left, blended_frame
+                    )
+                else:
+                    _, blended_frame = apply_borders_to_frames(
+                        left_border, right_border, blended_frame, blended_frame
+                    )
 
-            # 4. Select the final frame to display based on the dropdown
+            # ... (Preview selection logic) ...
             preview_source = self.preview_source_var.get()
-            logger.debug(f"Preview source selected: '{preview_source}'")
-            final_frame_4d = None  # Initialize to None
+            final_frame_4d = None
 
             if preview_source == "Blended Image":
-                logger.debug("  -> Displaying Blended Image.")
                 final_frame_4d = blended_frame
-            elif preview_source == "Inpainted Right Eye":  # <--- ADDED INPAINTED
-                logger.debug("  -> Displaying Inpainted Right Eye.")
+            elif preview_source == "Inpainted Right Eye":
                 final_frame_4d = inpainted
             elif preview_source == "Original (Left Eye)":
-                logger.debug("  -> Displaying Original (Left Eye).")
-                # --- FIX: Handle missing original_tensor for quad input ---
-                if original_left is not None:
-                    final_frame_4d = original_left
-                else:
-                    # This case should not be reachable if logic is correct, but as a fallback:
-                    logger.warning("Preview: 'Original (Left Eye)' selected, but no source is available.")
-                    final_frame_4d = torch.zeros_like(blended_frame)  # Show a black screen
-                # --- END FIX ---
+                final_frame_4d = original_left if original_left is not None else torch.zeros_like(blended_frame)
             elif preview_source == "Warped (Right BG)":
-                logger.debug("  -> Displaying Warped (Right BG).")
                 final_frame_4d = right_eye_original
             elif preview_source == "Processed Mask":
-                logger.debug("  -> Displaying Processed Mask.")
-                final_frame_4d = processed_mask.repeat(1, 3, 1, 1)  # Convert grayscale mask to 3-channel for display
+                final_frame_4d = processed_mask.repeat(1, 3, 1, 1)
             elif preview_source == "Anaglyph 3D":
-                logger.debug(" -> Displaying Anaglyph 3D.")
-                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY)  # Use standard for old red/cyan
-                anaglyph_np = right_np.copy()
-                anaglyph_np[:, :, 0] = left_gray_np  # Red channel from grayscale left eye
-                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+                if original_left is not None:
+                    # Red channel from grayscale left, Green/Blue from right
+                    left_gray = (original_left[:, 0:1, :, :] * 0.299 + 
+                                 original_left[:, 1:2, :, :] * 0.587 + 
+                                 original_left[:, 2:3, :, :] * 0.114)
+                    final_frame_4d = torch.cat([left_gray, blended_frame[:, 1:2, :, :], blended_frame[:, 2:3, :, :]], dim=1)
+                else:
+                    final_frame_4d = blended_frame
             elif preview_source == "Dubois Anaglyph":
-                logger.debug(" -> Displaying Dubois Anaglyph.")
-                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                anaglyph_np = apply_dubois_anaglyph(left_np, right_np)  # Use imported utility
-                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+                if original_left is not None:
+                    final_frame_4d = apply_dubois_anaglyph_torch(original_left, blended_frame)
+                else:
+                    final_frame_4d = blended_frame
             elif preview_source == "Optimized Anaglyph":
-                logger.debug(" -> Displaying Optimized Anaglyph.")
-                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                right_np = (blended_frame.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                anaglyph_np = apply_optimized_anaglyph(left_np, right_np)  # Use imported utility
-                final_frame_4d = (torch.from_numpy(anaglyph_np).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
+                if original_left is not None:
+                    final_frame_4d = apply_optimized_anaglyph_torch(original_left, blended_frame)
+                else:
+                    final_frame_4d = blended_frame
             elif preview_source == "Wigglegram":
-                logger.debug(" -> Starting Wigglegram animation.")
-                self.previewer._start_wigglegram_animation(original_left, blended_frame)
-                return None  # Wigglegram handles its own display
+                if original_left is not None:
+                    self.previewer._start_wigglegram_animation(original_left, blended_frame)
+                return None
             elif preview_source == "Depth Map" and depth_map_vis is not None:
-                logger.debug("  -> Displaying Depth Map.")
-                final_frame_4d = depth_map_vis.to(device)
+                final_frame_4d = depth_map_vis
             else:
-                logger.debug(f"  -> Fallback: Displaying Blended Image for unknown source '{preview_source}'.")
                 final_frame_4d = blended_frame
 
-            # Fallback in case final_frame wasn't set
             if final_frame_4d is None:
                 final_frame_4d = blended_frame
 
-            if flip_horizontal:
-                final_frame_4d = torch.flip(final_frame_4d, dims=[3])
-
-            # Store for saving SBS
-
-            self.preview_original_left_tensor = original_left.squeeze(0).cpu()
+            # Store for saving SBS (CPU side)
+            if original_left is not None:
+                self.preview_original_left_tensor = original_left.squeeze(0).cpu()
+            else:
+                self.preview_original_left_tensor = torch.zeros_like(blended_frame).squeeze(0).cpu()
             self.preview_blended_right_tensor = blended_frame.squeeze(0).cpu()
 
-            # 5. Convert to PIL Image for returning
-            # OPTIMIZATION: Scale and cast to uint8 on GPU (if available) before transferring to CPU.
+            # 5. Convert to PIL Image
             final_uint8 = (final_frame_4d[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)
-            final_np = final_uint8.cpu().numpy()
-            pil_img = Image.fromarray(final_np)
-            return pil_img
+            return Image.fromarray(final_uint8.cpu().numpy())
 
         except Exception as e:
             logger.error(f"Error in preview processing callback: {e}", exc_info=True)
@@ -2216,8 +2123,6 @@ class MergingGUI(ThemedTk):
             config["window_height"] = self.winfo_height()
             config["debug_logging_enabled"] = self.debug_logging_var.get()
             config["dark_mode_enabled"] = self.dark_mode_var.get()
-            # The following settings are already gathered by get_current_settings(),
-            # so these stray lines are removed.
 
             try:
                 with open("config_merging.mergecfg", "w") as f:

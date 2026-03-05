@@ -17,23 +17,11 @@ from .ui import (
     SBSPreviewWindow,
 )
 
-from .splatting import (
-    ConfigManager,
-    SPLATTER_DEFAULT_CONFIG,
-    load_config,
-    save_config,
-    compute_global_depth_stats,
-    load_pre_rendered_depth,
-    FFmpegDepthPipeReader,
-    ForwardWarpStereo,
-    FusionSidecarGenerator,
-)
+# Specialized sub-packages like .splatting should be imported directly 
+# from their respective modules to avoid unnecessary dependency loading
+# and log messages in applications that don't use them (like Merging GUI).
 
 __all__ = [
-    'ConfigManager',
-    'SPLATTER_DEFAULT_CONFIG',
-    'load_config',
-    'save_config',
     'ThemeManager',
     'DARK_COLORS',
     'LIGHT_COLORS',
@@ -41,9 +29,4 @@ __all__ = [
     'SBSPreviewWindow',
     'VideoIO',
     'read_video_frames',
-    'compute_global_depth_stats',
-    'load_pre_rendered_depth',
-    'FFmpegDepthPipeReader',
-    'ForwardWarpStereo',
-    'FusionSidecarGenerator',
 ]

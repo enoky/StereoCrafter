@@ -391,14 +391,14 @@ def read_video_frames(
 
     logger.debug(f"read_video_frames: process_length = {process_length} (type: {type(process_length)})")
     if dataset == "open":
-        logger.debug(f"==> Initializing VideoReader for: {video_path}")
+        logger.info(f"==> Initializing VideoReader for: {video_path}")
         vid_info_only = VideoReader(video_path, ctx=cpu(0))  # Use separate reader for info
         original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
         try:
             total_frames_original = int(len(vid_info_only)) if len(vid_info_only) not in (None, "", "N/A") else 0
         except (ValueError, TypeError):
             total_frames_original = 0
-        logger.debug(
+        logger.info(
             f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame"
         )
 

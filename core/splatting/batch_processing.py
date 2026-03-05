@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from decord import VideoReader, cpu
 
+from core.common.file_organizer import move_files_to_finished
 from dependency.stereocrafter_util import get_video_stream_info, release_cuda_memory
 from .depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
@@ -450,9 +451,12 @@ class BatchProcessor:
 
         # 3. Tasks Loop
         tasks = self.get_defined_tasks(settings)
+        all_tasks_successful = True
         processed_count = 0
+        
         for task in tasks:
             if self.stop_event.is_set():
+                all_tasks_successful = False
                 break
 
             self.progress_queue.put(("status", f"Processing {task.name} for {video_name}"))
@@ -460,6 +464,7 @@ class BatchProcessor:
             # Initialize Readers for this task/resolution
             readers = self._initialize_readers(video_path, vid_settings["actual_depth_map_path"], settings, task)
             if not readers:
+                all_tasks_successful = False
                 processed_count += 1
                 self.progress_queue.put(("processed", initial_task_counter + processed_count))
                 continue
@@ -492,9 +497,7 @@ class BatchProcessor:
                 video_stream_info=readers["source_info"],
                 input_bias=vid_settings["input_bias"],
                 assume_raw_input=not vid_settings["enable_global_norm"],
-                global_depth_min=vid_settings.get(
-                    "global_min", 0.0
-                ),  # Will handle normalization inside renderer if needed
+                global_depth_min=vid_settings.get("global_min", 0.0),
                 global_depth_max=vid_settings.get("global_max", 1.0),
                 depth_stream_info=readers["depth_info"],
                 user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
@@ -516,10 +519,70 @@ class BatchProcessor:
                 is_test_mode=settings.is_test_mode,
                 test_target_frame_idx=settings.test_target_frame_idx,
             )
+            
+            if not success:
+                all_tasks_successful = False
+                
             processed_count += 1
-            # Note: RenderProcessor already puts 'processed' events, but maybe we should synchronize here?
-            # renderer.render_video might need to be told the start index.
-            # For now, let's assume Rendering handles it and we just return count.
+            # Note: RenderProcessor already puts 'processed' events via progress_queue.
+
+        if all_tasks_successful:
+            self.logger.info(f"==> Successfully processed all tasks for {video_name}.")
+
+        # 4. Move to Finished (if enabled and all tasks for this video succeeded)
+        should_move = all_tasks_successful and settings.move_to_finished
+        
+        if should_move:
+            self.logger.info(f"==> All tasks successful for {video_name}. Moving source files to finished.")
+            
+            files_to_move = []
+            
+            # Source video
+            src_dir = os.path.dirname(video_path)
+            if is_single_file_mode and settings.single_finished_source_folder:
+                dest_source = settings.single_finished_source_folder
+            else:
+                dest_source = src_dir
+            files_to_move.append((video_path, dest_source))
+            
+            # Depth map
+            depth_path = vid_settings["actual_depth_map_path"]
+            depth_dir = os.path.dirname(depth_path)
+            if is_single_file_mode and settings.single_finished_depth_folder:
+                dest_depth = settings.single_finished_depth_folder
+            else:
+                dest_depth = depth_dir
+            files_to_move.append((depth_path, dest_depth))
+            
+            # Sidecars
+            sidecar_patterns = [
+                os.path.join(settings.sidecar_folder, f"{video_name}_depth{settings.sidecar_ext}"),
+                os.path.join(src_dir, f"{video_name}{settings.sidecar_ext}"),
+                os.path.join(depth_dir, f"{video_name}_depth{settings.sidecar_ext}"),
+            ]
+            
+            for sc_path in sidecar_patterns:
+                if os.path.exists(sc_path):
+                    # For sidecars, move to source dest if it was in source dir, else depth dest
+                    sc_dir = os.path.dirname(sc_path)
+                    if sc_dir == src_dir:
+                        files_to_move.append((sc_path, dest_source))
+                    else:
+                        files_to_move.append((sc_path, dest_depth))
+            
+            # Perform move
+            moved, failed, failed_list = move_files_to_finished(
+                files_to_move=files_to_move,
+                logger=self.logger,
+                wait_before_move=0.5
+            )
+            
+            if failed > 0:
+                self.logger.warning(f"Failed to move {failed} files for {video_name}: {failed_list}")
+            else:
+                self.logger.info(f"Successfully moved {moved} source/sidecar files to finished.")
+
+        return len(tasks)
 
         return len(tasks)
 

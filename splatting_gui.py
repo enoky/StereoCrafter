@@ -58,22 +58,24 @@ CUDA_AVAILABLE = False  # start state, will check automaticly later
 
 # --- MODIFIED IMPORT ---
 from dependency.stereocrafter_util import (
-    Tooltip,
     logger,
     get_video_stream_info,
-    draw_progress_bar,
-    check_cuda_availability,
-    release_cuda_memory,
-    CUDA_AVAILABLE,
     set_util_logger_level,
     start_ffmpeg_pipe_process,
+)
+from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
+from core.common.cli_utils import draw_progress_bar
+from core.common.image_processing import (
     custom_blur,
     custom_dilate,
     custom_dilate_left,
-    create_single_slider_with_label_updater,
-    create_dual_slider_layout,
     apply_dubois_anaglyph,
     apply_optimized_anaglyph,
+)
+from core.ui.widgets import (
+    Tooltip,
+    create_single_slider_with_label_updater,
+    create_dual_slider_layout,
 )
 
 try:
@@ -122,7 +124,7 @@ from core.splatting.config_manager import ConfigManager
 from core.ui import ThemeManager, SBSPreviewWindow
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
-
+from core.common.image_processing import apply_dubois_anaglyph_torch, apply_optimized_anaglyph_torch
 
 class SplatterGUI(ThemedTk):
     # --- UI MINIMUM WIDTHS (tweak these numbers) ---
@@ -889,6 +891,7 @@ class SplatterGUI(ThemedTk):
             gamma=gamma,
             stop_event=self.stop_event,
             status_callback=status_update,
+            flip_horizontal=bool(self.flip_horizontal_var.get()),
         )
 
         if scan_result:
@@ -4189,19 +4192,18 @@ class SplatterGUI(ThemedTk):
             r_px = int(round(r_pct * W_target / 100.0))
 
             if l_px > 0:
-                # Left eye: Opaque black border on the left side
-                # left_eye_tensor_resized is (1, 3, H, W)
+                # Left eye border (always on the logical left of the source)
                 left_eye_tensor_resized[:, :, :, :l_px] = 0.0
             if r_px > 0:
-                # Right eye: Opaque black border on the right side
-                # right_eye_tensor is (1, 3, H, W)
+                # Right eye border (always on the logical right of the source)
                 right_eye_tensor[:, :, :, -r_px:] = 0.0
 
         if preview_source == "Splat Result" or preview_source == "Splat Result(Low)":
             final_tensor = right_eye_tensor
         elif preview_source == "Occlusion Mask" or preview_source == "Occlusion Mask(Low)":
             final_tensor = occlusion_mask.repeat(1, 3, 1, 1)
-
+        elif preview_source == "Original (Left Eye)":
+            final_tensor = left_eye_tensor_resized
         elif preview_source == "Depth Map":
             # Direct grayscale view (visualization-only TV-range expansion for 10-bit depth, when tagged 'tv')
             depth_vis = depth_normalized
@@ -4225,7 +4227,7 @@ class SplatterGUI(ThemedTk):
                 pass
             depth_vis_uint8 = (np.clip(depth_vis, 0, 1) * 255).astype(np.uint8)
             depth_vis_3ch = np.stack([depth_vis_uint8] * 3, axis=-1)
-            final_tensor = torch.from_numpy(depth_vis_3ch).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            final_tensor = torch.from_numpy(depth_vis_3ch).permute(2, 0, 1).unsqueeze(0).float().cuda() / 255.0
 
         elif preview_source == "Depth Map (Color)":
             # Diagnostic color view (visualization-only TV-range expansion for 10-bit depth, when tagged 'tv')
@@ -4251,53 +4253,43 @@ class SplatterGUI(ThemedTk):
             depth_vis_uint8 = (np.clip(depth_vis, 0, 1) * 255).astype(np.uint8)
             vis_color = cv2.applyColorMap(depth_vis_uint8, cv2.COLORMAP_VIRIDIS)
             vis_rgb = cv2.cvtColor(vis_color, cv2.COLOR_BGR2RGB)
-            final_tensor = torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            final_tensor = torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float().cuda() / 255.0
 
-        elif preview_source == "Anaglyph 3D":
+        # --- 3D Modes and SBS Update ---
+        if preview_source == "Anaglyph 3D":
             left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             left_gray_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY)
             anaglyph_np = right_np.copy()
             anaglyph_np[:, :, 0] = left_gray_np
-            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float().cuda() / 255.0
 
         elif preview_source == "Dubois Anaglyph":
-            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            anaglyph_np = apply_dubois_anaglyph(left_np, right_np)
-            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            final_tensor = apply_dubois_anaglyph_torch(left_eye_tensor_resized, right_eye_tensor)
 
         elif preview_source == "Optimized Anaglyph":
-            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            anaglyph_np = apply_optimized_anaglyph(left_np, right_np)
-            final_tensor = torch.from_numpy(anaglyph_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            final_tensor = apply_optimized_anaglyph_torch(left_eye_tensor_resized, right_eye_tensor)
 
         elif preview_source == "Wigglegram":
             self.previewer._start_wigglegram_animation(left_eye_tensor_resized, right_eye_tensor)
             return None
+        
+        else:
+            # For non-3D modes, final_tensor is already set
+            pass
 
         # --- SBS Window Update ---
         if hasattr(self, "sbs_enabled_var") and self.sbs_enabled_var.get():
-            # If flip is enabled, the eyes are effectively swapped in flipped space
-            if params.get("flip_horizontal"):
-                # Un-flip both and swap
-                sbs_left = torch.flip(right_eye_tensor, dims=[3])
-                sbs_right = torch.flip(left_eye_tensor_resized, dims=[3])
-            else:
-                sbs_left = left_eye_tensor_resized
-                sbs_right = right_eye_tensor
-
             # Update window
             if self.sbs_window_obj and self.sbs_window_obj.exists():
-                self.sbs_window_obj.update_frame(sbs_left, sbs_right, overlays_callback=self._draw_sbs_overlays)
+                self.sbs_window_obj.update_frame(left_eye_tensor_resized, right_eye_tensor, overlays_callback=self._draw_sbs_overlays)
 
             # Cache for fast playback
             if hasattr(self.previewer, "cache_sbs_frame"):
                 try:
                     # Convert to uint8 numpy for compact storage
-                    l_np = (sbs_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                    r_np = (sbs_right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    l_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    r_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
                     frame_idx = int(self.previewer.frame_scrubber_var.get())
                     self.previewer.cache_sbs_frame(frame_idx, l_np, r_np)
                 except Exception as e:
@@ -4305,8 +4297,8 @@ class SplatterGUI(ThemedTk):
 
         # --- End SBS Update ---
 
-        else:
-            final_tensor = left_eye_tensor_resized.cpu()
+        if params.get("flip_horizontal"):
+            final_tensor = torch.flip(final_tensor, dims=[3])
 
         t_finish = time.perf_counter()
 

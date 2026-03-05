@@ -49,6 +49,7 @@ class BorderScanner:
         force: bool = False,
         stop_event=None,
         status_callback=None,
+        flip_horizontal: bool = False,
     ) -> Optional[Tuple[float, float]]:
         """Scan current depth map for border requirements.
 
@@ -64,6 +65,8 @@ class BorderScanner:
             force: Force rescan even if cached (unused, for API compatibility)
             stop_event: Optional threading.Event for cancellation
             status_callback: Optional callback(status_text) for status updates
+            flip_horizontal: If True, the depth map is scanned as-is, but the
+                results are swapped to reflect the un-flipped source.
 
         Returns:
             Tuple of (left_border_pct, right_border_pct) if successful, None otherwise
@@ -82,9 +85,14 @@ class BorderScanner:
             if status_callback:
                 status_callback(f"Scanning borders for {os.path.basename(depth_path)}...")
 
-            return self._scan_depth_video(
+            res = self._scan_depth_video(
                 vr, total_frames, conv, max_disp, gamma, stop_event, status_callback
             )
+            
+            if res and flip_horizontal:
+                # Swap L and R results back to original source orientation
+                return res[1], res[0]
+            return res
 
         except Exception as e:
             self.logger.error(f"Border scan failed: {e}", exc_info=True)
@@ -99,6 +107,7 @@ class BorderScanner:
         max_disp: float,
         gamma: float = 1.0,
         stop_event=None,
+        flip_horizontal: bool = False,
     ) -> Optional[Tuple[float, float]]:
         """Thread-safe helper for scanning a depth-map video for border requirements.
 
@@ -112,6 +121,7 @@ class BorderScanner:
             max_disp: Maximum disparity in pixels
             gamma: Gamma correction value for depth (default: 1.0)
             stop_event: Optional threading.Event for cancellation
+            flip_horizontal: If True, swap results to reflect un-flipped source.
 
         Returns:
             Tuple of (left_border_pct, right_border_pct) if successful,
@@ -123,9 +133,14 @@ class BorderScanner:
             if total_frames <= 0:
                 return None
 
-            return self._scan_depth_video(
+            res = self._scan_depth_video(
                 vr_depth, total_frames, conv, max_disp, gamma, stop_event
             )
+            
+            if res and flip_horizontal:
+                # Swap L and R results back to original source orientation
+                return res[1], res[0]
+            return res
 
         except Exception as e:
             self.logger.error(f"Border scan failed: {e}", exc_info=True)
