@@ -2,7 +2,7 @@
 
 ## Version 26-02-07.2 (Today's Changes)
 
-### New Features
+### New Features (26-02-07.20)
 
 #### Load/Refresh List Improvements
 
@@ -28,13 +28,13 @@
 
 - Toggling "Add Borders" checkbox now updates preview instantly
 
-### UI Improvements
+### UI Improvements (26-02-07.2)
 
 - Updated "Load/Refresh List" button behavior documentation
 - Added "Resume" documentation to Options section
 - Added Preview Source persistence to documentation
 
-### Files Modified
+### Files Modified (26-02-07.2)
 
 - `merging_gui.py`: Added resume mode, preview source persistence, live update for borders
 - `dependency/video_previewer.py`: Modified _handle_load_refresh for smarter scanning
@@ -46,7 +46,7 @@
 
 ## Version 26-02-07.1
 
-### New Features
+### New Features (26-02-07.1)
 
 #### Sidecar File Support
 
@@ -75,7 +75,7 @@
 - Fixed variable naming issues in border processing code
 - Fixed preview code to correctly apply borders
 
-### UI Improvements
+### UI Improvements (26-02-07.1)
 
 - Changed border info label color for better visibility in dark mode
 - Updated tooltip help text for new features
@@ -87,7 +87,7 @@
 - Functions moved: `find_video_by_core_name`, `find_sidecar_file`, `read_clip_sidecar`, `apply_borders_to_frames`
 - Prepared codebase for migrating non-GUI related code
 
-### Files Modified
+### Files Modified (26-02-07.1)
 
 - `merging_gui.py`: Added sidecar reading, border application, UI elements
 - `core/common/sidecar_manager.py`: Added sidecar and border helper functions

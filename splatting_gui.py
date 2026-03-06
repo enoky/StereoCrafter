@@ -4301,9 +4301,6 @@ class SplatterGUI(ThemedTk):
 
         # --- End SBS Update ---
 
-        if params.get("flip_horizontal"):
-            final_tensor = torch.flip(final_tensor, dims=[3])
-
         t_finish = time.perf_counter()
 
         # 5. Final transfer to CPU and PIL conversion

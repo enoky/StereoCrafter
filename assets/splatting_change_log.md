@@ -11,6 +11,7 @@ All notable changes to the splatting GUI and related components.
   - Flip state saved to `.fssidecar` files.
   - **Merging GUI** automatically detects the flip flag and flips the final output back to original orientation.
   - Applied early in the pipeline so preview and all preprocessing (dilation/blur) work on the flipped data.
+  - **Simplified Preview**: Removed the automatic "unflipping" of the preview image. Flipped processing now displays flipped in both the main preview and SBS window for visual consistency.
 
 ### Fixed (v26-03-04.3)
 
