@@ -1547,9 +1547,15 @@ class InpaintingGUI(ThemedTk):
         low_res_name_without_ext = os.path.splitext(low_res_filename)[0]
 
         splatted_suffix = None
-        if low_res_name_without_ext.endswith("_splatted2"):
+        if low_res_name_without_ext.endswith("_splatted2F"):
+            splatted_suffix = "_splatted2F.mp4"
+            splatted_core = "_splatted2F"
+        elif low_res_name_without_ext.endswith("_splatted2"):
             splatted_suffix = "_splatted2.mp4"
             splatted_core = "_splatted2"
+        elif low_res_name_without_ext.endswith("_splatted4F"):
+            splatted_suffix = "_splatted4F.mp4"
+            splatted_core = "_splatted4F"
         elif low_res_name_without_ext.endswith("_splatted4"):
             splatted_suffix = "_splatted4.mp4"
             splatted_core = "_splatted4"
@@ -2052,6 +2058,10 @@ class InpaintingGUI(ThemedTk):
         """
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
+        
+        # Detect F tag for flipped videos to propagate to output
+        flip_tag = "F" if video_name_without_ext.endswith("F") else ""
+        
         output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
 
         # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
@@ -2082,12 +2092,22 @@ class InpaintingGUI(ThemedTk):
         if is_hires_blend_enabled and hires_video_path:
             hires_base_name = os.path.basename(hires_video_path)
             hires_name_without_ext = os.path.splitext(hires_base_name)[0]
-            video_name_for_output = hires_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+            video_name_for_output = (
+                hires_name_without_ext.replace("_splatted4F", "")
+                .replace("_splatted2F", "")
+                .replace("_splatted4", "")
+                .replace("_splatted2", "")
+            )
             logger.debug(f"Output filename base set to Hi-Res: {video_name_for_output}")
         else:
-            video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+            video_name_for_output = (
+                video_name_without_ext.replace("_splatted4F", "")
+                .replace("_splatted2F", "")
+                .replace("_splatted4", "")
+                .replace("_splatted2", "")
+            )
 
-        output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
+        output_video_filename = f"{video_name_for_output}{output_suffix}{flip_tag}.mp4"
         output_video_path = os.path.join(save_dir, output_video_filename)
 
         hires_data = {
@@ -2513,7 +2533,7 @@ class InpaintingGUI(ThemedTk):
         # Determine splat type early
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-        is_dual_input = video_name_without_ext.endswith("_splatted2")
+        is_dual_input = video_name_without_ext.endswith("_splatted2") or video_name_without_ext.endswith("_splatted2F")
         self._log_resource_snapshot(stage="video_start", base_video_name=base_video_name, level=logging.INFO)
 
         # 1. SETUP & HI-RES DETECTION
@@ -3111,7 +3131,7 @@ class InpaintingGUI(ThemedTk):
         Expected common format: *-0006_640_splatted4.mp4 -> 6
         """
         stem = os.path.splitext(os.path.basename(video_path))[0]
-        strict_match = re.search(r"-(\d+)_\d+_splatted[24]$", stem)
+        strict_match = re.search(r"-(\d+)_\d+_splatted[24]F?$", stem)
         if strict_match:
             return int(strict_match.group(1))
 

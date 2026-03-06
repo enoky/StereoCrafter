@@ -853,9 +853,11 @@ class MergingGUI(ThemedTk):
             except Exception:
                 self.current_resolution_var.set("Error")
 
-            # Update Flip Status (from sidecar)
+            # Update Flip Status (from sidecar or filename)
             sidecar_data = source_dict.get("sidecar", {})
             is_flipped = sidecar_data.get("flip_horizontal", False)
+            if not is_flipped and os.path.splitext(filename)[0].endswith("F"):
+                is_flipped = True
             self.current_flip_status_var.set("Yes" if is_flipped else "No")
         else:
             self.current_filename_var.set("No video loaded")
@@ -1322,8 +1324,10 @@ class MergingGUI(ThemedTk):
                 # --- NEW: Read sidecar file for this clip ---
                 clip_sidecar_data = self._read_clip_sidecar(inpainted_video_path, core_name)
                 flip_horizontal = clip_sidecar_data.get("flip_horizontal", False)
+                if not flip_horizontal and os.path.splitext(base_name)[0].endswith("F"):
+                    flip_horizontal = True
                 logger.info(
-                    f"Sidecar for '{core_name}': left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}, flip_horizontal={flip_horizontal}"
+                    f"Sidecar/Filename for '{core_name}': left_border={clip_sidecar_data.get('left_border')}, right_border={clip_sidecar_data.get('right_border')}, flip_horizontal={flip_horizontal}"
                 )
 
                 left_border = clip_sidecar_data.get("left_border", 0.0)
@@ -1937,9 +1941,14 @@ class MergingGUI(ThemedTk):
             is_sbs_input = current_source_metadata.get("is_sbs_input", False)
             is_quad_input = current_source_metadata.get("is_quad_input", False)
 
-            # Get flip flag from sidecar
+            # Get flip flag from sidecar or filename
             sidecar_data = current_source_metadata.get("sidecar", {})
             flip_horizontal = sidecar_data.get("flip_horizontal", False)
+            if not flip_horizontal:
+                # Check for "F" suffix in inpainted filename as fallback
+                inpainted_path = current_source_metadata.get("inpainted", "")
+                if inpainted_path and os.path.splitext(os.path.basename(inpainted_path))[0].endswith("F"):
+                    flip_horizontal = True
 
             # Define the processing device based on the 'use_gpu' parameter
             use_gpu = params.get("use_gpu", False) and torch.cuda.is_available()
@@ -2102,12 +2111,23 @@ class MergingGUI(ThemedTk):
             if final_frame_4d is None:
                 final_frame_4d = blended_frame
 
+            if flip_horizontal:
+                final_frame_4d = torch.flip(final_frame_4d, dims=[3])
+
             # Store for saving SBS (CPU side)
-            if original_left is not None:
-                self.preview_original_left_tensor = original_left.squeeze(0).cpu()
+            if flip_horizontal:
+                # When unflipping an SBS [L, R], the result is [flip(R), flip(L)]
+                self.preview_original_left_tensor = torch.flip(blended_frame, dims=[3]).squeeze(0).cpu()
+                if original_left is not None:
+                    self.preview_blended_right_tensor = torch.flip(original_left, dims=[3]).squeeze(0).cpu()
+                else:
+                    self.preview_blended_right_tensor = torch.zeros_like(blended_frame).squeeze(0).cpu()
             else:
-                self.preview_original_left_tensor = torch.zeros_like(blended_frame).squeeze(0).cpu()
-            self.preview_blended_right_tensor = blended_frame.squeeze(0).cpu()
+                if original_left is not None:
+                    self.preview_original_left_tensor = original_left.squeeze(0).cpu()
+                else:
+                    self.preview_original_left_tensor = torch.zeros_like(blended_frame).squeeze(0).cpu()
+                self.preview_blended_right_tensor = blended_frame.squeeze(0).cpu()
 
             # 5. Convert to PIL Image
             final_uint8 = (final_frame_4d[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8)

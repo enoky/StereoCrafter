@@ -141,7 +141,8 @@ class RenderProcessor:
 
         # Determine output grid dimensions and final path
         grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
-        suffix = "_splatted2" if dual_output else "_splatted4"
+        flip_suffix = "F" if flip_horizontal else ""
+        suffix = f"_splatted2{flip_suffix}" if dual_output else f"_splatted4{flip_suffix}"
         res_suffix = f"_{width}"
         final_output_video_path = os.path.normpath(
             f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
