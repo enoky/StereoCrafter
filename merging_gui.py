@@ -16,9 +16,12 @@ from decord import VideoReader, cpu
 import logging
 import time
 import queue
-from dependency.stereocrafter_util import logger, set_util_logger_level, start_ffmpeg_pipe_process
+from core.common.video_io import start_ffmpeg_pipe_process
+from core.common.cli_utils import set_logger_level, draw_progress_bar
+
+logger = logging.getLogger(__name__)
+
 from core.common.gpu_utils import release_cuda_memory
-from core.common.cli_utils import draw_progress_bar
 from core.common.image_processing import apply_dubois_anaglyph, apply_optimized_anaglyph
 from core.common.video_io import get_video_stream_info
 from core.common.sidecar_manager import (
@@ -399,7 +402,7 @@ class MergingGUI(ThemedTk):
         else:
             level = logging.INFO
 
-        set_util_logger_level(level)
+        set_logger_level(logger, level)
         logging.getLogger().setLevel(level)
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
 

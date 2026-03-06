@@ -26,9 +26,11 @@ try:
 except ImportError:
     psutil = None
 
-from dependency.stereocrafter_util import logger, set_util_logger_level, encode_frames_to_mp4
+from core.common.video_io import encode_frames_to_mp4
+from core.common.cli_utils import set_logger_level, draw_progress_bar
 from core.common.gpu_utils import release_cuda_memory
-from core.common.cli_utils import draw_progress_bar
+
+logger = logging.getLogger(__name__)
 from core.common.video_io import get_video_stream_info
 from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
@@ -741,7 +743,7 @@ class InpaintingGUI(ThemedTk):
             if logging.root.level == logging.DEBUG:  # Check if this GUI set it
                 logging.root.setLevel(logging.INFO)  # Reset to a less verbose default
 
-        set_util_logger_level(level)  # Call the function from stereocrafter_util.py
+        set_logger_level(logger, level)  # Call the function from cli_utils.py
         self._ensure_file_logging(level)
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
 

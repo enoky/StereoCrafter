@@ -99,7 +99,7 @@ All notable changes to the splatting GUI and related components.
 
 ### Improvements (v26-02-21.0)
 
-- **HDR Detection**: Enhanced `stereocrafter_util.py` to correctly detect HLG transfer characteristics for 10-bit HEVC encoding.
+- **HDR Detection**: To correctly detect HLG transfer characteristics for 10-bit HEVC encoding.
 - **Legacy Compatibility**: Added internal mappings for old "BT.709" and "BT.2020" config strings to ensure high-quality profile selection.
 
 ---
@@ -136,7 +136,7 @@ All notable changes to the splatting GUI and related components.
 
 ### Changed (v2026-02-04)
 
-- **Slider Behavior Enhancement** (`dependency/stereocrafter_util.py`):
+- **Slider Behavior Enhancement**
   - **Middle-click**: Slider now jumps directly to mouse pointer position (matches frame scrubber behavior)
   - **Right-click**: Resets slider to default value
   - **Left-click**: Maintains original stepped increment behavior

@@ -5,11 +5,13 @@
 ### New Features
 
 #### Load/Refresh List Improvements
+
 - First press scans all video files
 - Subsequent presses only refresh preview (faster)
 - Automatically rescans if folder paths change
 
 #### Resume Mode
+
 - Added "Resume" checkbox in Options section
 - When enabled, skips files already in "finished" subfolder
 - Automatically moves completed files to "finished" subfolder
@@ -18,10 +20,12 @@
 - "Restore Finished Files" in File menu can undo the moves
 
 #### Preview Source Persistence
+
 - Preview Source dropdown selection is now saved to config
 - Restored on next session launch
 
 #### Add Borders Live Update
+
 - Toggling "Add Borders" checkbox now updates preview instantly
 
 ### UI Improvements
@@ -79,13 +83,13 @@
 
 ### Code Refactoring
 
-- Moved sidecar and border helper functions to `dependency/stereocrafter_util.py`
+- Moved sidecar and border helper functions to `core/common/sidecar_manager.py`
 - Functions moved: `find_video_by_core_name`, `find_sidecar_file`, `read_clip_sidecar`, `apply_borders_to_frames`
 - Prepared codebase for migrating non-GUI related code
 
 ### Files Modified
 
 - `merging_gui.py`: Added sidecar reading, border application, UI elements
-- `dependency/stereocrafter_util.py`: Added sidecar and border helper functions
+- `core/common/sidecar_manager.py`: Added sidecar and border helper functions
 - `dependency/merge_help.json`: Added help text for new options
 - `assets/merger_gui_guide.md`: Added documentation for new features and sidecar files

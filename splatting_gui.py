@@ -57,9 +57,11 @@ except ImportError:
 CUDA_AVAILABLE = False  # start state, will check automaticly later
 
 # --- MODIFIED IMPORT ---
-from dependency.stereocrafter_util import logger, set_util_logger_level, start_ffmpeg_pipe_process
+from core.common.video_io import start_ffmpeg_pipe_process
+from core.common.cli_utils import draw_progress_bar, set_logger_level
 from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
-from core.common.cli_utils import draw_progress_bar
+
+logger = logging.getLogger(__name__)
 from core.common.image_processing import (
     custom_blur,
     custom_dilate,
@@ -1380,10 +1382,9 @@ class SplatterGUI(ThemedTk):
             if logging.root.level == logging.DEBUG:  # Check if this GUI set it
                 logging.root.setLevel(logging.INFO)  # Reset to a less verbose default
 
-        # Make sure 'set_util_logger_level' is imported and available.
-        # It's already in dependency/stereocrafter_util, ensure it's imported at the top.
-        # Add 'import logging' at the top of splatting_gui.py if not already present.
-        set_util_logger_level(level)  # Call the function from stereocrafter_util.py
+        # Make sure 'set_logger_level' is imported and available.
+        # It's already in core/common/cli_utils, ensure it's imported at the top.
+        set_logger_level(logger, level)  # Call the function from cli_utils.py
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
 
     def _create_hover_tooltip(self, widget, key):
@@ -6171,7 +6172,7 @@ class SplatterGUI(ThemedTk):
             level_str = "INFO"
 
         # Call the utility function to change the root logger level
-        set_util_logger_level(new_level)
+        set_logger_level(logger, new_level)
 
         logger.info(f"Setting application logging level to: {level_str}")
 

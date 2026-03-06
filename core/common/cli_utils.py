@@ -1,6 +1,7 @@
 """CLI and console utilities for StereoCrafter."""
 
 import sys
+import logging
 
 def draw_progress_bar(current, total, bar_length=50, prefix="Progress:", suffix=""):
     """
@@ -27,3 +28,15 @@ def draw_progress_bar(current, total, bar_length=50, prefix="Progress:", suffix=
     if current == total:
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+
+def set_logger_level(logger, level):
+    """Set the logging level for a logger and all its handlers.
+
+    Args:
+        logger: The logger instance to modify
+        level: The logging level to set (e.g., logging.INFO)
+    """
+    logger.setLevel(level)
+    for h in logger.handlers:
+        h.setLevel(level)

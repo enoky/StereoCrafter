@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from decord import VideoReader
 
-from dependency.stereocrafter_util import start_ffmpeg_pipe_process, start_ffmpeg_pipe_process_dnxhr
+from core.common.video_io import start_ffmpeg_pipe_process, start_ffmpeg_pipe_process_dnxhr
 from core.common.gpu_utils import release_cuda_memory
 from core.common.cli_utils import draw_progress_bar
 from .forward_warp import ForwardWarpStereo
