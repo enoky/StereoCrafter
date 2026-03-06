@@ -2943,8 +2943,8 @@ class SplatterGUI(ThemedTk):
         config["convergence_point"] = self.zero_disparity_anchor_var.get()
         config["multi_map_enabled"] = self.multi_map_var.get()
         config["dark_mode_enabled"] = self.dark_mode_var.get()
-        config["enable_full_resolution"] = self.enable_full_res_var.get()
-        config["enable_low_resolution"] = self.enable_low_res_var.get()
+        config["enable_full_resolution"] = bool(self.enable_full_res_var.get())
+        config["enable_low_resolution"] = bool(self.enable_low_res_var.get())
 
         # Add special cases not directly mapped to _var
         config["window_width"] = self.winfo_width()

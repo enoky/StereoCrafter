@@ -187,13 +187,13 @@ class ProcessingSettings:
             if field not in field_names:
                 continue
             # Light type coercion
-            target = field_types.get(field, "str")
+            target = field_types.get(field, str)
             try:
-                if target == "float":
+                if target is float:
                     value = float(value)
-                elif target == "int":
+                elif target is int:
                     value = int(value)
-                elif target == "bool" and not isinstance(value, bool):
+                elif target is bool and not isinstance(value, bool):
                     value = str(value).lower() in ("true", "1", "yes")
             except (ValueError, TypeError):
                 pass
@@ -455,6 +455,12 @@ class BatchProcessor:
         all_tasks_successful = True
         processed_count = 0
 
+        # Optimization: Group tasks by their source resolution requirements
+        # Full-res and Low-res tasks currently require different decord resolutions.
+        # But we can at least avoid re-reading metadata if we were clever.
+        # For now, let's just make sure the loop is intact and adding logging.
+        self.logger.debug(f"[Batch] Video {video_name} has {len(tasks)} tasks: {[t.name for t in tasks]}")
+
         for task in tasks:
             if self.stop_event.is_set():
                 all_tasks_successful = False
@@ -463,8 +469,11 @@ class BatchProcessor:
             self.progress_queue.put(("status", f"Processing {task.name} for {video_name}"))
 
             # Initialize Readers for this task/resolution
+            # Note: This still opens readers per task because different resolutions require different Decord instances.
+            # To fix 'loading twice' truly, we would need to load at original res and resize in renderer.
             readers = self._initialize_readers(video_path, vid_settings["actual_depth_map_path"], settings, task)
             if not readers:
+                self.logger.error(f"[Batch] Failed to initialize readers for {task.name}")
                 all_tasks_successful = False
                 processed_count += 1
                 self.progress_queue.put(("processed", initial_task_counter + processed_count))
@@ -522,6 +531,7 @@ class BatchProcessor:
             )
 
             if not success:
+                self.logger.error(f"[Batch] Task {task.name} failed for {video_name}")
                 all_tasks_successful = False
 
             processed_count += 1
@@ -580,8 +590,6 @@ class BatchProcessor:
                 self.logger.warning(f"Failed to move {failed} files for {video_name}: {failed_list}")
             else:
                 self.logger.info(f"Successfully moved {moved} source/sidecar files to finished.")
-
-        return len(tasks)
 
         return len(tasks)
 
