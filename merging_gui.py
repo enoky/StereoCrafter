@@ -16,21 +16,20 @@ from decord import VideoReader, cpu
 import logging
 import time
 import queue
-from dependency.stereocrafter_util import (
-    logger,
-    get_video_stream_info,
-    set_util_logger_level,
-    start_ffmpeg_pipe_process,
+from dependency.stereocrafter_util import logger, set_util_logger_level, start_ffmpeg_pipe_process
+from core.common.gpu_utils import release_cuda_memory
+from core.common.cli_utils import draw_progress_bar
+from core.common.image_processing import apply_dubois_anaglyph, apply_optimized_anaglyph
+from core.common.video_io import get_video_stream_info
+from core.common.sidecar_manager import (
     SidecarConfigManager,
     find_video_by_core_name,
     find_sidecar_file,
     read_clip_sidecar,
 )
-from core.common.gpu_utils import release_cuda_memory
-from core.common.cli_utils import draw_progress_bar
 from core.common.image_processing import (
-    apply_mask_dilation, 
-    apply_gaussian_blur, 
+    apply_mask_dilation,
+    apply_gaussian_blur,
     apply_shadow_blur,
     apply_dubois_anaglyph_torch,
     apply_optimized_anaglyph_torch,
@@ -39,11 +38,8 @@ from core.common.image_processing import (
     apply_optimized_anaglyph,
     apply_borders_to_frames,
 )
-from core.ui.widgets import (
-    Tooltip,
-    create_single_slider_with_label_updater,
-)
-from dependency.video_previewer import VideoPreviewer
+from core.ui.widgets import Tooltip, create_single_slider_with_label_updater
+from core.ui.video_previewer import VideoPreviewer
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
 
@@ -615,7 +611,9 @@ class MergingGUI(ThemedTk):
 
         # Row 0: Filename
         ttk.Label(info_frame, text="File:").grid(row=0, column=0, sticky="w", padx=(0, 5))
-        ttk.Label(info_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w")
+        ttk.Label(info_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=1, sticky="w"
+        )
 
         # Row 1: Resolution
         ttk.Label(info_frame, text="Res:").grid(row=1, column=0, sticky="w", padx=(0, 5))
@@ -709,7 +707,9 @@ class MergingGUI(ThemedTk):
         self.progress_bar.pack(fill="x")
 
         # Current Filename
-        self.filename_label = ttk.Label(progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold"))
+        self.filename_label = ttk.Label(
+            progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")
+        )
         self.filename_label.pack(pady=(5, 0))
 
         self.status_label_var = tk.StringVar(value="Ready")
@@ -831,11 +831,11 @@ class MergingGUI(ThemedTk):
             source_dict = self.previewer.video_list[self.previewer.current_video_index]
             inpainted_path = source_dict.get("inpainted", "")
             filename = os.path.basename(inpainted_path)
-            
+
             # Update Filename
             self.current_filename_var.set(filename)
             self.title(f"Stereocrafter Merging GUI {GUI_VERSION} - {filename}")
-            
+
             # Update Resolution (from inpainted video)
             try:
                 if inpainted_path and os.path.exists(inpainted_path):
@@ -1933,7 +1933,7 @@ class MergingGUI(ThemedTk):
             current_source_metadata = self.previewer.video_list[self.previewer.current_video_index]
             is_sbs_input = current_source_metadata.get("is_sbs_input", False)
             is_quad_input = current_source_metadata.get("is_quad_input", False)
-            
+
             # Get flip flag from sidecar
             sidecar_data = current_source_metadata.get("sidecar", {})
             flip_horizontal = sidecar_data.get("flip_horizontal", False)
@@ -1988,7 +1988,7 @@ class MergingGUI(ThemedTk):
             mask = torch.mean(mask_raw, dim=1, keepdim=True)
 
             hires_H, hires_W = right_eye_original.shape[2], right_eye_original.shape[3]
-            
+
             # --- Optimized Resizing ---
             if inpainted.shape[2] != hires_H or inpainted.shape[3] != hires_W:
                 target_aspect = hires_W / hires_H
@@ -2003,7 +2003,7 @@ class MergingGUI(ThemedTk):
                         new_w = int(round(hires_H * inpaint_aspect))
                     inpainted = F.interpolate(inpainted, size=(new_h, new_w), mode="bicubic", align_corners=False)
                     mask = F.interpolate(mask, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                
+
                 # Final resize to target dimensions
                 inpainted = F.interpolate(inpainted, size=(hires_H, hires_W), mode="bicubic", align_corners=False)
                 mask = F.interpolate(mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False)
@@ -2012,13 +2012,13 @@ class MergingGUI(ThemedTk):
             processed_mask = mask.clone()
             if params.get("mask_binarize_threshold", -1.0) >= 0.0:
                 processed_mask = (processed_mask > params["mask_binarize_threshold"]).float()
-            
+
             if params.get("mask_dilate_kernel_size", 0) > 0:
                 processed_mask = apply_mask_dilation(processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu)
-            
+
             if params.get("mask_blur_kernel_size", 0) > 0:
                 processed_mask = apply_gaussian_blur(processed_mask, int(params["mask_blur_kernel_size"]), use_gpu)
-            
+
             if params.get("shadow_shift", 0) > 0:
                 processed_mask = apply_shadow_blur(
                     processed_mask,
@@ -2041,16 +2041,14 @@ class MergingGUI(ThemedTk):
             # Borders
             left_border = sidecar_data.get("left_border", 0.0)
             right_border = sidecar_data.get("right_border", 0.0)
-            
+
             if self.add_borders_var.get() and (left_border > 0 or right_border > 0):
                 if original_left is not None:
                     original_left, blended_frame = apply_borders_to_frames(
                         left_border, right_border, original_left, blended_frame
                     )
                 else:
-                    _, blended_frame = apply_borders_to_frames(
-                        left_border, right_border, blended_frame, blended_frame
-                    )
+                    _, blended_frame = apply_borders_to_frames(left_border, right_border, blended_frame, blended_frame)
 
             # ... (Preview selection logic) ...
             preview_source = self.preview_source_var.get()
@@ -2069,10 +2067,14 @@ class MergingGUI(ThemedTk):
             elif preview_source == "Anaglyph 3D":
                 if original_left is not None:
                     # Red channel from grayscale left, Green/Blue from right
-                    left_gray = (original_left[:, 0:1, :, :] * 0.299 + 
-                                 original_left[:, 1:2, :, :] * 0.587 + 
-                                 original_left[:, 2:3, :, :] * 0.114)
-                    final_frame_4d = torch.cat([left_gray, blended_frame[:, 1:2, :, :], blended_frame[:, 2:3, :, :]], dim=1)
+                    left_gray = (
+                        original_left[:, 0:1, :, :] * 0.299
+                        + original_left[:, 1:2, :, :] * 0.587
+                        + original_left[:, 2:3, :, :] * 0.114
+                    )
+                    final_frame_4d = torch.cat(
+                        [left_gray, blended_frame[:, 1:2, :, :], blended_frame[:, 2:3, :, :]], dim=1
+                    )
                 else:
                     final_frame_4d = blended_frame
             elif preview_source == "Dubois Anaglyph":

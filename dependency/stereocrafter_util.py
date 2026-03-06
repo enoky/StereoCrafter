@@ -4,46 +4,17 @@ This module redirects calls to the newly modularized locations in core.common an
 It also hosts project-specific FFmpeg video IO logic.
 """
 
-# Hardware/GPU Utils
-from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
-
-# CLI Utils
-from core.common.cli_utils import draw_progress_bar
-
-# Image Processing Utils
-from core.common.image_processing import (
-    apply_borders_to_frames,
-    apply_color_transfer,
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
-    custom_dilate,
-    custom_dilate_left,
-    custom_blur,
-    custom_blur_left_masked,
-)
-
-# Video IO Utils - get_video_stream_info moved to core.common
-from core.common.video_io import get_video_stream_info
-
-# UI Utils
-from core.ui.widgets import Tooltip, create_single_slider_with_label_updater, create_dual_slider_layout
+# Hardware/GPU Utils - only CUDA_AVAILABLE is used
+from core.common.gpu_utils import CUDA_AVAILABLE
 
 import os
 import json
 import shutil
 import threading
-import tkinter as tk
-from tkinter import Toplevel, Label, ttk
-from typing import Optional, Tuple, Callable, Dict, Any
+from typing import Optional
 import logging
-import numpy as np
-import torch
-from decord import VideoReader, cpu
 import subprocess
-import cv2
-import gc
 import time
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -148,30 +119,6 @@ def encode_frames_to_mp4(
     return True
 
 
-def read_video_frames_decord(
-    video_path: str,
-    process_length: int = -1,
-    target_fps: float = -1.0,
-    set_res_width: int = None,
-    set_res_height: int = None,
-    decord_ctx=cpu(0),
-):
-    info = get_video_stream_info(video_path)
-    temp_reader = VideoReader(video_path, ctx=cpu(0))
-    oh, ow = temp_reader.get_batch([0]).shape[1:3]
-    del temp_reader
-    dw, dh = (set_res_width, set_res_height) if set_res_width and set_res_height else (ow, oh)
-    vid = VideoReader(video_path, ctx=decord_ctx, width=dw, height=dh)
-    total = len(vid)
-    fps = target_fps if target_fps > 0 else vid.get_avg_fps()
-    stride = max(round(vid.get_avg_fps() / fps), 1)
-    idxs = list(range(0, total, stride))
-    if process_length != -1:
-        idxs = idxs[:process_length]
-    frames = vid.get_batch(idxs).asnumpy().astype("float32") / 255.0
-    return frames, fps, oh, ow, frames.shape[1], frames.shape[2], info
-
-
 def set_util_logger_level(level):
     logger.setLevel(level)
     for h in logger.handlers:
@@ -258,13 +205,3 @@ def start_ffmpeg_pipe_process_dnxhr(content_width, content_height, final_output_
     ]
     logger.info(f"Starting DNxHR pipe: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-# Import sidecar proxies at the end
-from core.common.sidecar_manager import (
-    SidecarConfigManager,
-    find_sidecar_file,
-    find_sidecar_in_folder,
-    read_clip_sidecar,
-    find_video_by_core_name,
-)

@@ -6,7 +6,7 @@ for efficient video loading.
 
 import json
 import logging
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import subprocess  # Needed for FFmpeg-based preview readers
 
@@ -543,3 +543,42 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
     except Exception:
         pass
     return None
+
+
+def read_video_frames_decord(
+    video_path: str,
+    process_length: int = -1,
+    target_fps: float = -1.0,
+    set_res_width: Optional[int] = None,
+    set_res_height: Optional[int] = None,
+    decord_ctx=cpu(0),
+) -> Tuple[np.ndarray, float, int, int, int, int, Optional[dict]]:
+    """Read video frames using decord with optional resizing and fps conversion.
+
+    Args:
+        video_path: Path to the video file
+        process_length: Number of frames to process (-1 for all)
+        target_fps: Target fps (-1 for original)
+        set_res_width: Target width (None for original)
+        set_res_height: Target height (None for original)
+        decord_ctx: Decord context for reading
+
+    Returns:
+        Tuple of (frames as float32 numpy array [T,H,W,C] normalized to 0-1,
+                  fps, original_height, original_width, output_height, output_width,
+                  stream_info)
+    """
+    info = get_video_stream_info(video_path)
+    temp_reader = VideoReader(video_path, ctx=cpu(0))
+    oh, ow = temp_reader.get_batch([0]).shape[1:3]
+    del temp_reader
+    dw, dh = (set_res_width, set_res_height) if set_res_width and set_res_height else (ow, oh)
+    vid = VideoReader(video_path, ctx=decord_ctx, width=dw, height=dh)
+    total = len(vid)
+    fps = target_fps if target_fps > 0 else vid.get_avg_fps()
+    stride = max(round(vid.get_avg_fps() / fps), 1)
+    idxs = list(range(0, total, stride))
+    if process_length != -1:
+        idxs = idxs[:process_length]
+    frames = vid.get_batch(idxs).asnumpy().astype("float32") / 255.0
+    return frames, fps, oh, ow, frames.shape[1], frames.shape[2], info

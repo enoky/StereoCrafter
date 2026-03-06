@@ -57,12 +57,7 @@ except ImportError:
 CUDA_AVAILABLE = False  # start state, will check automaticly later
 
 # --- MODIFIED IMPORT ---
-from dependency.stereocrafter_util import (
-    logger,
-    get_video_stream_info,
-    set_util_logger_level,
-    start_ffmpeg_pipe_process,
-)
+from dependency.stereocrafter_util import logger, set_util_logger_level, start_ffmpeg_pipe_process
 from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
 from core.common.cli_utils import draw_progress_bar
 from core.common.image_processing import (
@@ -72,11 +67,8 @@ from core.common.image_processing import (
     apply_dubois_anaglyph,
     apply_optimized_anaglyph,
 )
-from core.ui.widgets import (
-    Tooltip,
-    create_single_slider_with_label_updater,
-    create_dual_slider_layout,
-)
+from core.common.video_io import get_video_stream_info
+from core.ui.widgets import Tooltip, create_single_slider_with_label_updater, create_dual_slider_layout
 
 try:
     from Forward_Warp import forward_warp
@@ -86,7 +78,7 @@ except:
     from dependency.forward_warp_pytorch import forward_warp
 
     logger.info("Forward Warp Pytorch is active.")
-from dependency.video_previewer import VideoPreviewer
+from core.ui.video_previewer import VideoPreviewer
 
 GUI_VERSION = "26-03-04.3"
 
@@ -125,6 +117,7 @@ from core.ui import ThemeManager, SBSPreviewWindow
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
 from core.common.image_processing import apply_dubois_anaglyph_torch, apply_optimized_anaglyph_torch
+
 
 class SplatterGUI(ThemedTk):
     # --- UI MINIMUM WIDTHS (tweak these numbers) ---
@@ -4273,7 +4266,7 @@ class SplatterGUI(ThemedTk):
         elif preview_source == "Wigglegram":
             self.previewer._start_wigglegram_animation(left_eye_tensor_resized, right_eye_tensor)
             return None
-        
+
         else:
             # For non-3D modes, final_tensor is already set
             pass
@@ -4282,14 +4275,24 @@ class SplatterGUI(ThemedTk):
         if hasattr(self, "sbs_enabled_var") and self.sbs_enabled_var.get():
             # Update window
             if self.sbs_window_obj and self.sbs_window_obj.exists():
-                self.sbs_window_obj.update_frame(left_eye_tensor_resized, right_eye_tensor, overlays_callback=self._draw_sbs_overlays)
+                self.sbs_window_obj.update_frame(
+                    left_eye_tensor_resized, right_eye_tensor, overlays_callback=self._draw_sbs_overlays
+                )
 
             # Cache for fast playback
             if hasattr(self.previewer, "cache_sbs_frame"):
                 try:
                     # Convert to uint8 numpy for compact storage
-                    l_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                    r_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    l_np = (
+                        (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0)
+                        .clip(0, 255)
+                        .astype(np.uint8)
+                    )
+                    r_np = (
+                        (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0)
+                        .clip(0, 255)
+                        .astype(np.uint8)
+                    )
                     frame_idx = int(self.previewer.frame_scrubber_var.get())
                     self.previewer.cache_sbs_frame(frame_idx, l_np, r_np)
                 except Exception as e:
