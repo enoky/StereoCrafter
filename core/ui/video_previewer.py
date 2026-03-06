@@ -26,7 +26,11 @@ except Exception:
 # Import modularized components
 from core.ui.widgets import Tooltip
 from core.common.gpu_utils import release_cuda_memory
-from dependency.stereocrafter_util import logger, get_video_stream_info
+from core.common.video_io import get_video_stream_info
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 VERSION = "26-03-04.1"
 
@@ -414,20 +418,24 @@ class VideoPreviewer(ttk.Frame):
             preview_button_frame, text=">>", width=3, command=self._toggle_fast_forward, takefocus=False
         )
         self.fast_forward_button.pack(side="left", padx=(2, 2))
-        
+
         self.fast_forward_combo = ttk.Combobox(
             preview_button_frame,
             textvariable=self.fast_forward_step_var,
             values=[str(i) for i in range(2, 11)],
             state="readonly",
             width=2,
-            takefocus=False
+            takefocus=False,
         )
         self.fast_forward_combo.pack(side="left", padx=(0, 5))
-        
+
         tip_fast_forward = "Fast Forward (step N frames). Shortcut: Shift+Spacebar (Spacebar pauses)"
         self._create_hover_tooltip(self.fast_forward_button, "preview_fast_forward", tip_fast_forward)
-        self._create_hover_tooltip(self.fast_forward_combo, "preview_fast_forward_step", "Select the number of frames to skip during Fast Forward.")
+        self._create_hover_tooltip(
+            self.fast_forward_combo,
+            "preview_fast_forward_step",
+            "Select the number of frames to skip during Fast Forward.",
+        )
         # Prevent focused buttons from also consuming Space/Return via ttk default bindings.
         # This avoids double-toggling when the user clicks Fast Forward (button gains focus) then presses Space.
         self.play_pause_button.bind("<space>", lambda e: (self._toggle_play_pause(), "break")[1])

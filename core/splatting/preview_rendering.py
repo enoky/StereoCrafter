@@ -21,11 +21,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from dependency.stereocrafter_util import (
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
-    release_cuda_memory,
-)
+from core.common.image_processing import apply_dubois_anaglyph, apply_optimized_anaglyph
+from core.common.gpu_utils import release_cuda_memory
 
 from .forward_warp import ForwardWarpStereo
 
@@ -69,12 +66,7 @@ class PreviewRenderer:
         self.logger = logging.getLogger(__name__)
         self.cuda_available = cuda_available
 
-    def find_preview_sources(
-        self,
-        source_path: str,
-        depth_path: str,
-        multi_map: bool = False,
-    ) -> List[Dict[str, str]]:
+    def find_preview_sources(self, source_path: str, depth_path: str, multi_map: bool = False) -> List[Dict[str, str]]:
         """Find matching source video and depth map pairs for preview.
 
         Scans for matching source video and depth map pairs, handling both
@@ -100,16 +92,12 @@ class PreviewRenderer:
         is_depth_file = os.path.isfile(depth_path)
 
         if is_source_file and is_depth_file:
-            self.logger.debug(
-                f"Preview Scan: Single file mode. Source: {source_path}, Depth: {depth_path}"
-            )
+            self.logger.debug(f"Preview Scan: Single file mode. Source: {source_path}, Depth: {depth_path}")
             return [{"source_video": source_path, "depth_map": depth_path}]
 
         # Folder/batch mode
         if not os.path.isdir(source_path) or not os.path.isdir(depth_path):
-            self.logger.error(
-                "Preview Scan Failed: Inputs must be two files or two valid directories."
-            )
+            self.logger.error("Preview Scan Failed: Inputs must be two files or two valid directories.")
             return []
 
         video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
@@ -132,9 +120,7 @@ class PreviewRenderer:
                     if os.path.isdir(full_sub) and entry.lower() != "sidecars":
                         depth_candidate_folders.append(full_sub)
             except FileNotFoundError:
-                self.logger.error(
-                    f"Preview Scan Failed: Depth folder not found: {depth_path}"
-                )
+                self.logger.error(f"Preview Scan Failed: Depth folder not found: {depth_path}")
                 return []
 
             for video_path in sorted(source_videos):
@@ -146,22 +132,16 @@ class PreviewRenderer:
                     npz = os.path.join(dpath, f"{base_name}_depth.npz")
 
                     if os.path.exists(mp4):
-                        video_source_list.append(
-                            {"source_video": video_path, "depth_map": mp4}
-                        )
+                        video_source_list.append({"source_video": video_path, "depth_map": mp4})
                         matched = True
                         break
                     elif os.path.exists(npz):
-                        video_source_list.append(
-                            {"source_video": video_path, "depth_map": npz}
-                        )
+                        video_source_list.append({"source_video": video_path, "depth_map": npz})
                         matched = True
                         break
 
                 if not matched:
-                    self.logger.debug(
-                        f"Preview Scan: No depth map found for '{base_name}'."
-                    )
+                    self.logger.debug(f"Preview Scan: No depth map found for '{base_name}'.")
         else:
             # Normal mode: single depth folder
             for video_path in sorted(source_videos):
@@ -181,19 +161,12 @@ class PreviewRenderer:
                         break
 
                 if matching_depth_path:
-                    video_source_list.append(
-                        {
-                            "source_video": video_path,
-                            "depth_map": matching_depth_path,
-                        }
-                    )
+                    video_source_list.append({"source_video": video_path, "depth_map": matching_depth_path})
 
         if not video_source_list:
             self.logger.warning("Preview Scan: No matching source/depth pairs found.")
         else:
-            self.logger.info(
-                f"Preview Scan: Found {len(video_source_list)} matching pairs."
-            )
+            self.logger.info(f"Preview Scan: Found {len(video_source_list)} matching pairs.")
 
         return video_source_list
 
@@ -249,21 +222,14 @@ class PreviewRenderer:
 
         # Handle low-res preview sizing
         if is_low_res:
-            W_target, H_target = self._calculate_low_res_dimensions(
-                W_orig, H_orig, settings.get("target_width", 0)
-            )
+            W_target, H_target = self._calculate_low_res_dimensions(W_orig, H_orig, settings.get("target_width", 0))
 
             try:
                 source_resized = F.interpolate(
-                    source_frame.cuda(),
-                    size=(H_target, W_target),
-                    mode="bilinear",
-                    align_corners=False,
+                    source_frame.cuda(), size=(H_target, W_target), mode="bilinear", align_corners=False
                 )
             except Exception as e:
-                self.logger.error(
-                    f"Low-Res preview resize failed: {e}. Falling back to original."
-                )
+                self.logger.error(f"Low-Res preview resize failed: {e}. Falling back to original.")
                 W_target, H_target = W_orig, H_orig
                 source_resized = source_frame.cuda()
         else:
@@ -281,21 +247,10 @@ class PreviewRenderer:
         stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
 
         # Resize depth to target resolution
-        disp_map = (
-            torch.from_numpy(depth_processed)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .float()
-            .cuda()
-        )
+        disp_map = torch.from_numpy(depth_processed).unsqueeze(0).unsqueeze(0).float().cuda()
 
         if H_target != disp_map.shape[2] or W_target != disp_map.shape[3]:
-            disp_map = F.interpolate(
-                disp_map,
-                size=(H_target, W_target),
-                mode="bilinear",
-                align_corners=False,
-            )
+            disp_map = F.interpolate(disp_map, size=(H_target, W_target), mode="bilinear", align_corners=False)
 
         # Calculate disparity
         convergence = float(settings.get("convergence_point", 0.5))
@@ -315,12 +270,7 @@ class PreviewRenderer:
         left_pct = settings.get("left_border_pct", 0.0)
         right_pct = settings.get("right_border_pct", 0.0)
 
-        if preview_mode in [
-            "Anaglyph 3D",
-            "Dubois Anaglyph",
-            "Optimized Anaglyph",
-            "Wigglegram",
-        ]:
+        if preview_mode in ["Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph", "Wigglegram"]:
             l_px = int(round(left_pct * W_target / 100.0))
             r_px = int(round(right_pct * W_target / 100.0))
 
@@ -330,13 +280,7 @@ class PreviewRenderer:
                 right_eye[:, :, :, -r_px:] = 0.0
 
         # Render based on mode
-        final_tensor = self._render_by_mode(
-            source_resized,
-            right_eye,
-            depth_processed,
-            occlusion_mask,
-            preview_mode,
-        )
+        final_tensor = self._render_by_mode(source_resized, right_eye, depth_processed, occlusion_mask, preview_mode)
 
         # Handle wigglegram special case
         if preview_mode == "Wigglegram" and wigglegram_callback:
@@ -347,9 +291,7 @@ class PreviewRenderer:
 
         # Convert to PIL Image
         if final_tensor is not None:
-            pil_img = Image.fromarray(
-                (final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            )
+            pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
         else:
             pil_img = None
 
@@ -360,9 +302,7 @@ class PreviewRenderer:
         self.logger.debug("--- Finished Preview Render ---")
         return pil_img
 
-    def _calculate_low_res_dimensions(
-        self, W_orig: int, H_orig: int, target_width: int
-    ) -> Tuple[int, int]:
+    def _calculate_low_res_dimensions(self, W_orig: int, H_orig: int, target_width: int) -> Tuple[int, int]:
         """Calculate aspect-ratio-correct low-res dimensions.
 
         Args:
@@ -458,9 +398,7 @@ class PreviewRenderer:
         # Apply gamma
         gamma = float(settings.get("depth_gamma", 1.0))
         if round(gamma, 2) != 1.0:
-            depth_normalized = 1.0 - np.power(
-                1.0 - depth_normalized, gamma
-            )
+            depth_normalized = 1.0 - np.power(1.0 - depth_normalized, gamma)
             depth_normalized = np.clip(depth_normalized, 0, 1)
 
         # Low-res: resize processed depth
@@ -478,12 +416,7 @@ class PreviewRenderer:
         return depth_normalized
 
     def _render_by_mode(
-        self,
-        left_eye: torch.Tensor,
-        right_eye: torch.Tensor,
-        depth: np.ndarray,
-        occlusion: torch.Tensor,
-        mode: str,
+        self, left_eye: torch.Tensor, right_eye: torch.Tensor, depth: np.ndarray, occlusion: torch.Tensor, mode: str
     ) -> Optional[torch.Tensor]:
         """Render output based on preview mode.
 
@@ -536,9 +469,7 @@ class PreviewRenderer:
         """
         depth_uint8 = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
         depth_3ch = np.stack([depth_uint8] * 3, axis=-1)
-        return (
-            torch.from_numpy(depth_3ch).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        )
+        return torch.from_numpy(depth_3ch).permute(2, 0, 1).unsqueeze(0).float() / 255.0
 
     def _render_depth_color(self, depth: np.ndarray) -> torch.Tensor:
         """Render colorized depth map.
@@ -552,13 +483,9 @@ class PreviewRenderer:
         depth_uint8 = (np.clip(depth, 0, 1) * 255).astype(np.uint8)
         vis_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_VIRIDIS)
         vis_rgb = cv2.cvtColor(vis_color, cv2.COLOR_BGR2RGB)
-        return (
-            torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        )
+        return torch.from_numpy(vis_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
 
-    def _render_anaglyph_simple(
-        self, left: torch.Tensor, right: torch.Tensor
-    ) -> torch.Tensor:
+    def _render_anaglyph_simple(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         """Render simple red-cyan anaglyph.
 
         Args:
@@ -568,12 +495,8 @@ class PreviewRenderer:
         Returns:
             Anaglyph tensor [1, 3, H, W]
         """
-        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
-        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
+        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
         left_gray = cv2.cvtColor(left_np, cv2.COLOR_RGB2GRAY)
         anaglyph = right_np.copy()
@@ -581,9 +504,7 @@ class PreviewRenderer:
 
         return torch.from_numpy(anaglyph).permute(2, 0, 1).float().unsqueeze(0) / 255.0
 
-    def _render_anaglyph_dubois(
-        self, left: torch.Tensor, right: torch.Tensor
-    ) -> torch.Tensor:
+    def _render_anaglyph_dubois(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         """Render Dubois anaglyph.
 
         Args:
@@ -593,20 +514,14 @@ class PreviewRenderer:
         Returns:
             Anaglyph tensor [1, 3, H, W]
         """
-        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
-        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
+        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
         anaglyph = apply_dubois_anaglyph(left_np, right_np)
 
         return torch.from_numpy(anaglyph).permute(2, 0, 1).float().unsqueeze(0) / 255.0
 
-    def _render_anaglyph_optimized(
-        self, left: torch.Tensor, right: torch.Tensor
-    ) -> torch.Tensor:
+    def _render_anaglyph_optimized(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         """Render Optimized anaglyph.
 
         Args:
@@ -616,12 +531,8 @@ class PreviewRenderer:
         Returns:
             Anaglyph tensor [1, 3, H, W]
         """
-        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
-        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(
-            np.uint8
-        )
+        left_np = (left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        right_np = (right.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
         anaglyph = apply_optimized_anaglyph(left_np, right_np)
 

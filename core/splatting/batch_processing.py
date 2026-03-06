@@ -17,7 +17,8 @@ import torch
 from decord import VideoReader, cpu
 
 from core.common.file_organizer import move_files_to_finished
-from dependency.stereocrafter_util import get_video_stream_info, release_cuda_memory
+from core.common.video_io import get_video_stream_info
+from core.common.gpu_utils import release_cuda_memory
 from .depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
@@ -453,7 +454,7 @@ class BatchProcessor:
         tasks = self.get_defined_tasks(settings)
         all_tasks_successful = True
         processed_count = 0
-        
+
         for task in tasks:
             if self.stop_event.is_set():
                 all_tasks_successful = False
@@ -519,10 +520,10 @@ class BatchProcessor:
                 is_test_mode=settings.is_test_mode,
                 test_target_frame_idx=settings.test_target_frame_idx,
             )
-            
+
             if not success:
                 all_tasks_successful = False
-                
+
             processed_count += 1
             # Note: RenderProcessor already puts 'processed' events via progress_queue.
 
@@ -531,12 +532,12 @@ class BatchProcessor:
 
         # 4. Move to Finished (if enabled and all tasks for this video succeeded)
         should_move = all_tasks_successful and settings.move_to_finished
-        
+
         if should_move:
             self.logger.info(f"==> All tasks successful for {video_name}. Moving source files to finished.")
-            
+
             files_to_move = []
-            
+
             # Source video
             src_dir = os.path.dirname(video_path)
             if is_single_file_mode and settings.single_finished_source_folder:
@@ -544,7 +545,7 @@ class BatchProcessor:
             else:
                 dest_source = src_dir
             files_to_move.append((video_path, dest_source))
-            
+
             # Depth map
             depth_path = vid_settings["actual_depth_map_path"]
             depth_dir = os.path.dirname(depth_path)
@@ -553,14 +554,14 @@ class BatchProcessor:
             else:
                 dest_depth = depth_dir
             files_to_move.append((depth_path, dest_depth))
-            
+
             # Sidecars
             sidecar_patterns = [
                 os.path.join(settings.sidecar_folder, f"{video_name}_depth{settings.sidecar_ext}"),
                 os.path.join(src_dir, f"{video_name}{settings.sidecar_ext}"),
                 os.path.join(depth_dir, f"{video_name}_depth{settings.sidecar_ext}"),
             ]
-            
+
             for sc_path in sidecar_patterns:
                 if os.path.exists(sc_path):
                     # For sidecars, move to source dest if it was in source dir, else depth dest
@@ -569,14 +570,12 @@ class BatchProcessor:
                         files_to_move.append((sc_path, dest_source))
                     else:
                         files_to_move.append((sc_path, dest_depth))
-            
+
             # Perform move
             moved, failed, failed_list = move_files_to_finished(
-                files_to_move=files_to_move,
-                logger=self.logger,
-                wait_before_move=0.5
+                files_to_move=files_to_move, logger=self.logger, wait_before_move=0.5
             )
-            
+
             if failed > 0:
                 self.logger.warning(f"Failed to move {failed} files for {video_name}: {failed_list}")
             else:

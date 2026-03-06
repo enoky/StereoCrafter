@@ -4,6 +4,7 @@ Provides video reading and frame extraction utilities using decord
 for efficient video loading.
 """
 
+import json
 import logging
 from typing import Any, Optional, Tuple, Union
 
@@ -444,9 +445,6 @@ def read_video_frames(
         f"Total frames for processing: {total_frames_to_process}"
     )
 
-    # Import here to avoid circular dependency
-    from dependency.stereocrafter_util import get_video_stream_info
-
     video_stream_info = get_video_stream_info(video_path)  # Get stream info for FFmpeg later
 
     # If strict FFmpeg decode is requested, swap in an FFmpeg-backed reader for frame fetch.
@@ -491,3 +489,57 @@ def read_video_frames(
         video_stream_info,
         total_frames_to_process,
     )
+
+
+_FFPROBE_AVAIL: Optional[bool] = None
+_INFO_CACHE: dict = {}
+
+
+def get_video_stream_info(video_path: str) -> Optional[dict]:
+    """Get video stream information using ffprobe.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Dictionary containing stream info (width, height, codec, etc.) or None if unavailable
+    """
+    global _FFPROBE_AVAIL, _INFO_CACHE
+    if not video_path:
+        return None
+    if video_path in _INFO_CACHE:
+        return _INFO_CACHE[video_path]
+
+    if _FFPROBE_AVAIL is None:
+        try:
+            subprocess.run(["ffprobe", "-version"], check=True, capture_output=True)
+            _FFPROBE_AVAIL = True
+        except Exception:
+            _FFPROBE_AVAIL = False
+    if not _FFPROBE_AVAIL:
+        return None
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,codec_name,profile,pix_fmt,color_range,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+            "-show_entries",
+            "side_data=mastering_display_metadata,max_content_light_level",
+            "-of",
+            "json",
+            video_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        if "streams" in data and data["streams"]:
+            info = {k: v for k, v in data["streams"][0].items() if v and v not in ("N/A", "und", "unknown")}
+            _INFO_CACHE[video_path] = info
+            return info
+    except Exception:
+        pass
+    return None

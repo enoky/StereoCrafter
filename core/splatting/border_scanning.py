@@ -11,12 +11,8 @@ from typing import Optional, Tuple
 import numpy as np
 from decord import VideoReader, cpu
 
-from .depth_processing import (
-    DEPTH_VIS_TV10_BLACK_NORM,
-    DEPTH_VIS_TV10_WHITE_NORM,
-    _infer_depth_bit_depth,
-)
-from dependency.stereocrafter_util import get_video_stream_info
+from .depth_processing import DEPTH_VIS_TV10_BLACK_NORM, DEPTH_VIS_TV10_WHITE_NORM, _infer_depth_bit_depth
+from core.common.video_io import get_video_stream_info
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +81,8 @@ class BorderScanner:
             if status_callback:
                 status_callback(f"Scanning borders for {os.path.basename(depth_path)}...")
 
-            res = self._scan_depth_video(
-                vr, total_frames, conv, max_disp, gamma, stop_event, status_callback
-            )
-            
+            res = self._scan_depth_video(vr, total_frames, conv, max_disp, gamma, stop_event, status_callback)
+
             if res and flip_horizontal:
                 # Swap L and R results back to original source orientation
                 return res[1], res[0]
@@ -133,10 +127,8 @@ class BorderScanner:
             if total_frames <= 0:
                 return None
 
-            res = self._scan_depth_video(
-                vr_depth, total_frames, conv, max_disp, gamma, stop_event
-            )
-            
+            res = self._scan_depth_video(vr_depth, total_frames, conv, max_disp, gamma, stop_event)
+
             if res and flip_horizontal:
                 # Swap L and R results back to original source orientation
                 return res[1], res[0]
@@ -220,9 +212,7 @@ class BorderScanner:
         max_L = min(5.0, round(float(max_L), 3))
         max_R = min(5.0, round(float(max_R), 3))
 
-        self.logger.info(
-            f"Border scan complete: L={max_L}, R={max_R} (Conv={conv:.2f}, Disp={max_disp:.1f})"
-        )
+        self.logger.info(f"Border scan complete: L={max_L}, R={max_R} (Conv={conv:.2f}, Disp={max_disp:.1f})")
 
         if status_callback:
             status_callback(f"Scan complete: L={max_L}%, R={max_R}%")
@@ -243,7 +233,7 @@ class BorderScanner:
         """
         try:
             # Try to get the file path from the reader
-            if hasattr(video_reader, '_file_path'):
+            if hasattr(video_reader, "_file_path"):
                 depth_path = video_reader._file_path
             else:
                 # Fallback - can't determine compensation
@@ -253,18 +243,14 @@ class BorderScanner:
             if _infer_depth_bit_depth(_info) > 8:
                 color_range = str((_info or {}).get("color_range", "unknown")).lower()
                 if color_range == "tv":
-                    return 1.0 / (
-                        DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
-                    )
+                    return 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
         except Exception:
             pass
 
         return 1.0
 
     @staticmethod
-    def calculate_basic_border(
-        convergence: float, max_disp: float, tv_comp: float = 1.0
-    ) -> float:
+    def calculate_basic_border(convergence: float, max_disp: float, tv_comp: float = 1.0) -> float:
         """Calculate border width for Auto Basic mode.
 
         Args:
@@ -280,11 +266,7 @@ class BorderScanner:
 
     @staticmethod
     def calculate_border_from_depth(
-        depth_value: float,
-        conv: float,
-        max_disp: float,
-        gamma: float = 1.0,
-        tv_comp: float = 1.0,
+        depth_value: float, conv: float, max_disp: float, gamma: float = 1.0, tv_comp: float = 1.0
     ) -> float:
         """Calculate border width from a single depth value.
 
@@ -307,9 +289,7 @@ class BorderScanner:
         return min(5.0, border)
 
     @staticmethod
-    def sync_sliders_to_auto_borders(
-        left_border: float, right_border: float
-    ) -> Tuple[float, float]:
+    def sync_sliders_to_auto_borders(left_border: float, right_border: float) -> Tuple[float, float]:
         """Convert left/right borders to width/bias values.
 
         Args:

@@ -18,12 +18,9 @@ import torch
 import torch.nn.functional as F
 from decord import VideoReader
 
-from dependency.stereocrafter_util import (
-    start_ffmpeg_pipe_process,
-    start_ffmpeg_pipe_process_dnxhr,
-    release_cuda_memory,
-    draw_progress_bar,
-)
+from dependency.stereocrafter_util import start_ffmpeg_pipe_process, start_ffmpeg_pipe_process_dnxhr
+from core.common.gpu_utils import release_cuda_memory
+from core.common.cli_utils import draw_progress_bar
 from .forward_warp import ForwardWarpStereo
 from .depth_processing import process_depth_batch, normalize_and_gamma_depth
 
@@ -146,7 +143,9 @@ class RenderProcessor:
         grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
         suffix = "_splatted2" if dual_output else "_splatted4"
         res_suffix = f"_{width}"
-        final_output_video_path = os.path.normpath(f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4")
+        final_output_video_path = os.path.normpath(
+            f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
+        )
         logger.info(f"==> Target Output Path: {final_output_video_path}")
 
         task_name = "LowRes" if is_low_res_task else "HiRes"
@@ -427,12 +426,16 @@ class RenderProcessor:
             if os.path.exists(final_output_video_path):
                 file_size = os.path.getsize(final_output_video_path)
                 if file_size > 0:
-                    logger.debug(f"==> VERIFIED: Output file created successfully at {final_output_video_path} ({file_size / (1024*1024):.2f} MB)")
+                    logger.debug(
+                        f"==> VERIFIED: Output file created successfully at {final_output_video_path} ({file_size / (1024 * 1024):.2f} MB)"
+                    )
                 else:
                     logger.error(f"==> ERROR: Output file exists but is EMPTY (0 bytes) at {final_output_video_path}")
                     encoding_successful = False
             else:
-                logger.error(f"==> ERROR: Output file was NOT FOUND at {final_output_video_path} despite FFmpeg returning 0.")
+                logger.error(
+                    f"==> ERROR: Output file was NOT FOUND at {final_output_video_path} despite FFmpeg returning 0."
+                )
                 encoding_successful = False
 
         return encoding_successful

@@ -845,7 +845,7 @@ def load_pre_rendered_depth(
         process_length = -1
 
     # Import here to avoid circular dependency
-    from dependency.stereocrafter_util import get_video_stream_info
+    from core.common.video_io import get_video_stream_info
 
     logger.debug(f"==> Initializing depth reader from: {depth_map_path}")
 
