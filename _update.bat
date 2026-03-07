@@ -82,11 +82,21 @@ git pull !REMOTE! !BRANCH!
 
 if %errorlevel% neq 0 (
     echo.
-    echo [ERROR] Git pull failed. You may have local changes that conflict.
-    echo Please commit or stash your changes and try again.
-    pause
-    exit /b %errorlevel%
+    echo [WARNING] Git pull failed. This usually means you have local changes that conflict.
+    echo.
+    set /p force_pull="Would you like to DISCARD your local changes and force update? (Y/N): "
+    if /i "!force_pull!"=="Y" (
+        echo [INFO] Forcing update (reset --hard)...
+        git reset --hard !REMOTE!/!BRANCH!
+        git pull !REMOTE! !BRANCH!
+    ) else (
+        echo.
+        echo [ERROR] Update aborted. Please commit or stash your changes manually.
+        pause
+        exit /b 1
+    )
 )
+
 
 :: --- Update Submodules ---
 echo.

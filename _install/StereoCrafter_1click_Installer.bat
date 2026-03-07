@@ -2,13 +2,38 @@
 setlocal enabledelayedexpansion
 REM StereoCrafter Universal Smart Installer (v4.2 - Fixed Log Pathing)
 
-:: --- LOG INITIALIZATION (The "Absolute" Fix) ---
-:: %~dp0 is the folder where THIS script is located.
-:: We set the log to always live next to the script, no matter where we 'cd' to.
+:: --- LOG INITIALIZATION ---
 set "LOGFILE=%~dp0install_log.txt"
+
+:: --- HEALTH CHECK (Pre-flight Permissions) ---
+echo [0/7] Verifying Environment...
+
+:: Check if running from a ZIP
+echo %~dp0 | findstr /i "Temp" >nul
+if !errorlevel! equ 0 (
+    echo [WARNING] It looks like you are running this from a temporary folder or a ZIP.
+    echo Please EXTRACT the folder to your Desktop or a permanent location first.
+)
+
+:: Check Write Permissions
+echo test > "%~dp0write_test.txt" 2>nul
+if !errorlevel! neq 0 (
+    echo [ERROR] Access Denied! Cannot write to this folder.
+    echo Please move the StereoCrafter folder to your Desktop or Documents.
+    echo Or try right-clicking this script and selecting 'Run as Administrator'.
+    pause && exit /b 1
+)
+del "%~dp0write_test.txt"
+
+:: Check for Admin (Required for persistent pathing/winget)
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [INFO] Note: Not running as Administrator. Some features (winget) might prompt for permission.
+)
 
 :: Clear the log and start the session
 echo [%date% %time%] --- NEW INSTALLATION/UPDATE SESSION --- > "%LOGFILE%"
+
 
 call :log "[1/7] Checking for Git..."
 where git >nul 2>&1
@@ -53,7 +78,29 @@ if /i "!PREFIX!"=="StereoCrafter" (
     set "ALREADY_HOME=false"
 )
 
-call :log "[4/7] Repository Check..."
+call :log "[4/7] Repository Selection..."
+
+:: Define URLs
+set "Bill8_URL=https://github.com/Billynom8/StereoCrafter.git"
+set "ENOKY_URL=https://github.com/enoky/StereoCrafter.git"
+
+echo.
+echo =========================================================
+echo REPOSITORY SELECTION
+echo =========================================================
+echo 1. Billynom8 - !Bill8_URL! [DEFAULT]
+echo 2. enoky    - !ENOKY_URL!
+echo.
+set "repo_choice=1"
+set /p repo_choice="Select source (1 or 2): "
+
+set "SELECTED_URL=!Bill8_URL!"
+set "PULL_REMOTE=origin"
+if "!repo_choice!"=="2" (
+    set "SELECTED_URL=!ENOKY_URL!"
+    set "PULL_REMOTE=upstream"
+)
+
 if "!ALREADY_HOME!"=="false" (
     set "FOUND_SUB="
     for /d %%D in (StereoCrafter*) do (
@@ -63,12 +110,56 @@ if "!ALREADY_HOME!"=="false" (
     if defined FOUND_SUB (
         call :log "[INFO] Found project in subfolder: !FOUND_SUB!"
         cd "!FOUND_SUB!"
+        set "ALREADY_HOME=true"
     ) else (
-        call :log "[INFO] Cloning fresh repository..."
-        git clone --recurse-submodules https://github.com/enoky/StereoCrafter.git >> "%LOGFILE%" 2>&1
+        call :log "[INFO] Cloning fresh repository from !SELECTED_URL!..."
+        git clone --recurse-submodules !SELECTED_URL! >> "%LOGFILE%" 2>&1
+        if !errorlevel! neq 0 (
+            call :log "[ERROR] Git clone failed. Check log for details: %LOGFILE%"
+            pause && exit /b 1
+        )
         cd StereoCrafter
+        set "ALREADY_HOME=true"
     )
 )
+
+:: Standardize Remotes (matching _update.bat structure)
+where git >nul 2>&1
+if %errorlevel% equ 0 (
+    if exist ".git" (
+        call :log "[INFO] Standardizing remotes (origin=Billynom8, upstream=enoky)..."
+        git remote set-url origin !Bill8_URL! 2>nul || git remote add origin !Bill8_URL! 2>nul
+        git remote set-url upstream !ENOKY_URL! 2>nul || git remote add upstream !ENOKY_URL! 2>nul
+    )
+)
+
+:: Optional Update Pull
+if "!ALREADY_HOME!"=="true" (
+    echo.
+    set /p do_pull="Detected existing repo. Pull latest code from !PULL_REMOTE!? (Y/N) [Default=N]: "
+    if /i "!do_pull!"=="Y" (
+        call :log "[INFO] Pulling updates from !PULL_REMOTE!..."
+        
+        :: Detect branch (main or master)
+        git fetch !PULL_REMOTE! main --quiet 2>nul
+        if !errorlevel! equ 0 ( set "BR=main" ) else ( set "BR=master" )
+        
+        git pull !PULL_REMOTE! !BR! >> "%LOGFILE%" 2>&1
+        if !errorlevel! neq 0 (
+            echo.
+            echo [WARNING] Git pull failed. This usually means you have local changes.
+            set /p force_pull="Would you like to DISCARD your local changes and force update? (Y/N): "
+            if /i "!force_pull!"=="Y" (
+                call :log "[INFO] Forcing update (reset --hard)..."
+                git reset --hard !PULL_REMOTE!/!BR! >> "%LOGFILE%" 2>&1
+                git pull !PULL_REMOTE! !BR! >> "%LOGFILE%" 2>&1
+            ) else (
+                call :log "[SKIP] User declined force update. Manual resolution required."
+            )
+        )
+    )
+)
+
 
 call :log "[5/7] Setting up Environment..."
 if exist "venv" (
