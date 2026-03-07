@@ -18,14 +18,6 @@ if !errorlevel! equ 0 (
     echo Please EXTRACT the folder to a permanent location first.
 )
 
-:: Check Write Permissions
-echo test > "write_test.txt" 2>nul
-if !errorlevel! neq 0 (
-    echo [ERROR] Access Denied! Cannot write to: "%CD%"
-    echo Please move the StereoCrafter folder to your Desktop or Documents.
-    pause && exit /b 1
-)
-del "write_test.txt"
 
 
 :: --- Detect Remotes ---

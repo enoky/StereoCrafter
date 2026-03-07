@@ -20,26 +20,12 @@ if !errorlevel! equ 0 (
     echo Please EXTRACT the folder to your Desktop or a permanent location first.
 )
 
-:: Check Write Permissions
-echo test > "write_test.txt" 2>nul
-if !errorlevel! neq 0 (
-    echo [ERROR] Access Denied! Cannot write to: "%CD%"
-    echo.
-    echo Possible reasons:
-    echo 1. You haven't EXTRACTED the zip file.
-    echo 2. The folder is in a protected area (like C:\Program Files).
-    echo 3. You are running from a Network/UNC drive which doesn't support Admin mode.
-    echo.
-    echo ACTION: Move the StereoCrafter folder to your DESKTOP and try again.
-    pause && exit /b 1
-)
-del "write_test.txt"
 
 
 :: Check for Admin (Required for persistent pathing/winget)
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [INFO] Note: Not running as Administrator. Some features (winget) might prompt for permission.
+    echo [INFO] Note: Not running as Administrator. Some features [winget] might prompt for permission.
 )
 
 :: Clear the log and start the session
