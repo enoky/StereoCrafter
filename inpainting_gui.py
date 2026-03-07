@@ -42,7 +42,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-07.1"
+GUI_VERSION = "26-03-07.2"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1965,9 +1965,10 @@ class InpaintingGUI(ThemedTk):
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
         frames_blend_mask_processed_unpadded_original_length = blend_processed_mask[:num_frames_original].clone()
 
-        # --- Pad for Tiling (for pipeline input) ---
-        frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
-        frames_inpaint_mask_padded = pad_for_tiling(inpaint_processed_mask, tile_num, tile_overlap=(128, 128))
+        # --- Prepare Tiling (for pipeline input) ---
+        # Note: legacy pad_for_tiling was removed; spatial_tiled_process now handles its own padding.
+        frames_warpped_padded = frames_warpped_normalized
+        frames_inpaint_mask_padded = inpaint_processed_mask
 
         padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
 
