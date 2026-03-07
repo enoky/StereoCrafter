@@ -1,6 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
-REM StereoCrafter Universal Smart Installer (v4.2 - Fixed Log Pathing)
+
+:: --- ANCHORING ---
+:: Force the script to run from its own directory (Critical for 'Run as Admin')
+cd /d "%~dp0"
+
+REM StereoCrafter Universal Smart Installer (v4.3 - Admin Path Fix)
 
 :: --- LOG INITIALIZATION ---
 set "LOGFILE=%~dp0install_log.txt"
@@ -9,21 +14,27 @@ set "LOGFILE=%~dp0install_log.txt"
 echo [0/7] Verifying Environment...
 
 :: Check if running from a ZIP
-echo %~dp0 | findstr /i "Temp" >nul
+echo "%~dp0" | findstr /i "Temp" >nul
 if !errorlevel! equ 0 (
     echo [WARNING] It looks like you are running this from a temporary folder or a ZIP.
     echo Please EXTRACT the folder to your Desktop or a permanent location first.
 )
 
 :: Check Write Permissions
-echo test > "%~dp0write_test.txt" 2>nul
+echo test > "write_test.txt" 2>nul
 if !errorlevel! neq 0 (
-    echo [ERROR] Access Denied! Cannot write to this folder.
-    echo Please move the StereoCrafter folder to your Desktop or Documents.
-    echo Or try right-clicking this script and selecting 'Run as Administrator'.
+    echo [ERROR] Access Denied! Cannot write to: "%CD%"
+    echo.
+    echo Possible reasons:
+    echo 1. You haven't EXTRACTED the zip file.
+    echo 2. The folder is in a protected area (like C:\Program Files).
+    echo 3. You are running from a Network/UNC drive which doesn't support Admin mode.
+    echo.
+    echo ACTION: Move the StereoCrafter folder to your DESKTOP and try again.
     pause && exit /b 1
 )
-del "%~dp0write_test.txt"
+del "write_test.txt"
+
 
 :: Check for Admin (Required for persistent pathing/winget)
 net session >nul 2>&1

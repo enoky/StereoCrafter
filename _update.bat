@@ -1,14 +1,32 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: --- ANCHORING ---
+cd /d "%~dp0"
+
 echo.
 echo =================================================
 echo === StereoCrafter Modern Update Script ===
 echo =================================================
 echo.
 
-:: Change to the directory of this batch file
-cd /d "%~dp0"
+:: --- HEALTH CHECK ---
+:: Check if running from a ZIP
+echo "%~dp0" | findstr /i "Temp" >nul
+if !errorlevel! equ 0 (
+    echo [WARNING] It looks like you are running this from a temporary folder or a ZIP.
+    echo Please EXTRACT the folder to a permanent location first.
+)
+
+:: Check Write Permissions
+echo test > "write_test.txt" 2>nul
+if !errorlevel! neq 0 (
+    echo [ERROR] Access Denied! Cannot write to: "%CD%"
+    echo Please move the StereoCrafter folder to your Desktop or Documents.
+    pause && exit /b 1
+)
+del "write_test.txt"
+
 
 :: --- Detect Remotes ---
 set "Bill8_URL=https://github.com/Billynom8/StereoCrafter.git"

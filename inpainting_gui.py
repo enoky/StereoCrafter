@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 from core.common.video_io import get_video_stream_info
 from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
+from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
+
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
@@ -131,6 +133,7 @@ class InpaintingGUI(ThemedTk):
         )
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
+        self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
 
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -1518,7 +1521,7 @@ class InpaintingGUI(ThemedTk):
             final_left_frames_for_sbs = frames_left_original_cropped
 
         # --- NEW: Unflip logic for Quad (SBS) inputs only ---
-        # According to user requirements: 
+        # According to user requirements:
         # - Dual inputs never unflip in inpainting; they keep the 'F' tag for Merging GUI.
         # - Quad inputs (SBS) always unflip if the input is flipped, removing the 'F' tag.
         input_has_f = os.path.splitext(base_video_name)[0].endswith("F")
@@ -1701,6 +1704,7 @@ class InpaintingGUI(ThemedTk):
             "keep_inpaint_cache": self.keep_inpaint_cache_var.get(),
             "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
+            "move_to_finished": self.move_to_finished_var.get(),
         }
         return config
 
@@ -2075,7 +2079,7 @@ class InpaintingGUI(ThemedTk):
         """
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-        
+
         # Detect F tag for flipped videos to propagate to output
         input_has_f = video_name_without_ext.endswith("F")
         if is_dual_input:
@@ -2084,7 +2088,7 @@ class InpaintingGUI(ThemedTk):
         else:
             # Quad (SBS) always unflips internally, so it loses the F tag in the filename
             flip_tag = ""
-        
+
         output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
 
         # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
@@ -2389,7 +2393,7 @@ class InpaintingGUI(ThemedTk):
             command=self._toggle_blend_parameters_state,
         )
         blend_enable_check.grid(
-            row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2
+            row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2
         )  # Spans all 4 columns
         Tooltip(blend_enable_check, self.help_data.get("enable_post_inpainting_blend", ""))
 
@@ -2411,8 +2415,17 @@ class InpaintingGUI(ThemedTk):
             variable=self.keep_inpaint_cache_var,
             command=self._toggle_keep_inpaint_cache_state,
         )
-        keep_cache_check.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        keep_cache_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         Tooltip(keep_cache_check, self.help_data.get("keep_inpaint_cache", ""))
+
+        move_finished_check = ttk.Checkbutton(
+            post_process_frame,
+            text="Resume",
+            variable=self.move_to_finished_var,
+            command=self.save_config,
+        )
+        move_finished_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(move_finished_check, self.help_data.get("move_to_finished", ""))
         current_row += 1
 
         # Row 1: Blend Mask Source
@@ -3085,6 +3098,7 @@ class InpaintingGUI(ThemedTk):
         self.mask_blur_kernel_size_var.set("7")
         self.blend_mask_source_var.set("hybrid")
         self.keep_inpaint_cache_var.set(False)
+        self.move_to_finished_var.set(True)
 
         self.enable_post_inpainting_blend.set(False)  # Default state is OFF
         self.enable_color_transfer.set(True)  # Default state is ON
@@ -3097,6 +3111,7 @@ class InpaintingGUI(ThemedTk):
         logger.info("GUI settings reset to defaults.")
 
     def restore_finished_files(self):
+        """Moves all files from 'finished' folders back to their original input folders."""
         if not messagebox.askyesno(
             "Restore Finished Files",
             "Are you sure you want to move all processed videos from the 'finished' folders back to their respective input directories?",
@@ -3106,37 +3121,15 @@ class InpaintingGUI(ThemedTk):
         input_folder = self.input_folder_var.get()
         hires_input_folder = self.hires_blend_folder_var.get()
 
-        restore_dirs = [(input_folder, os.path.join(input_folder, "finished"))]
+        restore_dirs = [(input_folder, "finished")]
 
         # Only check the hires folder if it's different from the low-res folder
         if os.path.normpath(input_folder) != os.path.normpath(hires_input_folder):
-            restore_dirs.append((hires_input_folder, os.path.join(hires_input_folder, "finished")))
+            restore_dirs.append((hires_input_folder, "finished"))
 
-        restored_count = 0
-        errors_count = 0
-
-        for input_dir, finished_dir in restore_dirs:
-            if not os.path.isdir(finished_dir):
-                logger.info(f"Restore skipped: 'finished' folder not found at {finished_dir}")
-                continue
-
-            # Collect files to move first
-            files_to_move = [f for f in os.listdir(finished_dir) if os.path.isfile(os.path.join(finished_dir, f))]
-
-            if not files_to_move:
-                logger.info(f"Restore skipped: No files found in {finished_dir}")
-                continue
-
-            for filename in files_to_move:
-                src_path = os.path.join(finished_dir, filename)
-                dest_path = os.path.join(input_dir, filename)
-                try:
-                    shutil.move(src_path, dest_path)
-                    restored_count += 1
-                    logger.info(f"Moved '{filename}' from '{finished_dir}' back to '{input_dir}'")
-                except Exception as e:
-                    errors_count += 1
-                    logger.error(f"Error moving file '{filename}' during restore: {e}")
+        restored_count, errors_count, failed_files = _restore_finished_files(
+            restore_dirs=restore_dirs, logger=logger, wait_before_move=0.5
+        )
 
         if restored_count > 0 or errors_count > 0:
             messagebox.showinfo(
@@ -3226,7 +3219,30 @@ class InpaintingGUI(ThemedTk):
                 )
                 input_videos = filtered_videos
 
+            # --- Resume/Skip Logic ---
+            if self.move_to_finished_var.get():
+                low_res_finished_dir = os.path.join(input_folder, "finished")
+                hires_input_folder_pref = self.hires_blend_folder_var.get()
+
+                if os.path.isdir(low_res_finished_dir):
+                    finished_files = set(os.listdir(low_res_finished_dir))
+
+                    # If hires folder is different, we might also want to check it,
+                    # but typically checking the primary input folder is enough to identify processed clips.
+
+                    original_count = len(input_videos)
+                    input_videos = [v for v in input_videos if os.path.basename(v) not in finished_files]
+                    skipped_count = original_count - len(input_videos)
+                    if skipped_count > 0:
+                        logger.info(f"Resume mode: Skipped {skipped_count} already processed videos found in 'finished'.")
+
+                if not input_videos:
+                    self.after(0, lambda: messagebox.showinfo("Info", "All videos in the input folder have already been processed."))
+                    self.after(0, self.processing_done)
+                    return
+
             self.total_videos.set(len(input_videos))
+
             # finished_folder = os.path.join(input_folder, "finished")
             # os.makedirs(finished_folder, exist_ok=True)
             os.makedirs(output_folder, exist_ok=True)
@@ -3328,38 +3344,35 @@ class InpaintingGUI(ThemedTk):
                         logger.info(
                             "Single Clip ID mode: leaving processed input files in place (skipping move to 'finished')."
                         )
+                    elif not self.move_to_finished_var.get():
+                        logger.info("Move to Finished disabled: leaving processed input files in place.")
                     else:
                         # Define finished folder paths dynamically
                         low_res_input_folder = input_folder
                         hires_input_folder = self.hires_blend_folder_var.get()
 
-                        low_res_finished_folder = os.path.join(low_res_input_folder, "finished")
+                        files_to_move = []
 
-                        # 1. Move LOW-RES input file
-                        try:
-                            os.makedirs(low_res_finished_folder, exist_ok=True)  # Ensure low-res finished exists
-                            shutil.move(video_path, low_res_finished_folder)
-                            logger.debug(f"Moved {video_path} to {low_res_finished_folder}")
-                        except Exception as e:
-                            logger.error(f"Failed to move {video_path} to {low_res_finished_folder}: {e}")
+                        # 1. Add LOW-RES input file
+                        files_to_move.append((video_path, low_res_input_folder))
 
-                        # 2. Move HI-RES input file if it was used
+                        # 2. Add sidecar file (if exists)
+                        json_path = os.path.splitext(video_path)[0] + ".spsidecar"
+                        if os.path.exists(json_path):
+                            files_to_move.append((json_path, low_res_input_folder))
+
+                        # 3. Add HI-RES input file if it was used
                         if hi_res_input_path:
-                            # Ensure the high-res folder is different before trying to move
                             if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
-                                hires_finished_folder = os.path.join(hires_input_folder, "finished")
-                                try:
-                                    os.makedirs(hires_finished_folder, exist_ok=True)  # Ensure hi-res finished exists
-                                    shutil.move(hi_res_input_path, hires_finished_folder)
-                                    logger.debug(f"Moved Hi-Res input {hi_res_input_path} to {hires_finished_folder}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}"
-                                    )
-                            else:
-                                logger.warning(
-                                    f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder."
-                                )
+                                files_to_move.append((hi_res_input_path, hires_input_folder))
+
+                        # Perform the move with a delay to ensure handles are released
+                        move_files_to_finished(
+                            files_to_move=files_to_move,
+                            logger=logger,
+                            wait_before_move=0.5
+                        )
+
                 else:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
 
