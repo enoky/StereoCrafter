@@ -4,13 +4,20 @@ Provides video reading and frame extraction utilities using decord
 for efficient video loading.
 """
 
+import os
+import json
+import shutil
+import threading
+import time
 import logging
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import subprocess  # Needed for FFmpeg-based preview readers
 
 import numpy as np
 from decord import VideoReader, cpu
+
+from core.common.gpu_utils import CUDA_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +46,7 @@ class VideoIO:
     """Video input/output operations for video processing."""
 
     @staticmethod
-    def read_video_info(
-        video_path: str,
-    ) -> Tuple[int, int, int, float]:
+    def read_video_info(video_path: str) -> Tuple[int, int, int, float]:
         """Read video information without loading frames.
 
         Args:
@@ -57,17 +62,12 @@ class VideoIO:
         height, width = first_frame.shape[1:3]
         fps = float(reader.get_avg_fps())
 
-        logger.debug(
-            f"==> Video info: {total_frames} frames, {width}x{height}, {fps} fps"
-        )
+        logger.debug(f"==> Video info: {total_frames} frames, {width}x{height}, {fps} fps")
 
         return total_frames, height, width, fps
 
     @staticmethod
-    def read_frame(
-        reader: VideoReader,
-        index: int,
-    ) -> np.ndarray:
+    def read_frame(reader: VideoReader, index: int) -> np.ndarray:
         """Read a single frame from a video reader.
 
         Args:
@@ -80,10 +80,7 @@ class VideoIO:
         return reader.get_batch([index]).asnumpy()[0]
 
     @staticmethod
-    def read_frames_batch(
-        reader: VideoReader,
-        indices: list,
-    ) -> np.ndarray:
+    def read_frames_batch(reader: VideoReader, indices: list) -> np.ndarray:
         """Read multiple frames from a video reader.
 
         Args:
@@ -96,15 +93,23 @@ class VideoIO:
         return reader.get_batch(indices).asnumpy()
 
 
-
 class FFmpegRGBPipeReader:
     """
     Sequential RGB frame reader backed by an FFmpeg pipe (rawvideo).
     Designed for render-time usage where get_batch() is called with
     increasing frame indices (typically contiguous batches).
     """
-    def __init__(self, video_path: str, width: int, height: int, fps: float, total_frames: int,
-                 in_range: str = "tv", in_matrix: str = "bt709"):
+
+    def __init__(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        total_frames: int,
+        in_range: str = "tv",
+        in_matrix: str = "bt709",
+    ):
         self.video_path = video_path
         self.width = int(width)
         self.height = int(height)
@@ -138,10 +143,7 @@ class FFmpegRGBPipeReader:
             f"in_color_matrix={self.in_matrix}:out_color_matrix={self.in_matrix},"
             "format=rgb24"
         )
-        vf_fallback = (
-            f"scale={self.width}:{self.height}:flags=bicubic,"
-            "format=rgb24"
-        )
+        vf_fallback = f"scale={self.width}:{self.height}:flags=bicubic,format=rgb24"
         vf = vf_fallback if self._force_fallback else vf_strict
         args += ["-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-vsync", "0", "-"]
         return args
@@ -167,7 +169,6 @@ class FFmpegRGBPipeReader:
     def get_batch(self, indices):
         if not indices:
             return _NumpyBatch(np.empty((0, self.height, self.width, 3), dtype=np.uint8))
-
 
         try:
             # Expect indices to be increasing most of the time; if not, restart.
@@ -236,15 +237,23 @@ class FFmpegRGBPipeReader:
             raise
 
 
-
 class FFmpegRGBSingleFrameReader:
     """
     Random-access RGB reader for preview usage.
     Each get_batch([idx]) spawns a small FFmpeg decode for that frame.
     Slower than Decord, but matches FFmpeg's YUV->RGB conversion.
     """
-    def __init__(self, video_path: str, width: int, height: int, fps: float, total_frames: int,
-                 in_range: str = "tv", in_matrix: str = "bt709"):
+
+    def __init__(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        total_frames: int,
+        in_range: str = "tv",
+        in_matrix: str = "bt709",
+    ):
         self.video_path = video_path
         self.width = int(width)
         self.height = int(height)
@@ -276,11 +285,24 @@ class FFmpegRGBSingleFrameReader:
 
         def _decode_one(idx: int, vf: str) -> tuple[bytes, str, int]:
             cmd = [
-                "ffmpeg", "-v", "error", "-nostdin",
-                "-i", self.video_path, "-an", "-sn", "-dn",
-                "-vf", vf,
-                "-frames:v", "1",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"
+                "ffmpeg",
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                self.video_path,
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                vf,
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             raw = b""
@@ -322,11 +344,7 @@ class FFmpegRGBSingleFrameReader:
                 f"in_color_matrix={self.in_matrix}:out_color_matrix={self.in_matrix},"
                 "format=rgb24"
             )
-            vf_fallback = (
-                f"select='eq(n\\,{idx})',"
-                f"scale={self.width}:{self.height}:flags=bicubic,"
-                "format=rgb24"
-            )
+            vf_fallback = f"select='eq(n\\,{idx})',scale={self.width}:{self.height}:flags=bicubic,format=rgb24"
 
             raw, err, rc = _decode_one(idx, vf_strict)
             if not raw or len(raw) < self._frame_size:
@@ -341,7 +359,6 @@ class FFmpegRGBSingleFrameReader:
 
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 3)
             frames[j] = frame
-
 
         return _NumpyBatch(frames)
 
@@ -373,16 +390,23 @@ def read_video_frames(
     Raises:
         NotImplementedError: If dataset is not 'open'
     """
+    # Handle process_length that might be passed as string
+    try:
+        process_length = int(process_length) if process_length not in (None, "", "N/A") else -1
+    except (ValueError, TypeError):
+        process_length = -1
+
+    logger.debug(f"read_video_frames: process_length = {process_length} (type: {type(process_length)})")
     if dataset == "open":
-        logger.debug(f"==> Initializing VideoReader for: {video_path}")
-        vid_info_only = VideoReader(
-            video_path, ctx=cpu(0)
-        )  # Use separate reader for info
+        logger.info(f"==> Initializing VideoReader for: {video_path}")
+        vid_info_only = VideoReader(video_path, ctx=cpu(0))  # Use separate reader for info
         original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
-        total_frames_original = len(vid_info_only)
-        logger.debug(
-            f"==> Original video shape: {total_frames_original} frames, "
-            f"{original_height}x{original_width} per frame"
+        try:
+            total_frames_original = int(len(vid_info_only)) if len(vid_info_only) not in (None, "", "N/A") else 0
+        except (ValueError, TypeError):
+            total_frames_original = 0
+        logger.info(
+            f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame"
         )
 
         height_for_reader = original_height
@@ -391,23 +415,15 @@ def read_video_frames(
         if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
             height_for_reader = pre_res_height
             width_for_reader = pre_res_width
-            logger.debug(
-                f"==> Pre-processing resolution set to: "
-                f"{width_for_reader}x{height_for_reader}"
-            )
+            logger.debug(f"==> Pre-processing resolution set to: {width_for_reader}x{height_for_reader}")
         else:
-            logger.debug(
-                f"==> Using original video resolution for reading: "
-                f"{width_for_reader}x{height_for_reader}"
-            )
+            logger.debug(f"==> Using original video resolution for reading: {width_for_reader}x{height_for_reader}")
 
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
 
     # decord automatically resizes if width/height are passed to VideoReader
-    video_reader = VideoReader(
-        video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader
-    )
+    video_reader = VideoReader(video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader)
 
     # Verify the actual shape after Decord processing, using the first frame
     first_frame_shape = video_reader.get_batch([0]).shape
@@ -415,9 +431,18 @@ def read_video_frames(
 
     fps = float(video_reader.get_avg_fps())  # Use actual FPS from the reader
 
-    total_frames_available = len(video_reader)
+    # Handle case where len(video_reader) might return a string
+    try:
+        total_frames_available_raw = len(video_reader)
+        if isinstance(total_frames_available_raw, int) and total_frames_available_raw > 0:
+            total_frames_available = total_frames_available_raw
+        else:
+            total_frames_available = 0
+    except (ValueError, TypeError):
+        total_frames_available = 0
+
     total_frames_to_process = total_frames_available  # Use available frames directly
-    if process_length != -1 and process_length < total_frames_available:
+    if total_frames_available > 0 and process_length != -1 and process_length < total_frames_available:
         total_frames_to_process = process_length
 
     logger.debug(
@@ -426,12 +451,7 @@ def read_video_frames(
         f"Total frames for processing: {total_frames_to_process}"
     )
 
-    # Import here to avoid circular dependency
-    from dependency.stereocrafter_util import get_video_stream_info
-
-    video_stream_info = get_video_stream_info(
-        video_path
-    )  # Get stream info for FFmpeg later
+    video_stream_info = get_video_stream_info(video_path)  # Get stream info for FFmpeg later
 
     # If strict FFmpeg decode is requested, swap in an FFmpeg-backed reader for frame fetch.
     # This keeps decode/colorspace conversion consistent across preview + renders for problem clips.
@@ -475,3 +495,329 @@ def read_video_frames(
         video_stream_info,
         total_frames_to_process,
     )
+
+
+_FFPROBE_AVAIL: Optional[bool] = None
+_INFO_CACHE: dict = {}
+
+
+def get_video_stream_info(video_path: str) -> Optional[dict]:
+    """Get video stream information using ffprobe.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Dictionary containing stream info (width, height, codec, etc.) or None if unavailable
+    """
+    global _FFPROBE_AVAIL, _INFO_CACHE
+    if not video_path:
+        return None
+    if video_path in _INFO_CACHE:
+        return _INFO_CACHE[video_path]
+
+    if _FFPROBE_AVAIL is None:
+        try:
+            subprocess.run(["ffprobe", "-version"], check=True, capture_output=True)
+            _FFPROBE_AVAIL = True
+        except Exception:
+            _FFPROBE_AVAIL = False
+    if not _FFPROBE_AVAIL:
+        return None
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,codec_name,profile,pix_fmt,color_range,color_primaries,transfer_characteristics,color_space,r_frame_rate",
+            "-show_entries",
+            "side_data=mastering_display_metadata,max_content_light_level",
+            "-of",
+            "json",
+            video_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        if "streams" in data and data["streams"]:
+            info = {k: v for k, v in data["streams"][0].items() if v and v not in ("N/A", "und", "unknown")}
+            _INFO_CACHE[video_path] = info
+            return info
+    except Exception:
+        pass
+    return None
+
+
+def read_video_frames_decord(
+    video_path: str,
+    process_length: int = -1,
+    target_fps: float = -1.0,
+    set_res_width: Optional[int] = None,
+    set_res_height: Optional[int] = None,
+    decord_ctx=cpu(0),
+) -> Tuple[np.ndarray, float, int, int, int, int, Optional[dict]]:
+    """Read video frames using decord with optional resizing and fps conversion.
+
+    Args:
+        video_path: Path to the video file
+        process_length: Number of frames to process (-1 for all)
+        target_fps: Target fps (-1 for original)
+        set_res_width: Target width (None for original)
+        set_res_height: Target height (None for original)
+        decord_ctx: Decord context for reading
+
+    Returns:
+        Tuple of (frames as float32 numpy array [T,H,W,C] normalized to 0-1,
+                  fps, original_height, original_width, output_height, output_width,
+                  stream_info)
+    """
+    info = get_video_stream_info(video_path)
+    temp_reader = VideoReader(video_path, ctx=cpu(0))
+    oh, ow = temp_reader.get_batch([0]).shape[1:3]
+    del temp_reader
+    dw, dh = (set_res_width, set_res_height) if set_res_width and set_res_height else (ow, oh)
+    vid = VideoReader(video_path, ctx=decord_ctx, width=dw, height=dh)
+    total = len(vid)
+    fps = target_fps if target_fps > 0 else vid.get_avg_fps()
+    stride = max(round(vid.get_avg_fps() / fps), 1)
+    idxs = list(range(0, total, stride))
+    if process_length != -1:
+        idxs = idxs[:process_length]
+    frames = vid.get_batch(idxs).asnumpy().astype("float32") / 255.0
+    return frames, fps, oh, ow, frames.shape[1], frames.shape[2], info
+
+
+def encode_frames_to_mp4(
+    temp_png_dir: str,
+    final_output_mp4_path: str,
+    fps: float,
+    total_output_frames: int,
+    video_stream_info: Optional[dict],
+    stop_event: Optional[threading.Event] = None,
+    sidecar_json_data: Optional[dict] = None,
+    user_output_crf: Optional[int] = None,
+    output_sidecar_ext: str = ".json",
+) -> bool:
+    """Encode a directory of PNG frames to an MP4 video using FFmpeg.
+
+    Args:
+        temp_png_dir: Directory containing PNG frames named %05d.png
+        final_output_mp4_path: Path to the output MP4 file
+        fps: Output video frame rate
+        total_output_frames: Total number of frames to encode
+        video_stream_info: Source video stream info for matching color space
+        stop_event: Optional threading event to cancel encoding
+        sidecar_json_data: Optional data to save to a JSON sidecar file
+        user_output_crf: Optional override for CRF (quality) setting
+        output_sidecar_ext: Extension for the sidecar file
+
+    Returns:
+        True if encoding succeeded, False otherwise
+    """
+    if total_output_frames == 0:
+        logger.warning(f"No frames to encode for {os.path.basename(final_output_mp4_path)}. Skipping.")
+        if os.path.exists(temp_png_dir):
+            shutil.rmtree(temp_png_dir)
+        return False
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-framerate",
+        str(fps),
+        "-i",
+        os.path.join(temp_png_dir, "%05d.png"),
+    ]
+
+    output_codec, output_pix_fmt, default_cpu_crf, output_profile = "libx264", "yuv420p", "23", "main"
+    x265_params, default_nvenc_cq = [], "23"
+
+    if user_output_crf is not None:
+        default_cpu_crf = str(user_output_crf)
+        default_nvenc_cq = str(user_output_crf)
+
+    is_hdr = (
+        video_stream_info
+        and video_stream_info.get("color_primaries") == "bt2020"
+        and video_stream_info.get("transfer_characteristics") == "smpte2084"
+    )
+    orig_pix = video_stream_info.get("pix_fmt", "") if video_stream_info else ""
+    is_high_bit = "10" in orig_pix or "12" in orig_pix or "16" in orig_pix
+
+    if is_hdr or (is_high_bit and video_stream_info.get("codec_name") in ("hevc", "prores", "dnxhd", "dnxhr")):
+        output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
+        output_pix_fmt = "yuv420p10le"
+        output_profile = "main10"
+    else:
+        output_codec = "h264_nvenc" if CUDA_AVAILABLE else "libx264"
+
+    ffmpeg_cmd.extend(["-c:v", output_codec])
+    if "nvenc" in output_codec:
+        ffmpeg_cmd.extend(["-preset", "medium", "-cq", default_nvenc_cq])
+    else:
+        ffmpeg_cmd.extend(["-crf", default_cpu_crf])
+    ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
+    if output_profile:
+        ffmpeg_cmd.extend(["-profile:v", output_profile])
+
+    if video_stream_info:
+        for k, f in [
+            ("color_primaries", "-color_primaries"),
+            ("transfer_characteristics", "-color_trc"),
+            ("color_space", "-colorspace"),
+            ("color_range", "-color_range"),
+        ]:
+            if video_stream_info.get(k):
+                ffmpeg_cmd.extend([f, video_stream_info[k]])
+
+    if os.path.splitext(final_output_mp4_path)[1].lower() in (".mp4", ".mov", ".m4v"):
+        ffmpeg_cmd.extend(["-movflags", "+write_colr"])
+
+    ffmpeg_cmd.append(final_output_mp4_path)
+
+    try:
+        process = subprocess.Popen(
+            ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8"
+        )
+        while process.poll() is None:
+            if stop_event and stop_event.is_set():
+                process.terminate()
+                return False
+            time.sleep(0.1)
+        if process.returncode != 0:
+            return False
+    except Exception as e:
+        logger.error(f"Encoding failed: {e}")
+        return False
+    finally:
+        if os.path.exists(temp_png_dir):
+            shutil.rmtree(temp_png_dir)
+
+    if sidecar_json_data:
+        path = f"{os.path.splitext(final_output_mp4_path)[0]}{output_sidecar_ext}"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sidecar_json_data, f, indent=4)
+    return True
+
+
+def start_ffmpeg_pipe_process(
+    content_width: int,
+    content_height: int,
+    final_output_mp4_path: str,
+    fps: float,
+    video_stream_info: Optional[dict] = None,
+    output_format_str: str = "",
+    user_output_crf: Optional[int] = None,
+    pad_to_16_9: bool = False,
+    debug_label: Optional[str] = None,
+    encoding_options: Optional[dict] = None,
+) -> Optional[subprocess.Popen]:
+    """Start an FFmpeg process that reads raw video from a pipe.
+
+    Args:
+        content_width: Width of input frames
+        content_height: Height of input frames
+        final_output_mp4_path: Output path for the video
+        fps: Frame rate
+        video_stream_info: Source video stream info (currently unused in this version)
+        output_format_str: Optional format string
+        user_output_crf: Optional CRF override
+        pad_to_16_9: Whether to pad to 16:9 (currently unused)
+        debug_label: Optional label for logging
+        encoding_options: Optional extra encoding options
+
+    Returns:
+        The subprocess.Popen instance
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{content_width}x{content_height}",
+        "-pix_fmt",
+        "bgr48le",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+    ]
+    codec, pix, crf = "libx264", "yuv420p", "23"
+    if CUDA_AVAILABLE:
+        codec = "h264_nvenc"
+    if user_output_crf is not None:
+        crf = str(user_output_crf)
+    cmd.extend(["-c:v", codec])
+    if "nvenc" in codec:
+        cmd.extend(["-preset", "p4", "-qp", crf])
+    else:
+        cmd.extend(["-crf", crf])
+    cmd.extend(["-pix_fmt", pix, "-movflags", "+write_colr", final_output_mp4_path])
+    logger.info(f"Starting FFmpeg pipe: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def start_ffmpeg_pipe_process_dnxhr(
+    content_width: int,
+    content_height: int,
+    final_output_mov_path: str,
+    fps: float,
+    dnxhr_profile: str = "HQX",
+) -> Optional[subprocess.Popen]:
+    """Start an FFmpeg process for high-quality DNxHR output via pipe.
+
+    Args:
+        content_width: Width of input frames
+        content_height: Height of input frames
+        final_output_mov_path: Output path for the MOV file
+        fps: Frame rate
+        dnxhr_profile: DNxHR profile (SQ, HQ, HQX, 444)
+
+    Returns:
+        The subprocess.Popen instance
+    """
+    prof = {"SQ": "dnxhr_sq", "HQ": "dnxhr_hq", "HQX": "dnxhr_hqx", "444": "dnxhr_444"}.get(
+        dnxhr_profile.strip().upper()[:3], "dnxhr_hqx"
+    )
+    pix = "yuv444p10le" if prof == "dnxhr_444" else "yuv422p10le"
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-s",
+        f"{content_width}x{content_height}",
+        "-pix_fmt",
+        "bgr48le",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-c:v",
+        "dnxhd",
+        "-profile:v",
+        prof,
+        "-pix_fmt",
+        pix,
+        "-an",
+        final_output_mov_path,
+    ]
+    logger.info(f"Starting DNxHR pipe: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

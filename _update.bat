@@ -11,20 +11,45 @@ echo.
 cd /d "%~dp0"
 
 :: --- Detect Remotes ---
+set "Bill8_URL=https://github.com/Billynom8/StereoCrafter.git"
+set "ENOKY_URL=https://github.com/enoky/StereoCrafter.git"
+
+:: Check if origin points to either repo, if not set it
 set "ORIGIN_URL=Not Found"
 for /f "tokens=*" %%i in ('git remote get-url origin 2^>nul') do set "ORIGIN_URL=%%i"
 
+:: Check if upstream points to either repo, if not set it
 set "UPSTREAM_URL=Not Found"
 for /f "tokens=*" %%i in ('git remote get-url upstream 2^>nul') do set "UPSTREAM_URL=%%i"
 
+:: Configure origin if not set or pointing to wrong repo
+if "!ORIGIN_URL!"=="Not Found" (
+    git remote add origin !Bill8_URL! 2>nul
+    set "ORIGIN_URL=!Bill8_URL!"
+) else (
+    echo !ORIGIN_URL! | findstr /i "Billynom8" >nul
+    if !errorlevel! neq 0 (
+        git remote set-url origin !Bill8_URL! 2>nul
+        set "ORIGIN_URL=!Bill8_URL!"
+    )
+)
+
+:: Configure upstream if not set or pointing to wrong repo
+if "!UPSTREAM_URL!"=="Not Found" (
+    git remote add upstream !ENOKY_URL! 2>nul
+    set "UPSTREAM_URL=!ENOKY_URL!"
+) else (
+    echo !UPSTREAM_URL! | findstr /i "enoky" >nul
+    if !errorlevel! neq 0 (
+        git remote set-url upstream !ENOKY_URL! 2>nul
+        set "UPSTREAM_URL=!ENOKY_URL!"
+    )
+)
+
 :: --- Configuration Selection ---
 echo [1/4] Please Select Update Source:
-echo 1. origin    - !ORIGIN_URL!
-if not "!UPSTREAM_URL!"=="Not Found" (
-    echo 2. upstream  - !UPSTREAM_URL!
-) else (
-    echo 2. [Not Configured]
-)
+echo 1. Billynom8 - !Bill8_URL!
+echo 2. enoky    - !ENOKY_URL!
 echo.
 
 set "REMOTE=origin"
@@ -39,13 +64,9 @@ if "%choice%"=="2" (
     )
 )
 
-:: Safety check for TencentARC
-set "CHECK_URL=!ORIGIN_URL!"
-if "!REMOTE!"=="upstream" set "CHECK_URL=!UPSTREAM_URL!"
-echo !CHECK_URL! | findstr /i "TencentARC" >nul
-if %errorlevel% equ 0 (
-    echo [NOTE] You are updating from the official TencentARC repository.
-)
+:: Safety check - warn if pulling from unexpected repo
+set "CHECK_URL=!Bill8_URL!"
+if "!REMOTE!"=="upstream" set "CHECK_URL=!ENOKY_URL!"
 
 echo.
 echo [2/4] Pulling latest changes from !REMOTE!...

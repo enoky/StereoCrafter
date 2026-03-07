@@ -17,6 +17,7 @@
   "low_res_height": "The target height for the low-resolution output. The input video and depth maps will be resized to this height for the low-resolution pass.",
   "low_res_batch_size": "The number of frames to process simultaneously when generating the low-resolution output. Can often be higher than the full-resolution batch size due to lower memory requirements. Too high a value will bog down ffmpeg encode.",
   "dual_output": "If checked, will generate dual panel for inpaint right eye only. Unchecked will generate quad panel for complete low-res stereo SBS after inpainting. Use this(Dual) to save on resources and manual blending.",
+  "flip_horizontal": "Horizontally flip the source and depthmap video. Use this for scenes where objects move from left-to-right, as inpainting_gui is optimized for right-side inpaints. The merging_gui will automatically flip it back during final assembly.",
   "splat_test": "Saves an SBS PNG image and separate render/preview splat images. For testing Preview/Render Parity.",
   "map_test": "Saves an SBS PNG image and separate render/preview depthmap images. For testing Preview/Render Parity.",
   "track_dp_total_true_on_render": "When enabled, rendering tracks the true max disparity across all frames and saves it to sidecar + auto_pass_export.csv. Turn off to test baseline render speed.",

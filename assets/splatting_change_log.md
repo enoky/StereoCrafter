@@ -2,6 +2,28 @@
 
 All notable changes to the splatting GUI and related components.
 
+## Version 26-03-04.3
+
+### Added (v26-03-04.3)
+
+- **Horizontal Flip Feature**: Added ability to horizontally flip source and depth maps during splatting to facilitate right-side-only inpainting.
+  - New "Flip Horizontal" checkbox in Splatting GUI.
+  - Flip state saved to `.fssidecar` files.
+  - **Merging GUI** automatically detects the flip flag and flips the final output back to original orientation.
+  - Applied early in the pipeline so preview and all preprocessing (dilation/blur) work on the flipped data.
+  - **Simplified Preview**: Removed the automatic "unflipping" of the preview image. Flipped processing now displays flipped in both the main preview and SBS window for visual consistency.
+
+### Fixed (v26-03-04.3)
+
+- **Depth Preview Contrast**: Restored TV-range expansion for 10-bit depth maps (`DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True`). Prevents "washed out" or "lighter" dark areas in the depth map preview, matching VLC and legacy behavior.
+- **Type Safety**: Fixed multiple "str vs int" comparison errors in `VideoIO`, `DepthPipeReader`, and `RenderProcessor` when handling `ffprobe` metadata or GUI inputs.
+
+## Version 26-03-02.1
+
+### Bug Fixes (v26-03-02.1)
+
+- **ffmpeg decode**: Fixed issue where ffmpeg decode checkbox was not operating correctly.
+
 ## Version 26-02-27.9
 
 ### Added (v26-02-27.9)
@@ -78,7 +100,7 @@ All notable changes to the splatting GUI and related components.
 
 ### Improvements (v26-02-21.0)
 
-- **HDR Detection**: Enhanced `stereocrafter_util.py` to correctly detect HLG transfer characteristics for 10-bit HEVC encoding.
+- **HDR Detection**: To correctly detect HLG transfer characteristics for 10-bit HEVC encoding.
 - **Legacy Compatibility**: Added internal mappings for old "BT.709" and "BT.2020" config strings to ensure high-quality profile selection.
 
 ---
@@ -115,7 +137,7 @@ All notable changes to the splatting GUI and related components.
 
 ### Changed (v2026-02-04)
 
-- **Slider Behavior Enhancement** (`dependency/stereocrafter_util.py`):
+- **Slider Behavior Enhancement**
   - **Middle-click**: Slider now jumps directly to mouse pointer position (matches frame scrubber behavior)
   - **Right-click**: Resets slider to default value
   - **Left-click**: Maintains original stepped increment behavior

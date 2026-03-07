@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import numpy as np
 from decord import VideoReader, cpu
 
-from dependency.stereocrafter_util import get_video_stream_info
+from core.common.video_io import get_video_stream_info
 from core.splatting.depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
@@ -72,11 +72,7 @@ class AnalysisService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def compute_clip_global_depth_stats(
-        depth_map_path: str,
-        stop_event,
-        chunk_size: int = 100,
-    ) -> Tuple[float, float]:
+    def compute_clip_global_depth_stats(depth_map_path: str, stop_event, chunk_size: int = 100) -> Tuple[float, float]:
         """Compute global min/max depth values from a depth video by chunked scan.
 
         Used only for the preview's Global-Normalisation cache.  The caller
@@ -92,10 +88,7 @@ class AnalysisService:
             ``(global_min, global_max)`` as ``float``, or ``(0.0, 1.0)`` on
             error / early stop.
         """
-        logger.info(
-            f"==> Starting clip-local depth stats pre-pass for "
-            f"{os.path.basename(depth_map_path)}..."
-        )
+        logger.info(f"==> Starting clip-local depth stats pre-pass for {os.path.basename(depth_map_path)}...")
         global_min: float = float("inf")
         global_max: float = float("-inf")
 
@@ -132,16 +125,11 @@ class AnalysisService:
                 if chunk_max > global_max:
                     global_max = chunk_max
 
-            logger.info(
-                f"==> Clip-local depth stats computed: "
-                f"min_raw={global_min:.3f}, max_raw={global_max:.3f}"
-            )
+            logger.info(f"==> Clip-local depth stats computed: min_raw={global_min:.3f}, max_raw={global_max:.3f}")
             return float(global_min), float(global_max)
 
         except Exception as e:
-            logger.error(
-                f"Error during clip-local depth stats scan for preview: {e}"
-            )
+            logger.error(f"Error during clip-local depth stats scan for preview: {e}")
             return 0.0, 1.0
         finally:
             gc.collect()
@@ -212,10 +200,10 @@ class AnalysisService:
 
         depth_dilate_size_x = _pfloat("depth_dilate_size_x", 3.0)
         depth_dilate_size_y = _pfloat("depth_dilate_size_y", 3.0)
-        depth_blur_size_x   = _pfloat("depth_blur_size_x",   5.0)
-        depth_blur_size_y   = _pfloat("depth_blur_size_y",   5.0)
-        depth_dilate_left   = _pfloat("depth_dilate_left",   0.0)
-        depth_blur_left     = _pfloat("depth_blur_left",     0.0)
+        depth_blur_size_x = _pfloat("depth_blur_size_x", 5.0)
+        depth_blur_size_y = _pfloat("depth_blur_size_y", 5.0)
+        depth_dilate_left = _pfloat("depth_dilate_left", 0.0)
+        depth_blur_left = _pfloat("depth_blur_left", 0.0)
 
         try:
             depth_gamma = float(p.get("depth_gamma", depth_gamma))
@@ -246,10 +234,7 @@ class AnalysisService:
         if sample_frames >= total_frames:
             indices = list(range(total_frames))
         else:
-            indices = [
-                int(round(i * (total_frames - 1) / (sample_frames - 1)))
-                for i in range(sample_frames)
-            ]
+            indices = [int(round(i * (total_frames - 1) / (sample_frames - 1))) for i in range(sample_frames)]
         indices = sorted(set(max(0, min(total_frames - 1, i)) for i in indices))
 
         # -- Depth stream info / bit depth ---------------------------------
@@ -304,9 +289,7 @@ class AnalysisService:
             try:
                 depth_map_basename = os.path.splitext(os.path.basename(depth_path))[0]
                 sidecar_ext = p.get("sidecar_ext", ".fssidecar")
-                json_sidecar_path = os.path.join(
-                    sidecar_folder, f"{depth_map_basename}{sidecar_ext}"
-                )
+                json_sidecar_path = os.path.join(sidecar_folder, f"{depth_map_basename}{sidecar_ext}")
                 if os.path.exists(json_sidecar_path):
                     enable_global_norm = False
             except Exception:
@@ -401,10 +384,9 @@ class AnalysisService:
                 depth_norm = np.clip(depth_norm, 0.0, 1.0)
 
                 # Pixel sub-sample (match preview stride)
-                ds = depth_norm[
-                    :: max(1, int(pixel_stride)),
-                    :: max(1, int(pixel_stride)),
-                ].astype(np.float32, copy=False)
+                ds = depth_norm[:: max(1, int(pixel_stride)), :: max(1, int(pixel_stride))].astype(
+                    np.float32, copy=False
+                )
                 valid = (ds > 0.001) & (ds < 0.999)
                 if not np.any(valid):
                     continue
@@ -418,24 +400,19 @@ class AnalysisService:
                     try:
                         if (
                             _infer_depth_bit_depth(depth_stream_info) > 8
-                            and str(
-                                (depth_stream_info or {}).get("color_range", "unknown")
-                            ).lower()
-                            == "tv"
+                            and str((depth_stream_info or {}).get("color_range", "unknown")).lower() == "tv"
                         ):
-                            tv_disp_comp = 1.0 / (
-                                DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM
-                            )
+                            tv_disp_comp = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
                     except Exception:
                         tv_disp_comp = 1.0
 
-                scale     = 2.0 * (float(max_disp) / 20.0) * tv_disp_comp
-                min_pct   = (dmin - float(convergence_point)) * scale
-                max_pct   = (dmax - float(convergence_point)) * scale
+                scale = 2.0 * (float(max_disp) / 20.0) * tv_disp_comp
+                min_pct = (dmin - float(convergence_point)) * scale
+                max_pct = (dmax - float(convergence_point)) * scale
 
                 depth_pct = abs(min_pct) if min_pct < 0 else 0.0
-                pop_pct   = max_pct      if max_pct  > 0 else 0.0
-                total     = float(depth_pct + pop_pct)
+                pop_pct = max_pct if max_pct > 0 else 0.0
+                total = float(depth_pct + pop_pct)
 
                 if max_total is None or total > max_total:
                     max_total = total

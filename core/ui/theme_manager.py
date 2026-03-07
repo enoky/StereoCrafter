@@ -22,6 +22,9 @@ DARK_COLORS = {
     "tooltip_bg": "#4a4a4a",
     "tooltip_fg": "white",
     "theme": "black",
+    "panel_bg": "#3a4047",
+    "panel_trough": "#262b31",
+    "panel_bar": "#5d96e0",
 }
 
 # Light theme color palette
@@ -36,6 +39,9 @@ LIGHT_COLORS = {
     "tooltip_bg": "#ffffe0",
     "tooltip_fg": "black",
     "theme": "clam",
+    "panel_bg": "#e6ebf2",
+    "panel_trough": "#bcc6d3",
+    "panel_bar": "#4f83cc",
 }
 
 
@@ -74,11 +80,7 @@ class ThemeManager:
         config: Optional configuration dictionary
     """
 
-    def __init__(
-        self,
-        dark_mode_var: Optional["tk.BooleanVar"] = None,
-        config: Optional[Dict[str, Any]] = None,
-    ):
+    def __init__(self, dark_mode_var: Optional["tk.BooleanVar"] = None, config: Optional[Dict[str, Any]] = None):
         """Initialize the theme manager.
 
         Args:
@@ -87,7 +89,7 @@ class ThemeManager:
         """
         self.dark_mode_var = dark_mode_var
         self.config = config or {}
-        
+
     def is_dark_mode(self) -> bool:
         """Check if dark mode is currently enabled.
 
@@ -97,7 +99,7 @@ class ThemeManager:
         if self.dark_mode_var:
             return bool(self.dark_mode_var.get())
         return is_dark_mode(self.config)
-    
+
     def get_colors(self) -> Dict[str, str]:
         """Get the current theme colors.
 
@@ -105,12 +107,8 @@ class ThemeManager:
             Dictionary containing current color palette
         """
         return get_theme_colors(self.is_dark_mode())
-    
-    def apply_theme_to_style(
-        self,
-        style: "ttk.Style",
-        root_window: Optional["tk.Tk"] = None,
-    ) -> None:
+
+    def apply_theme_to_style(self, style: "ttk.Style", root_window: Optional["tk.Tk"] = None) -> None:
         """Apply the current theme to ttk styles.
 
         Args:
@@ -137,7 +135,7 @@ class ThemeManager:
 
             # Crucial: let the theme switch take effect before configuring styles
             root_window.update_idletasks()
-        
+
         # Configure basic styles for the current theme
         # We apply to common prefixes to be thorough
         bg = colors["bg"]
@@ -146,9 +144,9 @@ class ThemeManager:
 
         for style_name in ["TFrame", "TLabelframe", "TLabel", "TCheckbutton", "TRadiobutton"]:
             style.configure(style_name, background=bg, foreground=fg)
-        
+
         style.configure("TLabelframe.Label", background=bg, foreground=fg)
-        
+
         # Configure style maps for interactive widgets
         style.map(
             "TCheckbutton",
@@ -160,7 +158,7 @@ class ThemeManager:
             foreground=[("active", fg), ("!disabled", fg)],
             background=[("active", bg), ("!disabled", bg)],
         )
-        
+
         # Configure Entry and Combobox
         # Some themes require explicit state mappings to override native looks
         style.map(
@@ -169,7 +167,7 @@ class ThemeManager:
             foreground=[("!disabled", fg), ("focus", fg)],
         )
         style.configure("TEntry", insertcolor=fg)
-        
+
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", entry_bg), ("!disabled", entry_bg), ("focus", entry_bg)],
@@ -181,12 +179,8 @@ class ThemeManager:
         # Force a final update to catch any delayed renders
         if root_window:
             root_window.update_idletasks()
-    
-    def apply_theme_to_menus(
-        self,
-        menus: list,
-        menubar: Optional["tk.Menu"] = None,
-    ) -> None:
+
+    def apply_theme_to_menus(self, menus: list, menubar: Optional["tk.Menu"] = None) -> None:
         """Apply theme colors to menu widgets.
 
         Args:
@@ -194,11 +188,11 @@ class ThemeManager:
             menubar: Optional menubar widget
         """
         colors = self.get_colors()
-        
+
         all_menus = list(menus)
         if menubar:
             all_menus.append(menubar)
-        
+
         for menu in all_menus:
             try:
                 menu.config(
@@ -209,13 +203,8 @@ class ThemeManager:
                 )
             except Exception:
                 pass
-    
-    def apply_theme_to_labels(
-        self,
-        labels: list,
-        bg: Optional[str] = None,
-        fg: Optional[str] = None,
-    ) -> None:
+
+    def apply_theme_to_labels(self, labels: list, bg: Optional[str] = None, fg: Optional[str] = None) -> None:
         """Apply theme colors to label widgets.
 
         Args:
@@ -224,7 +213,7 @@ class ThemeManager:
             fg: Optional foreground color override
         """
         colors = self.get_colors()
-        
+
         for label in labels:
             try:
                 if bg:
@@ -237,11 +226,8 @@ class ThemeManager:
                     label.config(fg=colors["fg"])
             except Exception:
                 pass
-    
-    def apply_theme_to_canvas(
-        self,
-        canvas: "tk.Canvas",
-    ) -> None:
+
+    def apply_theme_to_canvas(self, canvas: "tk.Canvas") -> None:
         """Apply theme background color to a canvas widget.
 
         Args:
@@ -252,7 +238,7 @@ class ThemeManager:
             canvas.config(bg=colors["bg"], highlightthickness=0)
         except Exception:
             pass
-    
+
     def get_style_config(self) -> Dict[str, str]:
         """Get the current style configuration for persistence.
 
@@ -266,7 +252,7 @@ class ThemeManager:
             "theme_fg": colors["fg"],
             "theme_entry_bg": colors["entry_bg"],
         }
-    
+
     @staticmethod
     def get_available_themes() -> list:
         """Get list of available theme names.
@@ -275,3 +261,93 @@ class ThemeManager:
             List of theme names
         """
         return ["default", "black", "clam", "alt", "classic"]
+
+    def configure_compact_styles(self, style: "ttk.Style") -> None:
+        """Configure compact button and entry styles for space-efficient UIs.
+
+        Args:
+            style: ttk.Style object to configure
+        """
+        colors = self.get_colors()
+        panel_bg = colors.get("panel_bg", colors["bg"])
+
+        try:
+            style.configure("SmallTool.TButton", padding=(0, 0), anchor="center")
+            style.configure("CompactAction.TButton", padding=(4, 0), anchor="center")
+            style.configure("Loading.TButton", padding=(4, 0), anchor="center")
+            style.configure("TEntry", padding=(1, 0))
+            style.configure("TCombobox", padding=(1, 0), arrowsize=10)
+            style.configure("TSpinbox", padding=(1, 0), arrowsize=10)
+        except Exception:
+            pass
+
+    def configure_progressbar_style(
+        self, style: "ttk.Style", trough_color: Optional[str] = None, bar_color: Optional[str] = None
+    ) -> None:
+        """Configure progress bar styles with custom colors.
+
+        Args:
+            style: ttk.Style object to configure
+            trough_color: Optional color for the progress bar trough
+            bar_color: Optional color for the progress bar fill
+        """
+        colors = self.get_colors()
+        trough = trough_color or colors.get("panel_trough", colors["bg"])
+        bar = bar_color or colors.get("panel_bar", "#5d96e0")
+
+        try:
+            style.configure(
+                "Custom.Horizontal.TProgressbar",
+                troughcolor=trough,
+                background=bar,
+                lightcolor=bar,
+                darkcolor=bar,
+                bordercolor=trough,
+                thickness=12,
+            )
+            style.configure(
+                "ProgressPanel.TLabel", background=colors.get("panel_bg", colors["bg"]), foreground=colors["fg"]
+            )
+        except Exception:
+            pass
+
+    def apply_theme_to_labelframes(self, labelframes: list) -> None:
+        """Apply theme colors to a list of labelframe widgets.
+
+        Args:
+            labelframes: List of tk.LabelFrame widgets to configure
+        """
+        colors = self.get_colors()
+
+        for lf in labelframes:
+            if lf is not None:
+                try:
+                    lf.configure(bg=colors["bg"], fg=colors["fg"])
+                except Exception:
+                    pass
+
+    def apply_theme_to_widgets_by_names(
+        self, widget_dict: Dict[str, Any], bg: Optional[str] = None, fg: Optional[str] = None
+    ) -> None:
+        """Apply theme colors to widgets referenced by name dictionary.
+
+        Args:
+            widget_dict: Dictionary mapping widget names to widget objects
+            bg: Optional background color override
+            fg: Optional foreground color override
+        """
+        colors = self.get_colors()
+        panel_bg = colors.get("panel_bg", colors["bg"])
+
+        for w_name, w in widget_dict.items():
+            if w is not None:
+                try:
+                    if fg and hasattr(w, "configure"):
+                        w.configure(bg=bg or panel_bg, fg=fg)
+                    else:
+                        w.configure(bg=bg or panel_bg)
+                except Exception:
+                    try:
+                        w.configure(bg=bg or panel_bg)
+                    except Exception:
+                        pass

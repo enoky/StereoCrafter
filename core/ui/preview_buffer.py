@@ -61,6 +61,8 @@ class PreviewFrameBuffer:
             str(params.get("preview_source", "")),
             preview_size,
             str(params.get("enable_global_norm", "")),
+            str(params.get("strict_ffmpeg_decode", "")),
+            str(params.get("flip_horizontal", False)),
         ]
         return "|".join(key_parts)
 

@@ -2,14 +2,16 @@
 
 ## Version 26-02-07.2 (Today's Changes)
 
-### New Features
+### New Features (26-02-07.20)
 
 #### Load/Refresh List Improvements
+
 - First press scans all video files
 - Subsequent presses only refresh preview (faster)
 - Automatically rescans if folder paths change
 
 #### Resume Mode
+
 - Added "Resume" checkbox in Options section
 - When enabled, skips files already in "finished" subfolder
 - Automatically moves completed files to "finished" subfolder
@@ -18,19 +20,21 @@
 - "Restore Finished Files" in File menu can undo the moves
 
 #### Preview Source Persistence
+
 - Preview Source dropdown selection is now saved to config
 - Restored on next session launch
 
 #### Add Borders Live Update
+
 - Toggling "Add Borders" checkbox now updates preview instantly
 
-### UI Improvements
+### UI Improvements (26-02-07.2)
 
 - Updated "Load/Refresh List" button behavior documentation
 - Added "Resume" documentation to Options section
 - Added Preview Source persistence to documentation
 
-### Files Modified
+### Files Modified (26-02-07.2)
 
 - `merging_gui.py`: Added resume mode, preview source persistence, live update for borders
 - `dependency/video_previewer.py`: Modified _handle_load_refresh for smarter scanning
@@ -42,7 +46,7 @@
 
 ## Version 26-02-07.1
 
-### New Features
+### New Features (26-02-07.1)
 
 #### Sidecar File Support
 
@@ -71,7 +75,7 @@
 - Fixed variable naming issues in border processing code
 - Fixed preview code to correctly apply borders
 
-### UI Improvements
+### UI Improvements (26-02-07.1)
 
 - Changed border info label color for better visibility in dark mode
 - Updated tooltip help text for new features
@@ -79,13 +83,13 @@
 
 ### Code Refactoring
 
-- Moved sidecar and border helper functions to `dependency/stereocrafter_util.py`
+- Moved sidecar and border helper functions to `core/common/sidecar_manager.py`
 - Functions moved: `find_video_by_core_name`, `find_sidecar_file`, `read_clip_sidecar`, `apply_borders_to_frames`
 - Prepared codebase for migrating non-GUI related code
 
-### Files Modified
+### Files Modified (26-02-07.1)
 
 - `merging_gui.py`: Added sidecar reading, border application, UI elements
-- `dependency/stereocrafter_util.py`: Added sidecar and border helper functions
+- `core/common/sidecar_manager.py`: Added sidecar and border helper functions
 - `dependency/merge_help.json`: Added help text for new options
 - `assets/merger_gui_guide.md`: Added documentation for new features and sidecar files
