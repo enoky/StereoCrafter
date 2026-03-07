@@ -40,7 +40,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-02-22.0"
+GUI_VERSION = "26-03-07.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -1517,6 +1517,23 @@ class InpaintingGUI(ThemedTk):
             final_right_or_dual_frames = frames_output_final
             final_left_frames_for_sbs = frames_left_original_cropped
 
+        # --- NEW: Unflip logic for Quad (SBS) inputs only ---
+        # According to user requirements: 
+        # - Dual inputs never unflip in inpainting; they keep the 'F' tag for Merging GUI.
+        # - Quad inputs (SBS) always unflip if the input is flipped, removing the 'F' tag.
+        input_has_f = os.path.splitext(base_video_name)[0].endswith("F")
+        if not is_dual_input and input_has_f:
+            logger.info(f"Unflipping SBS output for Quad input '{base_video_name}'.")
+            # For SBS [L, R] coming from a flipped source, the "true" Left is flip(Right) and "true" Right is flip(Left)
+            # final_right_or_dual_frames is the inpaint result (Right)
+            # final_left_frames_for_sbs is the original left (Left)
+            new_left = torch.flip(final_right_or_dual_frames, dims=[3])
+            new_right = torch.flip(final_left_frames_for_sbs, dims=[3])
+            final_left_frames_for_sbs = new_left
+            final_right_or_dual_frames = new_right
+            logger.debug("Successfully unflipped and swapped eyes in SBS for final output.")
+        # --- END NEW ---
+
         # Final check: ensure the tensor to be encoded is actually populated
         if final_right_or_dual_frames is None or final_right_or_dual_frames.numel() == 0:
             logger.error(f"Final output frames for encoding are empty or None after preparation for {base_video_name}.")
@@ -2060,7 +2077,13 @@ class InpaintingGUI(ThemedTk):
         video_name_without_ext = os.path.splitext(base_video_name)[0]
         
         # Detect F tag for flipped videos to propagate to output
-        flip_tag = "F" if video_name_without_ext.endswith("F") else ""
+        input_has_f = video_name_without_ext.endswith("F")
+        if is_dual_input:
+            # Dual always keeps F tag if it had it (unflip happens later in merging_gui)
+            flip_tag = "F" if input_has_f else ""
+        else:
+            # Quad (SBS) always unflips internally, so it loses the F tag in the filename
+            flip_tag = ""
         
         output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
 
@@ -2179,8 +2202,8 @@ class InpaintingGUI(ThemedTk):
 
         current_row = 0  # Initialize row counter for folder_frame
 
-        # Input Folder
-        input_label = ttk.Label(folder_frame, text="Input Folder:")
+        # Lo-Res Blend Folder
+        input_label = ttk.Label(folder_frame, text="Lo-Res Blend Folder:")
         input_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
         ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(

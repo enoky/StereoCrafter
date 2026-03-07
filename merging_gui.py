@@ -16,6 +16,7 @@ from decord import VideoReader, cpu
 import logging
 import time
 import queue
+import re
 from core.common.video_io import start_ffmpeg_pipe_process
 from core.common.cli_utils import set_logger_level, draw_progress_bar
 
@@ -46,7 +47,7 @@ from core.ui.video_previewer import VideoPreviewer
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
 
-GUI_VERSION = "26-03-04.3"
+GUI_VERSION = "26-03-07.0"
 
 
 class MergingGUI(ThemedTk):
@@ -1084,10 +1085,12 @@ class MergingGUI(ThemedTk):
         original_folder = self.original_folder_var.get()
 
         # Get core name for sidecar
-        inpaint_suffix = "_inpainted_right_eye.mp4"
-        sbs_suffix = "_inpainted_sbs.mp4"
-        is_sbs_input = base_name.endswith(sbs_suffix)
-        core_name_with_width = base_name[: -len(sbs_suffix)] if is_sbs_input else base_name[: -len(inpaint_suffix)]
+        inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
+        sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
+        
+        is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
+        suffix_to_remove = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name).group(0)
+        core_name_with_width = base_name[: -len(suffix_to_remove)]
         last_underscore_idx = core_name_with_width.rfind("_")
         core_name = core_name_with_width[:last_underscore_idx] if last_underscore_idx != -1 else core_name_with_width
 
@@ -1303,12 +1306,16 @@ class MergingGUI(ThemedTk):
             original_video_path_to_move = None  # To track which original file to move
             try:
                 # --- 1. Find corresponding files (same logic as preview) ---
-                inpaint_suffix = "_inpainted_right_eye.mp4"
-                sbs_suffix = "_inpainted_sbs.mp4"
-                is_sbs_input = base_name.endswith(sbs_suffix)
-                core_name_with_width = (
-                    base_name[: -len(sbs_suffix)] if is_sbs_input else base_name[: -len(inpaint_suffix)]
-                )
+                inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
+                sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
+                
+                is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
+                match = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name)
+                if not match:
+                    logger.error(f"Could not identify suffix for '{base_name}'. Skipping.")
+                    continue
+                suffix_to_remove = match.group(0)
+                core_name_with_width = base_name[: -len(suffix_to_remove)]
 
                 # --- FIX: Gracefully handle cases where the filename format is unexpected ---
                 last_underscore_idx = core_name_with_width.rfind("_")
@@ -1336,8 +1343,8 @@ class MergingGUI(ThemedTk):
                 # --- END NEW ---
 
                 mask_folder = settings["mask_folder"]
-                splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
-                splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
+                splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4*.mp4")
+                splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2*.mp4")
                 splatted4_matches = glob.glob(splatted4_pattern)
                 splatted2_matches = glob.glob(splatted2_pattern)
 
@@ -1512,6 +1519,13 @@ class MergingGUI(ThemedTk):
                         original_left = splatted_tensor[:, :, : H // 2, : W // 2]
                         mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
                         warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
+
+                    if flip_horizontal and is_dual_input:
+                        # In Dual mode, original_left is the raw video (not flipped).
+                        # We flip it early to align with the already-flipped inpainted/splatted files.
+                        # We then process everything in 'Flipped Space'.
+                        original_left = torch.flip(original_left, dims=[3])
+                    # (In Quad mode, original_left comes from the splatted file and is already flipped)
 
                     mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
                     mask_gray_np = np.mean(mask_np, axis=3)
@@ -1827,8 +1841,9 @@ class MergingGUI(ThemedTk):
             return []
 
         all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
+        inpaint_pattern = re.compile(r"_inpainted_(right_eye|sbs)F?\.mp4$")
         valid_inpainted_videos = [
-            f for f in all_mp4s if f.endswith("_inpainted_right_eye.mp4") or f.endswith("_inpainted_sbs.mp4")
+            f for f in all_mp4s if inpaint_pattern.search(f)
         ]
 
         video_source_list = []
@@ -1836,19 +1851,15 @@ class MergingGUI(ThemedTk):
 
         for inpainted_path in valid_inpainted_videos:
             base_name = os.path.basename(inpainted_path)
-            inpaint_suffix = "_inpainted_right_eye.mp4"
-            logger.debug(f"Preview Scan: Checking '{base_name}'...")
-            sbs_suffix = "_inpainted_sbs.mp4"
-
-            is_sbs_input = False  # Assume single-eye unless proven otherwise
-
-            if base_name.endswith(inpaint_suffix):
-                core_name_with_width = base_name[: -len(inpaint_suffix)]
-            elif base_name.endswith(sbs_suffix):
-                core_name_with_width = base_name[: -len(sbs_suffix)]
-                is_sbs_input = True  # Set flag for double-wide inpainted video
-            else:
+            inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
+            sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
+            
+            is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
+            match = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name)
+            if not match:
                 continue
+            suffix_to_remove = match.group(0)
+            core_name_with_width = base_name[: -len(suffix_to_remove)]
 
             last_underscore_idx = core_name_with_width.rfind("_")
             if last_underscore_idx == -1:
@@ -1869,8 +1880,8 @@ class MergingGUI(ThemedTk):
             # --- END NEW ---
 
             mask_folder = self.mask_folder_var.get()
-            splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4.mp4")
-            splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2.mp4")
+            splatted4_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted4*.mp4")
+            splatted2_pattern = os.path.join(mask_folder, f"{core_name}_*_splatted2*.mp4")
             logger.debug(
                 f"  - Searching for splatted file with patterns: '{splatted4_pattern}' and '{splatted2_pattern}'"
             )
@@ -1979,6 +1990,12 @@ class MergingGUI(ThemedTk):
                 original_left = original_tensor.to(device) if original_tensor is not None else None
                 depth_map_vis = None
                 is_dual_input = True
+
+            if flip_horizontal and is_dual_input:
+                # In Dual mode, original_left is the raw video (not flipped).
+                # We flip it to align with the flipped inpainted/splatted tensors.
+                original_left = torch.flip(original_left, dims=[3])
+            # (In Quad mode, original_left is sliced from the splatted tensor and is already flipped)
 
             # Configure preview source dropdown based on input type
             preview_options = [
