@@ -40,7 +40,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-07.0"
+GUI_VERSION = "26-03-07.1"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -3617,35 +3617,7 @@ def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
     return b
 
 
-def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128)) -> torch.Tensor:
-    """
-    Zero-pads a batch of frames (shape [T, C, H, W]) so that (H, W) fits perfectly into 'tile_num' splits plus overlap.
-    """
-    if tile_num <= 1:
-        return frames
-
-    T, C, H, W = frames.shape
-    overlap_y, overlap_x = tile_overlap
-
-    # Calculate ideal tile dimensions and strides
-    # Ensure stride is at least 1 to avoid infinite loops or zero-sized tiles with small inputs
-    stride_y = max(1, (H + overlap_y * (tile_num - 1)) // tile_num - overlap_y)
-    stride_x = max(1, (W + overlap_x * (tile_num - 1)) // tile_num - overlap_x)
-
-    # Recalculate size_y and size_x based on minimum stride
-    size_y = stride_y + overlap_y
-    size_x = stride_x + overlap_x
-
-    ideal_H = stride_y * tile_num + overlap_y
-    ideal_W = stride_x * tile_num + overlap_x
-
-    pad_bottom = max(0, ideal_H - H)
-    pad_right = max(0, ideal_W - W)
-
-    if pad_bottom > 0 or pad_right > 0:
-        logger.debug(f"Padding frames from ({H}x{W}) to ({H + pad_bottom}x{W + pad_right}) for tiling.")
-        frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
-    return frames
+# Removed pad_for_tiling as its functionality is now integrated into spatial_tiled_process for better robustness.
 
 
 def spatial_tiled_process(
@@ -3659,32 +3631,49 @@ def spatial_tiled_process(
 ) -> torch.Tensor:
     """
     Splits frames into tiles, processes them with `process_func`, then blends the results back together.
+    Ensures that tile dimensions are divisible by `spatial_n_compress` to avoid pipeline errors.
     """
     height = cond_frames.shape[2]
     width = cond_frames.shape[3]
 
     tile_overlap = (128, 128)
-    overlap_y, overlap_x = tile_overlap
+    # Ensure overlap is divisible by compress factor (8)
+    overlap_y = (tile_overlap[0] // spatial_n_compress) * spatial_n_compress
+    overlap_x = (tile_overlap[1] // spatial_n_compress) * spatial_n_compress
 
-    # Calculate tile sizes and strides, ensuring minimum stride
-    size_y = (height + overlap_y * (tile_num - 1)) // tile_num
-    size_x = (width + overlap_x * (tile_num - 1)) // tile_num
-    tile_size = (size_y, size_x)
+    # Calculate stride such that (stride + overlap) is divisible by 8 and covers the entire dimension.
+    # stride * (tile_num - 1) + (stride + overlap) >= dimension  => stride * tile_num + overlap >= dimension.
+    stride_y = (height - overlap_y + tile_num - 1) // tile_num
+    stride_y = ((stride_y + spatial_n_compress - 1) // spatial_n_compress) * spatial_n_compress
+    stride_y = max(stride_y, spatial_n_compress)
 
-    tile_stride = (max(1, size_y - overlap_y), max(1, size_x - overlap_x))  # Ensure stride is at least 1
+    stride_x = (width - overlap_x + tile_num - 1) // tile_num
+    stride_x = ((stride_x + spatial_n_compress - 1) // spatial_n_compress) * spatial_n_compress
+    stride_x = max(stride_x, spatial_n_compress)
+
+    tile_size_y = stride_y + overlap_y
+    tile_size_x = stride_x + overlap_x
+
+    # Pad input frames if necessary to perfectly fit the calculated tiles
+    padded_height = stride_y * (tile_num - 1) + tile_size_y
+    padded_width = stride_x * (tile_num - 1) + tile_size_x
+
+    pad_bottom = padded_height - height
+    pad_right = padded_width - width
+
+    if pad_bottom > 0 or pad_right > 0:
+        logger.debug(f"Padding frames from ({height}x{width}) to ({padded_height}x{padded_width}) for tiling.")
+        cond_frames = F.pad(cond_frames, (0, pad_right, 0, pad_bottom), mode="reflect")
+        mask_frames = F.pad(mask_frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
 
     cols = []
     for i in range(tile_num):
         row_tiles = []
         for j in range(tile_num):
-            y_start = i * tile_stride[0]
-            x_start = j * tile_stride[1]
-            y_end = y_start + tile_size[0]
-            x_end = x_start + tile_size[1]
-
-            # Ensure bounds do not exceed original image dimensions if padding was used
-            y_end = min(y_end, height)
-            x_end = min(x_end, width)
+            y_start = i * stride_y
+            x_start = j * stride_x
+            y_end = y_start + tile_size_y
+            x_end = x_start + tile_size_x
 
             cond_tile = cond_frames[:, :, y_start:y_end, x_start:x_end]
             mask_tile = mask_frames[:, :, y_start:y_end, x_start:x_end]
@@ -3693,12 +3682,7 @@ def spatial_tiled_process(
                 logger.warning(
                     f"Skipping empty tile: y_start={y_start}, y_end={y_end}, x_start={x_start}, x_end={x_end}"
                 )
-                # Append a zero tensor of expected latent output size to keep structure consistent
-                # This needs careful consideration if `tile_output` becomes empty, it could break blending.
-                # A better approach for empty tiles might be to just skip and fill later, or ensure valid tiles.
-                # For simplicity, assuming pipeline handles small/empty inputs gracefully or valid tiles are always generated.
-                # Here, we'll try to let the pipeline handle it, or it will error out if it can't.
-                pass  # Let the process_func handle if it gets an empty tile.
+                continue
 
             with torch.no_grad():
                 tile_output = process_func(
@@ -3715,7 +3699,7 @@ def spatial_tiled_process(
             row_tiles.append(tile_output)
         cols.append(row_tiles)
 
-    latent_stride = (tile_stride[0] // spatial_n_compress, tile_stride[1] // spatial_n_compress)
+    latent_stride = (stride_y // spatial_n_compress, stride_x // spatial_n_compress)
     latent_overlap = (overlap_y // spatial_n_compress, overlap_x // spatial_n_compress)
 
     blended_rows = []
@@ -3723,11 +3707,9 @@ def spatial_tiled_process(
         row_result = []
         for j, tile in enumerate(row_tiles):
             if i > 0:
-                # Ensure the previous tile exists for blending
                 if len(cols[i - 1]) > j and cols[i - 1][j] is not None:
                     tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
             if j > 0:
-                # Ensure the previous tile in the row exists for blending
                 if len(row_result) > j - 1 and row_result[j - 1] is not None:
                     tile = blend_h(row_result[j - 1], tile, latent_overlap[1])
             row_result.append(tile)
@@ -3767,6 +3749,13 @@ def spatial_tiled_process(
         raise ValueError("Spatial tiling failed to produce any valid output rows.")
 
     x = torch.cat(final_rows, dim=2)
+
+    # Crop the latents back to the original (relative) dimensions.
+    # Since the pipeline requires 8-divisible input, and we assuming the input was already such,
+    # cropping to height//8 and width//8 is exact.
+    latent_h = height // spatial_n_compress
+    latent_w = width // spatial_n_compress
+    x = x[:, :, :latent_h, :latent_w]
 
     return x
 
