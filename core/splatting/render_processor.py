@@ -308,13 +308,17 @@ class RenderProcessor:
                         f"Resizing depth from {depth_w}x{depth_h} to match video {video_w}x{video_h} for aspect-ratio parity."
                     )
                     interp = cv2.INTER_AREA if (video_w < depth_w and video_h < depth_h) else cv2.INTER_LINEAR
-                    resized_depth = np.empty(
-                        (batch_depth_numpy_raw.shape[0], video_h, video_w), dtype=batch_depth_numpy_raw.dtype
-                    )
+                    # Correctly account for potential channel dimension (e.g., RGB depth maps)
+                    output_shape = (batch_depth_numpy_raw.shape[0], video_h, video_w)
+                    if batch_depth_numpy_raw.ndim == 4:
+                        output_shape += (batch_depth_numpy_raw.shape[3],)
+
+                    resized_depth = np.empty(output_shape, dtype=batch_depth_numpy_raw.dtype)
                     for idx in range(batch_depth_numpy_raw.shape[0]):
-                        resized_depth[idx] = cv2.resize(
-                            batch_depth_numpy_raw[idx], (video_w, video_h), interpolation=interp
-                        )
+                        res = cv2.resize(batch_depth_numpy_raw[idx], (video_w, video_h), interpolation=interp)
+                        if batch_depth_numpy_raw.ndim == 4 and res.ndim == 2:
+                            res = res[..., np.newaxis]
+                        resized_depth[idx] = res
                     batch_depth_numpy_raw = resized_depth
 
                 # 2. Normalize and apply gamma (BEFORE dilation/blur)

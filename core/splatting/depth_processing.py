@@ -806,7 +806,10 @@ class _ResizingDepthReader:
         if arr.ndim == 4:
             out = np.empty((arr.shape[0], self._out_h, self._out_w, arr.shape[3]), dtype=arr.dtype)
             for i in range(arr.shape[0]):
-                out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+                res = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+                if res.ndim == 2:
+                    res = res[..., np.newaxis]
+                out[i] = res
         else:
             out = np.empty((arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype)
             for i in range(arr.shape[0]):
