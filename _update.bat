@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: --- ANCHORING ---
+REM --- ANCHORING ---
 cd /d "%~dp0"
 
 echo.
@@ -10,8 +10,8 @@ echo === StereoCrafter Modern Update Script ===
 echo =================================================
 echo.
 
-:: --- HEALTH CHECK ---
-:: Check if running from a ZIP
+REM --- HEALTH CHECK ---
+REM Check if running from a ZIP
 echo "%~dp0" | findstr /i "Temp" >nul
 if !errorlevel! equ 0 (
     echo [WARNING] It looks like you are running this from a temporary folder or a ZIP.
@@ -20,19 +20,19 @@ if !errorlevel! equ 0 (
 
 
 
-:: --- Detect Remotes ---
+REM --- Detect Remotes ---
 set "Bill8_URL=https://github.com/Billynom8/StereoCrafter.git"
 set "ENOKY_URL=https://github.com/enoky/StereoCrafter.git"
 
-:: Check if origin points to either repo, if not set it
+REM Check if origin points to either repo, if not set it
 set "ORIGIN_URL=Not Found"
 for /f "tokens=*" %%i in ('git remote get-url origin 2^>nul') do set "ORIGIN_URL=%%i"
 
-:: Check if upstream points to either repo, if not set it
+REM Check if upstream points to either repo, if not set it
 set "UPSTREAM_URL=Not Found"
 for /f "tokens=*" %%i in ('git remote get-url upstream 2^>nul') do set "UPSTREAM_URL=%%i"
 
-:: Configure origin if not set or pointing to wrong repo
+REM Configure origin if not set or pointing to wrong repo
 if "!ORIGIN_URL!"=="Not Found" (
     git remote add origin !Bill8_URL! 2>nul
     set "ORIGIN_URL=!Bill8_URL!"
@@ -44,7 +44,7 @@ if "!ORIGIN_URL!"=="Not Found" (
     )
 )
 
-:: Configure upstream if not set or pointing to wrong repo
+REM Configure upstream if not set or pointing to wrong repo
 if "!UPSTREAM_URL!"=="Not Found" (
     git remote add upstream !ENOKY_URL! 2>nul
     set "UPSTREAM_URL=!ENOKY_URL!"
@@ -56,7 +56,7 @@ if "!UPSTREAM_URL!"=="Not Found" (
     )
 )
 
-:: --- Configuration Selection ---
+REM --- Configuration Selection ---
 echo [1/4] Please Select Update Source:
 echo 1. Billynom8 - !Bill8_URL!
 echo 2. enoky    - !ENOKY_URL!
@@ -74,19 +74,16 @@ if "%choice%"=="2" (
     )
 )
 
-:: Safety check - warn if pulling from unexpected repo
+REM Safety check - warn if pulling from unexpected repo
 set "CHECK_URL=!Bill8_URL!"
 if "!REMOTE!"=="upstream" set "CHECK_URL=!ENOKY_URL!"
 
 echo.
 echo [2/4] Pulling latest changes from !REMOTE!...
-:: Fetch first to see if branch exists
+REM Fetch first to see if branch exists
 git fetch !REMOTE! main --quiet 2>nul
-if %errorlevel% equ 0 (
-    set "BRANCH=main"
-) else (
-    set "BRANCH=master"
-)
+set "BRANCH=master"
+if !errorlevel! equ 0 set "BRANCH=main"
 
 git pull !REMOTE! !BRANCH!
 
@@ -94,9 +91,9 @@ if %errorlevel% neq 0 (
     echo.
     echo [WARNING] Git pull failed. This usually means you have local changes that conflict.
     echo.
-    set /p force_pull="Would you like to DISCARD your local changes and force update? (Y/N): "
+    set /p force_pull="Would you like to DISCARD your local changes and force update? [Y/N]: "
     if /i "!force_pull!"=="Y" (
-        echo [INFO] Forcing update (reset --hard)...
+        echo [INFO] Forcing update [reset --hard]...
         git reset --hard !REMOTE!/!BRANCH!
         git pull !REMOTE! !BRANCH!
     ) else (
@@ -108,16 +105,16 @@ if %errorlevel% neq 0 (
 )
 
 
-:: --- Update Submodules ---
+REM --- Update Submodules ---
 echo.
 echo [3/4] Updating submodules...
 git submodule update --init --recursive
 
-:: --- UV Sync ---
+REM --- UV Sync ---
 echo.
 echo [4/4] Syncing dependencies with uv...
 
-:: Verify uv is installed
+REM Verify uv is installed
 where uv >nul 2>&1
 if %errorlevel% neq 0 (
     echo uv not found. Installing uv...
@@ -125,22 +122,22 @@ if %errorlevel% neq 0 (
     set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 )
 
-:: Run the sync
+REM Run the sync
 uv sync
 
 if %errorlevel% equ 0 (
     echo.
     echo =================================================
     echo UPDATE SUCCESSFUL
-    echo Source: !REMOTE! (!BRANCH!)
+    echo Source: !REMOTE! [!BRANCH!]
     echo Project and environment are now up to date.
     echo =================================================
     
-    :: Check for the old redundant venv folder
+    REM Check for the old redundant venv folder
     if exist "venv" (
         echo.
         echo [NOTE] A legacy 'venv' folder was detected. 
-        echo This project now uses '.venv' (with a dot) via UV.
+        echo This project now uses '.venv' [with a dot] via UV.
         echo The 'venv' folder is now REDUNDANT and can be safely deleted 
         echo to save several GBs of disk space.
     )

@@ -1,19 +1,19 @@
 @echo off
 setlocal enabledelayedexpansion
 
-:: --- ANCHORING ---
-:: Force the script to run from its own directory (Critical for 'Run as Admin')
+REM --- ANCHORING ---
+REM Force the script to run from its own directory [Critical for 'Run as Admin']
 cd /d "%~dp0"
 
 REM StereoCrafter Universal Smart Installer (v4.3 - Admin Path Fix)
 
-:: --- LOG INITIALIZATION ---
+REM --- LOG INITIALIZATION ---
 set "LOGFILE=%~dp0install_log.txt"
 
-:: --- HEALTH CHECK (Pre-flight Permissions) ---
+REM --- HEALTH CHECK [Pre-flight Permissions] ---
 echo [0/7] Verifying Environment...
 
-:: Check if running from a ZIP
+REM Check if running from a ZIP
 echo "%~dp0" | findstr /i "Temp" >nul
 if !errorlevel! equ 0 (
     echo [WARNING] It looks like you are running this from a temporary folder or a ZIP.
@@ -22,13 +22,13 @@ if !errorlevel! equ 0 (
 
 
 
-:: Check for Admin (Required for persistent pathing/winget)
+REM Check for Admin [Required for persistent pathing/winget]
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo [INFO] Note: Not running as Administrator. Some features [winget] might prompt for permission.
 )
 
-:: Clear the log and start the session
+REM Clear the log and start the session
 echo [%date% %time%] --- NEW INSTALLATION/UPDATE SESSION --- > "%LOGFILE%"
 
 
@@ -77,7 +77,7 @@ if /i "!PREFIX!"=="StereoCrafter" (
 
 call :log "[4/7] Repository Selection..."
 
-:: Define URLs
+REM Define URLs
 set "Bill8_URL=https://github.com/Billynom8/StereoCrafter.git"
 set "ENOKY_URL=https://github.com/enoky/StereoCrafter.git"
 
@@ -117,37 +117,39 @@ if "!ALREADY_HOME!"=="false" (
         )
         cd StereoCrafter
         set "ALREADY_HOME=true"
+        set "JUST_CLONED=true"
     )
 )
 
-:: Standardize Remotes (matching _update.bat structure)
+REM Standardize Remotes [matching _update.bat structure]
 where git >nul 2>&1
 if %errorlevel% equ 0 (
     if exist ".git" (
-        call :log "[INFO] Standardizing remotes (origin=Billynom8, upstream=enoky)..."
+        call :log "[INFO] Standardizing remotes [origin=Billynom8, upstream=enoky]..."
         git remote set-url origin !Bill8_URL! 2>nul || git remote add origin !Bill8_URL! 2>nul
         git remote set-url upstream !ENOKY_URL! 2>nul || git remote add upstream !ENOKY_URL! 2>nul
     )
 )
 
-:: Optional Update Pull
-if "!ALREADY_HOME!"=="true" (
+REM Optional Update Pull [Only if we didn't just clone it]
+if "!ALREADY_HOME!"=="true" if "!JUST_CLONED!" neq "true" (
     echo.
-    set /p do_pull="Detected existing repo. Pull latest code from !PULL_REMOTE!? (Y/N) [Default=N]: "
+    set /p do_pull="Detected existing repo. Pull latest code from !PULL_REMOTE!? [Y/N] [Default=N]: "
     if /i "!do_pull!"=="Y" (
         call :log "[INFO] Pulling updates from !PULL_REMOTE!..."
         
-        :: Detect branch (main or master)
+        REM Detect branch [main or master]
         git fetch !PULL_REMOTE! main --quiet 2>nul
-        if !errorlevel! equ 0 ( set "BR=main" ) else ( set "BR=master" )
+        set "BR=master"
+        if !errorlevel! equ 0 set "BR=main"
         
         git pull !PULL_REMOTE! !BR! >> "%LOGFILE%" 2>&1
         if !errorlevel! neq 0 (
             echo.
             echo [WARNING] Git pull failed. This usually means you have local changes.
-            set /p force_pull="Would you like to DISCARD your local changes and force update? (Y/N): "
+            set /p force_pull="Would you like to DISCARD your local changes and force update? [Y/N]: "
             if /i "!force_pull!"=="Y" (
-                call :log "[INFO] Forcing update (reset --hard)..."
+                call :log "[INFO] Forcing update [reset --hard]..."
                 git reset --hard !PULL_REMOTE!/!BR! >> "%LOGFILE%" 2>&1
                 git pull !PULL_REMOTE! !BR! >> "%LOGFILE%" 2>&1
             ) else (
@@ -163,7 +165,7 @@ if exist "venv" (
     call :log "[INFO] Legacy 'venv' detected."
     echo.
     echo This project now uses UV and '.venv' [with a dot].
-    set /p del_venv="Would you like to delete the old 'venv' to save space? (Y/N): "
+    set /p del_venv="Would you like to delete the old 'venv' to save space? [Y/N]: "
     if /i "!del_venv!"=="Y" (
         call :log "[INFO] Removing legacy venv..."
         rmdir /s /q venv >> "%LOGFILE%" 2>&1
@@ -174,18 +176,18 @@ call :log "[INFO] Pinning Python 3.12 and syncing..."
 uv python pin 3.12 >> "%LOGFILE%" 2>&1
 uv sync >> "%LOGFILE%" 2>&1
 
-REM --- [6/7] WEIGHTS SECTION (Parenthesis Safe) ---
+REM --- [6/7] WEIGHTS SECTION [Parenthesis Safe] ---
 echo.
 echo =========================================================
 echo MODEL WEIGHTS DOWNLOAD
 echo =========================================================
-set /p get_weights="Would you like to download weights now? (Y/N): "
+set /p get_weights="Would you like to download weights now? [Y/N]: "
 
 if /i "!get_weights!"=="Y" (
     call :log "[INFO] Starting weight downloads..."
     if not exist "weights" mkdir weights
 
-    set /p hf_login="Do you need to log in to Hugging Face? (Y/N): "
+    set /p hf_login="Do you need to log in to Hugging Face? [Y/N]: "
     if /i "!hf_login!"=="Y" (
         echo [PROMPT] Please paste your Hugging Face Access Token below:
         uv run hf auth login
@@ -210,9 +212,9 @@ call :log "[FINISH] Session complete."
 pause
 exit /b
 
-:: --- THE LOGGING FUNCTION ---
+REM --- THE LOGGING FUNCTION ---
 :log
 echo %~1
-:: Use double quotes around the logfile path to handle spaces in folder names
+REM Use double quotes around the logfile path to handle spaces in folder names
 echo [%time%] %~1 >> "%LOGFILE%"
 exit /b
