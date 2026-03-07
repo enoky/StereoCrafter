@@ -645,12 +645,18 @@ def encode_frames_to_mp4(
     is_hdr = (
         video_stream_info
         and video_stream_info.get("color_primaries") == "bt2020"
-        and video_stream_info.get("transfer_characteristics") == "smpte2084"
+        and video_stream_info.get("transfer_characteristics") in ("smpte2084", "arib-std-b67")
     )
     orig_pix = video_stream_info.get("pix_fmt", "") if video_stream_info else ""
     is_high_bit = "10" in orig_pix or "12" in orig_pix or "16" in orig_pix
+    output_color_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
 
-    if is_hdr or (is_high_bit and video_stream_info.get("codec_name") in ("hevc", "prores", "dnxhd", "dnxhr")):
+    force_10bit = (
+        is_hdr
+        or output_color_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
+    )
+
+    if force_10bit or (is_high_bit and video_stream_info.get("codec_name") in ("hevc", "prores", "dnxhd", "dnxhr")):
         output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
         output_pix_fmt = "yuv420p10le"
         output_profile = "main10"
@@ -754,9 +760,17 @@ def start_ffmpeg_pipe_process(
         "-i",
         "-",
     ]
-    codec, pix, crf = "libx264", "yuv420p", "23"
+    codec, crf = "libx264", "23"
     if CUDA_AVAILABLE:
         codec = "h264_nvenc"
+
+    color_tags_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
+    force_10bit = color_tags_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
+    if force_10bit:
+        codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
+        pix = "yuv420p10le"
+    else:
+        pix = "yuv420p"
     if user_output_crf is not None:
         crf = str(user_output_crf)
     cmd.extend(["-c:v", codec])
@@ -764,7 +778,19 @@ def start_ffmpeg_pipe_process(
         cmd.extend(["-preset", "p4", "-qp", crf])
     else:
         cmd.extend(["-crf", crf])
-    cmd.extend(["-pix_fmt", pix, "-movflags", "+write_colr", final_output_mp4_path])
+    cmd.extend(["-pix_fmt", pix])
+
+    if force_10bit and video_stream_info:
+        for k, f in [
+            ("color_primaries", "-color_primaries"),
+            ("transfer_characteristics", "-color_trc"),
+            ("color_space", "-colorspace"),
+            ("color_range", "-color_range"),
+        ]:
+            if video_stream_info.get(k):
+                cmd.extend([f, video_stream_info[k]])
+
+    cmd.extend(["-movflags", "+write_colr", final_output_mp4_path])
     logger.info(f"Starting FFmpeg pipe: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

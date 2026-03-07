@@ -460,6 +460,7 @@ class RenderProcessor:
 
     def _get_encode_stream_info(self, source_info: Optional[dict], mode: str) -> dict:
         info = dict(source_info) if source_info else {}
+        info["color_tags_mode"] = mode
         defaults = {
             "color_primaries": "bt709",
             "transfer_characteristics": "bt709",
