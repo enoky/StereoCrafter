@@ -197,7 +197,19 @@ class EncodingSettingsDialog:
         self.dialog.update_idletasks()
         width = self.dialog.winfo_reqwidth()
         height = self.dialog.winfo_reqheight()
-        self.dialog.geometry(f"{width}x{height}")
+
+        parent_x = self.parent.winfo_rootx()
+        parent_y = self.parent.winfo_rooty()
+
+        # Position slightly to the right of the left edge and just under the menubar (which is usually represented by rooty)
+        x = parent_x + 20
+        y = parent_y + 10
+        
+        # Ensure the dialog is not positioned off-screen
+        x = max(0, x)
+        y = max(0, y)
+
+        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
 
     def _create_nvenc_frame(self, parent: ttk.Frame, row: int):
         """Create the NVENC options frame."""
