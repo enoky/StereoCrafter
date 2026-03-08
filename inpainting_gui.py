@@ -34,13 +34,16 @@ logger = logging.getLogger(__name__)
 from core.common.video_io import get_video_stream_info
 from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
+from core.ui.encoding_settings import EncodingSettingsDialog
+from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
+
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-07.0"
+GUI_VERSION = "26-03-08.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -131,6 +134,7 @@ class InpaintingGUI(ThemedTk):
         )
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
+        self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
 
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -628,6 +632,10 @@ class InpaintingGUI(ThemedTk):
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                if hasattr(self, "options_menu"):
+                    self.options_menu.config(
+                        bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg
+                    )
 
             # ttk.Entry widget styling
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
@@ -1518,7 +1526,7 @@ class InpaintingGUI(ThemedTk):
             final_left_frames_for_sbs = frames_left_original_cropped
 
         # --- NEW: Unflip logic for Quad (SBS) inputs only ---
-        # According to user requirements: 
+        # According to user requirements:
         # - Dual inputs never unflip in inpainting; they keep the 'F' tag for Merging GUI.
         # - Quad inputs (SBS) always unflip if the input is flipped, removing the 'F' tag.
         input_has_f = os.path.splitext(base_video_name)[0].endswith("F")
@@ -1701,6 +1709,7 @@ class InpaintingGUI(ThemedTk):
             "keep_inpaint_cache": self.keep_inpaint_cache_var.get(),
             "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
+            "move_to_finished": self.move_to_finished_var.get(),
         }
         return config
 
@@ -1961,9 +1970,10 @@ class InpaintingGUI(ThemedTk):
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
         frames_blend_mask_processed_unpadded_original_length = blend_processed_mask[:num_frames_original].clone()
 
-        # --- Pad for Tiling (for pipeline input) ---
-        frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
-        frames_inpaint_mask_padded = pad_for_tiling(inpaint_processed_mask, tile_num, tile_overlap=(128, 128))
+        # --- Prepare Tiling (for pipeline input) ---
+        # Note: legacy pad_for_tiling was removed; spatial_tiled_process now handles its own padding.
+        frames_warpped_padded = frames_warpped_normalized
+        frames_inpaint_mask_padded = inpaint_processed_mask
 
         padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
 
@@ -2075,7 +2085,7 @@ class InpaintingGUI(ThemedTk):
         """
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-        
+
         # Detect F tag for flipped videos to propagate to output
         input_has_f = video_name_without_ext.endswith("F")
         if is_dual_input:
@@ -2084,7 +2094,7 @@ class InpaintingGUI(ThemedTk):
         else:
             # Quad (SBS) always unflips internally, so it loses the F tag in the filename
             flip_tag = ""
-        
+
         output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
 
         # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
@@ -2180,11 +2190,16 @@ class InpaintingGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu)
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
-        self.file_menu.add_separator()  # Separator for organization
-        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+
+        # --- Options Menu ---
+        self.options_menu = tk.Menu(self.menubar, tearoff=0)
+        self.options_menu.add_command(label="Encoding Settings...", command=self._show_encoding_settings)
+        self.options_menu.add_separator()
+        self.options_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.menubar.add_cascade(label="Options", menu=self.options_menu)
 
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -2277,23 +2292,16 @@ class InpaintingGUI(ThemedTk):
         )
         current_row += 1
 
-        # Row 2: Frames Chunk (Left) & Frame Overlap (Right)
+        # Row 2: Frames Chunk (Left)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(
             row=current_row, column=1, sticky="w", padx=5
         )
-
-        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
-        output_crf_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
-        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(
-            row=current_row, column=3, sticky="w", padx=5
-        )
         current_row += 1
 
-        # Row 3: Original Input Bias (Left) & CPU Offload (Right)
+        # Row 3: Process Length
         process_length_label = ttk.Label(param_frame, text="Process Length:")
         process_length_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(
@@ -2389,7 +2397,7 @@ class InpaintingGUI(ThemedTk):
             command=self._toggle_blend_parameters_state,
         )
         blend_enable_check.grid(
-            row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2
+            row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2
         )  # Spans all 4 columns
         Tooltip(blend_enable_check, self.help_data.get("enable_post_inpainting_blend", ""))
 
@@ -2411,8 +2419,14 @@ class InpaintingGUI(ThemedTk):
             variable=self.keep_inpaint_cache_var,
             command=self._toggle_keep_inpaint_cache_state,
         )
-        keep_cache_check.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        keep_cache_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         Tooltip(keep_cache_check, self.help_data.get("keep_inpaint_cache", ""))
+
+        move_finished_check = ttk.Checkbutton(
+            post_process_frame, text="Resume", variable=self.move_to_finished_var, command=self.save_config
+        )
+        move_finished_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(move_finished_check, self.help_data.get("move_to_finished", ""))
         current_row += 1
 
         # Row 1: Blend Mask Source
@@ -3085,6 +3099,7 @@ class InpaintingGUI(ThemedTk):
         self.mask_blur_kernel_size_var.set("7")
         self.blend_mask_source_var.set("hybrid")
         self.keep_inpaint_cache_var.set(False)
+        self.move_to_finished_var.set(True)
 
         self.enable_post_inpainting_blend.set(False)  # Default state is OFF
         self.enable_color_transfer.set(True)  # Default state is ON
@@ -3097,6 +3112,7 @@ class InpaintingGUI(ThemedTk):
         logger.info("GUI settings reset to defaults.")
 
     def restore_finished_files(self):
+        """Moves all files from 'finished' folders back to their original input folders."""
         if not messagebox.askyesno(
             "Restore Finished Files",
             "Are you sure you want to move all processed videos from the 'finished' folders back to their respective input directories?",
@@ -3106,37 +3122,15 @@ class InpaintingGUI(ThemedTk):
         input_folder = self.input_folder_var.get()
         hires_input_folder = self.hires_blend_folder_var.get()
 
-        restore_dirs = [(input_folder, os.path.join(input_folder, "finished"))]
+        restore_dirs = [(input_folder, "finished")]
 
         # Only check the hires folder if it's different from the low-res folder
         if os.path.normpath(input_folder) != os.path.normpath(hires_input_folder):
-            restore_dirs.append((hires_input_folder, os.path.join(hires_input_folder, "finished")))
+            restore_dirs.append((hires_input_folder, "finished"))
 
-        restored_count = 0
-        errors_count = 0
-
-        for input_dir, finished_dir in restore_dirs:
-            if not os.path.isdir(finished_dir):
-                logger.info(f"Restore skipped: 'finished' folder not found at {finished_dir}")
-                continue
-
-            # Collect files to move first
-            files_to_move = [f for f in os.listdir(finished_dir) if os.path.isfile(os.path.join(finished_dir, f))]
-
-            if not files_to_move:
-                logger.info(f"Restore skipped: No files found in {finished_dir}")
-                continue
-
-            for filename in files_to_move:
-                src_path = os.path.join(finished_dir, filename)
-                dest_path = os.path.join(input_dir, filename)
-                try:
-                    shutil.move(src_path, dest_path)
-                    restored_count += 1
-                    logger.info(f"Moved '{filename}' from '{finished_dir}' back to '{input_dir}'")
-                except Exception as e:
-                    errors_count += 1
-                    logger.error(f"Error moving file '{filename}' during restore: {e}")
+        restored_count, errors_count, failed_files = _restore_finished_files(
+            restore_dirs=restore_dirs, logger=logger, wait_before_move=0.5
+        )
 
         if restored_count > 0 or errors_count > 0:
             messagebox.showinfo(
@@ -3226,7 +3220,37 @@ class InpaintingGUI(ThemedTk):
                 )
                 input_videos = filtered_videos
 
+            # --- Resume/Skip Logic ---
+            if self.move_to_finished_var.get():
+                low_res_finished_dir = os.path.join(input_folder, "finished")
+                hires_input_folder_pref = self.hires_blend_folder_var.get()
+
+                if os.path.isdir(low_res_finished_dir):
+                    finished_files = set(os.listdir(low_res_finished_dir))
+
+                    # If hires folder is different, we might also want to check it,
+                    # but typically checking the primary input folder is enough to identify processed clips.
+
+                    original_count = len(input_videos)
+                    input_videos = [v for v in input_videos if os.path.basename(v) not in finished_files]
+                    skipped_count = original_count - len(input_videos)
+                    if skipped_count > 0:
+                        logger.info(
+                            f"Resume mode: Skipped {skipped_count} already processed videos found in 'finished'."
+                        )
+
+                if not input_videos:
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Info", "All videos in the input folder have already been processed."
+                        ),
+                    )
+                    self.after(0, self.processing_done)
+                    return
+
             self.total_videos.set(len(input_videos))
+
             # finished_folder = os.path.join(input_folder, "finished")
             # os.makedirs(finished_folder, exist_ok=True)
             os.makedirs(output_folder, exist_ok=True)
@@ -3328,38 +3352,31 @@ class InpaintingGUI(ThemedTk):
                         logger.info(
                             "Single Clip ID mode: leaving processed input files in place (skipping move to 'finished')."
                         )
+                    elif not self.move_to_finished_var.get():
+                        logger.info("Move to Finished disabled: leaving processed input files in place.")
                     else:
                         # Define finished folder paths dynamically
                         low_res_input_folder = input_folder
                         hires_input_folder = self.hires_blend_folder_var.get()
 
-                        low_res_finished_folder = os.path.join(low_res_input_folder, "finished")
+                        files_to_move = []
 
-                        # 1. Move LOW-RES input file
-                        try:
-                            os.makedirs(low_res_finished_folder, exist_ok=True)  # Ensure low-res finished exists
-                            shutil.move(video_path, low_res_finished_folder)
-                            logger.debug(f"Moved {video_path} to {low_res_finished_folder}")
-                        except Exception as e:
-                            logger.error(f"Failed to move {video_path} to {low_res_finished_folder}: {e}")
+                        # 1. Add LOW-RES input file
+                        files_to_move.append((video_path, low_res_input_folder))
 
-                        # 2. Move HI-RES input file if it was used
+                        # 2. Add sidecar file (if exists)
+                        json_path = os.path.splitext(video_path)[0] + ".spsidecar"
+                        if os.path.exists(json_path):
+                            files_to_move.append((json_path, low_res_input_folder))
+
+                        # 3. Add HI-RES input file if it was used
                         if hi_res_input_path:
-                            # Ensure the high-res folder is different before trying to move
                             if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
-                                hires_finished_folder = os.path.join(hires_input_folder, "finished")
-                                try:
-                                    os.makedirs(hires_finished_folder, exist_ok=True)  # Ensure hi-res finished exists
-                                    shutil.move(hi_res_input_path, hires_finished_folder)
-                                    logger.debug(f"Moved Hi-Res input {hi_res_input_path} to {hires_finished_folder}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}"
-                                    )
-                            else:
-                                logger.warning(
-                                    f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder."
-                                )
+                                files_to_move.append((hi_res_input_path, hires_input_folder))
+
+                        # Perform the move with a delay to ensure handles are released
+                        move_files_to_finished(files_to_move=files_to_move, logger=logger, wait_before_move=0.5)
+
                 else:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
 
@@ -3383,6 +3400,43 @@ class InpaintingGUI(ThemedTk):
             "Developed by [Your Name/Alias] for StereoCrafter projects."  # Customize this!
         )
         messagebox.showinfo("About Batch Video Inpainting", about_text)
+
+    def _show_encoding_settings(self):
+        """Show the encoding settings dialog."""
+        config = {
+            "encoding_encoder": self.app_config.get("encoding_encoder", "Auto"),
+            "encoding_quality": self.app_config.get("encoding_quality", "Medium"),
+            "encoding_tune": self.app_config.get("encoding_tune", "None"),
+            "output_crf": self.output_crf_var.get(),
+            "nvenc_lookahead_enabled": self.app_config.get("nvenc_lookahead_enabled", False),
+            "nvenc_lookahead": self.app_config.get("nvenc_lookahead", 16),
+            "nvenc_spatial_aq": self.app_config.get("nvenc_spatial_aq", False),
+            "nvenc_temporal_aq": self.app_config.get("nvenc_temporal_aq", False),
+            "nvenc_aq_strength": self.app_config.get("nvenc_aq_strength", 8),
+            "color_tags": self.app_config.get("color_tags", "Auto"),
+        }
+
+        dialog = EncodingSettingsDialog(
+            self,
+            app_config=config,
+            help_data=self.help_data,
+            title="Inpainting GUI - Encoding Settings",
+            show_extra_options=False,
+            show_color_tags=True,
+        )
+        self.wait_window(dialog.dialog)
+
+        if dialog.result:
+            self.app_config["encoding_encoder"] = dialog.result.get("encoding_encoder", "Auto")
+            self.app_config["encoding_quality"] = dialog.result.get("encoding_quality", "Medium")
+            self.app_config["encoding_tune"] = dialog.result.get("encoding_tune", "None")
+            self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
+            self.app_config["nvenc_lookahead_enabled"] = dialog.result.get("nvenc_lookahead_enabled", False)
+            self.app_config["nvenc_lookahead"] = dialog.result.get("nvenc_lookahead", 16)
+            self.app_config["nvenc_spatial_aq"] = dialog.result.get("nvenc_spatial_aq", False)
+            self.app_config["nvenc_temporal_aq"] = dialog.result.get("nvenc_temporal_aq", False)
+            self.app_config["nvenc_aq_strength"] = dialog.result.get("nvenc_aq_strength", 8)
+            self.app_config["color_tags"] = dialog.result.get("color_tags", "Auto")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
@@ -3617,35 +3671,7 @@ def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
     return b
 
 
-def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128)) -> torch.Tensor:
-    """
-    Zero-pads a batch of frames (shape [T, C, H, W]) so that (H, W) fits perfectly into 'tile_num' splits plus overlap.
-    """
-    if tile_num <= 1:
-        return frames
-
-    T, C, H, W = frames.shape
-    overlap_y, overlap_x = tile_overlap
-
-    # Calculate ideal tile dimensions and strides
-    # Ensure stride is at least 1 to avoid infinite loops or zero-sized tiles with small inputs
-    stride_y = max(1, (H + overlap_y * (tile_num - 1)) // tile_num - overlap_y)
-    stride_x = max(1, (W + overlap_x * (tile_num - 1)) // tile_num - overlap_x)
-
-    # Recalculate size_y and size_x based on minimum stride
-    size_y = stride_y + overlap_y
-    size_x = stride_x + overlap_x
-
-    ideal_H = stride_y * tile_num + overlap_y
-    ideal_W = stride_x * tile_num + overlap_x
-
-    pad_bottom = max(0, ideal_H - H)
-    pad_right = max(0, ideal_W - W)
-
-    if pad_bottom > 0 or pad_right > 0:
-        logger.debug(f"Padding frames from ({H}x{W}) to ({H + pad_bottom}x{W + pad_right}) for tiling.")
-        frames = F.pad(frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
-    return frames
+# Removed pad_for_tiling as its functionality is now integrated into spatial_tiled_process for better robustness.
 
 
 def spatial_tiled_process(
@@ -3659,32 +3685,49 @@ def spatial_tiled_process(
 ) -> torch.Tensor:
     """
     Splits frames into tiles, processes them with `process_func`, then blends the results back together.
+    Ensures that tile dimensions are divisible by `spatial_n_compress` to avoid pipeline errors.
     """
     height = cond_frames.shape[2]
     width = cond_frames.shape[3]
 
     tile_overlap = (128, 128)
-    overlap_y, overlap_x = tile_overlap
+    # Ensure overlap is divisible by compress factor (8)
+    overlap_y = (tile_overlap[0] // spatial_n_compress) * spatial_n_compress
+    overlap_x = (tile_overlap[1] // spatial_n_compress) * spatial_n_compress
 
-    # Calculate tile sizes and strides, ensuring minimum stride
-    size_y = (height + overlap_y * (tile_num - 1)) // tile_num
-    size_x = (width + overlap_x * (tile_num - 1)) // tile_num
-    tile_size = (size_y, size_x)
+    # Calculate stride such that (stride + overlap) is divisible by 8 and covers the entire dimension.
+    # stride * (tile_num - 1) + (stride + overlap) >= dimension  => stride * tile_num + overlap >= dimension.
+    stride_y = (height - overlap_y + tile_num - 1) // tile_num
+    stride_y = ((stride_y + spatial_n_compress - 1) // spatial_n_compress) * spatial_n_compress
+    stride_y = max(stride_y, spatial_n_compress)
 
-    tile_stride = (max(1, size_y - overlap_y), max(1, size_x - overlap_x))  # Ensure stride is at least 1
+    stride_x = (width - overlap_x + tile_num - 1) // tile_num
+    stride_x = ((stride_x + spatial_n_compress - 1) // spatial_n_compress) * spatial_n_compress
+    stride_x = max(stride_x, spatial_n_compress)
+
+    tile_size_y = stride_y + overlap_y
+    tile_size_x = stride_x + overlap_x
+
+    # Pad input frames if necessary to perfectly fit the calculated tiles
+    padded_height = stride_y * (tile_num - 1) + tile_size_y
+    padded_width = stride_x * (tile_num - 1) + tile_size_x
+
+    pad_bottom = padded_height - height
+    pad_right = padded_width - width
+
+    if pad_bottom > 0 or pad_right > 0:
+        logger.debug(f"Padding frames from ({height}x{width}) to ({padded_height}x{padded_width}) for tiling.")
+        cond_frames = F.pad(cond_frames, (0, pad_right, 0, pad_bottom), mode="reflect")
+        mask_frames = F.pad(mask_frames, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
 
     cols = []
     for i in range(tile_num):
         row_tiles = []
         for j in range(tile_num):
-            y_start = i * tile_stride[0]
-            x_start = j * tile_stride[1]
-            y_end = y_start + tile_size[0]
-            x_end = x_start + tile_size[1]
-
-            # Ensure bounds do not exceed original image dimensions if padding was used
-            y_end = min(y_end, height)
-            x_end = min(x_end, width)
+            y_start = i * stride_y
+            x_start = j * stride_x
+            y_end = y_start + tile_size_y
+            x_end = x_start + tile_size_x
 
             cond_tile = cond_frames[:, :, y_start:y_end, x_start:x_end]
             mask_tile = mask_frames[:, :, y_start:y_end, x_start:x_end]
@@ -3693,12 +3736,7 @@ def spatial_tiled_process(
                 logger.warning(
                     f"Skipping empty tile: y_start={y_start}, y_end={y_end}, x_start={x_start}, x_end={x_end}"
                 )
-                # Append a zero tensor of expected latent output size to keep structure consistent
-                # This needs careful consideration if `tile_output` becomes empty, it could break blending.
-                # A better approach for empty tiles might be to just skip and fill later, or ensure valid tiles.
-                # For simplicity, assuming pipeline handles small/empty inputs gracefully or valid tiles are always generated.
-                # Here, we'll try to let the pipeline handle it, or it will error out if it can't.
-                pass  # Let the process_func handle if it gets an empty tile.
+                continue
 
             with torch.no_grad():
                 tile_output = process_func(
@@ -3715,7 +3753,7 @@ def spatial_tiled_process(
             row_tiles.append(tile_output)
         cols.append(row_tiles)
 
-    latent_stride = (tile_stride[0] // spatial_n_compress, tile_stride[1] // spatial_n_compress)
+    latent_stride = (stride_y // spatial_n_compress, stride_x // spatial_n_compress)
     latent_overlap = (overlap_y // spatial_n_compress, overlap_x // spatial_n_compress)
 
     blended_rows = []
@@ -3723,11 +3761,9 @@ def spatial_tiled_process(
         row_result = []
         for j, tile in enumerate(row_tiles):
             if i > 0:
-                # Ensure the previous tile exists for blending
                 if len(cols[i - 1]) > j and cols[i - 1][j] is not None:
                     tile = blend_v(cols[i - 1][j], tile, latent_overlap[0])
             if j > 0:
-                # Ensure the previous tile in the row exists for blending
                 if len(row_result) > j - 1 and row_result[j - 1] is not None:
                     tile = blend_h(row_result[j - 1], tile, latent_overlap[1])
             row_result.append(tile)
@@ -3767,6 +3803,13 @@ def spatial_tiled_process(
         raise ValueError("Spatial tiling failed to produce any valid output rows.")
 
     x = torch.cat(final_rows, dim=2)
+
+    # Crop the latents back to the original (relative) dimensions.
+    # Since the pipeline requires 8-divisible input, and we assuming the input was already such,
+    # cropping to height//8 and width//8 is exact.
+    latent_h = height // spatial_n_compress
+    latent_w = width // spatial_n_compress
+    x = x[:, :, :latent_h, :latent_w]
 
     return x
 

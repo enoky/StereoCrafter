@@ -20,6 +20,17 @@
     "resume": "If checked, moves processed files to a 'finished' subfolder after successful encoding and skips them on subsequent runs. Useful for resuming interrupted batch processing.",
     "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
     "batch_chunk_size": "The number of frames to process in memory at one time during batch processing. Lower this value if you run out of RAM on long videos.",
+    "encoding_settings": "Opens a dialog to configure video encoding options including encoder, quality preset, tune, CRF, and NVENC-specific options.",
+
+    "encoding_encoder": "Select encoder mode.\n• Auto: uses NVENC if CUDA/NVENC is available; otherwise CPU (libx264/libx265).\n• Force CPU: always uses CPU encoding.\nQuality (CRF/QP) is still controlled by the CRF field.",
+    "encoding_quality": "Controls encoder speed/efficiency preset.\n• CPU (libx264/libx265): maps to ultrafast → veryslow.\n• NVENC (h264_nvenc/hevc_nvenc): maps Fastest→p1 ... Slowest→p7.\nSlower presets usually improve compression efficiency at the same CRF/QP, but take longer.\nDefault is Medium.",
+    "encoding_tune": "Optional tune for CPU encoding (libx264/libx265). None means no tune flag.\nCommon tunes:\n• Film / Still Image (libx264 only)\n• Grain / Animation / PSNR / SSIM\n• Fast Decode / Zero Latency\nNote: Tune is ignored when NVENC is used.",
+    "output_crf": "Constant Rate Factor (CRF) for video quality control. Lower values = higher quality, larger file size.\n• 18-23: Good quality range for x264\n• 23-28: Good quality range for x265\n• 15-20: Good quality range for NVENC",
+    "encoding_nvenc_lookahead_enabled": "Enable lookahead for NVENC. Allows the encoder to look ahead to improve compression efficiency. Useful for slower moving content but adds encoding latency.",
+    "encoding_nvenc_lookahead": "Number of frames to look ahead when lookahead is enabled. Higher values improve compression but increase encoding time and memory usage.",
+    "encoding_nvenc_spatial_aq": "Enable Spatial Adaptive Quantization for NVENC. Allows the encoder to allocate more bits to complex areas within each frame.",
+    "encoding_nvenc_temporal_aq": "Enable Temporal Adaptive Quantization for NVENC. Allows the encoder to allocate more bits to frames that need it based on previous frames.",
+    "encoding_nvenc_aq_strength": "Strength of Adaptive Quantization (1-15). Higher values allocate more bits to complex areas.",
 
     "start_blending": "Starts the batch process to merge all found videos using the current settings.",
     "stop_blending": "Stops the batch process after the current video chunk is finished.",

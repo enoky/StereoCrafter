@@ -18,6 +18,7 @@ import numpy as np
 from decord import VideoReader, cpu
 
 from core.common.gpu_utils import CUDA_AVAILABLE
+from core.common.encoding_utils import build_encoder_args, get_encoding_config_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -636,32 +637,42 @@ def encode_frames_to_mp4(
     ]
 
     output_codec, output_pix_fmt, default_cpu_crf, output_profile = "libx264", "yuv420p", "23", "main"
-    x265_params, default_nvenc_cq = [], "23"
 
-    if user_output_crf is not None:
-        default_cpu_crf = str(user_output_crf)
-        default_nvenc_cq = str(user_output_crf)
+    enc_config = get_encoding_config_from_dict(encoding_options or {})
+    crf = user_output_crf if user_output_crf is not None else enc_config.get("crf", 23)
 
     is_hdr = (
         video_stream_info
         and video_stream_info.get("color_primaries") == "bt2020"
-        and video_stream_info.get("transfer_characteristics") == "smpte2084"
+        and video_stream_info.get("transfer_characteristics") in ("smpte2084", "arib-std-b67")
     )
     orig_pix = video_stream_info.get("pix_fmt", "") if video_stream_info else ""
     is_high_bit = "10" in orig_pix or "12" in orig_pix or "16" in orig_pix
+    output_color_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
 
-    if is_hdr or (is_high_bit and video_stream_info.get("codec_name") in ("hevc", "prores", "dnxhd", "dnxhr")):
-        output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
-        output_pix_fmt = "yuv420p10le"
-        output_profile = "main10"
-    else:
-        output_codec = "h264_nvenc" if CUDA_AVAILABLE else "libx264"
+    force_10bit = is_hdr or output_color_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
+
+    enc_args = build_encoder_args(
+        encoder=enc_config.get("encoder", "Auto"),
+        quality=enc_config.get("quality", "Medium"),
+        tune=enc_config.get("tune", "None"),
+        crf=crf,
+        force_10bit=force_10bit,
+        nvenc_options={
+            "lookahead_enabled": enc_config.get("nvenc_lookahead_enabled", False),
+            "lookahead": enc_config.get("nvenc_lookahead", 16),
+            "spatial_aq": enc_config.get("nvenc_spatial_aq", False),
+            "temporal_aq": enc_config.get("nvenc_temporal_aq", False),
+            "aq_strength": enc_config.get("nvenc_aq_strength", 8),
+        },
+    )
+
+    output_codec = enc_args["codec"]
+    output_pix_fmt = enc_args["pix_fmt"]
+    output_profile = "main10" if "10" in output_pix_fmt else "main"
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
-    if "nvenc" in output_codec:
-        ffmpeg_cmd.extend(["-preset", "medium", "-cq", default_nvenc_cq])
-    else:
-        ffmpeg_cmd.extend(["-crf", default_cpu_crf])
+    ffmpeg_cmd.extend(enc_args["extra_args"])
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
     if output_profile:
         ffmpeg_cmd.extend(["-profile:v", output_profile])
@@ -754,27 +765,48 @@ def start_ffmpeg_pipe_process(
         "-i",
         "-",
     ]
-    codec, pix, crf = "libx264", "yuv420p", "23"
-    if CUDA_AVAILABLE:
-        codec = "h264_nvenc"
-    if user_output_crf is not None:
-        crf = str(user_output_crf)
-    cmd.extend(["-c:v", codec])
-    if "nvenc" in codec:
-        cmd.extend(["-preset", "p4", "-qp", crf])
-    else:
-        cmd.extend(["-crf", crf])
-    cmd.extend(["-pix_fmt", pix, "-movflags", "+write_colr", final_output_mp4_path])
+    enc_config = get_encoding_config_from_dict(encoding_options or {})
+    crf = user_output_crf if user_output_crf is not None else enc_config.get("crf", 23)
+
+    color_tags_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
+    force_10bit = color_tags_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
+
+    enc_args = build_encoder_args(
+        encoder=enc_config.get("encoder", "Auto"),
+        quality=enc_config.get("quality", "Medium"),
+        tune=enc_config.get("tune", "None"),
+        crf=crf,
+        force_10bit=force_10bit,
+        nvenc_options={
+            "lookahead_enabled": enc_config.get("nvenc_lookahead_enabled", False),
+            "lookahead": enc_config.get("nvenc_lookahead", 16),
+            "spatial_aq": enc_config.get("nvenc_spatial_aq", False),
+            "temporal_aq": enc_config.get("nvenc_temporal_aq", False),
+            "aq_strength": enc_config.get("nvenc_aq_strength", 8),
+        },
+    )
+
+    cmd.extend(["-c:v", enc_args["codec"]])
+    cmd.extend(enc_args["extra_args"])
+    cmd.extend(["-pix_fmt", enc_args["pix_fmt"]])
+
+    if force_10bit and video_stream_info:
+        for k, f in [
+            ("color_primaries", "-color_primaries"),
+            ("transfer_characteristics", "-color_trc"),
+            ("color_space", "-colorspace"),
+            ("color_range", "-color_range"),
+        ]:
+            if video_stream_info.get(k):
+                cmd.extend([f, video_stream_info[k]])
+
+    cmd.extend(["-movflags", "+write_colr", final_output_mp4_path])
     logger.info(f"Starting FFmpeg pipe: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def start_ffmpeg_pipe_process_dnxhr(
-    content_width: int,
-    content_height: int,
-    final_output_mov_path: str,
-    fps: float,
-    dnxhr_profile: str = "HQX",
+    content_width: int, content_height: int, final_output_mov_path: str, fps: float, dnxhr_profile: str = "HQX"
 ) -> Optional[subprocess.Popen]:
     """Start an FFmpeg process for high-quality DNxHR output via pipe.
 

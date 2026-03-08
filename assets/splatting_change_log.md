@@ -2,6 +2,21 @@
 
 All notable changes to the splatting GUI and related components.
 
+## Version 26-03-08.0
+
+### Added (v26-03-08.0)
+
+- **Unified Encoding Settings Dialog**: Moved all encoding options to a shared dialog (Options → Encoding Settings...).
+  - **Encoder**: Auto (NVENC/CPU) or Force CPU
+  - **Quality Preset**: Fastest to Slowest (controls encoding speed/efficiency)
+  - **CPU Tune**: Film, Grain, Animation, etc. (ignored for NVENC)
+  - **Full Res CRF / Low Res CRF**: Separate quality settings for each output resolution
+  - **NVENC Options**: Lookahead, Spatial AQ, Temporal AQ, AQ Strength
+  - **DNxHR Options**: Enable DNxHR Split, DNxHR Profile
+  - **Color Tags**: Off, Auto, BT.709 L/F, BT.2020 PQ/HLG
+- Implemented as reusable `core/ui/encoding_settings.py` shared across all three GUIs
+- Removed duplicate CRF fields from main UI (now in encoding dialog)
+
 ## Version 26-03-04.3
 
 ### Added (v26-03-04.3)
