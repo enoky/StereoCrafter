@@ -177,6 +177,8 @@ class MergingGUI(ThemedTk):
         self.nvenc_temporal_aq_var = tk.BooleanVar(value=self.app_config.get("nvenc_temporal_aq", False))
         self.nvenc_aq_strength_var = tk.IntVar(value=self.app_config.get("nvenc_aq_strength", 8))
         self.color_tags_var = tk.StringVar(value=self.app_config.get("color_tags", "Auto"))
+        self.dnxhr_fullres_split_var = tk.BooleanVar(value=self.app_config.get("dnxhr_fullres_split", False))
+        self.dnxhr_profile_var = tk.StringVar(value=self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -806,6 +808,8 @@ class MergingGUI(ThemedTk):
             "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
             "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
             "color_tags": self.color_tags_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
         }
 
         dialog = EncodingSettingsDialog(
@@ -813,7 +817,7 @@ class MergingGUI(ThemedTk):
             app_config=config,
             help_data=self.help_data,
             title="Merging GUI - Encoding Settings",
-            show_extra_options=False,
+            show_extra_options=True,
             show_color_tags=True,
         )
         self.wait_window(dialog.dialog)
@@ -830,6 +834,8 @@ class MergingGUI(ThemedTk):
             self.nvenc_temporal_aq_var.set(dialog.result.get("nvenc_temporal_aq", False))
             self.nvenc_aq_strength_var.set(dialog.result.get("nvenc_aq_strength", 8))
             self.color_tags_var.set(dialog.result.get("color_tags", "Auto"))
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
     def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
         """Scans a folder for a file matching the core_name with any common video extension."""
@@ -1298,6 +1304,8 @@ class MergingGUI(ThemedTk):
                 "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
                 "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
                 "color_tags": self.color_tags_var.get(),
+                "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+                "dnxhr_profile": self.dnxhr_profile_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),

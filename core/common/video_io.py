@@ -737,16 +737,24 @@ def start_ffmpeg_pipe_process(
         content_height: Height of input frames
         final_output_mp4_path: Output path for the video
         fps: Frame rate
-        video_stream_info: Source video stream info (currently unused in this version)
+        video_stream_info: Source video stream info (may contain color_tags_mode)
         output_format_str: Optional format string
         user_output_crf: Optional CRF override
         pad_to_16_9: Whether to pad to 16:9 (currently unused)
         debug_label: Optional label for logging
-        encoding_options: Optional extra encoding options
+        encoding_options: Optional dict with encoding settings:
+            - codec: "Auto", "H.264", "H.265"
+            - encoding_encoder: "Auto", "Force CPU"
+            - encoding_quality: quality preset
+            - encoding_tune: tune option
+            - output_crf: CRF value
+            - nvenc_lookahead_enabled, nvenc_lookahead, etc.
 
     Returns:
         The subprocess.Popen instance
     """
+    from core.common.encoding_utils import build_encoder_args, get_encoding_config_from_dict
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -766,32 +774,74 @@ def start_ffmpeg_pipe_process(
         "-i",
         "-",
     ]
-    enc_config = get_encoding_config_from_dict(encoding_options or {})
-    crf = user_output_crf if user_output_crf is not None else enc_config.get("crf", 23)
 
+    # Determine if we need 10-bit output based on color tags
     color_tags_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
+    # Also check encoding_options for color_tags if not in video_stream_info
+    if not color_tags_mode and encoding_options and "color_tags" in encoding_options:
+        color_tags_mode = str(encoding_options["color_tags"]).lower()
     force_10bit = color_tags_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
 
-    enc_args = build_encoder_args(
-        codec=enc_config.get("codec", "H.265"),
-        encoder=enc_config.get("encoder", "Auto"),
-        quality=enc_config.get("quality", "Medium"),
-        tune=enc_config.get("tune", "None"),
-        crf=crf,
-        force_10bit=force_10bit,
-        nvenc_options={
-            "lookahead_enabled": enc_config.get("nvenc_lookahead_enabled", False),
-            "lookahead": enc_config.get("nvenc_lookahead", 16),
-            "spatial_aq": enc_config.get("nvenc_spatial_aq", False),
-            "temporal_aq": enc_config.get("nvenc_temporal_aq", False),
-            "aq_strength": enc_config.get("nvenc_aq_strength", 8),
-        },
-    )
+    # Build encoding arguments from encoding_options if provided
+    if encoding_options:
+        enc_config = get_encoding_config_from_dict(encoding_options)
+        encoder_args = build_encoder_args(
+            codec=enc_config.get("codec", "Auto"),
+            encoder=enc_config.get("encoder", "Auto"),
+            quality=enc_config.get("quality", "Medium"),
+            tune=enc_config.get("tune", "None"),
+            crf=int(enc_config.get("crf", 23)) if user_output_crf is None else user_output_crf,
+            force_10bit=force_10bit,
+            nvenc_options={
+                "lookahead_enabled": enc_config.get("nvenc_lookahead_enabled", False),
+                "lookahead": enc_config.get("nvenc_lookahead", 16),
+                "spatial_aq": enc_config.get("nvenc_spatial_aq", False),
+                "temporal_aq": enc_config.get("nvenc_temporal_aq", False),
+                "aq_strength": enc_config.get("nvenc_aq_strength", 8),
+            }
+            if enc_config.get("nvenc_lookahead_enabled")
+            else None,
+        )
+        codec = encoder_args["codec"]
+        crf = str(encoder_args.get("crf", enc_config.get("crf", 23)))
+        preset = encoder_args["preset"]
+        tune_flag = encoder_args["tune"]
+        pix = encoder_args["pix_fmt"]
+        extra_args = encoder_args.get("extra_args", [])
+    else:
+        # Fallback to old behavior (simple auto-detection)
+        codec, crf = "libx264", "23"
+        if CUDA_AVAILABLE:
+            codec = "h264_nvenc"
+        if user_output_crf is not None:
+            crf = str(user_output_crf)
+        pix = "yuv420p10le" if force_10bit else "yuv420p"
+        preset, tune_flag, extra_args = None, None, []
 
-    cmd.extend(["-c:v", enc_args["codec"]])
-    cmd.extend(enc_args["extra_args"])
-    cmd.extend(["-pix_fmt", enc_args["pix_fmt"]])
+    cmd.extend(["-c:v", codec])
 
+    # Add preset and tune
+    if preset:
+        if "nvenc" in codec:
+            cmd.extend(["-preset", preset])
+        else:
+            cmd.extend(["-preset", preset])
+    elif "nvenc" in codec:
+        cmd.extend(["-preset", "p4"])
+
+    # Add CRF/QP
+    if extra_args:
+        # Handle nvenc args which are in extra_args
+        cmd.extend(extra_args)
+    else:
+        if "nvenc" in codec:
+            cmd.extend(["-qp", crf])
+        else:
+            cmd.extend(["-crf", crf])
+
+    cmd.extend(["-pix_fmt", pix])
+
+    # Add color metadata if forcing 10-bit and we have source info
     if force_10bit and video_stream_info:
         for k, f in [
             ("color_primaries", "-color_primaries"),

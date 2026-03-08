@@ -140,6 +140,10 @@ class InpaintingGUI(ThemedTk):
         self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
 
+        # DNxHR encoding options
+        self.dnxhr_fullres_split_var = tk.BooleanVar(value=self.app_config.get("dnxhr_fullres_split", False))
+        self.dnxhr_profile_var = tk.StringVar(value=self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
+
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
         self.stop_event = threading.Event()
@@ -1720,6 +1724,8 @@ class InpaintingGUI(ThemedTk):
             "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
             "move_to_finished": self.move_to_finished_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
         }
         return config
 
@@ -3428,6 +3434,8 @@ class InpaintingGUI(ThemedTk):
             "nvenc_temporal_aq": self.app_config.get("nvenc_temporal_aq", False),
             "nvenc_aq_strength": self.app_config.get("nvenc_aq_strength", 8),
             "color_tags": self.app_config.get("color_tags", "Auto"),
+            "dnxhr_fullres_split": self.app_config.get("dnxhr_fullres_split", False),
+            "dnxhr_profile": self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"),
         }
 
         dialog = EncodingSettingsDialog(
@@ -3435,7 +3443,7 @@ class InpaintingGUI(ThemedTk):
             app_config=config,
             help_data=self.help_data,
             title="Inpainting GUI - Encoding Settings",
-            show_extra_options=False,
+            show_extra_options=True,
             show_color_tags=True,
         )
         self.wait_window(dialog.dialog)
@@ -3452,6 +3460,10 @@ class InpaintingGUI(ThemedTk):
             self.app_config["nvenc_temporal_aq"] = dialog.result.get("nvenc_temporal_aq", False)
             self.app_config["nvenc_aq_strength"] = dialog.result.get("nvenc_aq_strength", 8)
             self.app_config["color_tags"] = dialog.result.get("color_tags", "Auto")
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
+            self.app_config["dnxhr_fullres_split"] = dialog.result.get("dnxhr_fullres_split", False)
+            self.app_config["dnxhr_profile"] = dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
