@@ -45,10 +45,10 @@ def init_dnd(root) -> bool:
         return False
     try:
         _dnd_require(root)
-        logger.info("Drag-and-drop support enabled.")
+        logger.debug("Drag-and-drop support enabled.")
         return True
     except Exception as e:
-        logger.info(f"Drag-and-drop not available: {e}")
+        logger.debug(f"Drag-and-drop not available: {e}")
         return False
 
 

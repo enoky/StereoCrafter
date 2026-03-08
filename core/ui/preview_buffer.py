@@ -46,6 +46,7 @@ class PreviewFrameBuffer:
         preview_size = params.get("preview_size", "100%")
         key_parts = [
             video_path or "",
+            # Splatting GUI parameters
             str(params.get("max_disp", "")),
             str(params.get("convergence_point", "")),
             str(params.get("depth_gamma", "")),
@@ -63,6 +64,18 @@ class PreviewFrameBuffer:
             str(params.get("enable_global_norm", "")),
             str(params.get("strict_ffmpeg_decode", "")),
             str(params.get("flip_horizontal", False)),
+            # Merging GUI parameters
+            str(params.get("mask_binarize_threshold", "")),
+            str(params.get("mask_dilate_kernel_size", "")),
+            str(params.get("mask_blur_kernel_size", "")),
+            str(params.get("shadow_shift", "")),
+            str(params.get("shadow_decay_gamma", "")),
+            str(params.get("shadow_start_opacity", "")),
+            str(params.get("shadow_opacity_decay", "")),
+            str(params.get("shadow_min_opacity", "")),
+            str(params.get("add_borders", "")),
+            str(params.get("enable_color_transfer", "")),
+            str(params.get("output_format", "")),
         ]
         return "|".join(key_parts)
 
