@@ -36,6 +36,7 @@ from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
+from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
@@ -54,6 +55,9 @@ class InpaintingGUI(ThemedTk):
         self.title(f"Stereocrafter Inpainting (Batch) {GUI_VERSION}")
         self.app_config = self.load_config()
         self.help_data = self.load_help_data()
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         # Window size and position variables
@@ -654,6 +658,9 @@ class InpaintingGUI(ThemedTk):
             # ttk.Label styling (for all ttk.Label widgets including the info frame ones)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
 
+            # DnD drop-target highlight style (theme-aware)
+            configure_dnd_styles(self.style, True, self._dnd_enabled)
+
         else:
             # --- Light Theme ---
             bg_color = "#d9d9d9"
@@ -686,6 +693,9 @@ class InpaintingGUI(ThemedTk):
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
+
+            # DnD drop-target highlight style (theme-aware)
+            configure_dnd_styles(self.style, False, self._dnd_enabled)
 
         self.update_idletasks()  # Ensure all theme changes are rendered for accurate reqheight
 
@@ -2219,34 +2229,37 @@ class InpaintingGUI(ThemedTk):
 
         # Lo-Res Blend Folder
         input_label = ttk.Label(folder_frame, text="Lo-Res Blend Folder:")
-        input_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
-        )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=current_row, column=2, padx=5)
-        current_row += 1
+        entry_input = ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40)
+        entry_input.grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=0, column=2, padx=5)
 
-        # --- NEW: Hi-Res Blend Folder ---
+        # Hi-Res Blend Folder
         hires_label = ttk.Label(folder_frame, text="Hi-Res Blend Folder:")
-        hires_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        hires_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(hires_label, "Folder containing matching high-resolution splatted files for final blending.")
-        ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
-        )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(
-            row=current_row, column=2, padx=5
-        )
-        current_row += 1
+        entry_hires = ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40)
+        entry_hires.grid(row=1, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=1, column=2, padx=5)
 
         # Output Folder
         output_label = ttk.Label(folder_frame, text="Output Folder:")
-        output_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        output_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_label, self.help_data.get("output_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
+        entry_output = ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40)
+        entry_output.grid(row=2, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=2, column=2, padx=5)
+
+        # Register Drag & Drop for folder entries
+        register_dnd_entries(
+            [
+                (entry_input, self.input_folder_var, True, None),
+                (entry_hires, self.hires_blend_folder_var, True, None),
+                (entry_output, self.output_folder_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
         )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=current_row, column=2, padx=5)
 
         # --- MAIN PARAMETERS FRAME ---
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)

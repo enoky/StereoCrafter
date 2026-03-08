@@ -47,6 +47,7 @@ from core.ui.video_previewer import VideoPreviewer
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
+from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
 GUI_VERSION = "26-03-08.1"
 
@@ -79,6 +80,9 @@ class MergingGUI(ThemedTk):
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
         self.app_config = self._load_config()
         self.help_data = self._load_help_texts()
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         # --- Sidecar Config Manager ---
         self.sidecar_manager = SidecarConfigManager()
@@ -304,6 +308,9 @@ class MergingGUI(ThemedTk):
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
         self.theme_manager.configure_progressbar_style(self.style)
+
+        # DnD drop-target highlight style (theme-aware)
+        configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
 
         # --- FIX: Re-apply the custom loading button style after the theme changes ---
         # This ensures the red text color is not overridden by the theme's default button style.
@@ -541,6 +548,17 @@ class MergingGUI(ThemedTk):
         btn_out.grid(row=3, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
+
+        # Register Drag & Drop for folder entries
+        register_dnd_entries(
+            [
+                (entry_inpaint, self.inpainted_folder_var, True, None),
+                (entry_orig, self.original_folder_var, True, None),
+                (entry_mask, self.mask_folder_var, True, None),
+                (entry_out, self.output_folder_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
+        )
 
         # --- PREVIEW FRAME (using the new module) ---
         # Moved back to its original position after the folder frame.

@@ -26,6 +26,7 @@ from typing import Optional, Tuple, Any, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import math
 
+
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
 # not the depth values used for splatting.
@@ -82,7 +83,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-08.1"
+GUI_VERSION = "26-03-08.2"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -115,7 +116,7 @@ from core.splatting.forward_warp import execute_forward_warp
 from core.splatting.config_manager import ConfigManager
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
-from core.ui import ThemeManager, SBSPreviewWindow
+from core.ui import ThemeManager, SBSPreviewWindow, init_dnd, register_dnd_entries, configure_dnd_styles
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
@@ -130,6 +131,9 @@ class SplatterGUI(ThemedTk):
     UI_DEPTH_COL_MIN = 520
 
     # --- GLOBAL CONFIGURATION DICTIONARY ---
+    # Common video extensions for filtering
+    VIDEO_EXTS = ['.mp4', '.mkv', '.mov', '.avi', '.webm', '.ts', '.m4v']
+
     APP_CONFIG_DEFAULTS = {
         # File Extensions
         "SIDECAR_EXT": ".fssidecar",
@@ -198,6 +202,9 @@ class SplatterGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         self.config_manager = ConfigManager()
         self.app_config = {}
@@ -491,6 +498,9 @@ class SplatterGUI(ThemedTk):
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
 
+        # DnD drop-target highlight style (theme-aware)
+        configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
+
         colors = self.theme_manager.get_colors()
         self.theme_manager.configure_progressbar_style(self.style)
 
@@ -639,6 +649,17 @@ class SplatterGUI(ThemedTk):
         file_path = filedialog.askopenfilename(initialdir=initial_dir, filetypes=filetypes_list)
         if file_path:
             var.set(file_path)
+
+    def _setup_entry_dnd(self):
+        """Register file/folder drag-and-drop targets on path entry widgets."""
+        register_dnd_entries(
+            [
+                (self.entry_source_clips, self.input_source_clips_var, False, self.VIDEO_EXTS),
+                (self.entry_input_depth_maps, self.input_depth_maps_var, False, self.VIDEO_EXTS),
+                (self.entry_output_splatted, self.output_splatted_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
+        )
 
     def _safe_float(self, var, default=0.0):
         """Safely convert StringVar/BooleanVar to float."""
@@ -1610,6 +1631,10 @@ class SplatterGUI(ThemedTk):
                 _btn.configure(style="CompactAction.TButton")
             except Exception:
                 pass
+
+        # --- Register drag-and-drop on path entries ---
+        self._setup_entry_dnd()
+
         # Reset current_row for next frame
         current_row = 0
 
