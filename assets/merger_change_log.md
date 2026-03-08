@@ -1,5 +1,18 @@
 # Merging GUI Change Log
 
+## Version 26-03-08.0
+
+### Added (v26-03-08.0)
+
+- **Unified Encoding Settings Dialog**: Added encoding options accessible via Options → Encoding Settings....
+  - **Encoder**: Auto (NVENC/CPU) or Force CPU
+  - **Quality Preset**: Fastest to Slowest (controls encoding speed/efficiency)
+  - **CPU Tune**: Film, Grain, Animation, etc. (ignored for NVENC)
+  - **CRF**: Constant Rate Factor for video quality control
+  - **NVENC Options**: Lookahead, Spatial AQ, Temporal AQ, AQ Strength
+  - **Color Tags**: Off, Auto, BT.709 L/F, BT.2020 PQ/HLG
+- Implemented as reusable `core/ui/encoding_settings.py` shared across all three GUIs
+
 ## Version 26-02-07.2 (Today's Changes)
 
 ### New Features (26-02-07.20)

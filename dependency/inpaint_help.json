@@ -2,7 +2,6 @@
   "input_folder": "Select the directory containing your input MP4 videos. The script expects '_splatted4' for quad inputs (Original, Depth, Mask, Warped) or '_splatted2' for dual inputs (Mask, Warped).",
   "output_folder": "Choose the directory where the processed (inpainted) videos will be saved. Output will be Side-by-Side (original | inpainted) for quad inputs, or only the inpainted right eye for dual inputs.",
   "num_inference_steps": "Number of denoising steps for the video generation process. Higher values generally lead to better quality but increase processing time. Default:5 ",
-  "output_crf": "Constant Rate Factor for video encoding (lower is higher quality). Adjust based on codec (H.264/H.265).",
   "tile_num": "Number of spatial tiles (e.g., 2 means 2x2 grid) to split each video frame into. Useful for processing high-resolution videos with limited GPU memory. Set to 1 to disable tiling. Default:1",
   "frames_chunk": "The number of frames processed together in a single temporal batch. Adjust based on your GPU memory. Larger chunks can be faster but require more VRAM. Default:23",
   "frame_overlap": "The number of frames that temporally overlap between consecutive processing chunks. These overlapping frames from the previous generated output and original input are smoothly blended to condition the start of the current chunk, reducing visual glitches. Default:3",
@@ -29,5 +28,15 @@
   "ema_radius": "Number of frames after each seam to smooth using an exponential moving average. Use small values (1–2) for subtle polish. 0 disables. Default:2",
   "ema_alpha": "Smoothing strength for the EMA seam polish (0.0–1.0). Lower = gentler and preserves the current frame more; higher follows the preceding frame more. Default:0.25",
   "general_help": "This is a GUI for StereoCrafter, a Stable Video Diffusion Inpainting Pipeline. It takes warped videos (e.g., from depth_splatting_gui.py) and fills in occluded areas. Input videos are expected to be either 'quad-splatted' (original, depth, mask, warped) or 'dual-splatted' (mask, warped). Outputs are either Side-by-Side (original | inpainted) or just the inpainted right eye, respectively. Adjust 'Tile Number' and 'Frames Chunk' if you encounter out-of-memory errors. 'Frame Overlap' helps smooth transitions between processed chunks. Use 'Original Input Bias' to balance consistency with the generated past vs. adherence to the original video source.",
-  "move_to_finished": "If enabled, processed videos will be moved to a 'finished' subfolder within their input directory. This allows you to re-run the script later and automatically skip videos that have already been processed."
+  "move_to_finished": "If enabled, processed videos will be moved to a 'finished' subfolder within their input directory. This allows you to re-run the script later and automatically skip videos that have already been processed.",
+  "encoding_settings": "Opens a dialog to configure video encoding options including encoder, quality preset, tune, CRF, and NVENC-specific options.",
+  "encoding_encoder": "Select encoder mode.\n• Auto: uses NVENC if CUDA/NVENC is available; otherwise CPU (libx264/libx265).\n• Force CPU: always uses CPU encoding.\nQuality (CRF/QP) is still controlled by the CRF field.",
+  "encoding_quality": "Controls encoder speed/efficiency preset.\n• CPU (libx264/libx265): maps to ultrafast → veryslow.\n• NVENC (h264_nvenc/hevc_nvenc): maps Fastest→p1 ... Slowest→p7.\nSlower presets usually improve compression efficiency at the same CRF/QP, but take longer.\nDefault is Medium.",
+  "encoding_tune": "Optional tune for CPU encoding (libx264/libx265). None means no tune flag.\nCommon tunes:\n• Film / Still Image (libx264 only)\n• Grain / Animation / PSNR / SSIM\n• Fast Decode / Zero Latency\nNote: Tune is ignored when NVENC is used.",
+  "output_crf": "Constant Rate Factor (CRF) for video quality control. Lower values = higher quality, larger file size.\n• 18-23: Good quality range for x264\n• 23-28: Good quality range for x265\n• 15-20: Good quality range for NVENC",
+  "encoding_nvenc_lookahead_enabled": "Enable lookahead for NVENC. Allows the encoder to look ahead to improve compression efficiency. Useful for slower moving content but adds encoding latency.",
+  "encoding_nvenc_lookahead": "Number of frames to look ahead when lookahead is enabled. Higher values improve compression but increase encoding time and memory usage.",
+  "encoding_nvenc_spatial_aq": "Enable Spatial Adaptive Quantization for NVENC. Allows the encoder to allocate more bits to complex areas within each frame.",
+  "encoding_nvenc_temporal_aq": "Enable Temporal Adaptive Quantization for NVENC. Allows the encoder to allocate more bits to frames that need it based on previous frames.",
+  "encoding_nvenc_aq_strength": "Strength of Adaptive Quantization (1-15). Higher values allocate more bits to complex areas."
 }

@@ -44,10 +44,11 @@ from core.common.image_processing import (
 )
 from core.ui.widgets import Tooltip, create_single_slider_with_label_updater
 from core.ui.video_previewer import VideoPreviewer
+from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
 
-GUI_VERSION = "26-03-07.0"
+GUI_VERSION = "26-03-08.0"
 
 
 class MergingGUI(ThemedTk):
@@ -160,6 +161,18 @@ class MergingGUI(ThemedTk):
         self.preview_source_var = tk.StringVar(value=self.app_config.get("preview_source", "Blended Image"))
         self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
+        # --- Encoding Settings ---
+        self.encoding_encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
+        self.encoding_quality_var = tk.StringVar(value=self.app_config.get("encoding_quality", "Medium"))
+        self.encoding_tune_var = tk.StringVar(value=self.app_config.get("encoding_tune", "None"))
+        self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
+        self.nvenc_lookahead_enabled_var = tk.BooleanVar(value=self.app_config.get("nvenc_lookahead_enabled", False))
+        self.nvenc_lookahead_var = tk.IntVar(value=self.app_config.get("nvenc_lookahead", 16))
+        self.nvenc_spatial_aq_var = tk.BooleanVar(value=self.app_config.get("nvenc_spatial_aq", False))
+        self.nvenc_temporal_aq_var = tk.BooleanVar(value=self.app_config.get("nvenc_temporal_aq", False))
+        self.nvenc_aq_strength_var = tk.IntVar(value=self.app_config.get("nvenc_aq_strength", 8))
+        self.color_tags_var = tk.StringVar(value=self.app_config.get("color_tags", "Auto"))
+
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
         # --- END FIX ---
@@ -237,9 +250,14 @@ class MergingGUI(ThemedTk):
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished Files", command=self.restore_finished_files)
         self.file_menu.add_separator()
-        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.exit_application)
+
+        # --- Options Menu ---
+        self.options_menu = tk.Menu(self.menubar, tearoff=0)
+        self.options_menu.add_command(label="Encoding Settings...", command=self._show_encoding_settings)
+        self.options_menu.add_separator()
+        self.options_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.menubar.add_cascade(label="Options", menu=self.options_menu)
 
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -274,6 +292,8 @@ class MergingGUI(ThemedTk):
                 menus.append(self.file_menu)
             if hasattr(self, "help_menu"):
                 menus.append(self.help_menu)
+            if hasattr(self, "options_menu"):
+                menus.append(self.options_menu)
             self.theme_manager.apply_theme_to_menus(menus=menus, menubar=self.menubar)
 
         # Previewer Canvas
@@ -754,6 +774,43 @@ class MergingGUI(ThemedTk):
         if folder:
             var.set(folder)
 
+    def _show_encoding_settings(self):
+        """Show the encoding settings dialog."""
+        config = {
+            "encoding_encoder": self.encoding_encoder_var.get(),
+            "encoding_quality": self.encoding_quality_var.get(),
+            "encoding_tune": self.encoding_tune_var.get(),
+            "output_crf": self.output_crf_var.get(),
+            "nvenc_lookahead_enabled": self.nvenc_lookahead_enabled_var.get(),
+            "nvenc_lookahead": self.nvenc_lookahead_var.get(),
+            "nvenc_spatial_aq": self.nvenc_spatial_aq_var.get(),
+            "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
+            "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
+            "color_tags": self.color_tags_var.get(),
+        }
+
+        dialog = EncodingSettingsDialog(
+            self,
+            app_config=config,
+            help_data=self.help_data,
+            title="Merging GUI - Encoding Settings",
+            show_extra_options=False,
+            show_color_tags=True,
+        )
+        self.wait_window(dialog.dialog)
+
+        if dialog.result:
+            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
+            self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
+            self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
+            self.nvenc_lookahead_enabled_var.set(dialog.result.get("nvenc_lookahead_enabled", False))
+            self.nvenc_lookahead_var.set(dialog.result.get("nvenc_lookahead", 16))
+            self.nvenc_spatial_aq_var.set(dialog.result.get("nvenc_spatial_aq", False))
+            self.nvenc_temporal_aq_var.set(dialog.result.get("nvenc_temporal_aq", False))
+            self.nvenc_aq_strength_var.set(dialog.result.get("nvenc_aq_strength", 8))
+            self.color_tags_var.set(dialog.result.get("color_tags", "Auto"))
+
     def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
         """Scans a folder for a file matching the core_name with any common video extension."""
         return find_video_by_core_name(folder, core_name)
@@ -1087,7 +1144,7 @@ class MergingGUI(ThemedTk):
         # Get core name for sidecar
         inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
         sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
-        
+
         is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
         suffix_to_remove = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name).group(0)
         core_name_with_width = base_name[: -len(suffix_to_remove)]
@@ -1210,6 +1267,17 @@ class MergingGUI(ThemedTk):
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
+                # Encoding params
+                "encoding_encoder": self.encoding_encoder_var.get(),
+                "encoding_quality": self.encoding_quality_var.get(),
+                "encoding_tune": self.encoding_tune_var.get(),
+                "output_crf": int(self.output_crf_var.get()),
+                "nvenc_lookahead_enabled": self.nvenc_lookahead_enabled_var.get(),
+                "nvenc_lookahead": self.nvenc_lookahead_var.get(),
+                "nvenc_spatial_aq": self.nvenc_spatial_aq_var.get(),
+                "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
+                "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
+                "color_tags": self.color_tags_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
@@ -1308,7 +1376,7 @@ class MergingGUI(ThemedTk):
                 # --- 1. Find corresponding files (same logic as preview) ---
                 inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
                 sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
-                
+
                 is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
                 match = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name)
                 if not match:
@@ -1450,7 +1518,7 @@ class MergingGUI(ThemedTk):
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
-                # --- NEW: Pass padding setting to FFmpeg ---
+                # --- NEW: Pass encoding settings to FFmpeg ---
                 ffmpeg_process = start_ffmpeg_pipe_process(
                     content_width=output_width,
                     content_height=output_height,
@@ -1459,7 +1527,18 @@ class MergingGUI(ThemedTk):
                     video_stream_info=video_stream_info,
                     pad_to_16_9=settings["pad_to_16_9"],
                     output_format_str=output_format,
-                )  # Pass the format string
+                    encoding_options={
+                        "encoding_encoder": settings.get("encoding_encoder", "Auto"),
+                        "encoding_quality": settings.get("encoding_quality", "Medium"),
+                        "encoding_tune": settings.get("encoding_tune", "None"),
+                        "output_crf": settings.get("output_crf", 23),
+                        "nvenc_lookahead_enabled": settings.get("nvenc_lookahead_enabled", False),
+                        "nvenc_lookahead": settings.get("nvenc_lookahead", 16),
+                        "nvenc_spatial_aq": settings.get("nvenc_spatial_aq", False),
+                        "nvenc_temporal_aq": settings.get("nvenc_temporal_aq", False),
+                        "nvenc_aq_strength": settings.get("nvenc_aq_strength", 8),
+                    },
+                )  # Pass the encoding options
 
                 if ffmpeg_process is None:
                     raise RuntimeError("Failed to start FFmpeg pipe process.")
@@ -1842,9 +1921,7 @@ class MergingGUI(ThemedTk):
 
         all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
         inpaint_pattern = re.compile(r"_inpainted_(right_eye|sbs)F?\.mp4$")
-        valid_inpainted_videos = [
-            f for f in all_mp4s if inpaint_pattern.search(f)
-        ]
+        valid_inpainted_videos = [f for f in all_mp4s if inpaint_pattern.search(f)]
 
         video_source_list = []
         self._clear_border_info()  # Clear border info before scanning
@@ -1853,7 +1930,7 @@ class MergingGUI(ThemedTk):
             base_name = os.path.basename(inpainted_path)
             inpaint_suffix_reg = r"_inpainted_right_eyeF?\.mp4$"
             sbs_suffix_reg = r"_inpainted_sbsF?\.mp4$"
-            
+
             is_sbs_input = bool(re.search(sbs_suffix_reg, base_name))
             match = re.search(sbs_suffix_reg if is_sbs_input else inpaint_suffix_reg, base_name)
             if not match:

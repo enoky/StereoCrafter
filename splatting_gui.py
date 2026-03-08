@@ -82,7 +82,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-07.0"
+GUI_VERSION = "26-03-08.0"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -116,6 +116,7 @@ from core.splatting.config_manager import ConfigManager
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
 from core.ui import ThemeManager, SBSPreviewWindow
+from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
 from core.common.image_processing import apply_dubois_anaglyph_torch, apply_optimized_anaglyph_torch
@@ -473,7 +474,10 @@ class SplatterGUI(ThemedTk):
 
         # Menus
         if hasattr(self, "menubar"):
-            self.theme_manager.apply_theme_to_menus(menus=[self.file_menu, self.help_menu], menubar=self.menubar)
+            menu_list = [self.file_menu, self.help_menu]
+            if hasattr(self, "options_menu"):
+                menu_list.append(self.options_menu)
+            self.theme_manager.apply_theme_to_menus(menus=menu_list, menubar=self.menubar)
 
         # Previewer Canvas
         if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
@@ -1408,221 +1412,46 @@ class SplatterGUI(ThemedTk):
 
     def show_encoding_options_popup(self):
         """Popup window for encoder/NVENC/DNxHR options (Options → Encoding Options...)."""
-        # If already open, just focus it
-        try:
-            w = getattr(self, "_encoding_popup_win", None)
-            if w is not None and w.winfo_exists():
-                w.lift()
-                w.focus_force()
-                return
-        except Exception:
-            pass
+        config = {
+            "encoding_encoder": self.encoding_encoder_var.get(),
+            "encoding_quality": self.encoding_quality_var.get(),
+            "encoding_tune": self.encoding_tune_var.get(),
+            "output_crf_full": self.output_crf_full_var.get(),
+            "output_crf_low": self.output_crf_low_var.get(),
+            "nvenc_lookahead_enabled": self.encoding_nvenc_lookahead_enabled_var.get(),
+            "nvenc_lookahead": self.encoding_nvenc_lookahead_var.get(),
+            "nvenc_spatial_aq": self.encoding_nvenc_spatial_aq_var.get(),
+            "nvenc_temporal_aq": self.encoding_nvenc_temporal_aq_var.get(),
+            "nvenc_aq_strength": self.encoding_nvenc_aq_strength_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
+            "color_tags": self.color_tags_mode_var.get(),
+        }
 
-        # Back-compat: older configs used "Auto" for these fields
-        try:
-            if str(self.encoding_quality_var.get()).strip().lower() == "auto":
-                self.encoding_quality_var.set("Medium")
-        except Exception:
-            pass
-        try:
-            if str(self.encoding_tune_var.get()).strip().lower() == "auto":
-                self.encoding_tune_var.set("None")
-        except Exception:
-            pass
-        try:
-            cur = str(self.dnxhr_profile_var.get()).strip().upper()
-            dnx_map = {
-                "SQ": "SQ (8-bit 4:2:2)",
-                "HQ": "HQ (8-bit 4:2:2)",
-                "HQX": "HQX (10-bit 4:2:2)",
-                "444": "444 (10-bit 4:4:4)",
-            }
-            if cur in dnx_map:
-                self.dnxhr_profile_var.set(dnx_map[cur])
-        except Exception:
-            pass
-
-        win = tk.Toplevel(self)
-        self._encoding_popup_win = win
-        win.title("Encoding Options")
-        try:
-            win.transient(self)
-        except Exception:
-            pass
-        try:
-            win.grab_set()
-        except Exception:
-            pass
-        win.resizable(False, False)
-
-        outer = ttk.Frame(win, padding=10)
-        outer.pack(fill="both", expand=True)
-
-        # --- Encoder (global) ---
-        row = 0
-        lbl_encoder = ttk.Label(outer, text="Encoder:")
-        lbl_encoder.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=3)
-        self._create_hover_tooltip(lbl_encoder, "encoding_encoder")
-
-        cb_encoder = ttk.Combobox(
-            outer, textvariable=self.encoding_encoder_var, values=("Auto", "Force CPU"), state="readonly", width=20
+        dialog = EncodingSettingsDialog(
+            self,
+            app_config=config,
+            help_data=self.help_texts,
+            title="Splatting GUI - Encoding Settings",
+            show_extra_options=True,
+            show_dual_crf=True,
         )
-        cb_encoder.grid(row=row, column=1, sticky="w", pady=3)
+        self.wait_window(dialog.dialog)
 
-        row += 1
-        lbl_quality = ttk.Label(outer, text="Quality Preset:")
-        lbl_quality.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=3)
-        self._create_hover_tooltip(lbl_quality, "encoding_quality")
-
-        cb_quality = ttk.Combobox(
-            outer,
-            textvariable=self.encoding_quality_var,
-            values=("Fastest", "Faster", "Fast", "Medium", "Slow", "Slower", "Slowest"),
-            state="readonly",
-            width=20,
-        )
-        cb_quality.grid(row=row, column=1, sticky="w", pady=3)
-
-        row += 1
-        lbl_tune = ttk.Label(outer, text="CPU Tune:")
-        lbl_tune.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=3)
-        self._create_hover_tooltip(lbl_tune, "encoding_tune")
-
-        cb_tune = ttk.Combobox(
-            outer,
-            textvariable=self.encoding_tune_var,
-            values=("None", "Film", "Grain", "Animation", "Still Image", "PSNR", "SSIM", "Fast Decode", "Zero Latency"),
-            state="readonly",
-            width=20,
-        )
-        cb_tune.grid(row=row, column=1, sticky="w", pady=3)
-
-        # --- NVENC tweaks ---
-        row += 1
-        nv_frame = ttk.LabelFrame(outer, text="NVENC (only applies when NVENC is used)", padding=8)
-        nv_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
-        nv_frame.grid_columnconfigure(1, weight=1)
-
-        nv_r = 0
-        chk_la = ttk.Checkbutton(nv_frame, variable=self.encoding_nvenc_lookahead_enabled_var)
-        chk_la.grid(row=nv_r, column=0, sticky="w", pady=2)
-        lbl_la = ttk.Label(nv_frame, text="Enable Lookahead")
-        lbl_la.grid(row=nv_r, column=1, sticky="w", pady=2)
-        self._create_hover_tooltip(lbl_la, "encoding_nvenc_lookahead_enabled")
-
-        nv_r += 1
-        lbl_laf = ttk.Label(nv_frame, text="Lookahead Frames:")
-        lbl_laf.grid(row=nv_r, column=0, sticky="e", padx=(0, 8), pady=2, columnspan=1)
-        self._create_hover_tooltip(lbl_laf, "encoding_nvenc_lookahead")
-
-        sp_la = ttk.Spinbox(
-            nv_frame, from_=0, to=64, increment=1, textvariable=self.encoding_nvenc_lookahead_var, width=8
-        )
-        sp_la.grid(row=nv_r, column=1, sticky="w", pady=2)
-
-        nv_r += 1
-        chk_saq = ttk.Checkbutton(nv_frame, variable=self.encoding_nvenc_spatial_aq_var)
-        chk_saq.grid(row=nv_r, column=0, sticky="w", pady=2)
-        lbl_saq = ttk.Label(nv_frame, text="Spatial AQ")
-        lbl_saq.grid(row=nv_r, column=1, sticky="w", pady=2)
-        self._create_hover_tooltip(lbl_saq, "encoding_nvenc_spatial_aq")
-
-        nv_r += 1
-        chk_taq = ttk.Checkbutton(nv_frame, variable=self.encoding_nvenc_temporal_aq_var)
-        chk_taq.grid(row=nv_r, column=0, sticky="w", pady=2)
-        lbl_taq = ttk.Label(nv_frame, text="Temporal AQ")
-        lbl_taq.grid(row=nv_r, column=1, sticky="w", pady=2)
-        self._create_hover_tooltip(lbl_taq, "encoding_nvenc_temporal_aq")
-
-        nv_r += 1
-        lbl_aq = ttk.Label(nv_frame, text="AQ Strength:")
-        lbl_aq.grid(row=nv_r, column=0, sticky="e", padx=(0, 8), pady=2)
-        self._create_hover_tooltip(lbl_aq, "encoding_nvenc_aq_strength")
-
-        sp_aq = ttk.Spinbox(
-            nv_frame, from_=1, to=15, increment=1, textvariable=self.encoding_nvenc_aq_strength_var, width=8
-        )
-        sp_aq.grid(row=nv_r, column=1, sticky="w", pady=2)
-
-        # --- DNxHR split ---
-        row += 1
-        dnx_frame = ttk.LabelFrame(outer, text="DNxHR Split (Full-Res Dual mode only)", padding=8)
-        dnx_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 6))
-        dnx_frame.grid_columnconfigure(1, weight=1)
-
-        dnx_r = 0
-        chk_dnx = ttk.Checkbutton(dnx_frame, variable=self.dnxhr_fullres_split_var)
-        chk_dnx.grid(row=dnx_r, column=0, sticky="w", pady=2)
-        lbl_dnx = ttk.Label(dnx_frame, text="Enable DNxHR Split")
-        lbl_dnx.grid(row=dnx_r, column=1, sticky="w", pady=2)
-        self._create_hover_tooltip(lbl_dnx, "dnxhr_fullres_split_tooltip")
-
-        dnx_r += 1
-        lbl_prof = ttk.Label(dnx_frame, text="DNxHR Profile:")
-        lbl_prof.grid(row=dnx_r, column=0, sticky="e", padx=(0, 8), pady=2)
-        self._create_hover_tooltip(lbl_prof, "dnxhr_profile")
-
-        cb_prof = ttk.Combobox(
-            dnx_frame,
-            textvariable=self.dnxhr_profile_var,
-            values=("SQ (8-bit 4:2:2)", "HQ (8-bit 4:2:2)", "HQX (10-bit 4:2:2)", "444 (10-bit 4:4:4)"),
-            state="readonly",
-            width=20,
-        )
-        cb_prof.grid(row=dnx_r, column=1, sticky="w", pady=2)
-
-        # Buttons
-        row += 1
-        btn_row = ttk.Frame(outer)
-        btn_row.grid(row=row, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side="right")
-
-        # Basic enable/disable wiring
-        def _refresh_enabled_states(*_):
-            try:
-                la_on = bool(self.encoding_nvenc_lookahead_enabled_var.get())
-            except Exception:
-                la_on = False
-            try:
-                sp_la.configure(state=("normal" if la_on else "disabled"))
-            except Exception:
-                pass
-
-            try:
-                aq_on = bool(self.encoding_nvenc_spatial_aq_var.get()) or bool(
-                    self.encoding_nvenc_temporal_aq_var.get()
-                )
-            except Exception:
-                aq_on = False
-            try:
-                sp_aq.configure(state=("normal" if aq_on else "disabled"))
-            except Exception:
-                pass
-
-            try:
-                dnx_on = bool(self.dnxhr_fullres_split_var.get())
-            except Exception:
-                dnx_on = False
-            try:
-                cb_prof.configure(state=("readonly" if dnx_on else "disabled"))
-            except Exception:
-                pass
-
-        try:
-            self.encoding_nvenc_lookahead_enabled_var.trace_add("write", _refresh_enabled_states)
-            self.encoding_nvenc_spatial_aq_var.trace_add("write", _refresh_enabled_states)
-            self.encoding_nvenc_temporal_aq_var.trace_add("write", _refresh_enabled_states)
-            self.dnxhr_fullres_split_var.trace_add("write", _refresh_enabled_states)
-        except Exception:
-            pass
-
-        _refresh_enabled_states()
-
-        # Esc closes
-        try:
-            win.bind("<Escape>", lambda e: win.destroy())
-        except Exception:
-            pass
+        if dialog.result:
+            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
+            self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
+            self.output_crf_full_var.set(str(dialog.result.get("output_crf_full", 23)))
+            self.output_crf_low_var.set(str(dialog.result.get("output_crf_low", 23)))
+            self.encoding_nvenc_lookahead_enabled_var.set(dialog.result.get("nvenc_lookahead_enabled", False))
+            self.encoding_nvenc_lookahead_var.set(dialog.result.get("nvenc_lookahead", 16))
+            self.encoding_nvenc_spatial_aq_var.set(dialog.result.get("nvenc_spatial_aq", False))
+            self.encoding_nvenc_temporal_aq_var.set(dialog.result.get("nvenc_temporal_aq", False))
+            self.encoding_nvenc_aq_strength_var.set(dialog.result.get("nvenc_aq_strength", 8))
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
+            self.color_tags_mode_var.set(dialog.result.get("color_tags", "Auto"))
 
     def _create_widgets(self):
         """Initializes and places all GUI widgets."""
@@ -1648,9 +1477,6 @@ class SplatterGUI(ThemedTk):
         )
         self.file_menu.add_separator()
 
-        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
-        self.file_menu.add_separator()
-
         # Update Slider from Sidecar Toggle (Existing)
         self.file_menu.add_checkbutton(label="Update Slider from Sidecar", variable=self.update_slider_from_sidecar_var)
 
@@ -1672,6 +1498,9 @@ class SplatterGUI(ThemedTk):
         # --- Options menu (Encoding popup) ---
         self.options_menu = tk.Menu(self.menubar, tearoff=0)
         self.options_menu.add_command(label="Encoding Options...", command=self.show_encoding_options_popup)
+        self.options_menu.add_separator()
+
+        self.options_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.menubar.add_cascade(label="Options", menu=self.options_menu)
 
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -1966,7 +1795,6 @@ class SplatterGUI(ThemedTk):
         # --- 2. Splatting & Output Settings Frame (Bottom Left) ---
         # Compact 2x2 layout:
         #   Row 0: Process Length | Auto-Convergence
-        #   Row 1: Output CRF Full | Output CRF Low
 
         self.output_settings_frame = tk.LabelFrame(
             self.process_settings_container, text="Splatting & Output Settings", labelanchor="nw"
@@ -2002,42 +1830,6 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
 
-        # Row 1, Col 0: Output CRF Full
-        self.crf_full_frame = ttk.Frame(self.output_settings_frame)
-        self.crf_full_frame.grid(row=1, column=0, sticky="w", padx=5, pady=0)
-        self.lbl_output_crf_full = ttk.Label(self.crf_full_frame, text="Output CRF Full:")
-        self.lbl_output_crf_full.pack(side="left", padx=(0, 3))
-        self.entry_output_crf_full = ttk.Entry(self.crf_full_frame, textvariable=self.output_crf_full_var, width=3)
-        self.entry_output_crf_full.pack(side="left")
-        self._create_hover_tooltip(self.lbl_output_crf_full, "output_crf")
-        self._create_hover_tooltip(self.entry_output_crf_full, "output_crf")
-
-        # Row 1, Col 1: Output CRF Low
-        self.crf_low_frame = ttk.Frame(self.output_settings_frame)
-        self.crf_low_frame.grid(row=1, column=1, sticky="w", padx=5, pady=0)
-        self.lbl_output_crf_low = ttk.Label(self.crf_low_frame, text="Output CRF Low:")
-        self.lbl_output_crf_low.pack(side="left", padx=(0, 3))
-        self.entry_output_crf_low = ttk.Entry(self.crf_low_frame, textvariable=self.output_crf_low_var, width=3)
-        self.entry_output_crf_low.pack(side="left")
-        self._create_hover_tooltip(self.lbl_output_crf_low, "output_crf")
-        self._create_hover_tooltip(self.entry_output_crf_low, "output_crf")
-
-        # Row 2, Col 0: Output color tag mode (metadata-only; written into output file headers)
-        self.color_tags_frame = ttk.Frame(self.output_settings_frame)
-        self.color_tags_frame.grid(row=2, column=0, sticky="w", padx=5, pady=0)
-        self.lbl_color_tags_mode = ttk.Label(self.color_tags_frame, text="Color Tags:")
-        self.lbl_color_tags_mode.pack(side="left", padx=(0, 3))
-        self.combo_color_tags_mode = ttk.Combobox(
-            self.color_tags_frame,
-            textvariable=self.color_tags_mode_var,
-            values=["Off", "Auto", "BT.709 L", "BT.709 F", "BT.2020 PQ", "BT.2020 HLG"],
-            state="readonly",
-            width=12,
-        )
-        self.combo_color_tags_mode.pack(side="left")
-        self._create_hover_tooltip(self.lbl_color_tags_mode, "color_tags_mode")
-        self._create_hover_tooltip(self.combo_color_tags_mode, "color_tags_mode")
-
         # Row 2, Col 1: Border Mode Pulldown + Rescan Button
         self.border_mode_frame = ttk.Frame(self.output_settings_frame)
         self.border_mode_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
@@ -2069,7 +1861,7 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.btn_border_rescan, "border_rescan")
 
         # Track these for disabling during processing
-        self.widgets_to_disable.extend([self.combo_color_tags_mode, self.combo_border_mode, self.btn_border_rescan])
+        self.widgets_to_disable.extend([self.combo_border_mode, self.btn_border_rescan])
 
         # Row 3, Col 0: Strict FFmpeg decode toggle (affects how the source video is decoded for splatting/preview)
         self.strict_decode_frame = ttk.Frame(self.preprocessing_frame)

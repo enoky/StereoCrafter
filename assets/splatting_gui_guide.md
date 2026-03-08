@@ -39,8 +39,14 @@ These parameters configure the core splatting and output encoding process.
   - **Average:** Simple auto-convergence derived from the temporal average of the center 75% depth region.
   - **Peak:** Simple auto-convergence derived from the temporal maximum of the center 75% depth region.
   - **Hybrid:** Combines Average and Peak (50/50 blend).
-- **Output CRF (Full / Low):** Constant Rate Factor for video encoding. Lower values mean higher quality. You can now set different quality levels for the Full Resolution and Low Resolution outputs independently.
-- **Color Tags:** Metadata-only tags written into the output file headers (e.g., BT.709, BT.2020). This does not affect the splatting math but helps players/editors interpret the color space correctly.
+- **Encoding Settings:** Access video encoding options via **Options → Encoding Settings...** menu.
+  - **Encoder**: Auto (uses NVENC if available) or Force CPU
+  - **Quality Preset**: Fastest → Slowest (slower = better compression)
+  - **CPU Tune**: Film, Grain, Animation, etc. (for CPU encoding only)
+  - **Full Res CRF / Low Res CRF**: Quality control (lower = better quality)
+  - **NVENC Options**: Lookahead, Spatial AQ, Temporal AQ, AQ Strength
+  - **DNxHR Options**: Enable DNxHR Split, DNxHR Profile (for professional workflows)
+  - **Color Tags**: Metadata for color space (BT.709, BT.2020, etc.)
 
 ### 4. Depth Map Pre-processing (Hi-Res Only)
 

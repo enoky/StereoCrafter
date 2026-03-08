@@ -45,6 +45,13 @@ These sliders give you fine-grained control over how the mask is processed befor
 - **Resume:** If checked, moves successfully processed files to a `finished` subfolder after encoding and skips them on subsequent runs. Also works with "Process Current Clip" - after processing a single clip, the source files will be moved to the finished folder. Useful for resuming interrupted batch processing or for processing clips one-by-one. Use "Restore Finished Files" in the File menu to move files back if needed.
 - **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 - **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
+- **Encoding Settings:** Access video encoding options via **Options → Encoding Settings...** menu.
+  - **Encoder**: Auto (uses NVENC if available) or Force CPU
+  - **Quality Preset**: Fastest → Slowest (slower = better compression)
+  - **CPU Tune**: Film, Grain, Animation, etc. (for CPU encoding only)
+  - **CRF**: Quality control (lower = better quality)
+  - **NVENC Options**: Lookahead, Spatial AQ, Temporal AQ, AQ Strength
+  - **Color Tags**: Metadata for color space (BT.709, BT.2020, etc.)
 
 ### 5. Progress and Controls
 

@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 from core.common.video_io import get_video_stream_info
 from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
+from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 
 from pipelines.stereo_video_inpainting import (
@@ -42,7 +43,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-07.2"
+GUI_VERSION = "26-03-08.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -631,6 +632,10 @@ class InpaintingGUI(ThemedTk):
                 self.menubar.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.file_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
                 self.help_menu.config(bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg)
+                if hasattr(self, "options_menu"):
+                    self.options_menu.config(
+                        bg=menu_bg, fg=menu_fg, activebackground=active_bg, activeforeground=active_fg
+                    )
 
             # ttk.Entry widget styling
             self.style.configure("TEntry", fieldbackground=entry_field_bg, foreground=fg_color, insertcolor=fg_color)
@@ -2185,11 +2190,16 @@ class InpaintingGUI(ThemedTk):
         self.menubar.add_cascade(label="File", menu=self.file_menu)
         self.file_menu.add_command(label="Load Settings...", command=self.load_settings)
         self.file_menu.add_command(label="Save Settings...", command=self.save_settings)
-        self.file_menu.add_separator()  # Separator for organization
-        self.file_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reset to Default", command=self.reset_to_defaults)
         self.file_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
+
+        # --- Options Menu ---
+        self.options_menu = tk.Menu(self.menubar, tearoff=0)
+        self.options_menu.add_command(label="Encoding Settings...", command=self._show_encoding_settings)
+        self.options_menu.add_separator()
+        self.options_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._apply_theme)
+        self.menubar.add_cascade(label="Options", menu=self.options_menu)
 
         # --- Help Menu ---
         self.help_menu = tk.Menu(self.menubar, tearoff=0)
@@ -2282,23 +2292,16 @@ class InpaintingGUI(ThemedTk):
         )
         current_row += 1
 
-        # Row 2: Frames Chunk (Left) & Frame Overlap (Right)
+        # Row 2: Frames Chunk (Left)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(
             row=current_row, column=1, sticky="w", padx=5
         )
-
-        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
-        output_crf_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
-        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(
-            row=current_row, column=3, sticky="w", padx=5
-        )
         current_row += 1
 
-        # Row 3: Original Input Bias (Left) & CPU Offload (Right)
+        # Row 3: Process Length
         process_length_label = ttk.Label(param_frame, text="Process Length:")
         process_length_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(
@@ -2420,10 +2423,7 @@ class InpaintingGUI(ThemedTk):
         Tooltip(keep_cache_check, self.help_data.get("keep_inpaint_cache", ""))
 
         move_finished_check = ttk.Checkbutton(
-            post_process_frame,
-            text="Resume",
-            variable=self.move_to_finished_var,
-            command=self.save_config,
+            post_process_frame, text="Resume", variable=self.move_to_finished_var, command=self.save_config
         )
         move_finished_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
         Tooltip(move_finished_check, self.help_data.get("move_to_finished", ""))
@@ -3235,10 +3235,17 @@ class InpaintingGUI(ThemedTk):
                     input_videos = [v for v in input_videos if os.path.basename(v) not in finished_files]
                     skipped_count = original_count - len(input_videos)
                     if skipped_count > 0:
-                        logger.info(f"Resume mode: Skipped {skipped_count} already processed videos found in 'finished'.")
+                        logger.info(
+                            f"Resume mode: Skipped {skipped_count} already processed videos found in 'finished'."
+                        )
 
                 if not input_videos:
-                    self.after(0, lambda: messagebox.showinfo("Info", "All videos in the input folder have already been processed."))
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Info", "All videos in the input folder have already been processed."
+                        ),
+                    )
                     self.after(0, self.processing_done)
                     return
 
@@ -3368,11 +3375,7 @@ class InpaintingGUI(ThemedTk):
                                 files_to_move.append((hi_res_input_path, hires_input_folder))
 
                         # Perform the move with a delay to ensure handles are released
-                        move_files_to_finished(
-                            files_to_move=files_to_move,
-                            logger=logger,
-                            wait_before_move=0.5
-                        )
+                        move_files_to_finished(files_to_move=files_to_move, logger=logger, wait_before_move=0.5)
 
                 else:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
@@ -3397,6 +3400,43 @@ class InpaintingGUI(ThemedTk):
             "Developed by [Your Name/Alias] for StereoCrafter projects."  # Customize this!
         )
         messagebox.showinfo("About Batch Video Inpainting", about_text)
+
+    def _show_encoding_settings(self):
+        """Show the encoding settings dialog."""
+        config = {
+            "encoding_encoder": self.app_config.get("encoding_encoder", "Auto"),
+            "encoding_quality": self.app_config.get("encoding_quality", "Medium"),
+            "encoding_tune": self.app_config.get("encoding_tune", "None"),
+            "output_crf": self.output_crf_var.get(),
+            "nvenc_lookahead_enabled": self.app_config.get("nvenc_lookahead_enabled", False),
+            "nvenc_lookahead": self.app_config.get("nvenc_lookahead", 16),
+            "nvenc_spatial_aq": self.app_config.get("nvenc_spatial_aq", False),
+            "nvenc_temporal_aq": self.app_config.get("nvenc_temporal_aq", False),
+            "nvenc_aq_strength": self.app_config.get("nvenc_aq_strength", 8),
+            "color_tags": self.app_config.get("color_tags", "Auto"),
+        }
+
+        dialog = EncodingSettingsDialog(
+            self,
+            app_config=config,
+            help_data=self.help_data,
+            title="Inpainting GUI - Encoding Settings",
+            show_extra_options=False,
+            show_color_tags=True,
+        )
+        self.wait_window(dialog.dialog)
+
+        if dialog.result:
+            self.app_config["encoding_encoder"] = dialog.result.get("encoding_encoder", "Auto")
+            self.app_config["encoding_quality"] = dialog.result.get("encoding_quality", "Medium")
+            self.app_config["encoding_tune"] = dialog.result.get("encoding_tune", "None")
+            self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
+            self.app_config["nvenc_lookahead_enabled"] = dialog.result.get("nvenc_lookahead_enabled", False)
+            self.app_config["nvenc_lookahead"] = dialog.result.get("nvenc_lookahead", 16)
+            self.app_config["nvenc_spatial_aq"] = dialog.result.get("nvenc_spatial_aq", False)
+            self.app_config["nvenc_temporal_aq"] = dialog.result.get("nvenc_temporal_aq", False)
+            self.app_config["nvenc_aq_strength"] = dialog.result.get("nvenc_aq_strength", 8)
+            self.app_config["color_tags"] = dialog.result.get("color_tags", "Auto")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
