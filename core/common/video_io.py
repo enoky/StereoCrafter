@@ -636,10 +636,11 @@ def encode_frames_to_mp4(
         os.path.join(temp_png_dir, "%05d.png"),
     ]
 
-    output_codec, output_pix_fmt, default_cpu_crf, output_profile = "libx264", "yuv420p", "23", "main"
+    # Determine codec, pixel format, and CRF
+    output_codec, output_pix_fmt, crf, output_profile = "libx264", "yuv420p", "23", "main"
 
-    enc_config = get_encoding_config_from_dict(encoding_options or {})
-    crf = user_output_crf if user_output_crf is not None else enc_config.get("crf", 23)
+    if user_output_crf is not None:
+        crf = str(user_output_crf)
 
     is_hdr = (
         video_stream_info
@@ -648,32 +649,30 @@ def encode_frames_to_mp4(
     )
     orig_pix = video_stream_info.get("pix_fmt", "") if video_stream_info else ""
     is_high_bit = "10" in orig_pix or "12" in orig_pix or "16" in orig_pix
-    output_color_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
 
-    force_10bit = is_hdr or output_color_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
+    if is_hdr or (is_high_bit and video_stream_info.get("codec_name") in ("hevc", "prores", "dnxhd", "dnxhr")):
+        output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
+        output_pix_fmt = "yuv420p10le"
+        output_profile = "main10"
+    else:
+        output_codec = "h264_nvenc" if CUDA_AVAILABLE else "libx264"
 
-    enc_args = build_encoder_args(
-        codec=enc_config.get("codec", "H.265"),
-        encoder=enc_config.get("encoder", "Auto"),
-        quality=enc_config.get("quality", "Medium"),
-        tune=enc_config.get("tune", "None"),
-        crf=crf,
-        force_10bit=force_10bit,
-        nvenc_options={
-            "lookahead_enabled": enc_config.get("nvenc_lookahead_enabled", False),
-            "lookahead": enc_config.get("nvenc_lookahead", 16),
-            "spatial_aq": enc_config.get("nvenc_spatial_aq", False),
-            "temporal_aq": enc_config.get("nvenc_temporal_aq", False),
-            "aq_strength": enc_config.get("nvenc_aq_strength", 8),
-        },
-    )
+    # Check for color_tags_mode to force 10-bit if needed
+    color_tags_mode = str(video_stream_info.get("color_tags_mode", "")).lower() if video_stream_info else ""
+    if color_tags_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020"):
+        output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
+        output_pix_fmt = "yuv420p10le"
+        output_profile = "main10"
 
-    output_codec = enc_args["codec"]
-    output_pix_fmt = enc_args["pix_fmt"]
-    output_profile = "main10" if "10" in output_pix_fmt else "main"
-
+    # Build ffmpeg command
     ffmpeg_cmd.extend(["-c:v", output_codec])
-    ffmpeg_cmd.extend(enc_args["extra_args"])
+
+    # Add CRF/QP
+    if "nvenc" in output_codec:
+        ffmpeg_cmd.extend(["-preset", "p4", "-qp", crf])
+    else:
+        ffmpeg_cmd.extend(["-crf", crf])
+
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
     if output_profile:
         ffmpeg_cmd.extend(["-profile:v", output_profile])
