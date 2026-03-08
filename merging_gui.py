@@ -48,7 +48,7 @@ from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-08.1"
 
 
 class MergingGUI(ThemedTk):
@@ -162,7 +162,8 @@ class MergingGUI(ThemedTk):
         self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- Encoding Settings ---
-        self.encoding_encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
+        self.codec_var = tk.StringVar(value=self.app_config.get("codec", "H.265"))
+        self.encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
         self.encoding_quality_var = tk.StringVar(value=self.app_config.get("encoding_quality", "Medium"))
         self.encoding_tune_var = tk.StringVar(value=self.app_config.get("encoding_tune", "None"))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
@@ -777,7 +778,7 @@ class MergingGUI(ThemedTk):
     def _show_encoding_settings(self):
         """Show the encoding settings dialog."""
         config = {
-            "encoding_encoder": self.encoding_encoder_var.get(),
+            "codec": self.codec_var.get(),
             "encoding_quality": self.encoding_quality_var.get(),
             "encoding_tune": self.encoding_tune_var.get(),
             "output_crf": self.output_crf_var.get(),
@@ -800,7 +801,8 @@ class MergingGUI(ThemedTk):
         self.wait_window(dialog.dialog)
 
         if dialog.result:
-            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.codec_var.set(dialog.result.get("codec", "H.265"))
+            self.encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
             self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
             self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
             self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
@@ -1268,7 +1270,7 @@ class MergingGUI(ThemedTk):
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 # Encoding params
-                "encoding_encoder": self.encoding_encoder_var.get(),
+                "codec": self.codec_var.get(),
                 "encoding_quality": self.encoding_quality_var.get(),
                 "encoding_tune": self.encoding_tune_var.get(),
                 "output_crf": int(self.output_crf_var.get()),
@@ -1528,7 +1530,7 @@ class MergingGUI(ThemedTk):
                     pad_to_16_9=settings["pad_to_16_9"],
                     output_format_str=output_format,
                     encoding_options={
-                        "encoding_encoder": settings.get("encoding_encoder", "Auto"),
+                        "codec": settings.get("codec", "Auto"),
                         "encoding_quality": settings.get("encoding_quality", "Medium"),
                         "encoding_tune": settings.get("encoding_tune", "None"),
                         "output_crf": settings.get("output_crf", 23),

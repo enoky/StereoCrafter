@@ -43,7 +43,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-08.1"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -3404,6 +3404,7 @@ class InpaintingGUI(ThemedTk):
     def _show_encoding_settings(self):
         """Show the encoding settings dialog."""
         config = {
+            "codec": self.app_config.get("codec", "H.265"),
             "encoding_encoder": self.app_config.get("encoding_encoder", "Auto"),
             "encoding_quality": self.app_config.get("encoding_quality", "Medium"),
             "encoding_tune": self.app_config.get("encoding_tune", "None"),
@@ -3427,6 +3428,7 @@ class InpaintingGUI(ThemedTk):
         self.wait_window(dialog.dialog)
 
         if dialog.result:
+            self.app_config["codec"] = dialog.result.get("codec", "H.265")
             self.app_config["encoding_encoder"] = dialog.result.get("encoding_encoder", "Auto")
             self.app_config["encoding_quality"] = dialog.result.get("encoding_quality", "Medium")
             self.app_config["encoding_tune"] = dialog.result.get("encoding_tune", "None")

@@ -653,6 +653,7 @@ def encode_frames_to_mp4(
     force_10bit = is_hdr or output_color_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
 
     enc_args = build_encoder_args(
+        codec=enc_config.get("codec", "H.265"),
         encoder=enc_config.get("encoder", "Auto"),
         quality=enc_config.get("quality", "Medium"),
         tune=enc_config.get("tune", "None"),
@@ -772,6 +773,7 @@ def start_ffmpeg_pipe_process(
     force_10bit = color_tags_mode in ("bt.2020 pq", "bt.2020 hlg", "bt.2020")
 
     enc_args = build_encoder_args(
+        codec=enc_config.get("codec", "H.265"),
         encoder=enc_config.get("encoder", "Auto"),
         quality=enc_config.get("quality", "Medium"),
         tune=enc_config.get("tune", "None"),

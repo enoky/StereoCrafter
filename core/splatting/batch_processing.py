@@ -135,6 +135,7 @@ class ProcessingSettings:
     multi_map: bool = False
     selected_depth_map: str = ""
     color_tags_mode: str = "Auto"
+    codec: str = "Auto"
     encoding_encoder: str = "Auto"
     encoding_quality: str = "Auto"
     encoding_tune: str = "Auto"
@@ -481,6 +482,7 @@ class BatchProcessor:
 
             # Run Rendering
             encoding_options = {
+                "codec": settings.codec,
                 "encoder": settings.encoding_encoder,
                 "quality": settings.encoding_quality,
                 "tune": settings.encoding_tune,

@@ -82,7 +82,7 @@ except:
     logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-08.1"
 
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -291,7 +291,8 @@ class SplatterGUI(ThemedTk):
         self.color_tags_mode_var = tk.StringVar(value="Auto")
 
         # --- Encoding Options ---
-        self.encoding_encoder_var = tk.StringVar(value="Auto")
+        self.codec_var = tk.StringVar(value="H.265")
+        self.encoder_var = tk.StringVar(value="Auto")
         self.encoding_quality_var = tk.StringVar(value="Medium")
         self.encoding_tune_var = tk.StringVar(value="None")
         self.encoding_nvenc_lookahead_enabled_var = tk.BooleanVar(value=False)
@@ -1413,7 +1414,7 @@ class SplatterGUI(ThemedTk):
     def show_encoding_options_popup(self):
         """Popup window for encoder/NVENC/DNxHR options (Options → Encoding Options...)."""
         config = {
-            "encoding_encoder": self.encoding_encoder_var.get(),
+            "codec": self.codec_var.get(),
             "encoding_quality": self.encoding_quality_var.get(),
             "encoding_tune": self.encoding_tune_var.get(),
             "output_crf_full": self.output_crf_full_var.get(),
@@ -1439,7 +1440,8 @@ class SplatterGUI(ThemedTk):
         self.wait_window(dialog.dialog)
 
         if dialog.result:
-            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.codec_var.set(dialog.result.get("codec", "H.265"))
+            self.encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
             self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
             self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
             self.output_crf_full_var.set(str(dialog.result.get("output_crf_full", 23)))

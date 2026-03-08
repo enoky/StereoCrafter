@@ -5,6 +5,7 @@ from core.common.encoding_utils import (
     QUALITY_PRESETS,
     CPU_TUNE_OPTIONS,
     ENCODER_OPTIONS,
+    CODEC_OPTIONS,
     DEFAULT_ENCODING_CONFIG,
     build_encoder_args,
 )
@@ -58,7 +59,8 @@ class EncodingSettingsDialog:
         """Initialize tkinter variables from app config."""
         config = self.app_config
 
-        self.encoder_var = tk.StringVar(value=config.get("encoding_encoder", DEFAULT_ENCODING_CONFIG["encoder"]))
+        self.codec_var = tk.StringVar(value=config.get("codec", "H.265"))
+        self.encoder_var = tk.StringVar(value=config.get("encoding_encoder", "Auto"))
         self.quality_var = tk.StringVar(value=config.get("encoding_quality", DEFAULT_ENCODING_CONFIG["quality"]))
         self.tune_var = tk.StringVar(value=config.get("encoding_tune", DEFAULT_ENCODING_CONFIG["tune"]))
 
@@ -108,6 +110,14 @@ class EncodingSettingsDialog:
 
         row = 0
 
+        lbl_codec = ttk.Label(outer, text="Codec:")
+        lbl_codec.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=4)
+        self._add_tooltip(lbl_codec, "encoding_codec")
+
+        cb_codec = ttk.Combobox(outer, textvariable=self.codec_var, values=CODEC_OPTIONS, state="readonly", width=18)
+        cb_codec.grid(row=row, column=1, sticky="w", pady=4)
+
+        row += 1
         lbl_encoder = ttk.Label(outer, text="Encoder:")
         lbl_encoder.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=4)
         self._add_tooltip(lbl_encoder, "encoding_encoder")
@@ -355,6 +365,7 @@ class EncodingSettingsDialog:
             Dict with all encoding settings
         """
         settings = {
+            "codec": self.codec_var.get(),
             "encoding_encoder": self.encoder_var.get(),
             "encoding_quality": self.quality_var.get(),
             "encoding_tune": self.tune_var.get(),
@@ -398,6 +409,7 @@ class EncodingSettingsDialog:
                 crf = int(self.crf_var.get())
 
         return build_encoder_args(
+            codec=self.codec_var.get(),
             encoder=self.encoder_var.get(),
             quality=self.quality_var.get(),
             tune=self.tune_var.get(),

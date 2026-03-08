@@ -6,6 +6,8 @@ logger = logging.getLogger(__name__)
 
 QUALITY_PRESETS = ("Fastest", "Faster", "Fast", "Medium", "Slow", "Slower", "Slowest")
 
+CODEC_OPTIONS = ("Auto", "H.264", "H.265")
+
 CPU_PRESET_MAP = {
     "Fastest": "ultrafast",
     "Faster": "faster",
@@ -31,6 +33,7 @@ CPU_TUNE_OPTIONS = ("None", "Film", "Grain", "Animation", "Still Image", "PSNR",
 ENCODER_OPTIONS = ("Auto", "Force CPU")
 
 DEFAULT_ENCODING_CONFIG = {
+    "codec": "H.265",
     "encoder": "Auto",
     "quality": "Medium",
     "tune": "None",
@@ -43,20 +46,38 @@ DEFAULT_ENCODING_CONFIG = {
 }
 
 
-def get_encoder_codec(encoder: str, force_10bit: bool = False) -> str:
+def get_encoder_codec(codec: str = "H.265", force_10bit: bool = False, encoder: str = "Auto") -> str:
     """Determine the encoder codec based on settings.
 
     Args:
-        encoder: "Auto" or "Force CPU"
+        codec: "Auto", "H.264", or "H.265"
         force_10bit: Whether to use 10-bit encoding
+        encoder: "Auto" (use NVENC if available) or "Force CPU"
 
     Returns:
         Codec string (e.g., "h264_nvenc", "libx264", "hevc_nvenc", "libx265")
     """
-    if encoder == "Force CPU":
-        return "libx265" if force_10bit else "libx264"
+    use_nvenc = encoder != "Force CPU"
 
-    if CUDA_AVAILABLE:
+    if codec == "H.264":
+        if force_10bit:
+            logger.warning("H.264 does not support 10-bit encoding well. Forcing H.265.")
+            codec = "H.265"
+        if use_nvenc and CUDA_AVAILABLE:
+            return "h264_nvenc"
+        return "libx264"
+
+    if codec == "H.265" or codec == "Auto":
+        if force_10bit:
+            if use_nvenc and CUDA_AVAILABLE:
+                return "hevc_nvenc"
+            return "libx265"
+        else:
+            if use_nvenc and CUDA_AVAILABLE:
+                return "h264_nvenc" if codec == "Auto" else "hevc_nvenc"
+            return "libx265"
+
+    if use_nvenc and CUDA_AVAILABLE:
         return "hevc_nvenc" if force_10bit else "h264_nvenc"
 
     return "libx265" if force_10bit else "libx264"
@@ -107,6 +128,7 @@ def get_tune_flag(tune: str, codec: str) -> Optional[str]:
 
 
 def build_encoder_args(
+    codec: str = "H.265",
     encoder: str = "Auto",
     quality: str = "Medium",
     tune: str = "None",
@@ -117,6 +139,7 @@ def build_encoder_args(
     """Build encoding arguments for FFmpeg.
 
     Args:
+        codec: Codec selection ("Auto", "H.264", or "H.265")
         encoder: Encoder selection ("Auto" or "Force CPU")
         quality: Quality preset ("Fastest" to "Slowest")
         tune: CPU tune option
@@ -130,12 +153,12 @@ def build_encoder_args(
             - aq_strength: int
 
     Returns:
-        Dict with keys: codec, preset, tune, crf, pix_fmt, extra_args
+        Dict with keys: codec, encoder, preset, tune, crf, pix_fmt, extra_args
     """
-    codec = get_encoder_codec(encoder, force_10bit)
-    is_nvenc = "nvenc" in codec
+    codec_result = get_encoder_codec(codec, force_10bit, encoder)
+    is_nvenc = "nvenc" in codec_result
     preset = quality_to_preset(quality, is_nvenc)
-    tune_flag = get_tune_flag(tune, codec)
+    tune_flag = get_tune_flag(tune, codec_result)
 
     pix_fmt = "yuv420p10le" if force_10bit else "yuv420p"
 
@@ -160,7 +183,8 @@ def build_encoder_args(
         extra_args.extend(["-crf", str(crf)])
 
     return {
-        "codec": codec,
+        "codec": codec_result,
+        "encoder": codec_result,
         "preset": preset,
         "tune": tune_flag,
         "pix_fmt": pix_fmt,
@@ -179,6 +203,9 @@ def get_encoding_config_from_dict(config: Dict[str, Any]) -> Dict[str, Any]:
         Normalized encoding config dict with defaults applied
     """
     result = DEFAULT_ENCODING_CONFIG.copy()
+
+    if "codec" in config:
+        result["codec"] = config["codec"]
 
     if "encoder" in config:
         result["encoder"] = config["encoder"]
