@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 set -e
 
 echo "=========================================="
@@ -24,7 +24,7 @@ cd weights
 if [ -d "stable-video-diffusion-img2vid-xt-1-1" ] && \
    [ -d "DepthCrafter" ] && \
    [ -d "StereoCrafter" ]; then
-    echo "✅ All model weights already downloaded"
+    echo "âœ… All model weights already downloaded"
 else
     echo "Downloading model weights..."
     
@@ -74,7 +74,7 @@ else
         fi
     fi
     
-    echo "✅ All models downloaded"
+    echo "âœ… All models downloaded"
 fi
 
 cd ..

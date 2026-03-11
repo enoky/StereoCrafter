@@ -79,6 +79,87 @@ Under **Pod Template**, click **Edit** and enter the following:
 *   Select **Deploy On-Demand**
 
 ## 🚀 Local Setup 
+
+### Option 1: Docker (Recommended - Fastest & Easiest)
+
+**Why Docker?**
+- ✅ No dependency conflicts or DLL issues (especially on Windows)
+- ✅ Simulates RunPod deployment environment exactly
+- ✅ Pre-configured with all dependencies
+- ✅ Works on Windows, Linux, and Mac
+- ✅ One command to start everything
+
+**Prerequisites:**
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed
+- NVIDIA GPU with drivers installed
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (for GPU support)
+
+**Quick Start:**
+
+```bash
+# Clone the repository
+git clone https://github.com/keemzin/StereoCrafter.git
+cd StereoCrafter
+
+# Create .env file with your HuggingFace token
+echo HF_TOKEN=your_huggingface_token_here > .env
+
+# Start the container (downloads models on first run)
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Access the WebUI at http://localhost:7860
+```
+
+**Customizing Mounts:**
+
+Edit `docker-compose.yml` to mount additional folders:
+
+```yaml
+volumes:
+  # Your code (for live development)
+  - ./webui.py:/workspace/StereoCrafter/webui.py
+  - ./gui:/workspace/StereoCrafter/gui
+  - ./stereocrafter_ui:/workspace/StereoCrafter/stereocrafter_ui
+  
+  # Model weights (persistent Docker volume - no Windows path issues)
+  - stereocrafter-weights:/workspace/StereoCrafter/weights
+  
+  # Input/output folders (modify as needed)
+  - ./source_video:/workspace/StereoCrafter/source_video
+  - ./output_depthmaps:/workspace/StereoCrafter/output_depthmaps
+  - ./output_splatted:/workspace/StereoCrafter/output_splatted
+  - ./completed_output:/workspace/StereoCrafter/completed_output
+  - ./final_videos:/workspace/StereoCrafter/final_videos
+```
+
+**Docker Commands:**
+
+```bash
+# Stop the container
+docker compose down
+
+# Restart after code changes
+docker compose restart
+
+# View container status
+docker compose ps
+
+# Access container shell
+docker compose exec stereocrafter-webui bash
+
+# Remove everything (including downloaded models)
+docker compose down -v
+```
+
+---
+
+### Option 2: Manual Setup (Python Virtual Environment)
+
+**Note:** Manual setup can have dependency issues on Windows (DLL errors). Docker is recommended for most users.
+
 Thank you for your interest in contributing! This guide will help you set up the project locally, make changes, and submit your contributions.
 ### 📋 Prerequisites
 
@@ -97,7 +178,7 @@ python --version
 ffmpeg -version
 ```
 
-### Step 1: Clone Your StereoCrafter Fork
+### Step 1: Clone My StereoCrafter Fork
 
 ```bash
 # Clone YOUR fork (keemzin/StereoCrafter)
