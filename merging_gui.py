@@ -1560,6 +1560,7 @@ class MergingGUI(ThemedTk):
                         "encoding_quality": settings.get("encoding_quality", "Medium"),
                         "encoding_tune": settings.get("encoding_tune", "None"),
                         "output_crf": settings.get("output_crf", 23),
+                        "color_tags": settings.get("color_tags", "Auto"),
                         "nvenc_lookahead_enabled": settings.get("nvenc_lookahead_enabled", False),
                         "nvenc_lookahead": settings.get("nvenc_lookahead", 16),
                         "nvenc_spatial_aq": settings.get("nvenc_spatial_aq", False),
