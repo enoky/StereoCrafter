@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  stereocrafter-webui:
+    image: johnsdoes/stereocrafter-webui:rebase-v1.0.0
+    container_name: stereocrafter-webui
+    
+    # GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Port mapping
+    ports:
+      - "7860:7860"  # Gradio web interface
+    
+    # Volume mounts
+    volumes:
+      # Mount your code for live updates (development mode)
+      - ./webui.py:/workspace/StereoCrafter/webui.py
+      - ./gui:/workspace/StereoCrafter/gui
+      - ./stereocrafter_ui:/workspace/StereoCrafter/stereocrafter_ui
+      # Mount weights folder (so you don't re-download models)
+      - ./weights:/workspace/StereoCrafter/weights
+      
+      # Mount input/output folders for easy access
+      - ./source_video:/workspace/StereoCrafter/source_video
+      - ./input_source_clips:/workspace/StereoCrafter/input_source_clips
+      - ./output_depthmaps:/workspace/StereoCrafter/output_depthmaps
+      - ./output_splatted:/workspace/StereoCrafter/output_splatted
+      - ./completed_output:/workspace/StereoCrafter/completed_output
+      - ./final_videos:/workspace/StereoCrafter/final_videos
+    
+    # Environment variables
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HF_TOKEN=${HF_TOKEN}  # Set this in .env file
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Use host network for better performance (optional)
+    # network_mode: host
+    
+    # Shared memory size (important for PyTorch)
+    shm_size: '16gb'
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

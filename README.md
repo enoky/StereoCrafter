@@ -1,186 +1,357 @@
-# StereoCrafter GUI + DepthCrafter GUI Seg
+# Contributing to StereoCrafter WEBUI
 
-You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billynom8/DepthCrafter_GUI_Seg">here</a>.
+## 🎯 About This Project
 
-## Installation
+This is a **web-based UI fork** of the original [StereoCrafter](https://github.com/TencentARC/StereoCrafter) project by Tencent ARC Lab and by [Enoky](https://github.com/enoky/StereoCrafter) for the GUI implementation. This version is tested with a minimum RTX 6000 Ada ( Lovelace architecture ) and 48GB VRAM.
 
-### Option 1: Installer script (Windows)
+### Why a Web UI?
 
-#### PREREQUISITES:
-   - GIT: Ensure Git is installed and added to your system’s PATH.<br>
-     Download here: https://git-scm.com/downloads/win<br>
-     You can check the installation by running the command:<br>
-       `git --version`<br>
-     If it shows a version, Git is installed and on PATH.
-   
-   - CUDA ToolKit: Ensure CUDA 12.8 is installed and added to your PATH.<br>
-     Download here: https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64<br>
+The original StereoCrafter uses CLI and Enoky tkinter-based desktop GUIs, which work great locally but have limitations:
 
-   - FFMPEG: Ensure FFMpeg is installed and added to your PATH.<br>
-     See [Here](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/) for a tutorial on how to install.
+- **Limited to local hardware** - You're stuck with the GPU you bought. You cannot increase the VRAM.
+- **No remote access** - You can't process videos from anywhere.
+- **Resource intensive** - High-end GPUs are expensive to own. Yet they output results faster.
+- **OS, Batch and UI** - StereoCrafter is command-line usage only and can't do batch video file processing. Enoky is GUI-based and batch-processing enabled, but the python code is optimized for Windows 10/11 and might generate errors running on Linux/MacOS.
 
+### Our Solution: Cloud-Ready Web Interface
 
-#### INSTALL:
-   - Run <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
-   - Download and extract <a href="https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso">model</a> "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
+By converting to a **Gradio-based web UI**, we enabled:
 
-<hr>
+✅ **RunPod Integration** - Access high-end GPUs (RTX 4090, A6000) for pennies per hour  
+✅ **Remote Processing** - Process videos from any device with a browser  
+✅ **Cost Effective** - Pay only for GPU time you use, not ownership  
+✅ **Scalability** - Spin up multiple instances for batch processing  
+✅ **Accessibility** - Share processing power with team members  
 
-### Option 2: Manual Install
+**Example Cost Savings:**
+- RTX 4090 ownership: ~$1,600 upfront
+- RunPod RTX 4090: ~$0.50/hour (only when processing)
+- Process 10 hours/month: $5 vs $1,600 investment
 
-For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_Manual_Install.md">Click Here</a>
+### Honorable Mention
 
-<hr>
-<div align="center">
-<h2>StereoCrafter: Diffusion-based Generation of Long and High-fidelity Stereoscopic 3D from Monocular Videos</h2>
+All credit for the core StereoCrafter technology goes to the original authors at **Tencent ARC Lab**. This project simply wraps their excellent work in a web interface for cloud deployment.
 
-Sijie Zhao*&emsp;
-Wenbo Hu*&emsp;
-Xiaodong Cun*&emsp;
-Yong Zhang&dagger;&emsp;
-Xiaoyu Li&dagger;&emsp;<br>
-Zhe Kong&emsp;
-Xiangjun Gao&emsp;
-Muyao Niu&emsp;
-Ying Shan
+Original Paper: [StereoCrafter: Diffusion-based Generation of Long and High-fidelity Stereoscopic 3D from Monocular Videos](https://arxiv.org/abs/2409.07447)
 
-&emsp;* equal contribution &emsp; &dagger; corresponding author 
+### Project Status
 
-<h3>Tencent AI Lab&emsp;&emsp;ARC Lab, Tencent PCG</h3>
+⚠️ **This is a passion project built in free time!**
 
-<a href='https://arxiv.org/abs/2409.07447'><img src='https://img.shields.io/badge/arXiv-PDF-a92225'></a> &emsp;
-<a href='https://stereocrafter.github.io/'><img src='https://img.shields.io/badge/Project_Page-Page-64fefe' alt='Project Page'></a> &emsp;
-<a href='https://huggingface.co/TencentARC/StereoCrafter'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-yellow'></a>
-</div>
+This codebase is:
+- **Functional but not optimized** - It works, but there's room for improvement
+- **Built with enthusiasm** - Created out of love for the technology, not commercial purposes
+- **Community-driven** - Your contributions can help make it better!
 
-## 💡 Abstract
+We welcome optimizations, bug fixes, and feature improvements. This is a learning project for everyone involved!
 
-We propose a novel framework to convert any 2D videos to immersive stereoscopic 3D ones that can be viewed on different display devices, like 3D Glasses, Apple Vision Pro and 3D Display. It can be applied to various video sources, such as movies, vlogs, 3D cartoons, and AIGC videos.
+---
 
-![teaser](assets/teaser.jpg)
+# Quick Runpod deploy
+## 🚀 Runpod Setup Guide
 
-## 📣 News
-- `2024/12/27` We released our inference code and model weights.
-- `2024/09/11` We submitted our technical report on arXiv and released our project page.
+### 1. Select Pod Template
+*   Navigate to **Pod Template**
+*   Select **All**
+*   Choose **Runpod Pytorch 2.8.0**
 
-## 🎞️ Showcases
-Here we show some examples of input videos and their corresponding stereo outputs in Anaglyph 3D format.
-<div align="center">
-    <img src="assets/demo.gif">
-</div>
+### 2. Configure Hardware
+*   Click **Configure Pod**
+*   Select GPU: **RTX 6000 Ada**
+NOTE: Do not select a GPU that is below 48GB VRAM or GPUs that are not using Lovelace architecture. RTX 6000 Ada is the minimum GPU you should run this version of StereoCrafter.
 
+### 3. Edit Container Settings
+Under **Pod Template**, click **Edit** and enter the following:
 
-## 🛠️ Installation (for the original repository)
+| Setting | Value |
+| :--- | :--- |
+| **Container Name** | `johnsdoes/stereocrafter-webui:latest` |
+| **Container Disk** | `300 GB` *(Cost: ~$0.042/hr)* |
+| **Volume Disk** | `0 GB` |
+| **Expose HTTP Ports** | `7860` |
 
-#### 1. Set up the environment
-We run our code on Python 3.8 and Cuda 11.8.
-You can use Anaconda or Docker to build this basic environment.
+### 4. Environment Variables
+*   **Key:** `HF_TOKEN`
+*   **Value:** `your huggingface read token`
 
-#### 2. Clone the repo
+### 5. Deploy
+*   Click **Set Overrides**
+*   Select **Deploy On-Demand**
+
+## 🚀 Local Setup 
+Thank you for your interest in contributing! This guide will help you set up the project locally, make changes, and submit your contributions.
+### 📋 Prerequisites
+
+Before you begin, ensure you have:
+
+- **Git**: [Download here](https://git-scm.com/downloads)
+- **Python 3.12**: [Download here](https://www.python.org/downloads)
+- **CUDA 12.8**: [Download here](https://developer.nvidia.com/cuda-12-8-0-download-archive) (for GPU support)
+- **FFmpeg**: [Installation guide](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/)
+- **HuggingFace Account**: [Sign up here](https://huggingface.co/join) (HF_TOKEN needed for model downloads)
+
+Verify installations:
 ```bash
-# use --recursive to clone the dependent submodules
-git clone --recursive https://github.com/TencentARC/StereoCrafter
-cd StereoCrafter
+git --version
+python --version
+ffmpeg -version
 ```
 
-#### 3. Install the requirements
+### Step 1: Clone Your StereoCrafter Fork
+
 ```bash
+# Clone YOUR fork (keemzin/StereoCrafter)
+git clone https://github.com/keemzin/StereoCrafter.git
+cd StereoCrafter
+
+# Add upstream remote for syncing with original enoky/StereoCrafter
+git remote add upstream https://github.com/enoky/StereoCrafter.git
+
+# Verify remotes
+git remote -v
+```
+
+**Why clone from my fork?**
+
+This WEBUI fork includes all the necessary code patches pre-applied. Cloning from `keemzin/StereoCrafter` gives you everything in one step.
+
+**Can I update from the original enoky/StereoCrafter?**
+
+Yes! Use the `upstream` remote to fetch updates from the original repository:
+
+```bash
+# Fetch latest from upstream
+git fetch upstream
+
+# Check what's new
+git log --oneline upstream/main -n 10
+
+# Merge upstream changes (if compatible)
+git merge upstream/main
+```
+
+### Step 2: Download Model Weights
+
+Create a `weights` folder and download the required models:
+
+```bash
+# Create weights folder
+mkdir weights
+cd weights
+
+# Download models using git
+git clone https://huggingface.co/TencentARC/StereoCrafter
+git clone https://huggingface.co/tencent/DepthCrafter
+git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1
+
+cd ..
+```
+
+### Step 3: Set Up Python Virtual Environment
+
+```bash
+# Create virtual environment
+python -m venv venv
+
+# Activate virtual environment
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+source venv/bin/activate
+
+# Upgrade pip
+python -m pip install --upgrade pip
+```
+
+### Step 4: Install Dependencies
+
+```bash
+# Install Python packages
 pip install -r requirements.txt
 ```
 
-
-#### 4. Install customized 'Forward-Warp' package for forward splatting
-```
-cd ./dependency/Forward-Warp
-chmod a+x install.sh
-./install.sh
-```
-
-
-## 📦 Model Weights
-
-#### 1. Download the [SVD img2vid model](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) for the image encoder and VAE.
+### Step 5: Run the WEBUI
 
 ```bash
-# in StereoCrafter project root directory
-mkdir weights
-cd ./weights
-git lfs install
-git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1
+# Start the web interface
+python webui.py
 ```
 
-#### 2. Download the [DepthCrafter model](https://huggingface.co/tencent/DepthCrafter) for the video depth estimation.
+The WEBUI will open in your browser at `http://localhost:7860`
+
+## 🔧 Making Changes
+
+### Project Structure
+
+Only modify files in these locations
+- `webui.py` - Main application entry point
+- `gui/` - GUI components (legacy, being phased out)
+- `stereocrafter_ui/` - New WEBUI components (Gradio-based)
+
+**Do NOT modify:**
+- `pipelines/` - Core processing pipelines
+- `core/` - Core functionality
+- `dependency/` - External dependencies
+- Other original enoky/StereoCrafter files
+
+### Development Workflow
+
+1. **Create a new branch for your feature:**
+   ```bash
+   git checkout -b feature/your-feature-name
+   ```
+
+2. **Make your changes** in the allowed folders:
+   - `webui.py`
+   - `gui/`
+   - `stereocrafter_ui/`
+
+3. **Test your changes:**
+   ```bash
+   python webui.py
+   ```
+
+4. **Check for errors:**
+   - Test all affected features
+   - Verify no console errors
+   - Test on different video resolutions if applicable
+
+## 📤 Submitting Your Contribution
+
+### Step 1: Clone/modify/Commit Your Changes
+
 ```bash
-git clone https://huggingface.co/tencent/DepthCrafter
+# Check what files you've modified
+git status
+
+# Add your changes
+git add webui.py
+git add stereocrafter_ui/
+git add gui/
+
+# Commit with a descriptive message
+git commit -m "Add feature: Brief description of your changes"
 ```
 
-#### 3. Download the [StereoCrafter model](https://huggingface.co/TencentARC/StereoCrafter) for the stereo video generation.
+**Commit Message Guidelines:**
+- Use present tense ("Add feature" not "Added feature")
+- Be descriptive but concise
+- Reference issue numbers if applicable
+
+Examples:
+```
+Add manual preview selector to splatting UI
+Fix inpainting pipeline loading for local weights
+Update file manager with pipeline folder shortcuts
+```
+
+### Step 2: Push to Your Fork
+
 ```bash
-git clone https://huggingface.co/TencentARC/StereoCrafter
+# Push your branch to your fork
+git push myfork feature/your-feature-name
 ```
 
+### Step 3: Create a Pull Request
 
-## 🔄 Inference
+1. Go to https://github.com/keemzin/WEBUI-StereoCrafter
+2. Click "New Pull Request"
+3. Select your branch from your fork
+4. Fill in the PR template:
 
-Script:
+```markdown
+## Description
+Brief description of what this PR does
 
+## Changes Made
+- List of specific changes
+- Another change
+- etc.
+
+## Testing
+How you tested these changes
+
+## Screenshots (if applicable)
+Add screenshots showing the changes
+
+## Checklist
+- [ ] Code follows project structure (only modified webui.py, gui/, stereocrafter_ui/)
+- [ ] Tested locally and works as expected
+- [ ] No console errors
+- [ ] Updated documentation if needed
+```
+
+5. Click "Create Pull Request"
+
+## 🐛 Reporting Issues
+
+If you find a bug but don't know how to fix it:
+
+1. Go to the Issues page
+2. Click "New Issue"
+3. Provide:
+   - Clear description of the problem
+   - Steps to reproduce
+   - Expected vs actual behavior
+   - Screenshots/logs if applicable
+   - Your system info (OS, Python version, GPU)
+
+## 💡 Tips for Contributors
+
+### Code Style
+- Follow existing code style in the project
+- Use meaningful variable names
+- Add comments for complex logic
+- Keep functions focused and small
+
+### Testing
+- Test with different video resolutions
+- Test with different parameter combinations
+- Check memory usage for large videos
+- Verify UI responsiveness
+
+### Documentation
+- Update docstrings for new functions
+- Add inline comments for complex code
+- Update README if adding new features
+- Include usage examples
+
+### Common Issues
+
+**Import errors:**
 ```bash
-# in StereoCrafter project root directory
-sh run_inference.sh
+# Make sure you're in the virtual environment
+venv\Scripts\activate  # Windows
+source venv/bin/activate  # Linux/Mac
+
+# Reinstall requirements
+pip install -r requirements.txt
 ```
 
-There are two main steps in this script for generating stereo video.
+**CUDA errors:**
+- Verify CUDA 12.8 is installed
+- Check GPU drivers are up to date
+- Ensure PyTorch detects your GPU: `python -c "import torch; print(torch.cuda.is_available())"`
 
-#### 1. Depth-Based Video Splatting Using the Video Depth from DepthCrafter
-Execute the following command:
-```bash
-python depth_splatting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                                    --input_video_path [PATH] --output_video_path [PATH]
-```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the DepthCrafter model weights (e.g., `./weights/DepthCrafter`).
-- `--input_video_path`: Path to the input video (e.g., `./source_video/camel.mp4`).
-- `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
+**Model download fails:**
+- Check your HuggingFace token is valid
+- Ensure you have accepted the model licenses on HuggingFace
+- Try using Python download method instead of `uv`
 
-The first step generates a video grid with input video, visualized depth map, occlusion mask, and splatting right video, as shown below:
+## 📞 Getting Help
 
-<img src="assets/camel_splatting_results.jpg" alt="camel_splatting_results" width="800"/> 
+- **Questions:** Open a discussion on the repository
+- **Bugs:** Open an issue with details
+- **Feature requests:** Open an issue with the "enhancement" label
 
-#### 2. Stereo Video Inpainting of the Splatting Video
-Execute the following command:
-```bash
-python inpainting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                               --input_video_path [PATH] --save_dir [PATH]
-```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the StereoCrafter model weights (e.g., `./weights/StereoCrafter`).
-- `--input_video_path`: Path to the splatting video result generated by the first stage (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--save_dir`: Directory for the output stereo video (e.g., `./outputs`).
-- `--tile_num`: The number of tiles in width and height dimensions for tiled processing, which allows for handling high resolution input without requiring more GPU memory. The default value is `1` (1 $\times$ 1 tile). For input videos with a resolution of 2K or higher, you could use more tiles to avoid running out of memory.
+## 🙏 Thank You!
 
-The stereo video inpainting generates the stereo video result in side-by-side format and anaglyph 3D format, as shown below:
+Your contributions help make StereoCrafter WEBUI better for everyone. We appreciate your time and effort!
 
-<img src="assets/camel_sbs.jpg" alt="camel_sbs" width="800"/> 
+---
 
-<img src="assets/camel_anaglyph.jpg" alt="camel_anaglyph" width="400"/>
+If you’d like to support this project, please consider registering for RunPod using my referral link:
+https://runpod.io?ref=5r6ik1wp
 
-## 🤝 Acknowledgements
+Your support helps me troubleshoot issues, test new features, and continue developing the project. Currently, I’m relying mostly on free credits for testing, so every bit of support helps keep the project alive. 🚀
 
-We would like to express our gratitude to the following open-source projects:
-- [Stable Video Diffusion](https://github.com/Stability-AI/generative-models): A latent diffusion model trained to generate video clips from an image or text conditioning.
-- [DepthCrafter](https://github.com/Tencent/DepthCrafter): A novel method to generate temporally consistent depth sequences from videos.
-
-
-## 📚 Citation
-
-```bibtex
-@article{zhao2024stereocrafter,
-  title={Stereocrafter: Diffusion-based generation of long and high-fidelity stereoscopic 3d from monocular videos},
-  author={Zhao, Sijie and Hu, Wenbo and Cun, Xiaodong and Zhang, Yong and Li, Xiaoyu and Kong, Zhe and Gao, Xiangjun and Niu, Muyao and Shan, Ying},
-  journal={arXiv preprint arXiv:2409.07447},
-  year={2024}
-}
-```
