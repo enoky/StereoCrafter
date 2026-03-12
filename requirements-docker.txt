@@ -8,7 +8,7 @@ numpy==1.26.4
 matplotlib
 transformers
 accelerate
-xformers==0.0.33.post2
+xformers
 mediapy
 fire
 decord

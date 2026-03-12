@@ -127,12 +127,25 @@ class DepthCrafterDemo:
                 else: # This block handles the case where _ENABLE_XFORMERS_ATTENTION was False
                     _logger.info("xFormers memory-efficient attention disabled by global setting.")
 
-            # Enable attention slicing for additional VRAM savings (following reference implementation)
+            # Enable attention slicing conditionally based on available VRAM
+            # Attention slicing trades speed for memory - only enable on low VRAM GPUs
             try:
-                self.pipe.enable_attention_slicing()
-                _logger.info("Attention slicing enabled for VRAM optimization.")
+                if torch.cuda.is_available():
+                    # Get total VRAM in GB
+                    total_vram_bytes = torch.cuda.get_device_properties(0).total_memory
+                    total_vram_gb = total_vram_bytes / (1024**3)
+                    
+                    # Enable attention slicing only for GPUs with < 16GB VRAM
+                    # This helps low VRAM GPUs (12GB) but doesn't slow down high-end GPUs (24GB+)
+                    if total_vram_gb < 16:
+                        self.pipe.enable_attention_slicing()
+                        _logger.info(f"Attention slicing ENABLED for VRAM optimization (GPU: {total_vram_gb:.1f}GB VRAM).")
+                    else:
+                        _logger.info(f"Attention slicing DISABLED for maximum speed (GPU: {total_vram_gb:.1f}GB VRAM - sufficient memory available).")
+                else:
+                    _logger.warning("CUDA not available, skipping attention slicing configuration.")
             except Exception as e:
-                _logger.warning(f"Failed to enable attention slicing: {e}")
+                _logger.warning(f"Failed to configure attention slicing: {e}")
 
             _logger.debug("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
         except Exception as e:

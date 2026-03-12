@@ -6,6 +6,7 @@ Handles depth estimation interface and processing
 import os
 import threading
 import queue
+import torch
 import gradio as gr
 
 from ..base.base_ui import BaseWebUI
@@ -826,6 +827,12 @@ class DepthCrafterWebUI(BaseWebUI):
             logger.info("=" * 80)
             logger.info("Processing completed successfully!")
             logger.info("=" * 80)
+            
+            # Clear CUDA cache after all processing completes
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache cleared.")
+            
             return "Processing completed successfully!", 100
             
         except Exception as e:
@@ -934,7 +941,13 @@ class DepthCrafterWebUI(BaseWebUI):
             
             progress(1.0, desc="Re-merging completed!")
             logger.info("Re-merging completed for all found metadata files")
-            return "Re-merging completed successfully!", 10
+            
+            # Clear CUDA cache after re-merging completes
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache cleared.")
+            
+            return "Re-merging completed successfully!", 100
             
         except Exception as e:
             import traceback
