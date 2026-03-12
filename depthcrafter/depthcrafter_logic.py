@@ -127,6 +127,13 @@ class DepthCrafterDemo:
                 else: # This block handles the case where _ENABLE_XFORMERS_ATTENTION was False
                     _logger.info("xFormers memory-efficient attention disabled by global setting.")
 
+            # Enable attention slicing for additional VRAM savings (following reference implementation)
+            try:
+                self.pipe.enable_attention_slicing()
+                _logger.info("Attention slicing enabled for VRAM optimization.")
+            except Exception as e:
+                _logger.warning(f"Failed to enable attention slicing: {e}")
+
             _logger.debug("DepthCrafterPipeline initialized successfully.") # This was already there, ensure it remains.
         except Exception as e:
             _logger.critical(f"CRITICAL: Failed to initialize DepthCrafterPipeline: {e}", exc_info=True)

@@ -2,8 +2,8 @@
 
 services:
   stereocrafter-webui:
-    image: johnsdoes/stereocrafter-webui:rebase-v1.0.0
-    #image: stereocrafter-webui:local
+    #image: johnsdoes/stereocrafter-webui:rebase-v1.0.0
+    image: stereocrafter-webui:local
     container_name: stereocrafter-webui
     
     # GPU support
@@ -24,6 +24,9 @@ services:
       # Model weights (persistent)
       - stereocrafter-weights:/workspace/StereoCrafter/weights
       
+      # Modified enoky dependency for attention slicing optimization
+      - ./depthcrafter/depthcrafter_logic.py:/workspace/StereoCrafter/depthcrafter/depthcrafter_logic.py
+      
       # Mount input/output folders for easy access
       - ./source_video:/workspace/StereoCrafter/source_video
       - ./input_source_clips:/workspace/StereoCrafter/input_source_clips
@@ -31,6 +34,9 @@ services:
       - ./output_splatted:/workspace/StereoCrafter/output_splatted
       - ./completed_output:/workspace/StereoCrafter/completed_output
       - ./final_videos:/workspace/StereoCrafter/final_videos
+
+      # Modified enoky dependecy
+      - ./depthcrafter\depthcrafter_logic.py:/workspace/StereoCrafter/depthcrafter/depthcrafter_logic.py
     
     # Environment variables
     environment:
