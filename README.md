@@ -158,9 +158,13 @@ docker compose down -v
 
 ### Option 2: Manual Setup (Python Virtual Environment)
 
-**Note:** Manual setup can have dependency issues on Windows (DLL errors). Docker is recommended for most users.
+**⚠️ Known Issues on Windows:**
+- PyTorch DLL loading errors are common on Windows (`WinError 1114: DLL initialization failed`)
+- Requires Visual C++ Redistributables and proper CUDA installation
+- Can have conflicts with other Python installations or Anaconda
+- **Docker is strongly recommended for Windows users**
 
-Thank you for your interest in contributing! This guide will help you set up the project locally, make changes, and submit your contributions.
+**If you still want to try manual setup:**
 ### 📋 Prerequisites
 
 Before you begin, ensure you have:
@@ -259,6 +263,34 @@ python webui.py
 ```
 
 The WEBUI will open in your browser at `http://localhost:7860`
+
+**Troubleshooting Windows DLL Errors:**
+
+If you get `OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed`:
+
+1. **Install Visual C++ Redistributables:**
+   - Download: [VC++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+   - Install and restart your computer
+
+2. **Verify CUDA installation:**
+   ```bash
+   nvidia-smi
+   nvcc --version
+   ```
+
+3. **Reinstall PyTorch:**
+   ```bash
+   pip uninstall torch torchvision torchaudio
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   ```
+
+4. **If still failing, use Docker instead** (recommended solution)
+
+**Why Docker is better for Windows:**
+- No DLL conflicts
+- Pre-configured environment
+- Matches production RunPod environment exactly
+- One command to start: `docker compose up -d`
 
 ## 🔧 Making Changes
 
@@ -398,6 +430,19 @@ If you find a bug but don't know how to fix it:
 - Include usage examples
 
 ### Common Issues
+
+**PyTorch DLL errors on Windows (`WinError 1114`):**
+```
+OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed.
+Error loading "...\torch\lib\c10.dll"
+```
+
+**Solution:** Use Docker instead. This is a known Windows + PyTorch issue that's difficult to resolve. Docker works perfectly and matches the RunPod environment.
+
+If you must use venv:
+1. Install [VC++ Redistributables](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+2. Ensure CUDA 12.8 is properly installed
+3. Reinstall PyTorch: `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128`
 
 **Import errors:**
 ```bash

@@ -107,3 +107,10 @@ AGENTS.md
 /ryudoaema-updates
 weights
 .env
+
+output_depthmaps
+input_source_clips
+output_splatted
+final_videos
+venvbb/Scripts/python.exe
+REFER

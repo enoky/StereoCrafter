@@ -110,68 +110,81 @@ class DepthCrafterWebUI(BaseWebUI):
             ["mp4", "main10_mp4", "png_sequence"], 
             value="mp4", 
             label="Merged Output Format",
+            interactive=False,  # Disabled by default
             info="Only active if 'Process as Segments' is checked. Determines the file format of the final output after all processed segments are merged together. 'mp4': Creates a standard MP4 video file (typically 8-bit). 'main10_mp4': Creates HEVC HDR10 bit x265 MP4 video file. 'png_sequence': Creates a sequence of PNG images, one for each frame, in a new subfolder."
         )
         self.merge_alignment_method_var = gr.Dropdown(
             ["Shift & Scale", "Linear Blend"], 
             value="Shift & Scale", 
             label="Alignment Method",
+            interactive=False,  # Disabled by default
             info="Only active if 'Process as Segments' is checked. Determines the method used to align and blend overlapping regions between consecutive depth segments during merging. 'Shift & Scale': Attempts to globally adjust the brightness (shift) and contrast (scale) of one segment to match the overlapping part of the previous segment. Good for consistent lighting. 'Linear Blend': Performs a simple linear cross-fade (alpha blend) in the overlapping region. Can be smoother but might lose some contrast if segments have very different overall brightness levels. Experiment to see which works best for your content."
         )
         self.merge_dither_var = gr.Checkbox(
             label="Dithering", 
             value=False,
+            interactive=False,  # Disabled by default
             info="When enabled, applies dithering when converting the (often higher bit-depth) depth data to an 8-bit MP4 video. Dithering adds patterned noise to reduce visible banding artifacts that can occur in smooth gradients when color depth is reduced. Higher values mean stronger dithering noise. Typical range: 0.1 to 1.0. Experiment to find a good balance between reducing banding and avoiding excessive noise. Enable this if you see banding in your merged MP4 outputs."
         )
         self.merge_dither_strength_var = gr.Slider(
             0.0, 1.0, value=0.5, 
             label="Dither Strength",
+            interactive=False,  # Disabled by default
             info="Strength of the dithering effect when converting to 8-bit MP4. Higher values result in more noticeable dithering (more noise, less banding). Range 0.0 to 1.0."
         )
         self.merge_gamma_correct_var = gr.Checkbox(
             label="Gamma Adjust", 
             value=False,
+            interactive=False,  # Disabled by default
             info="When enabled and 'Merged Output Format' is 'mp4'. Applies gamma adjustment to the depth map values before saving as MP4. This can help adjust the perceived brightness and contrast of the depth map, boosting depth in the background while crushing in the forground. Useful if the default MP4 output appears too dark or too washed out. Values > 1.0 will generally make mid-tones brighter (pulling midground closer). Values < 1.0 will generally make mid-tones darker (pushing midground away). Default 1.5"
         )
         self.merge_gamma_value_var = gr.Slider(
             0.1, 3.0, value=1.5, 
             label="Gamma Value",
+            interactive=False,  # Disabled by default
             info="The gamma value to apply if gamma correction is enabled. Values > 1.0 brighten mid-tones, values < 1.0 darken mid-tones."
         )
         self.merge_percentile_norm_var = gr.Checkbox(
             label="Normalization", 
             value=False,
+            interactive=False,  # Disabled by default
             info="Only active if 'Process as Segments' is checked. When merging segments, this option normalizes the depth values based on percentiles across all segments rather than simple min/max. This can help to reduce the impact of extreme outliers (e.g., a few very bright or very dark pixels) on the overall brightness and contrast of the final merged output, leading to a more balanced result. If unchecked, a simpler global min/max normalization across all segments is typically used."
         )
         self.merge_norm_low_perc_var = gr.Slider(
             0.0, 5.0, value=0.1, 
             label="Norm Low Percentile",
+            interactive=False,  # Disabled by default
             info="Specifies the lower percentile of depth values that will be mapped to black (or the minimum output value) if Percentile Normalization is enabled. Helps ignore extreme dark outliers. Typical value: 0.1 to 1.0."
         )
         self.merge_norm_high_perc_var = gr.Slider(
             95.0, 100.0, value=99.9, 
             label="Norm High Percentile",
+            interactive=False,  # Disabled by default
             info="Specifies the upper percentile of depth values that will be mapped to white (or the maximum output value) if Percentile Normalization is enabled. Helps ignore extreme bright outliers. Typical value: 99.0 to 99.9."
         )
         self.keep_intermediate_npz_var = gr.Checkbox(
             label="Keep intermediate NPZ", 
             value=False,
+            interactive=False,  # Disabled by default until "Process as Segments" is checked
             info="Only active if 'Process as Segments' is checked. If this option is checked, the individual segment NPZ files (raw depth data) and any generated intermediate visual outputs (like segment MP4s or PNG sequences, based on 'Segment Visual Format') will be kept in the '[basename]_seg' subfolder even after merging is complete. If unchecked (default), this subfolder and its contents are usually deleted after a successful merge to save space, leaving only the final merged output. The 'Min Orig. Vid Frames to Keep NPZ' setting can override this to delete for short videos."
         )
         self.min_frames_to_keep_npz_var = gr.Number(
             label="Min Frames to Keep NPZ", 
             value=0,
+            interactive=False,  # Disabled by default
             info="Only active if 'Process as Segments' and 'Keep intermediate NPZ files' are both checked. This sets a threshold based on the *original* video's total frame count. If the original video has fewer frames than this number, the intermediate segment folder will be deleted even if 'Keep intermediate NPZ files' is checked. Set to 0 or a negative value to always respect the 'Keep intermediate NPZ files' checkbox, regardless of video length."
         )
         self.keep_intermediate_segment_visual_format_var = gr.Dropdown(
             ["png_sequence", "mp4", "none"], 
             value="mp4", 
             label="Segment Visual Format",
+            interactive=False,  # Disabled by default
             info="Only active if 'Process as Segments' is checked and 'Keep intermediate NPZ files' is also checked (or visuals are generated manually via button). Determines the format for saving visual representations of each individual processed segment's depth map. These are saved alongside the NPZ files in the segment subfolder. 'png_sequence': Saves each frame as a PNG image in a sub-subfolder. 'mp4': Saves a playable MP4 video of the segment's depth map. 'none': No visual representation is saved for segments, only the NPZ data files. These visuals are for previewing or debugging individual segments."
         )
         self.merge_output_suffix_var = gr.Textbox(
             label="Output Suffix", 
             value="_depth",
+            interactive=False,  # Disabled by default
             info="This suffix will be appended to the original video's basename to form the merged output filename (before the extension). Default is '_depth'. Example: If original is 'my_video.mp4' and suffix is '_custom_depth', merged output might be 'my_video_custom_depth.mp4'."
         )
         self.use_local_models_only_var = gr.Checkbox(
@@ -221,7 +234,7 @@ class DepthCrafterWebUI(BaseWebUI):
         )
         self.is_depth_far_black = gr.Checkbox(label="Is Depth Far Black", value=True)
         self.dark_mode_var = gr.Checkbox(label="Dark Mode", value=False)
-        self.disable_xformers_var = gr.Checkbox(label="Disable xFormers (VRAM Save)", value=True)
+        # Removed disable_xformers_var - always enable xformers for optimal VRAM usage
         
         # Status and progress
         self.status_message_var = gr.Textbox(label="Status", value="Ready")
@@ -343,6 +356,45 @@ class DepthCrafterWebUI(BaseWebUI):
             outputs=[self.input_dir_or_file_var]
         )
 
+        # Event handler to enable/disable merge options based on "Process as Segments"
+        def toggle_merge_options(process_as_segments):
+            """Enable/disable merge options based on segment processing checkbox"""
+            return [
+                gr.update(interactive=process_as_segments),  # keep_intermediate_npz_var
+                gr.update(interactive=process_as_segments),  # min_frames_to_keep_npz_var
+                gr.update(interactive=process_as_segments),  # keep_intermediate_segment_visual_format_var
+                gr.update(interactive=process_as_segments),  # merge_dither_var
+                gr.update(interactive=process_as_segments),  # merge_dither_strength_var
+                gr.update(interactive=process_as_segments),  # merge_gamma_correct_var
+                gr.update(interactive=process_as_segments),  # merge_gamma_value_var
+                gr.update(interactive=process_as_segments),  # merge_percentile_norm_var
+                gr.update(interactive=process_as_segments),  # merge_norm_low_perc_var
+                gr.update(interactive=process_as_segments),  # merge_norm_high_perc_var
+                gr.update(interactive=process_as_segments),  # merge_alignment_method_var
+                gr.update(interactive=process_as_segments),  # merge_output_format_var
+                gr.update(interactive=process_as_segments),  # merge_output_suffix_var
+            ]
+        
+        self.process_as_segments_var.change(
+            fn=toggle_merge_options,
+            inputs=[self.process_as_segments_var],
+            outputs=[
+                self.keep_intermediate_npz_var,
+                self.min_frames_to_keep_npz_var,
+                self.keep_intermediate_segment_visual_format_var,
+                self.merge_dither_var,
+                self.merge_dither_strength_var,
+                self.merge_gamma_correct_var,
+                self.merge_gamma_value_var,
+                self.merge_percentile_norm_var,
+                self.merge_norm_low_perc_var,
+                self.merge_norm_high_perc_var,
+                self.merge_alignment_method_var,
+                self.merge_output_format_var,
+                self.merge_output_suffix_var,
+            ]
+        )
+
         # Event handlers
         start_btn.click(
             fn=self.start_processing,
@@ -364,7 +416,7 @@ class DepthCrafterWebUI(BaseWebUI):
                 self.enable_dual_output_robust_norm, self.robust_norm_low_percentile,
                 self.robust_norm_high_percentile, self.robust_norm_output_min,
                 self.robust_norm_output_max, self.robust_output_suffix,
-                self.is_depth_far_black, self.disable_xformers_var
+                self.is_depth_far_black
             ],
             outputs=[self.status_message_var, self.progress]
         )
@@ -409,7 +461,7 @@ class DepthCrafterWebUI(BaseWebUI):
             self.enable_dual_output_robust_norm, self.robust_norm_low_percentile,
             self.robust_norm_high_percentile, self.robust_norm_output_min,
             self.robust_norm_output_max, self.robust_output_suffix,
-            self.is_depth_far_black, self.disable_xformers_var,
+            self.is_depth_far_black,
             self.progress, self.status_message_var
         ]
 
@@ -431,7 +483,7 @@ class DepthCrafterWebUI(BaseWebUI):
          enable_dual_output_robust_norm, robust_norm_low_percentile,
          robust_norm_high_percentile, robust_norm_output_min,
          robust_norm_output_max, robust_output_suffix,
-         is_depth_far_black, disable_xformers) = args
+         is_depth_far_black) = args
 
         try:
             # Parameter validation and type conversion
@@ -443,7 +495,8 @@ class DepthCrafterWebUI(BaseWebUI):
             # Convert and validate boolean parameters
             use_cudnn_benchmark = bool(use_cudnn_benchmark) if use_cudnn_benchmark is not None else False
             use_local_models_only = bool(use_local_models_only) if use_local_models_only is not None else False
-            disable_xformers = bool(disable_xformers) if disable_xformers is not None else True
+            # Always enable xformers for optimal VRAM usage (following reference implementation)
+            disable_xformers = False
             process_as_segments = bool(process_as_segments) if process_as_segments is not None else False
             save_final_json = bool(save_final_json) if save_final_json is not None else False
             keep_intermediate_npz = bool(keep_intermediate_npz) if keep_intermediate_npz is not None else False

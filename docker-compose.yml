@@ -3,6 +3,7 @@
 services:
   stereocrafter-webui:
     image: johnsdoes/stereocrafter-webui:rebase-v1.0.0
+    #image: stereocrafter-webui:local
     container_name: stereocrafter-webui
     
     # GPU support
@@ -20,14 +21,8 @@ services:
     
     # Volume mounts
     volumes:
-      # Mount your code for live updates (development mode)
-      - ./webui.py:/workspace/StereoCrafter/webui.py
-      - ./gui:/workspace/StereoCrafter/gui
-      - ./stereocrafter_ui:/workspace/StereoCrafter/stereocrafter_ui
-      # Sometime mounting failed, because of WSL. Downlaod make it persists instead
+      # Model weights (persistent)
       - stereocrafter-weights:/workspace/StereoCrafter/weights
-      # Mount weights folder (so you don't re-download models)
-      # - ./weights:/workspace/StereoCrafter/weights
       
       # Mount input/output folders for easy access
       - ./source_video:/workspace/StereoCrafter/source_video
@@ -36,8 +31,6 @@ services:
       - ./output_splatted:/workspace/StereoCrafter/output_splatted
       - ./completed_output:/workspace/StereoCrafter/completed_output
       - ./final_videos:/workspace/StereoCrafter/final_videos
-
-      #- ./runpod-docker-startup.sh:/workspace/StereoCrafter/runpod-docker-startup.sh
     
     # Environment variables
     environment:

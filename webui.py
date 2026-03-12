@@ -5,8 +5,16 @@ A unified interface for depth estimation, splatting, inpainting, and merging ope
 This is the main entry point that orchestrates all UI components.
 """
 
+import logging
 import gradio as gr
 from core.common.gpu_utils import check_cuda_availability, CUDA_AVAILABLE
+
+# Configure logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
 
 # Import UI components from the modular structure
 from stereocrafter_ui.depthcrafter import DepthCrafterWebUI
