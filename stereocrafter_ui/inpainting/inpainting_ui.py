@@ -293,7 +293,7 @@ class InpaintingWebUI:
         except FileNotFoundError:
             # Default structure based on user feedback
             return {
-                'input_folder': './output_splatted/lowres',
+                'input_folder': './output_splatted',
                 'output_folder': './completed_output',
                 'hires_blend_folder': './output_splatted/hires',
                 'num_inference_steps': 5,
@@ -385,13 +385,13 @@ class InpaintingWebUI:
                 gr.Markdown("### Folders")
                 input_folder = gr.Textbox(
                     label="Input Folder",
-                    value=self.app_config.get("input_folder", "./output_splatted/lowres"),
-                    info="Select the directory containing your input MP4 videos. The script expects '_splatted4' for quad inputs (Original, Depth, Mask, Warped) or '_splatted2' for dual inputs (Mask, Warped)."
+                    value=self.app_config.get("input_folder", "./output_splatted"),
+                    info="Select the directory containing your splatted MP4 videos (e.g., ./output_splatted, ./output_splatted/lowres, or ./output_splatted/hires). The script expects '_splatted4' for quad inputs or '_splatted2' for dual inputs."
                 )
                 hires_blend_folder = gr.Textbox(
                     label="Hi-Res Blend Folder",
                     value=self.app_config.get("hires_blend_folder", "./output_splatted/hires"),
-                    info="Path to hi-res splatted videos for final blending (optional)."
+                    info="Path to hi-res splatted videos for final blending (optional). Leave empty if not using hi-res blending."
                 )
                 output_folder = gr.Textbox(
                     label="Output Folder",
@@ -726,6 +726,10 @@ class InpaintingWebUI:
         )
         self.processing_thread.start()
 
+        # Initial yield to update UI immediately
+        yield ("🚀 Processing started...", 0, "0/0", "N/A", "N/A", "N/A", "N/A", "N/A",
+               gr.update(interactive=False), gr.update(interactive=True))
+
         # Poll for progress updates
         import time
         last_status = "🚀 Processing started..."
@@ -829,6 +833,25 @@ class InpaintingWebUI:
             logger.info("=== Starting batch processing ===")
             logger.info(f"Input folder: {params['input_folder']}")
             logger.info(f"Output folder: {params['output_folder']}")
+            logger.info(f"Hi-Res blend folder: {params.get('hires_blend_folder', 'None')}")
+            logger.info("=== Processing Parameters ===")
+            logger.info(f"  Inference steps: {params['num_inference_steps']}")
+            logger.info(f"  Decode chunk size: {params['decode_chunk_size']}")
+            logger.info(f"  Tile num: {params['tile_num']}")
+            logger.info(f"  Frames chunk: {params['frames_chunk']}")
+            logger.info(f"  Frame overlap: {params['frame_overlap']}")
+            logger.info(f"  Original input blend strength: {params['original_input_blend_strength']}")
+            logger.info(f"  Output CRF: {params['output_crf']}")
+            logger.info(f"  Process length: {params['process_length']}")
+            logger.info(f"  Offload type: {params['offload_type']}")
+            logger.info(f"  Enable post-inpainting blend: {params.get('enable_post_inpainting_blend', False)}")
+            logger.info(f"  Enable color transfer: {params.get('enable_color_transfer', False)}")
+            if params.get('enable_post_inpainting_blend'):
+                logger.info(f"  Mask initial threshold: {params.get('mask_initial_threshold', 0.3)}")
+                logger.info(f"  Mask morph kernel size: {params.get('mask_morph_kernel_size', 0.0)}")
+                logger.info(f"  Mask dilate kernel size: {params.get('mask_dilate_kernel_size', 5)}")
+                logger.info(f"  Mask blur kernel size: {params.get('mask_blur_kernel_size', 10)}")
+            logger.info("=" * 50)
             
             # Load pipeline
             self.progress_queue.put(("status", "Loading inpainting pipeline..."))
@@ -850,19 +873,21 @@ class InpaintingWebUI:
             )
             
             logger.info("Pipeline loaded successfully")
+            self.progress_queue.put(("status", "Pipeline loaded, scanning for videos..."))
 
             # Find videos
             logger.info(f"Scanning for videos in: {params['input_folder']}")
             input_videos = self.scan_for_videos(params['input_folder'])
             if not input_videos:
                 logger.warning("No splatted videos found")
-                self.progress_queue.put(("status", "No splatted videos found"))
+                self.progress_queue.put(("status", "❌ No splatted videos found in input folder"))
                 self.progress_queue.put(("batch_progress", "0/0"))
+                self.progress_queue.put(("progress", 0))
                 return
 
             total_videos = len(input_videos)
             logger.info(f"Found {total_videos} videos to process")
-            self.progress_queue.put(("status", f"Processing {total_videos} videos..."))
+            self.progress_queue.put(("status", f"Found {total_videos} videos, starting processing..."))
             self.progress_queue.put(("batch_progress", f"0/{total_videos}"))
 
             processed_count = 0
@@ -1004,6 +1029,21 @@ class InpaintingWebUI:
                     overlap_actual = min(overlap, input_slice.shape[0])
                     prev_overlap = previous_chunk_output[-overlap_actual:]
 
+                    # Ensure dimensions match before blending
+                    if prev_overlap.shape != input_slice[:overlap_actual].shape:
+                        logger.warning(
+                            f"Dimension mismatch in overlap blending: "
+                            f"prev_overlap {prev_overlap.shape} vs input_slice {input_slice[:overlap_actual].shape}. "
+                            f"Resizing prev_overlap to match."
+                        )
+                        # Resize prev_overlap to match input_slice dimensions
+                        prev_overlap = F.interpolate(
+                            prev_overlap.float(),
+                            size=(input_slice.shape[2], input_slice.shape[3]),
+                            mode='bicubic',
+                            align_corners=False
+                        ).to(input_slice.dtype)
+
                     if current_blend > 0:
                         weights = torch.linspace(0.0, 1.0, overlap_actual, device=prev_overlap.device).view(-1, 1, 1, 1) * current_blend
                         input_slice[:overlap_actual] = (1 - weights) * prev_overlap + weights * input_slice[:overlap_actual]
@@ -1090,27 +1130,20 @@ class InpaintingWebUI:
                     )
 
                 # Encode MP4
-                # GUI ALIGNMENT: FORCE CPU ENCODING
-                # The Windows GUI appears to use libx264 (CPU) resulting in ~2700kbps bitrate.
-                # WebUI defaults to NVENC if available (~5500kbps).
-                # To match 1:1, we temporarily disable CUDA for the util module during encoding.
-                original_cuda_flag = sc_util.CUDA_AVAILABLE
-                sc_util.CUDA_AVAILABLE = False
-                try:
-                    encode_frames_to_mp4(
-                        temp_png_dir=temp_png_dir,
-                        final_output_mp4_path=output_video_path,
-                        fps=fps,
-                        total_output_frames=len(final_output),
-                        video_stream_info=video_stream_info,
-                        user_output_crf=current_crf,
-                        output_sidecar_ext=".spsidecar"
-                    )
-                finally:
-                    sc_util.CUDA_AVAILABLE = original_cuda_flag
+                logger.info(f"Encoding output video with CRF={current_crf}")
+                encode_frames_to_mp4(
+                    temp_png_dir=temp_png_dir,
+                    final_output_mp4_path=output_video_path,
+                    fps=fps,
+                    total_output_frames=len(final_output),
+                    video_stream_info=video_stream_info,
+                    user_output_crf=current_crf,
+                    output_sidecar_ext=".spsidecar"
+                )
             finally:
                 shutil.rmtree(temp_png_dir, ignore_errors=True)
 
+            logger.info(f"✅ Successfully processed: {base_video_name}")
             return True, hires_data.get('hires_video_path')
 
         except Exception as e:
