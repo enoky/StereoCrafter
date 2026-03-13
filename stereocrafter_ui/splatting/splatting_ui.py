@@ -2444,6 +2444,7 @@ class SplatterWebUI:
             setup_result = self._setup_batch_processing(settings)
             if "error" in setup_result:
                 logger.error(setup_result["error"])
+                self.progress_queue.put(("error", setup_result["error"], 0))
                 return
 
             input_videos = setup_result["input_videos"]
@@ -2453,54 +2454,53 @@ class SplatterWebUI:
 
             if not input_videos:
                 logger.error("No input videos found for processing.")
+                self.progress_queue.put(("error", "No input videos found for processing.", 0))
                 return
 
             # --- 2. Apply From/To range on the *preview list* when available ---
             # In single-file mode, we always process the one file and ignore From/To.
             if not is_single_file_mode:
-                # Multi-file mode with no previewer/video_list: treat From/To as simple
-                # 1-based indices over the discovered input_videos list (old behavior).
-                # In *single-file* mode, we intentionally ignore From/To and leave
-                # input_videos unchanged so the current preview clip always runs.
-                if not is_single_file_mode:
-                    total_videos = len(input_videos)
-                    start_index_0 = 0
-                    end_index_0 = total_videos
+                # Multi-file mode: treat From/To as simple 1-based indices over the discovered input_videos list
+                total_videos = len(input_videos)
+                start_index_0 = 0
+                end_index_0 = total_videos
 
-                    from_str = settings.get("process_from", "")
-                    if from_str:
-                        try:
-                            from_val = int(from_str)
-                            if from_val > 0:
-                                start_index_0 = max(0, min(total_videos, from_val - 1))
-                        except ValueError:
-                            logger.warning(f"Invalid 'From' value '{from_str}', ignoring.")
+                from_str = settings.get("process_from", "")
+                if from_str:
+                    try:
+                        from_val = int(from_str)
+                        if from_val > 0:
+                            start_index_0 = max(0, min(total_videos, from_val - 1))
+                    except ValueError:
+                        logger.warning(f"Invalid 'From' value '{from_str}', ignoring.")
 
-                    to_str = settings.get("process_to", "")
-                    if to_str:
-                        try:
-                            to_val = int(to_str)
-                            if to_val > 0:
-                                end_index_0 = max(start_index_0 + 1, min(total_videos, to_val))
-                        except ValueError:
-                            logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
+                to_str = settings.get("process_to", "")
+                if to_str:
+                    try:
+                        to_val = int(to_str)
+                        if to_val > 0:
+                            end_index_0 = max(start_index_0 + 1, min(total_videos, to_val))
+                    except ValueError:
+                        logger.warning(f"Invalid 'To' value '{to_str}', ignoring.")
 
-                    if start_index_0 > 0 or end_index_0 < total_videos:
-                        logger.info(
-                            f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
-                            f"(out of {total_videos} total)"
-                        )
-                    input_videos = input_videos[start_index_0:end_index_0]
+                if start_index_0 > 0 or end_index_0 < total_videos:
+                    logger.info(
+                        f"Processing range: videos {start_index_0 + 1} to {end_index_0} "
+                        f"(out of {total_videos} total)"
+                    )
+                input_videos = input_videos[start_index_0:end_index_0]
 
             # After applying the range, make sure we still have something to do
             if not input_videos:
                 logger.error("No input videos left to process after applying From/To range.")
+                self.progress_queue.put(("error", "No input videos left to process after applying From/To range.", 0))
                 return
 
             # --- 3. Determine total tasks for the progress bar ---
             processing_tasks = self._get_defined_tasks(settings)
             if not processing_tasks:
                 logger.error("No processing tasks defined. Please enable at least one output resolution.")
+                self.progress_queue.put(("error", "No processing tasks defined. Please enable at least one output resolution.", 0))
                 return
 
             tasks_per_video = len(processing_tasks)
@@ -2516,7 +2516,10 @@ class SplatterWebUI:
             for idx, video_path in enumerate(input_videos):
                 if self.stop_event.is_set():
                     logger.info("==> Stopping processing due to user request")
+                    self.progress_queue.put(("stopped", "Processing stopped by user", 0))
                     break
+
+                logger.info(f"Processing video {idx + 1}/{len(input_videos)}: {os.path.basename(video_path)}")
 
                 # Delegates all per-video work to the helper
                 tasks_processed, _ = self._process_single_video_tasks(
@@ -2530,12 +2533,16 @@ class SplatterWebUI:
 
                 overall_task_counter += tasks_processed
 
+            # Signal completion
+            if not self.stop_event.is_set():
+                logger.info(f"✅ All processing completed! Processed {len(input_videos)} video(s)")
+                self.progress_queue.put(("complete", f"✅ Processing complete! Processed {len(input_videos)} video(s)", 100))
+
         except Exception as e:
             logger.error(f"An unexpected error occurred during batch processing: {e}", exc_info=True)
+            self.progress_queue.put(("error", f"Error: {str(e)}", 0))
         finally:
             release_cuda_memory()
-            # In Gradio version, we don't need to use after() method
-            # The processing info will be handled by the UI components
 
     def run_fusion_sidecar_generator(self):
         """Initializes and runs the FusionSidecarGenerator tool."""
@@ -2789,7 +2796,7 @@ class SplatterWebUI:
     
     def _generate_preview_frame_at_frame_number(self, video_path: str, depth_path: str, convergence: float, max_disparity: float, frame_number: int) -> tuple[Optional[np.ndarray], int]:
         """
-        Generate preview at a specific frame number.
+        Generate preview at a specific frame number using decord for accurate seeking.
         
         Args:
             video_path: Path to source video
@@ -2801,64 +2808,59 @@ class SplatterWebUI:
         Returns:
             (Preview image (numpy array) or None on error, total_frames)
         """
-        import cv2
         import torch
         from gui.warp import ForwardWarpStereo
+        from decord import VideoReader, cpu
         
         try:
-            # Open video and depth
-            video_cap = cv2.VideoCapture(video_path)
-            depth_cap = cv2.VideoCapture(depth_path)
+            # Open video and depth with decord (much better seeking than OpenCV)
+            video_reader = VideoReader(video_path, ctx=cpu(0))
+            depth_reader = VideoReader(depth_path, ctx=cpu(0))
             
-            if not video_cap.isOpened():
-                logger.error(f"Failed to open video: {video_path}")
-                return None, 0
+            video_total_frames = len(video_reader)
+            depth_total_frames = len(depth_reader)
             
-            if not depth_cap.isOpened():
-                logger.error(f"Failed to open depth map: {depth_path}")
-                video_cap.release()
-                return None, 0
-            
-            # Get total frames and clamp frame number
-            total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            if total_frames == 0:
+            if video_total_frames == 0:
                 logger.error(f"Video has 0 frames: {video_path}")
-                video_cap.release()
-                depth_cap.release()
                 return None, 0
             
-            frame_idx = max(0, min(frame_number, total_frames - 1))
+            if depth_total_frames == 0:
+                logger.error(f"Depth map has 0 frames: {depth_path}")
+                return None, 0
             
-            logger.info(f"Attempting to read frame {frame_idx} of {total_frames} from {os.path.basename(video_path)}")
+            # Clamp frame number to valid range for video
+            frame_idx = max(0, min(frame_number, video_total_frames - 1))
             
-            video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            depth_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            # Handle frame count mismatch between video and depth
+            if video_total_frames != depth_total_frames:
+                # Scale the frame index proportionally for the depth map
+                depth_frame_idx = int((frame_idx / (video_total_frames - 1)) * (depth_total_frames - 1))
+                depth_frame_idx = max(0, min(depth_frame_idx, depth_total_frames - 1))
+                logger.warning(
+                    f"Frame count mismatch: video={video_total_frames}, depth={depth_total_frames}. "
+                    f"Mapping video frame {frame_idx} to depth frame {depth_frame_idx}"
+                )
+            else:
+                depth_frame_idx = frame_idx
             
-            ret_v, video_frame = video_cap.read()
-            ret_d, depth_frame = depth_cap.read()
+            logger.info(f"Reading frame {frame_idx} of {video_total_frames} from {os.path.basename(video_path)}")
             
-            video_cap.release()
-            depth_cap.release()
+            # Decord provides accurate frame-level seeking
+            video_frame = video_reader[frame_idx].asnumpy()  # Returns RGB numpy array (H, W, 3)
+            depth_frame = depth_reader[depth_frame_idx].asnumpy()  # Returns RGB numpy array (H, W, 3)
             
-            if not ret_v:
-                logger.error(f"Failed to read video frame {frame_idx} from {os.path.basename(video_path)}")
-                return None, total_frames
+            # video_frame is already in RGB format from decord
+            video_frame_rgb = video_frame
             
-            if not ret_d:
-                logger.error(f"Failed to read depth frame {frame_idx} from {os.path.basename(depth_path)}")
-                return None, total_frames
-            
-            # Convert video frame to RGB
-            video_frame_rgb = cv2.cvtColor(video_frame, cv2.COLOR_BGR2RGB)
-            
-            # Process depth
+            # Process depth - convert to grayscale if needed
             if len(depth_frame.shape) == 3:
-                depth_frame = cv2.cvtColor(depth_frame, cv2.COLOR_BGR2GRAY)
+                # Convert RGB to grayscale
+                depth_frame = np.dot(depth_frame[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
             
             # Resize depth to match video dimensions
             h, w = video_frame_rgb.shape[:2]
             if depth_frame.shape[:2] != (h, w):
+                import cv2
                 depth_frame = cv2.resize(depth_frame, (w, h), interpolation=cv2.INTER_LINEAR)
             
             depth_normalized = depth_frame.astype(np.float32) / 255.0
@@ -2900,6 +2902,7 @@ class SplatterWebUI:
                 comparison = anaglyph
             elif preview_format == "Depth Map":
                 # Show depth map visualization
+                import cv2
                 depth_vis = (depth_with_convergence * 127.5 + 127.5).astype(np.uint8)
                 depth_vis_rgb = cv2.applyColorMap(depth_vis, cv2.COLORMAP_TURBO)
                 depth_vis_rgb = cv2.cvtColor(depth_vis_rgb, cv2.COLOR_BGR2RGB)
@@ -2912,8 +2915,8 @@ class SplatterWebUI:
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
             
-            logger.info(f"Manual preview generated: frame {frame_idx}/{total_frames}, convergence {convergence:.3f}, disparity {max_disparity:.1f}")
-            return comparison, total_frames
+            logger.info(f"Preview generated successfully: frame {frame_idx}/{video_total_frames-1}, convergence {convergence:.3f}, disparity {max_disparity:.1f}")
+            return comparison, video_total_frames
             
         except Exception as e:
             logger.error(f"Error generating manual preview: {e}")
@@ -3271,6 +3274,13 @@ class SplatterWebUI:
         """Starts the video processing in a separate thread."""
         self.stop_event.clear()
         
+        # Clear the progress queue
+        while not self.progress_queue.empty():
+            try:
+                self.progress_queue.get_nowait()
+            except queue.Empty:
+                break
+        
         # Convert types from Gradio inputs (they may come as strings)
         try:
             max_disp = float(max_disp)
@@ -3431,6 +3441,26 @@ class SplatterWebUI:
         self.processing_thread = threading.Thread(target=self._run_batch_process, args=(settings,))
         self.processing_thread.start()
         return "Processing started...", 50, gr.Button(interactive=False), gr.Button(interactive=False), gr.Button(interactive=True)
+
+    def check_processing_status(self):
+        """Check if processing is complete and return updated UI state."""
+        if self.processing_thread is None or not self.processing_thread.is_alive():
+            # Check for any messages in the queue
+            try:
+                status_type, message, progress = self.progress_queue.get_nowait()
+                if status_type == "complete":
+                    return message, 100, gr.Button(interactive=True), gr.Button(interactive=True), gr.Button(interactive=False)
+                elif status_type == "error":
+                    return message, 0, gr.Button(interactive=True), gr.Button(interactive=True), gr.Button(interactive=False)
+                elif status_type == "stopped":
+                    return message, 0, gr.Button(interactive=True), gr.Button(interactive=True), gr.Button(interactive=False)
+            except queue.Empty:
+                # Thread finished but no status message - assume complete
+                if self.processing_thread is not None and not self.processing_thread.is_alive():
+                    return "✅ Processing complete!", 100, gr.Button(interactive=True), gr.Button(interactive=True), gr.Button(interactive=False)
+        
+        # Still processing - return no updates (use gr.update() to keep current values)
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
     def start_single_processing(self,
                                 input_source_clips, input_depth_maps, output_splatted,
@@ -3999,10 +4029,6 @@ class SplatterWebUI:
                     self.border_width_comp, self.border_bias_comp, self.border_mode_comp, self.color_tags_mode_comp
                 ],
                 outputs=[self.status_label, self.progress_bar, self.start_button, self.start_single_button, self.stop_button]
-            ).then(
-                fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False), gr.Button(interactive=True)),
-                inputs=[],
-                outputs=[self.start_button, self.start_single_button, self.stop_button]
             )
             
             self.start_single_button.click(
@@ -4020,10 +4046,6 @@ class SplatterWebUI:
                     self.border_width_comp, self.border_bias_comp, self.border_mode_comp, self.color_tags_mode_comp
                 ],
                 outputs=[self.status_label, self.progress_bar, self.start_button, self.start_single_button, self.stop_button]
-            ).then(
-                fn=lambda: (gr.Button(interactive=False), gr.Button(interactive=False), gr.Button(interactive=True)),
-                inputs=[],
-                outputs=[self.start_button, self.start_single_button, self.stop_button]
             )
             
             self.stop_button.click(
@@ -4106,6 +4128,14 @@ class SplatterWebUI:
                 fn=lambda conv, disp: (conv, disp, f"✅ Applied convergence {conv:.3f} and disparity {disp:.1f} to main settings"),
                 inputs=[self.preview_convergence_slider, self.preview_disparity_slider],
                 outputs=[self.zero_disparity_anchor_comp, self.max_disp_comp, self.status_label]
+            )
+            
+            # Add a timer to check processing status every 2 seconds
+            status_timer = gr.Timer(value=2.0)
+            status_timer.tick(
+                fn=self.check_processing_status,
+                inputs=[],
+                outputs=[self.status_label, self.progress_bar, self.start_button, self.start_single_button, self.stop_button]
             )
 
         return interface
