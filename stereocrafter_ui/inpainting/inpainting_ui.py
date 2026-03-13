@@ -593,9 +593,9 @@ class InpaintingWebUI:
                     "tile_num": int(args[5]), "frames_chunk": int(args[6]),
                     "frame_overlap": int(args[7]), "original_input_blend_strength": float(args[8]),
                     "output_crf": int(args[9]), "process_length": int(args[10]), "offload_type": args[11],
-                    "mask_initial_threshold": float(args[11]), "mask_morph_kernel_size": float(args[12]),
-                    "mask_dilate_kernel_size": float(args[13]), "mask_blur_kernel_size": float(args[14]),
-                    "enable_post_inpainting_blend": args[15], "enable_color_transfer": args[16]
+                    "mask_initial_threshold": float(args[12]), "mask_morph_kernel_size": float(args[13]),
+                    "mask_dilate_kernel_size": float(args[14]), "mask_blur_kernel_size": float(args[15]),
+                    "enable_post_inpainting_blend": args[16], "enable_color_transfer": args[17]
                 }),
                 inputs=all_params,
                 outputs=[status_label]
@@ -647,6 +647,8 @@ class InpaintingWebUI:
 
     def start_processing(self, *args, progress=gr.Progress()):
         """Start batch processing"""
+        logger.info("=== Start button clicked ===")
+        
         # Extract parameters
         (input_folder, output_folder, hires_blend_folder,
          num_inference_steps, decode_chunk_size, tile_num, frames_chunk, frame_overlap,
@@ -654,6 +656,9 @@ class InpaintingWebUI:
          mask_initial_threshold, mask_morph_kernel_size,
          mask_dilate_kernel_size, mask_blur_kernel_size,
          enable_post_inpainting_blend, enable_color_transfer) = args
+
+        logger.info(f"Input folder: {input_folder}")
+        logger.info(f"Output folder: {output_folder}")
 
         # Validate
         try:
@@ -667,17 +672,21 @@ class InpaintingWebUI:
             process_length = int(process_length)
 
             if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1:
+                logger.error("Invalid parameter values")
                 return ("❌ Error: Invalid parameter values", 0, "0/0", "N/A", "N/A", "N/A", "N/A", "N/A",
                        gr.update(interactive=True), gr.update(interactive=False))
-        except ValueError:
+        except ValueError as e:
+            logger.error(f"Invalid numeric values: {e}")
             return ("❌ Error: Please enter valid numeric values", 0, "0/0", "N/A", "N/A", "N/A", "N/A", "N/A",
                    gr.update(interactive=True), gr.update(interactive=False))
 
         if not os.path.isdir(input_folder):
+            logger.error(f"Input folder does not exist: {input_folder}")
             return (f"❌ Error: Input folder '{input_folder}' does not exist", 0, "0/0", "N/A", "N/A", "N/A", "N/A", "N/A",
                    gr.update(interactive=True), gr.update(interactive=False))
 
         os.makedirs(output_folder, exist_ok=True)
+        logger.info("Validation passed, starting processing thread...")
 
         # Store parameters
         params = {
@@ -817,12 +826,20 @@ class InpaintingWebUI:
     def process_batch(self, params):
         """Main batch processing function"""
         try:
+            logger.info("=== Starting batch processing ===")
+            logger.info(f"Input folder: {params['input_folder']}")
+            logger.info(f"Output folder: {params['output_folder']}")
+            
             # Load pipeline
             self.progress_queue.put(("status", "Loading inpainting pipeline..."))
+            logger.info("Loading inpainting pipeline...")
             
             # Use local weights loader (loads StereoCrafter UNet without subfolder)
             svd_path = os.path.abspath("./weights/stable-video-diffusion-img2vid-xt-1-1")
             unet_path = os.path.abspath("./weights/StereoCrafter")
+            
+            logger.info(f"SVD path: {svd_path}")
+            logger.info(f"UNet path: {unet_path}")
             
             self.pipeline = load_inpainting_pipeline_local(
                 svd_path=svd_path,
@@ -831,15 +848,20 @@ class InpaintingWebUI:
                 dtype=torch.float16,
                 offload_type=params['offload_type']
             )
+            
+            logger.info("Pipeline loaded successfully")
 
             # Find videos
+            logger.info(f"Scanning for videos in: {params['input_folder']}")
             input_videos = self.scan_for_videos(params['input_folder'])
             if not input_videos:
+                logger.warning("No splatted videos found")
                 self.progress_queue.put(("status", "No splatted videos found"))
                 self.progress_queue.put(("batch_progress", "0/0"))
                 return
 
             total_videos = len(input_videos)
+            logger.info(f"Found {total_videos} videos to process")
             self.progress_queue.put(("status", f"Processing {total_videos} videos..."))
             self.progress_queue.put(("batch_progress", f"0/{total_videos}"))
 
