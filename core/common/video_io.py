@@ -15,10 +15,15 @@ from typing import Optional, Tuple
 import subprocess  # Needed for FFmpeg-based preview readers
 
 import numpy as np
-from decord import VideoReader, cpu
 
+# Import torch BEFORE decord to avoid DLL conflicts on Windows
+# See: https://github.com/dmlc/decord/issues/174
+import torch
 from core.common.gpu_utils import CUDA_AVAILABLE
 from core.common.encoding_utils import build_encoder_args, get_encoding_config_from_dict
+
+# Import decord after torch
+from decord import VideoReader, cpu
 
 logger = logging.getLogger(__name__)
 
@@ -638,7 +643,7 @@ def encode_frames_to_mp4(
 
     output_codec, output_pix_fmt, default_cpu_crf, output_profile = "libx264", "yuv420p", "23", "main"
 
-    enc_config = get_encoding_config_from_dict(encoding_options or {})
+    enc_config = get_encoding_config_from_dict({})  # Use empty dict as default
     crf = user_output_crf if user_output_crf is not None else enc_config.get("crf", 23)
 
     is_hdr = (

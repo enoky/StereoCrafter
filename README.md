@@ -68,11 +68,18 @@ Under **Pod Template**, click **Edit** and enter the following:
 | **Container Name** | `johnsdoes/stereocrafter-webui:latest` |
 | **Container Disk** | `300 GB` *(Cost: ~$0.042/hr)* |
 | **Volume Disk** | `0 GB` |
-| **Expose HTTP Ports** | `7860` |
+| **Expose HTTP Ports Stereocrafter** | `7860` |
+| **Expose HTTP Ports FileBrowser** | `8080` |
 
 ### 4. Environment Variables
 *   **Key:** `HF_TOKEN`
 *   **Value:** `your huggingface read token`
+*   **Key:** `FB_USERNAME`
+*   **Value:** `your Filebrowsr username`
+*   **Key:** `FB_PASSWORD`
+*   **Value:** `your Filebrowser password`
+
+
 
 ### 5. Deploy
 *   Click **Set Overrides**
@@ -111,6 +118,39 @@ docker compose up -d
 docker compose logs -f
 
 # Access the WebUI at http://localhost:7860
+```
+
+**With FileBrowser (optional):**
+
+FileBrowser gives you a web-based file manager at port 8080 to browse/upload/download your input and output files.
+
+Set credentials in `.env` before first run (minimum 12 characters for password):
+
+```env
+HF_TOKEN=your_huggingface_token_here
+FB_USERNAME=admin
+FB_PASSWORD=adminadmin12
+```
+
+Then start with the FileBrowser compose file:
+
+```bash
+# Build the FileBrowser image (first time only)
+docker build -f Dockerfile.filebrowser -t stereocrafter-filebrowser:local .
+
+# Start with FileBrowser
+docker-compose -f docker-compose.filebrowser.yml up -d
+
+# Access:
+#   StereoCrafter WebUI → http://localhost:7860
+#   FileBrowser         → http://localhost:8080
+```
+
+To reset FileBrowser credentials:
+```bash
+docker-compose -f docker-compose.filebrowser.yml down
+docker volume rm stereocrafter_filebrowser-data
+docker-compose -f docker-compose.filebrowser.yml up -d
 ```
 
 **Customizing Mounts:**
