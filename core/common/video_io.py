@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 import subprocess  # Needed for FFmpeg-based preview readers
 
 import numpy as np
+import torch
 from decord import VideoReader, cpu
 
 from core.common.gpu_utils import CUDA_AVAILABLE
@@ -904,3 +905,27 @@ def start_ffmpeg_pipe_process_dnxhr(
     ]
     logger.info(f"Starting DNxHR pipe: {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def reverse_frames(frames: torch.Tensor) -> torch.Tensor:
+    """Reverse the temporal order of video frames.
+
+    Args:
+        frames: Tensor of shape [T, C, H, W] or [T, H, W, C]
+
+    Returns:
+        Reversed frames tensor
+    """
+    return torch.flip(frames, dims=[0])
+
+
+def reverse_frames_numpy(frames: np.ndarray) -> np.ndarray:
+    """Reverse the temporal order of video frames (numpy).
+
+    Args:
+        frames: Numpy array of shape [T, H, W, C] or [T, H, W]
+
+    Returns:
+        Reversed frames array
+    """
+    return np.flip(frames, axis=0)

@@ -21,13 +21,13 @@ dependencies = [
     "openexr>=3.4.4",
     "pyperclip>=1.11.0",
     "tkinterdnd2>=0.4.3",
-    "torch==2.9.1",
-    "torchaudio==2.9.1",
-    "torchvision==0.24.1",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
     "transformers>=5.1.0",
     "triton-windows>=3.6.0.post25",
     "ttkthemes>=3.3.0",
-    "xformers==0.0.33.post2",
+    "xformers>=0.0.33.post2",
 ]
 
 [[tool.uv.index]]

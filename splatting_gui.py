@@ -56,6 +56,7 @@ except ImportError:
 
 # Import custom modules
 CUDA_AVAILABLE = False  # start state, will check automaticly later
+GUI_VERSION = "26-03-08.2"
 
 # --- MODIFIED IMPORT ---
 from core.common.video_io import start_ffmpeg_pipe_process
@@ -82,9 +83,6 @@ except:
 
     logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
-
-GUI_VERSION = "26-03-08.2"
-
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
 from core.splatting import FusionSidecarGenerator
@@ -132,7 +130,7 @@ class SplatterGUI(ThemedTk):
 
     # --- GLOBAL CONFIGURATION DICTIONARY ---
     # Common video extensions for filtering
-    VIDEO_EXTS = ['.mp4', '.mkv', '.mov', '.avi', '.webm', '.ts', '.m4v']
+    VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v"]
 
     APP_CONFIG_DEFAULTS = {
         # File Extensions
