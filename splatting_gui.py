@@ -115,7 +115,7 @@ from core.splatting.forward_warp import execute_forward_warp
 from core.splatting.config_manager import ConfigManager
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
-from core.ui import ThemeManager, SBSPreviewWindow, init_dnd, register_dnd_entries, configure_dnd_styles
+from core.ui import ThemeManager, init_dnd, register_dnd_entries, configure_dnd_styles
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
@@ -235,14 +235,6 @@ class SplatterGUI(ThemedTk):
         self._gn_warning_shown: bool = False
         self._suppress_buffer_invalidation: bool = False
 
-        # --- SBS preview (separate window; preview-only) ---
-
-        self.sbs_window_obj = None  # Reusable window object
-        self._sbs_dp_signature = None
-        self._sbs_dp_total_max_seen = None
-        self._sbs_dp_depth_pct = None
-        self._sbs_dp_pop_pct = None
-
         self._load_config()
         self._load_help_texts()
 
@@ -319,7 +311,6 @@ class SplatterGUI(ThemedTk):
         self.crosshair_multi_var = tk.BooleanVar(value=False)
         self.depth_pop_enabled_var = tk.BooleanVar(value=False)
         self.flip_horizontal_var = tk.BooleanVar(value=False)
-        self.sbs_enabled_var = tk.BooleanVar(value=False)
         self.auto_convergence_mode_var = tk.StringVar(value="Off")
         self.depth_gamma_var = tk.StringVar(value=defaults["DEPTH_GAMMA"])
         self.depth_dilate_size_x_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_X"])
@@ -410,10 +401,6 @@ class SplatterGUI(ThemedTk):
         # (Initial BooleanVar state does not trigger the checkbox command.)
         self.after(20, self._apply_preview_overlay_toggles)
 
-        # Re-open SBS window if it was enabled in config
-        if self.sbs_enabled_var.get():
-            self.after(25, self._on_sbs_toggle)
-
         self.after(100, self.check_queue)  # Start checking progress queue
 
         self.protocol("WM_DELETE_WINDOW", self.exit_app)
@@ -436,35 +423,29 @@ class SplatterGUI(ThemedTk):
             current_actual_width = self.window_width
 
         # --- NEW: More accurate height calculation ---
-        # --- FIX: Calculate base_height by summing widgets *other* than the previewer ---
-        # This is more stable than subtracting a potentially out-of-sync canvas height.
+        # Sum heights of all packed children (the previewer frame now only contains controls).
         base_height = 0
         for widget in self.winfo_children():
-            if widget is not self.previewer:
-                # --- FIX: Correctly handle tuple and int for pady ---
-                try:
-                    pady_value = widget.pack_info().get("pady", 0)
-                    total_pady = 0
-                    if isinstance(pady_value, int):
-                        total_pady = pady_value * 2
-                    elif isinstance(pady_value, (tuple, list)):
-                        total_pady = sum(pady_value)
-                    base_height += widget.winfo_reqheight() + total_pady
-                except tk.TclError:
-                    # This widget (e.g., the menubar) is not packed, so it has no pady.
-                    base_height += widget.winfo_reqheight()
+            # --- FIX: Correctly handle tuple and int for pady ---
+            try:
+                pady_value = widget.pack_info().get("pady", 0)
+                total_pady = 0
+                if isinstance(pady_value, int):
+                    total_pady = pady_value * 2
+                elif isinstance(pady_value, (tuple, list)):
+                    total_pady = sum(pady_value)
+                base_height += widget.winfo_reqheight() + total_pady
+            except tk.TclError:
+                # This widget (e.g., the menubar) is not packed, so it has no pady.
+                base_height += widget.winfo_reqheight()
         # --- END FIX ---
-
-        # Get the actual height of the displayed preview image, if it exists
-        preview_image_height = 0
-        if hasattr(self.previewer, "preview_image_tk") and self.previewer.preview_image_tk:
-            preview_image_height = self.previewer.preview_image_tk.height()
 
         # Add a small buffer for padding/borders
         padding = 10
 
-        # The new total height is the base UI height + the actual image height + padding
-        new_height = base_height + preview_image_height + padding
+        # The new total height is the base UI height + padding.
+        # The preview image is now in a separate Toplevel (canvas_window).
+        new_height = base_height + padding
         # --- END NEW ---
 
         self.geometry(f"{current_actual_width}x{new_height}")
@@ -490,8 +471,8 @@ class SplatterGUI(ThemedTk):
             self.theme_manager.apply_theme_to_menus(menus=menu_list, menubar=self.menubar)
 
         # Previewer Canvas
-        if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
-            self.theme_manager.apply_theme_to_canvas(self.previewer.preview_canvas)
+        if hasattr(self, "previewer") and hasattr(self.previewer, "canvas_window"):
+            self.theme_manager.apply_theme_to_canvas(self.previewer.canvas_window.preview_canvas)
 
         # Info Labels
         if hasattr(self, "info_frame") and hasattr(self, "info_labels"):
@@ -586,28 +567,9 @@ class SplatterGUI(ThemedTk):
         """
         Callback invoked every time a preview frame is displayed.
 
-        This handles SBS window updates, using cached data when available.
         Called whether the frame was freshly processed or retrieved from cache.
         """
-        if not hasattr(self, "sbs_enabled_var") or not self.sbs_enabled_var.get():
-            return
-        if not hasattr(self, "sbs_window_obj") or not self.sbs_window_obj:
-            return
-
-        # Try to use cached SBS frame data
-        cached_sbs = self.previewer.get_cached_sbs_frame(frame_idx)
-
-        if cached_sbs is not None:
-            left_np, right_np = cached_sbs
-            left_tensor = torch.from_numpy(left_np).permute(2, 0, 1).float() / 255.0
-            right_tensor = torch.from_numpy(right_np).permute(2, 0, 1).float() / 255.0
-            left_tensor = left_tensor.unsqueeze(0)
-            right_tensor = right_tensor.unsqueeze(0)
-            self.sbs_window_obj.update_frame(left_tensor, right_tensor, overlays_callback=self._draw_sbs_overlays)
-        elif not frame_was_cached:
-            # Frame was just processed, SBS should already be updated in callback
-            # This is a fallback in case SBS wasn't updated
-            pass
+        pass
 
     def _browse_folder(self, var):
         """Opens a folder dialog and updates a StringVar."""
@@ -1682,6 +1644,7 @@ class SplatterGUI(ThemedTk):
             "Anaglyph 3D",
             "Dubois Anaglyph",
             "Optimized Anaglyph",
+            "Side-by-Side",
             "Wigglegram",
         ]
         if not self.preview_source_var.get():
@@ -2238,13 +2201,6 @@ class SplatterGUI(ThemedTk):
         )
         self.depth_pop_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.depth_pop_checkbox, "depth_pop_readout")
-
-        # SBS preview (separate window; preview-only)
-        self.sbs_checkbox = ttk.Checkbutton(
-            checkbox_row, text="SBS", variable=self.sbs_enabled_var, takefocus=False, command=self._on_sbs_toggle
-        )
-        self.sbs_checkbox.pack(side="left", padx=(24, 0))
-        self._create_hover_tooltip(self.sbs_checkbox, "sbs_preview")
 
         self.flip_horizontal_checkbox = ttk.Checkbutton(
             checkbox_row,
@@ -3934,8 +3890,7 @@ class SplatterGUI(ThemedTk):
         try:
             if getattr(self, "previewer", None) is not None and hasattr(self.previewer, "set_depth_pop_metrics"):
                 show_metrics = bool(self.depth_pop_enabled_var.get()) and (
-                    preview_source in ("Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph")
-                    or (getattr(self, "sbs_enabled_var", None) is not None and self.sbs_enabled_var.get())
+                    preview_source in ("Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph", "Side-by-Side")
                 )
                 if show_metrics:
                     _stride = 8  # sample stride for speed (1/64 pixels)
@@ -3966,34 +3921,11 @@ class SplatterGUI(ThemedTk):
                     except Exception:
                         sig = None
 
-                    # SBS window metrics (independent of main preview overlay)
-                    try:
-                        if getattr(self, "sbs_enabled_var", None) is not None and bool(self.sbs_enabled_var.get()):
-                            self._sbs_dp_depth_pct = _depth_pct
-                            self._sbs_dp_pop_pct = _pop_pct
-                            if sig is not None and sig != getattr(self, "_sbs_dp_signature", None):
-                                self._sbs_dp_signature = sig
-                                self._sbs_dp_total_max_seen = None
-                            total_pct = float(_depth_pct) + float(_pop_pct)
-                            cur_max = getattr(self, "_sbs_dp_total_max_seen", None)
-                            if cur_max is None or total_pct > float(cur_max):
-                                self._sbs_dp_total_max_seen = total_pct
-                    except Exception:
-                        pass
-
                     try:
                         self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct, sig)
                     except TypeError:
                         self.previewer.set_depth_pop_metrics(_depth_pct, _pop_pct)
                 else:
-                    # Clear SBS D/P state when not showing metrics
-                    try:
-                        self._sbs_dp_depth_pct = None
-                        self._sbs_dp_pop_pct = None
-                        self._sbs_dp_signature = None
-                        self._sbs_dp_total_max_seen = None
-                    except Exception:
-                        pass
                     try:
                         self.previewer.set_depth_pop_metrics(None, None, None)
                     except TypeError:
@@ -4111,36 +4043,19 @@ class SplatterGUI(ThemedTk):
             self.previewer._start_wigglegram_animation(left_eye_tensor_resized, right_eye_tensor)
             return None
 
+        elif preview_source == "Side-by-Side":
+            # Concatenate left and right eye as SBS image
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                sbs_np = np.concatenate([right_np, left_np], axis=1)
+            else:
+                sbs_np = np.concatenate([left_np, right_np], axis=1)
+            return Image.fromarray(sbs_np)
+
         else:
             # For non-3D modes, final_tensor is already set
             pass
-
-        # --- SBS Window Update ---
-        if hasattr(self, "sbs_enabled_var") and self.sbs_enabled_var.get():
-            # Update window
-            if self.sbs_window_obj and self.sbs_window_obj.exists():
-                self.sbs_window_obj.update_frame(
-                    left_eye_tensor_resized, right_eye_tensor, overlays_callback=self._draw_sbs_overlays
-                )
-
-            # Cache for fast playback
-            if hasattr(self.previewer, "cache_sbs_frame"):
-                try:
-                    # Convert to uint8 numpy for compact storage
-                    l_np = (
-                        (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0)
-                        .clip(0, 255)
-                        .astype(np.uint8)
-                    )
-                    r_np = (
-                        (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0)
-                        .clip(0, 255)
-                        .astype(np.uint8)
-                    )
-                    frame_idx = int(self.previewer.frame_scrubber_var.get())
-                    self.previewer.cache_sbs_frame(frame_idx, l_np, r_np)
-                except Exception as e:
-                    logger.debug(f"SBS Caching failed: {e}")
 
         # --- End SBS Update ---
 
@@ -6435,100 +6350,6 @@ class SplatterGUI(ThemedTk):
             logger.info(f"Test outputs saved to: {output_dir} ({kind}:{task_name}{ffmpeg_tag})")
         except Exception as e:
             logger.error(f"Diagnostic capture save failed: {e}", exc_info=True)
-
-    # ============================
-    # SBS Preview Window (Update B) - Refactored to core.ui
-    # ============================
-
-    def _on_sbs_toggle(self):
-        """Toggle the external SBS preview window (preview-only)."""
-        enabled = bool(getattr(self, "sbs_enabled_var", None) is not None and self.sbs_enabled_var.get())
-        if enabled:
-            if not self.sbs_window_obj or not self.sbs_window_obj.exists():
-                self.sbs_window_obj = SBSPreviewWindow(self, on_close_callback=lambda: self.sbs_enabled_var.set(False))
-            self.sbs_window_obj.lift()
-
-            # One-time auto-switch main preview to splat result
-            if getattr(self, "preview_source_var", None) is not None:
-                if str(self.preview_source_var.get()) != "Splat Result":
-                    self.preview_source_var.set("Splat Result")
-
-            if hasattr(self, "previewer"):
-                self.previewer.update_preview()
-        else:
-            if self.sbs_window_obj:
-                self.sbs_window_obj.destroy()
-
-    def _update_sbs_preview_window(self, left_eye_tensor, right_eye_tensor):
-        """Update SBS window with Left=Original, Right=Splatted."""
-        if not self.sbs_window_obj or not self.sbs_window_obj.exists():
-            return
-
-        # Try to get cached SBS frame data
-        frame_idx = int(self.previewer.frame_scrubber_var.get())
-        cached_sbs = self.previewer.get_cached_sbs_frame(frame_idx)
-
-        if cached_sbs is not None:
-            left_np, right_np = cached_sbs
-            # Convert numpy arrays back to tensors for the update_frame method
-            left_tensor = torch.from_numpy(left_np).permute(2, 0, 1).float() / 255.0
-            right_tensor = torch.from_numpy(right_np).permute(2, 0, 1).float() / 255.0
-            left_tensor = left_tensor.unsqueeze(0)
-            right_tensor = right_tensor.unsqueeze(0)
-            self.sbs_window_obj.update_frame(left_tensor, right_tensor, overlays_callback=self._draw_sbs_overlays)
-        elif left_eye_tensor is not None and right_eye_tensor is not None:
-            self.sbs_window_obj.update_frame(
-                left_eye_tensor, right_eye_tensor, overlays_callback=self._draw_sbs_overlays
-            )
-
-    def _draw_sbs_overlays(self, img: Image.Image, sbs_obj):
-        """Draw Crosshair + D/P overlays onto the SBS PIL image."""
-        w_img, h_img = img.size
-        half_w = w_img // 2
-        draw = ImageDraw.Draw(img)
-
-        # Crosshair overlay
-        try:
-            if bool(self.crosshair_enabled_var.get()):
-                color = (255, 255, 255) if bool(self.crosshair_white_var.get()) else (0, 0, 0)
-                multi = bool(self.crosshair_multi_var.get())
-                sbs_obj.draw_bullseye_overlay(draw, 0, half_w, h_img, color, multi)
-                sbs_obj.draw_bullseye_overlay(draw, half_w, half_w, h_img, color, multi)
-        except Exception:
-            pass
-
-        # Depth/Pop overlay
-        try:
-            if bool(self.depth_pop_enabled_var.get()):
-                d_pct = getattr(self, "_sbs_dp_depth_pct", None)
-                p_pct = getattr(self, "_sbs_dp_pop_pct", None)
-                if d_pct is not None and p_pct is not None:
-                    color = (255, 255, 255) if bool(self.crosshair_white_var.get()) else (0, 0, 0)
-                    total_pct = float(d_pct) + float(p_pct)
-                    txt = f"{float(d_pct):.1f}/{float(p_pct):.1f}% ({total_pct:.1f})"
-                    max_total = getattr(self, "_sbs_dp_total_max_seen", None) or total_pct
-                    max_txt = f"Max:{float(max_total):.1f}%"
-
-                    # Get font (best effort)
-                    try:
-                        font_size = max(10, min(20, int(h_img * 0.025)))
-                        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
-                    except Exception:
-                        try:
-                            font = ImageFont.truetype("arial.ttf", font_size)
-                        except Exception:
-                            font = ImageFont.load_default()
-
-                    bbox = draw.textbbox((0, 0), txt, font=font)
-                    tw, th = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
-                    y_txt = h_img - th - 10
-                    for x_off in (0, half_w):
-                        cx = x_off + (half_w // 2)
-                        draw.text((cx - (tw // 2), y_txt), txt, fill=color, font=font)
-                        mw = draw.textbbox((0, 0), max_txt, font=font)[2] - draw.textbbox((0, 0), max_txt, font=font)[0]
-                        draw.text((x_off + half_w - mw - 10, y_txt), max_txt, fill=color, font=font)
-        except Exception:
-            pass
 
 
 # [REFACTORED] Depth processing functions imported from core module

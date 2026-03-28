@@ -304,8 +304,8 @@ class MergingGUI(ThemedTk):
             self.theme_manager.apply_theme_to_menus(menus=menus, menubar=self.menubar)
 
         # Previewer Canvas
-        if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
-            self.theme_manager.apply_theme_to_canvas(self.previewer.preview_canvas)
+        if hasattr(self, "previewer") and hasattr(self.previewer, "canvas_window"):
+            self.theme_manager.apply_theme_to_canvas(self.previewer.canvas_window.preview_canvas)
 
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
@@ -447,35 +447,29 @@ class MergingGUI(ThemedTk):
             current_actual_width = self.window_width
 
         # --- NEW: More accurate height calculation ---
-        # --- FIX: Calculate base_height by summing widgets *other* than the previewer ---
-        # This is more stable than subtracting a potentially out-of-sync canvas height.
+        # Sum heights of all packed children (the previewer frame now only contains controls).
         base_height = 0
         for widget in self.winfo_children():
-            if widget is not self.previewer:
-                # --- FIX: Correctly handle tuple and int for pady ---
-                try:
-                    pady_value = widget.pack_info().get("pady", 0)
-                    total_pady = 0
-                    if isinstance(pady_value, int):
-                        total_pady = pady_value * 2
-                    elif isinstance(pady_value, (tuple, list)):
-                        total_pady = sum(pady_value)
-                    base_height += widget.winfo_reqheight() + total_pady
-                except tk.TclError:
-                    # This widget (e.g., the menubar) is not packed, so it has no pady.
-                    base_height += widget.winfo_reqheight()
+            # --- FIX: Correctly handle tuple and int for pady ---
+            try:
+                pady_value = widget.pack_info().get("pady", 0)
+                total_pady = 0
+                if isinstance(pady_value, int):
+                    total_pady = pady_value * 2
+                elif isinstance(pady_value, (tuple, list)):
+                    total_pady = sum(pady_value)
+                base_height += widget.winfo_reqheight() + total_pady
+            except tk.TclError:
+                # This widget (e.g., the menubar) is not packed, so it has no pady.
+                base_height += widget.winfo_reqheight()
         # --- END FIX ---
-
-        # Get the actual height of the displayed preview image, if it exists
-        preview_image_height = 0
-        if hasattr(self.previewer, "preview_image_tk") and self.previewer.preview_image_tk:
-            preview_image_height = self.previewer.preview_image_tk.height()
 
         # Add a small buffer for padding/borders
         padding = 10
 
-        # The new total height is the base UI height + the actual image height + padding
-        new_height = base_height + preview_image_height + padding
+        # The new total height is the base UI height + padding.
+        # The preview image is now in a separate Toplevel (canvas_window).
+        new_height = base_height + padding
         # --- END NEW ---
 
         self.geometry(f"{current_actual_width}x{new_height}")
@@ -752,16 +746,16 @@ class MergingGUI(ThemedTk):
         self.progress_bar.pack(fill="x")
 
         # Current Filename
-        self.filename_label = ttk.Label(
-            progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")
-        )
-        self.filename_label.pack(pady=(5, 0))
+        # self.filename_label = ttk.Label(
+        #     progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")
+        # )
+        # self.filename_label.pack(pady=(5, 0))
 
         self.status_label_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
-        self.status_label.pack(pady=5)
+        self.status_label.pack(pady=1)
 
-        buttons_frame = ttk.Frame(self, padding=10)
+        buttons_frame = ttk.Frame(self, padding=1)
         buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(buttons_frame, text="Start Blending", command=self.start_processing)
         self.start_button.pack(side="left", padx=5, expand=True)
@@ -2113,6 +2107,7 @@ class MergingGUI(ThemedTk):
                 "Anaglyph 3D",
                 "Dubois Anaglyph",
                 "Optimized Anaglyph",
+                "Side-by-Side",
                 "Wigglegram",
             ]
             if not is_dual_input:
@@ -2220,6 +2215,17 @@ class MergingGUI(ThemedTk):
             elif preview_source == "Optimized Anaglyph":
                 if original_left is not None:
                     final_frame_4d = apply_optimized_anaglyph_torch(original_left, blended_frame)
+                else:
+                    final_frame_4d = blended_frame
+            elif preview_source == "Side-by-Side":
+                if original_left is not None:
+                    left_np = (original_left[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    right_np = (blended_frame[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                        sbs_np = np.concatenate([right_np, left_np], axis=1)
+                    else:
+                        sbs_np = np.concatenate([left_np, right_np], axis=1)
+                    return Image.fromarray(sbs_np)
                 else:
                     final_frame_4d = blended_frame
             elif preview_source == "Wigglegram":

@@ -5,6 +5,7 @@ including theming, preview windows, and frame buffering for the UI.
 """
 
 from .sbs_preview import SBSPreviewWindow
+from .preview_canvas_window import PreviewCanvasWindow
 from .theme_manager import ThemeManager, DARK_COLORS, LIGHT_COLORS, get_theme_colors
 from .preview_buffer import PreviewFrameBuffer
 from .encoding_settings import EncodingSettingsDialog, create_encoding_dialog
@@ -12,6 +13,7 @@ from .dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
 __all__ = [
     "SBSPreviewWindow",
+    "PreviewCanvasWindow",
     "ThemeManager",
     "DARK_COLORS",
     "LIGHT_COLORS",
