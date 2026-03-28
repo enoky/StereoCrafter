@@ -27,7 +27,6 @@ These settings determine the resolution at which the splatting process will occu
 - **Dual Output Only:** If checked, will generate dual panel (Right Eye Inpaint + Occlusion Mask) for inpainting. Unchecked will generate quad panel (Left, Depth, Occlusion, Right) for debugging or manual blending.
 - **Flip Horizontal:** Horizontally flips both the source video and depth map. This is useful for scenes where movement is primarily left-to-right, as the inpainting model is optimized for right-side holes. The **Merging GUI** will automatically flip the result back to its original orientation during the final assembly.
 
-
 ### 3. Splatting & Output Settings
 
 These parameters configure the core splatting and output encoding process.
@@ -40,6 +39,7 @@ These parameters configure the core splatting and output encoding process.
   - **Peak:** Simple auto-convergence derived from the temporal maximum of the center 75% depth region.
   - **Hybrid:** Combines Average and Peak (50/50 blend).
 - **Encoding Settings:** Access video encoding options via **Options → Encoding Settings...** menu.
+  - **Codec**: H.264/H.265
   - **Encoder**: Auto (uses NVENC if available) or Force CPU
   - **Quality Preset**: Fastest → Slowest (slower = better compression)
   - **CPU Tune**: Film, Grain, Animation, etc. (for CPU encoding only)

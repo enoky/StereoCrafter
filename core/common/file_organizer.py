@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional, Callable
 
 
 def move_single_file(
-    src_path: str, dest_folder: str, logger: Optional[logging.Logger] = None
+    src_path: str, dest_folder: str, logger: Optional[logging.Logger] = None, max_retries: int = 1, retry_delay: float = 0.5
 ) -> Tuple[bool, Optional[str]]:
     """
     Moves a single file to a 'finished' subfolder within dest_folder.
@@ -17,6 +17,8 @@ def move_single_file(
         src_path: Source file path
         dest_folder: Destination folder (finished subfolder will be created inside)
         logger: Optional logger for output
+        max_retries: Number of attempts to try before failing
+        retry_delay: Delay between attempts
 
     Returns:
         Tuple of (success: bool, error_message: Optional[str])
@@ -24,32 +26,44 @@ def move_single_file(
     if not os.path.exists(src_path):
         return True, None  # File doesn't exist, consider it moved
 
-    try:
-        finished_dir = os.path.join(dest_folder, "finished")
-        os.makedirs(finished_dir, exist_ok=True)
+    for attempt in range(max_retries):
+        try:
+            finished_dir = os.path.join(dest_folder, "finished")
+            os.makedirs(finished_dir, exist_ok=True)
 
-        dest_path = os.path.join(finished_dir, os.path.basename(src_path))
+            dest_path = os.path.join(finished_dir, os.path.basename(src_path))
 
-        if os.path.exists(dest_path):
-            os.remove(src_path)
+            if os.path.exists(dest_path):
+                os.remove(src_path)
+                if logger:
+                    logger.info(f"Removed source file (destination exists): {os.path.basename(src_path)}")
+            else:
+                shutil.move(src_path, finished_dir)
+                if logger:
+                    logger.info(f"Moved {os.path.basename(src_path)} to {finished_dir}")
+
+            return True, None
+        except PermissionError as e:
+            error_msg = f"File in use: {e}"
+            if attempt < max_retries - 1:
+                if logger:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries}: {error_msg}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                continue
             if logger:
-                logger.info(f"Removed source file (destination exists): {os.path.basename(src_path)}")
-        else:
-            shutil.move(src_path, finished_dir)
+                logger.error(f"Failed to move {os.path.basename(src_path)} after {max_retries} attempts: {error_msg}")
+            return False, error_msg
+        except Exception as e:
+            error_msg = str(e)
+            if attempt < max_retries - 1:
+                if logger:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries}: {error_msg}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                continue
             if logger:
-                logger.info(f"Moved {os.path.basename(src_path)} to {finished_dir}")
-
-        return True, None
-    except PermissionError as e:
-        error_msg = f"File in use: {e}"
-        if logger:
-            logger.error(f"Failed to move {os.path.basename(src_path)}: {error_msg}")
-        return False, error_msg
-    except Exception as e:
-        error_msg = str(e)
-        if logger:
-            logger.error(f"Failed to move {os.path.basename(src_path)}: {error_msg}")
-        return False, error_msg
+                logger.error(f"Failed to move {os.path.basename(src_path)} after {max_retries} attempts: {error_msg}")
+            return False, error_msg
+    return False, "Unknown error"
 
 
 def move_files_to_finished(
@@ -57,6 +71,8 @@ def move_files_to_finished(
     logger: Optional[logging.Logger] = None,
     wait_before_move: float = 0.0,
     close_handles_callback: Optional[Callable[[], None]] = None,
+    max_retries: int = 5,
+    retry_delay: float = 0.5,
 ) -> Tuple[int, int, List[Tuple[str, str]]]:
     """
     Synchronously moves files to 'finished' subfolders.
@@ -66,6 +82,8 @@ def move_files_to_finished(
         logger: Optional logger for output
         wait_before_move: Seconds to wait before moving (helps with file handle release)
         close_handles_callback: Optional callback to release file handles before moving
+        max_retries: Number of attempts to try before failing
+        retry_delay: Delay between attempts
 
     Returns:
         Tuple of (moved_count, failed_count, list of (filename, error_message) for failures)
@@ -84,7 +102,7 @@ def move_files_to_finished(
             moved_count += 1
             continue
 
-        success, error_msg = move_single_file(src_path, dest_folder, logger)
+        success, error_msg = move_single_file(src_path, dest_folder, logger, max_retries, retry_delay)
 
         if success:
             moved_count += 1
@@ -179,7 +197,7 @@ class FileOrganizerWorker:
             # Try to move the file with retries
             success = False
             for attempt in range(self.max_retries):
-                result, error_msg = move_single_file(src_path, dest_folder, self.logger)
+                result, error_msg = move_single_file(src_path, dest_folder, logger=self.logger, max_retries=1)
 
                 if result:
                     success = True
@@ -255,21 +273,29 @@ def restore_finished_files(
             src_path = os.path.join(finished_path, filename)
             dest_path = os.path.join(input_folder, filename)
 
-            try:
-                if os.path.exists(dest_path):
-                    os.remove(src_path)
+            for attempt in range(5):
+                try:
+                    if os.path.exists(dest_path):
+                        os.remove(src_path)
+                        if logger:
+                            logger.info(f"Removed duplicate from finished: {filename}")
+                    else:
+                        shutil.move(src_path, input_folder)
+                        if logger:
+                            logger.info(f"Restored '{filename}' from finished to {input_folder}")
+                    restored_count += 1
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    if attempt < 4:
+                        if logger:
+                            logger.warning(f"Error restoring '{filename}': {error_msg}. Retrying in 0.5s...")
+                        time.sleep(0.5)
+                        continue
                     if logger:
-                        logger.info(f"Removed duplicate from finished: {filename}")
-                else:
-                    shutil.move(src_path, input_folder)
-                    if logger:
-                        logger.info(f"Restored '{filename}' from finished to {input_folder}")
-                restored_count += 1
-            except Exception as e:
-                error_msg = str(e)
-                if logger:
-                    logger.error(f"Error restoring '{filename}': {error_msg}")
-                failed_files.append((filename, error_msg))
+                        logger.error(f"Error restoring '{filename}' after 5 attempts: {error_msg}")
+                    failed_files.append((filename, error_msg))
+                    break
 
         # Remove empty finished folder
         try:

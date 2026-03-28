@@ -93,6 +93,7 @@ class RenderProcessor:
         dnxhr_profile: str = "HQX",
         is_test_mode: bool = False,
         test_target_frame_idx: Optional[int] = None,
+        mask_mode: str = "SC",
     ) -> bool:
         """Core splatting render loop.
 
@@ -375,6 +376,7 @@ class RenderProcessor:
                     zero_disparity_anchor_val=zero_disparity_anchor_val,
                     input_bias=input_bias,
                     tv_disp_comp=tv_disp_comp,
+                    mask_mode=mask_mode,
                 )
 
                 # 5. Handle results (diag tests or FFmpeg write)
@@ -565,6 +567,7 @@ class RenderProcessor:
         zero_disparity_anchor_val: float,
         input_bias: float,
         tv_disp_comp: float = 1.0,
+        mask_mode: str = "SC",
     ) -> List[np.ndarray]:
         """Process GPU splatting on normalized depth maps.
 
@@ -602,6 +605,7 @@ class RenderProcessor:
             input_bias=input_bias,
             tv_disp_comp=tv_disp_comp,
             debug_task_name="Render",
+            mask_mode=mask_mode,
         )
 
         # CPU conversion

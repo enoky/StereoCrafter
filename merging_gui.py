@@ -47,8 +47,9 @@ from core.ui.video_previewer import VideoPreviewer
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
+from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-08.1"
 
 
 class MergingGUI(ThemedTk):
@@ -79,6 +80,9 @@ class MergingGUI(ThemedTk):
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
         self.app_config = self._load_config()
         self.help_data = self._load_help_texts()
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         # --- Sidecar Config Manager ---
         self.sidecar_manager = SidecarConfigManager()
@@ -162,7 +166,8 @@ class MergingGUI(ThemedTk):
         self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- Encoding Settings ---
-        self.encoding_encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
+        self.codec_var = tk.StringVar(value=self.app_config.get("codec", "H.265"))
+        self.encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
         self.encoding_quality_var = tk.StringVar(value=self.app_config.get("encoding_quality", "Medium"))
         self.encoding_tune_var = tk.StringVar(value=self.app_config.get("encoding_tune", "None"))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
@@ -172,6 +177,8 @@ class MergingGUI(ThemedTk):
         self.nvenc_temporal_aq_var = tk.BooleanVar(value=self.app_config.get("nvenc_temporal_aq", False))
         self.nvenc_aq_strength_var = tk.IntVar(value=self.app_config.get("nvenc_aq_strength", 8))
         self.color_tags_var = tk.StringVar(value=self.app_config.get("color_tags", "Auto"))
+        self.dnxhr_fullres_split_var = tk.BooleanVar(value=self.app_config.get("dnxhr_fullres_split", False))
+        self.dnxhr_profile_var = tk.StringVar(value=self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -303,6 +310,9 @@ class MergingGUI(ThemedTk):
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
         self.theme_manager.configure_progressbar_style(self.style)
+
+        # DnD drop-target highlight style (theme-aware)
+        configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
 
         # --- FIX: Re-apply the custom loading button style after the theme changes ---
         # This ensures the red text color is not overridden by the theme's default button style.
@@ -541,6 +551,17 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
 
+        # Register Drag & Drop for folder entries
+        register_dnd_entries(
+            [
+                (entry_inpaint, self.inpainted_folder_var, True, None),
+                (entry_orig, self.original_folder_var, True, None),
+                (entry_mask, self.mask_folder_var, True, None),
+                (entry_out, self.output_folder_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
+        )
+
         # --- PREVIEW FRAME (using the new module) ---
         # Moved back to its original position after the folder frame.
         self.previewer = VideoPreviewer(
@@ -777,7 +798,7 @@ class MergingGUI(ThemedTk):
     def _show_encoding_settings(self):
         """Show the encoding settings dialog."""
         config = {
-            "encoding_encoder": self.encoding_encoder_var.get(),
+            "codec": self.codec_var.get(),
             "encoding_quality": self.encoding_quality_var.get(),
             "encoding_tune": self.encoding_tune_var.get(),
             "output_crf": self.output_crf_var.get(),
@@ -787,6 +808,8 @@ class MergingGUI(ThemedTk):
             "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
             "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
             "color_tags": self.color_tags_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
         }
 
         dialog = EncodingSettingsDialog(
@@ -794,13 +817,14 @@ class MergingGUI(ThemedTk):
             app_config=config,
             help_data=self.help_data,
             title="Merging GUI - Encoding Settings",
-            show_extra_options=False,
+            show_extra_options=True,
             show_color_tags=True,
         )
         self.wait_window(dialog.dialog)
 
         if dialog.result:
-            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.codec_var.set(dialog.result.get("codec", "H.265"))
+            self.encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
             self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
             self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
             self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
@@ -810,6 +834,8 @@ class MergingGUI(ThemedTk):
             self.nvenc_temporal_aq_var.set(dialog.result.get("nvenc_temporal_aq", False))
             self.nvenc_aq_strength_var.set(dialog.result.get("nvenc_aq_strength", 8))
             self.color_tags_var.set(dialog.result.get("color_tags", "Auto"))
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
     def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
         """Scans a folder for a file matching the core_name with any common video extension."""
@@ -1268,7 +1294,7 @@ class MergingGUI(ThemedTk):
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 # Encoding params
-                "encoding_encoder": self.encoding_encoder_var.get(),
+                "codec": self.codec_var.get(),
                 "encoding_quality": self.encoding_quality_var.get(),
                 "encoding_tune": self.encoding_tune_var.get(),
                 "output_crf": int(self.output_crf_var.get()),
@@ -1278,6 +1304,8 @@ class MergingGUI(ThemedTk):
                 "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
                 "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
                 "color_tags": self.color_tags_var.get(),
+                "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+                "dnxhr_profile": self.dnxhr_profile_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
@@ -1528,10 +1556,11 @@ class MergingGUI(ThemedTk):
                     pad_to_16_9=settings["pad_to_16_9"],
                     output_format_str=output_format,
                     encoding_options={
-                        "encoding_encoder": settings.get("encoding_encoder", "Auto"),
+                        "codec": settings.get("codec", "Auto"),
                         "encoding_quality": settings.get("encoding_quality", "Medium"),
                         "encoding_tune": settings.get("encoding_tune", "None"),
                         "output_crf": settings.get("output_crf", 23),
+                        "color_tags": settings.get("color_tags", "Auto"),
                         "nvenc_lookahead_enabled": settings.get("nvenc_lookahead_enabled", False),
                         "nvenc_lookahead": settings.get("nvenc_lookahead", 16),
                         "nvenc_spatial_aq": settings.get("nvenc_spatial_aq", False),

@@ -46,6 +46,7 @@ These sliders give you fine-grained control over how the mask is processed befor
 - **Preview Size:** Sets the maximum display size of the preview image. Larger values may impact UI performance.
 - **Batch Chunk Size:** The number of frames to process in memory at once. Lower this value if you run out of RAM on very long or high-resolution videos.
 - **Encoding Settings:** Access video encoding options via **Options → Encoding Settings...** menu.
+  - **Codec**: H.264/H.265
   - **Encoder**: Auto (uses NVENC if available) or Force CPU
   - **Quality Preset**: Fastest → Slowest (slower = better compression)
   - **CPU Tune**: Film, Grain, Animation, etc. (for CPU encoding only)

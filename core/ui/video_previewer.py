@@ -4,7 +4,7 @@ import gc
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Callable, Dict, Any, Union
+from typing import Optional, Callable, Dict, Any
 import torch
 import numpy as np
 import subprocess
@@ -25,7 +25,6 @@ except Exception:
 
 # Import modularized components
 from core.ui.widgets import Tooltip
-from core.common.gpu_utils import release_cuda_memory
 from core.common.video_io import get_video_stream_info
 
 import logging
@@ -221,7 +220,7 @@ class VideoPreviewer(ttk.Frame):
         self._depth_msb_shift = None
 
         gc.collect()
-        logger.info("Preview resources and file handles have been released.")
+        logger.debug("Preview resources and file handles have been released.")
 
     def invalidate_frame_buffer(self):
         """Public method to invalidate the frame buffer. Call when processing parameters change."""
@@ -958,12 +957,6 @@ class VideoPreviewer(ttk.Frame):
         """
         self.video_list = find_sources_callback()
 
-        if not self.video_list:
-            messagebox.showwarning("Not Found", "No valid source videos found.")
-            self.current_video_index = -1
-            self._update_nav_controls()
-            return
-
         target_index = 0
 
         if self.last_loaded_video_path:
@@ -1214,7 +1207,7 @@ class VideoPreviewer(ttk.Frame):
                 self.update_clip_callback()
 
             t_total_load = time.perf_counter()
-            logger.info(f"Previewer: Total video load took {t_total_load - t_load_start:.3f}s")
+            logger.debug(f"Previewer: Total video load took {t_total_load - t_load_start:.3f}s")
 
             if self.parent and hasattr(self.parent, "update_gui_from_sidecar"):
                 self.parent.update_gui_from_sidecar(source_paths.get("depth_map"))

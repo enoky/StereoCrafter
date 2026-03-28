@@ -9,7 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.io import write_video
+
+# from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
@@ -25,6 +26,7 @@ import platform
 from typing import Optional, Tuple, Any, Dict
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import math
+
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
@@ -55,6 +57,7 @@ except ImportError:
 
 # Import custom modules
 CUDA_AVAILABLE = False  # start state, will check automaticly later
+GUI_VERSION = "26-03-08.2"
 
 # --- MODIFIED IMPORT ---
 from core.common.video_io import start_ffmpeg_pipe_process
@@ -81,9 +84,6 @@ except:
 
     logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
-
-GUI_VERSION = "26-03-08.0"
-
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
 from core.splatting import FusionSidecarGenerator
@@ -115,7 +115,7 @@ from core.splatting.forward_warp import execute_forward_warp
 from core.splatting.config_manager import ConfigManager
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
-from core.ui import ThemeManager, SBSPreviewWindow
+from core.ui import ThemeManager, SBSPreviewWindow, init_dnd, register_dnd_entries, configure_dnd_styles
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.video_io import read_video_frames, _NumpyBatch
 from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
@@ -130,6 +130,9 @@ class SplatterGUI(ThemedTk):
     UI_DEPTH_COL_MIN = 520
 
     # --- GLOBAL CONFIGURATION DICTIONARY ---
+    # Common video extensions for filtering
+    VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v"]
+
     APP_CONFIG_DEFAULTS = {
         # File Extensions
         "SIDECAR_EXT": ".fssidecar",
@@ -159,6 +162,7 @@ class SplatterGUI(ThemedTk):
         "AUTO_BORDER_L": "0.0",
         "AUTO_BORDER_R": "0.0",
         "FLIP_HORIZONTAL": False,
+        "MASK_MODE": "SC",
     }
 
     # ---------------------------------------
@@ -183,6 +187,7 @@ class SplatterGUI(ThemedTk):
         "auto_border_L": "AUTO_BORDER_L",
         "auto_border_R": "AUTO_BORDER_R",
         "flip_horizontal": "FLIP_HORIZONTAL",
+        "mask_mode": "MASK_MODE",
     }
 
     # Maps Sidecar JSON Key to the actual tkinter variable attribute name
@@ -198,6 +203,9 @@ class SplatterGUI(ThemedTk):
     def __init__(self):
         super().__init__(theme="default")
         self.title(f"Stereocrafter Splatting (Batch) {GUI_VERSION}")
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         self.config_manager = ConfigManager()
         self.app_config = {}
@@ -291,7 +299,8 @@ class SplatterGUI(ThemedTk):
         self.color_tags_mode_var = tk.StringVar(value="Auto")
 
         # --- Encoding Options ---
-        self.encoding_encoder_var = tk.StringVar(value="Auto")
+        self.codec_var = tk.StringVar(value="H.265")
+        self.encoder_var = tk.StringVar(value="Auto")
         self.encoding_quality_var = tk.StringVar(value="Medium")
         self.encoding_tune_var = tk.StringVar(value="None")
         self.encoding_nvenc_lookahead_enabled_var = tk.BooleanVar(value=False)
@@ -329,6 +338,7 @@ class SplatterGUI(ThemedTk):
         self.border_mode_var = tk.StringVar(value=defaults["BORDER_MODE"])
         self.auto_border_L_var = tk.StringVar(value=defaults["AUTO_BORDER_L"])
         self.auto_border_R_var = tk.StringVar(value=defaults["AUTO_BORDER_R"])
+        self.mask_mode_var = tk.StringVar(value=defaults["MASK_MODE"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
 
@@ -490,6 +500,9 @@ class SplatterGUI(ThemedTk):
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
 
+        # DnD drop-target highlight style (theme-aware)
+        configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
+
         colors = self.theme_manager.get_colors()
         self.theme_manager.configure_progressbar_style(self.style)
 
@@ -639,6 +652,17 @@ class SplatterGUI(ThemedTk):
         if file_path:
             var.set(file_path)
 
+    def _setup_entry_dnd(self):
+        """Register file/folder drag-and-drop targets on path entry widgets."""
+        register_dnd_entries(
+            [
+                (self.entry_source_clips, self.input_source_clips_var, False, self.VIDEO_EXTS),
+                (self.entry_input_depth_maps, self.input_depth_maps_var, False, self.VIDEO_EXTS),
+                (self.entry_output_splatted, self.output_splatted_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
+        )
+
     def _safe_float(self, var, default=0.0):
         """Safely convert StringVar/BooleanVar to float."""
         try:
@@ -768,6 +792,7 @@ class SplatterGUI(ThemedTk):
             self.auto_border_R_var,
             self.preview_source_var,
             self.preview_size_var,
+            self.mask_mode_var,
         ]
         for var in vars_to_trace:
             var.trace_add("write", _invalidate_buffer)
@@ -1413,7 +1438,7 @@ class SplatterGUI(ThemedTk):
     def show_encoding_options_popup(self):
         """Popup window for encoder/NVENC/DNxHR options (Options → Encoding Options...)."""
         config = {
-            "encoding_encoder": self.encoding_encoder_var.get(),
+            "codec": self.codec_var.get(),
             "encoding_quality": self.encoding_quality_var.get(),
             "encoding_tune": self.encoding_tune_var.get(),
             "output_crf_full": self.output_crf_full_var.get(),
@@ -1439,7 +1464,8 @@ class SplatterGUI(ThemedTk):
         self.wait_window(dialog.dialog)
 
         if dialog.result:
-            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.codec_var.set(dialog.result.get("codec", "H.265"))
+            self.encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
             self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
             self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
             self.output_crf_full_var.set(str(dialog.result.get("output_crf_full", 23)))
@@ -1608,6 +1634,10 @@ class SplatterGUI(ThemedTk):
                 _btn.configure(style="CompactAction.TButton")
             except Exception:
                 pass
+
+        # --- Register drag-and-drop on path entries ---
+        self._setup_entry_dnd()
+
         # Reset current_row for next frame
         current_row = 0
 
@@ -1830,9 +1860,27 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
 
-        # Row 2, Col 1: Border Mode Pulldown + Rescan Button
+        # Row 1, Col 0: Mask Mode Pulldown (below Process Length)
+        self.mask_mode_frame = ttk.Frame(self.output_settings_frame)
+        self.mask_mode_frame.grid(row=1, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_mask_mode = ttk.Label(self.mask_mode_frame, text="Mask:")
+        self.lbl_mask_mode.pack(side="left", padx=(0, 3))
+        self.combo_mask_mode = ttk.Combobox(
+            self.mask_mode_frame,
+            textvariable=self.mask_mode_var,
+            values=["SC", "M2S"],
+            state="readonly",
+            width=5,
+            takefocus=False,
+        )
+        self.combo_mask_mode.pack(side="left")
+        self._create_hover_tooltip(self.lbl_mask_mode, "mask_mode")
+        self._create_hover_tooltip(self.combo_mask_mode, "mask_mode")
+        self.widgets_to_disable.append(self.combo_mask_mode)
+
+        # Row 1, Col 1: Border Mode Pulldown + Rescan Button
         self.border_mode_frame = ttk.Frame(self.output_settings_frame)
-        self.border_mode_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
+        self.border_mode_frame.grid(row=1, column=1, sticky="w", padx=5, pady=0)
         self.lbl_border_mode = ttk.Label(self.border_mode_frame, text="Border:")
         self.lbl_border_mode.pack(side="left", padx=(0, 3))
         self.combo_border_mode = ttk.Combobox(
@@ -2784,6 +2832,7 @@ class SplatterGUI(ThemedTk):
                 getattr(self, "track_dp_total_true_on_render_var", None)
                 and self.track_dp_total_true_on_render_var.get()
             ),
+            mask_mode=self.mask_mode_var.get(),
         )
 
     def get_current_preview_settings(self) -> dict:
@@ -2805,6 +2854,7 @@ class SplatterGUI(ThemedTk):
                 "strict_ffmpeg_decode": bool(self.strict_ffmpeg_decode_var.get()),
                 "enable_global_norm": self.enable_global_norm_var.get(),
                 "flip_horizontal": self.flip_horizontal_var.get(),
+                "mask_mode": self.mask_mode_var.get(),
             }
 
             # Resolve Border Percentages based on Mode
@@ -3963,6 +4013,7 @@ class SplatterGUI(ThemedTk):
             input_bias=0.0,
             tv_disp_comp=tv_disp_comp,
             debug_task_name="Preview",
+            mask_mode=params.get("mask_mode", "SC"),
         )
 
         t_warp = time.perf_counter()

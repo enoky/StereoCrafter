@@ -4,12 +4,7 @@ This package contains the modularized components of the Splatting GUI,
 organized by functionality.
 """
 
-from .batch_processing import (
-    BatchProcessor,
-    ProcessingTask,
-    ProcessingSettings,
-    BatchSetupResult,
-)
+from .batch_processing import BatchProcessor, ProcessingTask, ProcessingSettings, BatchSetupResult
 
 from .border_scanning import BorderScanner
 
@@ -34,9 +29,11 @@ from .depth_processing import (
     DEPTH_VIS_TV10_WHITE_NORM,
 )
 
-from .forward_warp import ForwardWarpStereo
+from .forward_warp import ForwardWarpStereo, execute_forward_warp
 
 from .fusion_export import FusionSidecarGenerator
+
+from .m2s_mask import build_m2s_occlusion_mask_from_disparity
 
 from .preview_rendering import PreviewRenderer
 
