@@ -39,6 +39,7 @@
   "convergence_point": "Set to 1.0 will place depth inside the screen. 0.0 will give 100% pop out. StereoCrafter Default = 0.5, Recommend 0.8. Shortcut: 1(-) and 3(+)",
   "border_mode": "Select border calculation strategy. Manual: uses sliders. Auto Basic: calculates based on Disparity/Convergence. Auto Adv.: uses depth map sampling for independent borders. Shortcut: 2(Cycle).",
   "border_rescan": "Trigger a quick scan of the depth map edges to calculate clip-specific borders (every 5th frame). Auto-switches modes (Off -> Manual, Auto Basic -> Auto Adv).",
+  "mask_mode": "Select occlusion mask generation mode. SC uses StereoCrafter's original forward-warp occupancy. M2S uses M2S-style occupancy test from the disparity map (often thinner).",
   "border_width": "Total width of black borders at the screen edges as a percentage of width. Used to mask parallax occlusion for pop-out objects.",
   "border_bias": "Shift the border distribution between left and right sides. -1.0 puts all border on the left, 1.0 all on the right, 0.0 is balanced.",
   "enable_global_normalization": "Enable if your depthmap needs it and you just want to process the clips without checking.",

@@ -9,7 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.io import write_video
+
+# from torchvision.io import write_video
 from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
@@ -161,6 +162,7 @@ class SplatterGUI(ThemedTk):
         "AUTO_BORDER_L": "0.0",
         "AUTO_BORDER_R": "0.0",
         "FLIP_HORIZONTAL": False,
+        "MASK_MODE": "SC",
     }
 
     # ---------------------------------------
@@ -185,6 +187,7 @@ class SplatterGUI(ThemedTk):
         "auto_border_L": "AUTO_BORDER_L",
         "auto_border_R": "AUTO_BORDER_R",
         "flip_horizontal": "FLIP_HORIZONTAL",
+        "mask_mode": "MASK_MODE",
     }
 
     # Maps Sidecar JSON Key to the actual tkinter variable attribute name
@@ -335,6 +338,7 @@ class SplatterGUI(ThemedTk):
         self.border_mode_var = tk.StringVar(value=defaults["BORDER_MODE"])
         self.auto_border_L_var = tk.StringVar(value=defaults["AUTO_BORDER_L"])
         self.auto_border_R_var = tk.StringVar(value=defaults["AUTO_BORDER_R"])
+        self.mask_mode_var = tk.StringVar(value=defaults["MASK_MODE"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
 
@@ -788,6 +792,7 @@ class SplatterGUI(ThemedTk):
             self.auto_border_R_var,
             self.preview_source_var,
             self.preview_size_var,
+            self.mask_mode_var,
         ]
         for var in vars_to_trace:
             var.trace_add("write", _invalidate_buffer)
@@ -1855,9 +1860,27 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.auto_convergence_combo, "auto_convergence_toggle")
         self.auto_convergence_combo.bind("<<ComboboxSelected>>", self.on_auto_convergence_mode_select)
 
-        # Row 2, Col 1: Border Mode Pulldown + Rescan Button
+        # Row 1, Col 0: Mask Mode Pulldown (below Process Length)
+        self.mask_mode_frame = ttk.Frame(self.output_settings_frame)
+        self.mask_mode_frame.grid(row=1, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_mask_mode = ttk.Label(self.mask_mode_frame, text="Mask:")
+        self.lbl_mask_mode.pack(side="left", padx=(0, 3))
+        self.combo_mask_mode = ttk.Combobox(
+            self.mask_mode_frame,
+            textvariable=self.mask_mode_var,
+            values=["SC", "M2S"],
+            state="readonly",
+            width=5,
+            takefocus=False,
+        )
+        self.combo_mask_mode.pack(side="left")
+        self._create_hover_tooltip(self.lbl_mask_mode, "mask_mode")
+        self._create_hover_tooltip(self.combo_mask_mode, "mask_mode")
+        self.widgets_to_disable.append(self.combo_mask_mode)
+
+        # Row 1, Col 1: Border Mode Pulldown + Rescan Button
         self.border_mode_frame = ttk.Frame(self.output_settings_frame)
-        self.border_mode_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
+        self.border_mode_frame.grid(row=1, column=1, sticky="w", padx=5, pady=0)
         self.lbl_border_mode = ttk.Label(self.border_mode_frame, text="Border:")
         self.lbl_border_mode.pack(side="left", padx=(0, 3))
         self.combo_border_mode = ttk.Combobox(
@@ -2809,6 +2832,7 @@ class SplatterGUI(ThemedTk):
                 getattr(self, "track_dp_total_true_on_render_var", None)
                 and self.track_dp_total_true_on_render_var.get()
             ),
+            mask_mode=self.mask_mode_var.get(),
         )
 
     def get_current_preview_settings(self) -> dict:
@@ -2830,6 +2854,7 @@ class SplatterGUI(ThemedTk):
                 "strict_ffmpeg_decode": bool(self.strict_ffmpeg_decode_var.get()),
                 "enable_global_norm": self.enable_global_norm_var.get(),
                 "flip_horizontal": self.flip_horizontal_var.get(),
+                "mask_mode": self.mask_mode_var.get(),
             }
 
             # Resolve Border Percentages based on Mode
@@ -3988,6 +4013,7 @@ class SplatterGUI(ThemedTk):
             input_bias=0.0,
             tv_disp_comp=tv_disp_comp,
             debug_task_name="Preview",
+            mask_mode=params.get("mask_mode", "SC"),
         )
 
         t_warp = time.perf_counter()

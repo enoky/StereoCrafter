@@ -152,6 +152,7 @@ class ProcessingSettings:
     sidecar_ext: str = ".fssidecar"
     sidecar_folder: str = ""
     track_dp_total_true_on_render: bool = False
+    mask_mode: str = "SC"
 
     # ------------------------------------------------------------------
     # Factory
@@ -530,6 +531,7 @@ class BatchProcessor:
                 dnxhr_profile=settings.dnxhr_profile,
                 is_test_mode=settings.is_test_mode,
                 test_target_frame_idx=settings.test_target_frame_idx,
+                mask_mode=settings.mask_mode,
             )
 
             if not success:
