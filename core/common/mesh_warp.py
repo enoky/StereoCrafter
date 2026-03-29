@@ -172,8 +172,9 @@ class FusionStereoReplicator:
             E.g., 25 = 2.5% of the screen width. Default is 25.0.
         convergence : float, optional
             Where the views converge (zero parallax).
-            0.0 = Extruded Max Foreground (White pixels)
-            1.0 = Base Background (Black pixels).
+            0.0 = Base Background (Black pixels, no extrusion).
+            1.0 = Extruded Max Foreground (White pixels).
+            Values > 1.0 extrapolate further beyond the foreground.
         view_bias : float, optional
             Shifts the extrusion apex horizontally.
             -1.0 = Apex at Left Camera, 0.0 = Centered, 1.0 = Apex at Right Camera.
@@ -191,6 +192,32 @@ class FusionStereoReplicator:
         left_img, right_img : np.ndarray
             The rendered Left and Right BGR images.
         """
+        # Auto-calculate extrusion smoothly using keyframe control points
+        if extrusion_scale < 0.0:
+            # Define as many (convergence, extrusion) keyframes as you want here
+            # Make sure convergence values are in ascending order
+            keyframes = [
+                (0.0, 0.65),  # (Convergence, Extrusion)
+                (0.5, 0.50),
+                (1.0, 0.53),
+                (2.0, 0.53),
+            ]
+
+            if convergence <= keyframes[0][0]:
+                extrusion_scale = keyframes[0][1]
+            elif convergence >= keyframes[-1][0]:
+                extrusion_scale = keyframes[-1][1]
+            else:
+                for i in range(len(keyframes) - 1):
+                    x0, y0 = keyframes[i]
+                    x1, y1 = keyframes[i + 1]
+                    if x0 <= convergence <= x1:
+                        # DaVinci-style Ease-in/Ease-out (Smoothstep) interpolation
+                        t = (convergence - x0) / (x1 - x0)
+                        smooth_t = t * t * (3.0 - 2.0 * t)
+                        extrusion_scale = y0 + smooth_t * (y1 - y0)
+                        break
+
         # Ensure incoming data matches the initialized texture size
         if image.shape[1] != self.width or image.shape[0] != self.height:
             image = cv2.resize(image, (self.width, self.height))
@@ -230,6 +257,7 @@ class FusionStereoReplicator:
         # Calculate Disparity in 3D world units (Percentage / 10 * 100 = Percentage / 1000)
         disparity_world = self.width * (disparity / 1000.0)
 
+        # 2. Setup 3D Extrusion Bounds
         # Calculate Absolute Extrusion Point
         # X is biased between eyes: -1 = Left ( -disparity_world / 2 ), 1 = Right ( +disparity_world / 2 )
         abs_x = view_bias * (disparity_world / 2.0)
@@ -237,14 +265,10 @@ class FusionStereoReplicator:
         abs_z = camera_distance + dolly_zoom
         abs_extrusion_point = (abs_x, abs_y, abs_z)
 
-        # 2. Setup Convergence Plane
-        d_min, d_max = depth_float.min(), depth_float.max()
-        z_min = (abs_extrusion_point[2] * extrusion_scale) * d_min
-        z_max = (abs_extrusion_point[2] * extrusion_scale) * d_max
-
-        # Convergence: 0 = z_max (Foreground), 1 = z_min (Background)
-        z_conv = z_max * (1.0 - convergence) + z_min * convergence
-        dist_to_conv = camera_distance - z_conv
+        # Calculate the absolute Z bounds of the extruded geometry (0.0 to 1.0 depth)
+        # for linear convergence slider mapping.
+        z_bg = 0.0  # Absolute depth 0.0
+        z_fg = abs_extrusion_point[2] * extrusion_scale  # Absolute depth 1.0
 
         # 3. Setup Uniforms
         self.prog["img_width"].value = float(self.width)
@@ -272,9 +296,15 @@ class FusionStereoReplicator:
             base_b, base_t = screen_b * (Near / camera_distance), screen_t * (Near / camera_distance)
 
             # CONVERGENCE SHIFT (Off-Axis):
-            # We offset the frustum window to align the two views at the dist_to_conv plane.
-            # Shift = -cx * (Near / dist_to_conv)
-            conv_shift = -cx * (Near / dist_to_conv)
+            # Instead of deriving a non-linear 3D convergence point (which can push the virtual
+            # camera backwards if depth > 1), we linearly interpolate the frustum shift based
+            # on the absolute background and foreground depths. This makes the
+            # convergence slider behave linearly and isometrically like forward_warp.py.
+            shift_bg = -cx * (Near / (camera_distance - z_bg))
+            shift_fg = -cx * (Near / (camera_distance - z_fg))
+
+            # convergence: 0.0 = Background (depth 0.0), 1.0 = Foreground (depth 1.0)
+            conv_shift = shift_bg + convergence * (shift_fg - shift_bg)
 
             L, R = base_l + conv_shift, base_r + conv_shift
             B, T = base_b, base_t  # Vertical shift is 0 for parallel stereo
@@ -338,7 +368,7 @@ def run_fusion_stereo(
         image: Color image (H, W, 3).
         depth: Grayscale depth (H, W).
         disparity: 0.0 to 100.0 (Percentage of screen width * 10).
-        convergence: 0.0 (BG) to 1.0 (FG).
+        convergence: 0.0 (BG) to 1.0 (FG). Values > 1.0 extrapolate beyond FG.
         view_bias: -1.0 (Left Eye) to 1.0 (Right Eye).
         dolly_zoom: Z-offset relative to camera.
         extrusion_scale: How much to extrude (depth strength).
