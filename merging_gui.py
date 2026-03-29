@@ -22,8 +22,8 @@ from core.common.cli_utils import set_logger_level, draw_progress_bar
 
 logger = logging.getLogger(__name__)
 
+# ruff: noqa: E402
 from core.common.gpu_utils import release_cuda_memory
-from core.common.image_processing import apply_dubois_anaglyph, apply_optimized_anaglyph
 from core.common.video_io import get_video_stream_info
 from core.common.sidecar_manager import (
     SidecarConfigManager,
@@ -38,8 +38,6 @@ from core.common.image_processing import (
     apply_dubois_anaglyph_torch,
     apply_optimized_anaglyph_torch,
     apply_color_transfer,
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
     apply_borders_to_frames,
 )
 from core.ui.widgets import Tooltip, create_single_slider_with_label_updater
@@ -49,7 +47,7 @@ from core.common.file_organizer import move_files_to_finished, restore_finished_
 from core.ui.theme_manager import ThemeManager
 from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
-GUI_VERSION = "26-03-08.1"
+GUI_VERSION = "26-03-29.0"
 
 
 class MergingGUI(ThemedTk):
@@ -297,7 +295,6 @@ class MergingGUI(ThemedTk):
         self.theme_manager.apply_theme_to_style(self.style, root_window=self)
 
         # 2. Apply theme to non-ttk widgets (Menu, Canvas, Labels)
-        colors = self.theme_manager.get_colors()
 
         # Menus
         if hasattr(self, "menubar"):
@@ -597,7 +594,7 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(self.previewer.next_video_button)
         self.widgets_to_disable.append(self.previewer.video_jump_entry)
         # Pack the previewer right after the folder frame
-        self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
+        self.previewer.pack(fill="x", padx=10, pady=5)
 
         # --- SLIDERS & INFO CONTAINER ---
         middle_container = ttk.Frame(self)

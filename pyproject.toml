@@ -56,6 +56,7 @@ skip-magic-trailing-comma = true
 # Linter-specific settings go here
 ignore = ["E501"]
 select = ["E", "F", "W"]
+unfixable = ["F841"]
 
 [dependency-groups]
 dev = [

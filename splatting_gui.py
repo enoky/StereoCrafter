@@ -1,4 +1,3 @@
-import gc
 import os
 import re
 import csv
@@ -7,11 +6,9 @@ import glob
 import shutil
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 # from torchvision.io import write_video
-from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import tkinter.font as tkfont
@@ -19,21 +16,16 @@ from ttkthemes import ThemedTk
 import json
 import threading
 import queue
-import subprocess
 import time
 import logging
-import platform
-from typing import Optional, Tuple, Any, Dict
+from typing import Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-import math
 
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
 # not the depth values used for splatting.
 DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
-DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
-DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
 
 try:
     from moviepy.editor import VideoFileClip
@@ -57,32 +49,17 @@ except ImportError:
 
 # Import custom modules
 CUDA_AVAILABLE = False  # start state, will check automaticly later
-GUI_VERSION = "26-03-08.2"
+GUI_VERSION = "26-03-29.0"
 
+# ruff: noqa: E402
 # --- MODIFIED IMPORT ---
-from core.common.video_io import start_ffmpeg_pipe_process
-from core.common.cli_utils import draw_progress_bar, set_logger_level
-from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
+from core.common.cli_utils import set_logger_level
+from core.common.gpu_utils import check_cuda_availability, release_cuda_memory
 
 logger = logging.getLogger(__name__)
-from core.common.image_processing import (
-    custom_blur,
-    custom_dilate,
-    custom_dilate_left,
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
-)
 from core.common.video_io import get_video_stream_info
 from core.ui.widgets import Tooltip, create_single_slider_with_label_updater, create_dual_slider_layout
 
-try:
-    from Forward_Warp import forward_warp
-
-    logger.info("CUDA Forward Warp is available.")
-except:
-    from dependency.forward_warp_pytorch import forward_warp
-
-    logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -101,9 +78,7 @@ from core.splatting import (
     ConvergenceCache,
 )
 from core.splatting.depth_processing import (
-    compute_global_depth_stats,
     load_pre_rendered_depth,
-    FFmpegDepthPipeReader,
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
     _infer_depth_bit_depth,
@@ -117,8 +92,8 @@ from core.splatting.config_manager import ConfigManager
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
 from core.ui import ThemeManager, init_dnd, register_dnd_entries, configure_dnd_styles
 from core.ui.encoding_settings import EncodingSettingsDialog
-from core.common.video_io import read_video_frames, _NumpyBatch
-from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
+from core.common.video_io import read_video_frames
+from core.common.sidecar_manager import SidecarConfigManager
 from core.common.image_processing import apply_dubois_anaglyph_torch, apply_optimized_anaglyph_torch
 
 
@@ -522,7 +497,7 @@ class SplatterGUI(ThemedTk):
         # 4. Handle window geometry adjustment
         self.update_idletasks()
 
-    def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode):
+    def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, fallback_value, gamma, mode):
         """Worker thread for running the Auto-Convergence calculation."""
 
         # Use the extracted ConvergenceEstimatorWrapper
@@ -541,7 +516,6 @@ class SplatterGUI(ThemedTk):
 
         # Determine TV range compensation for border calculation
         # This is fast if called here (usually cached or metadata-only)
-        tv_disp_comp = 1.0
         if hasattr(self, "border_scanner"):
             # We don't have a VideoReader here, so we'll let BorderScanner handle it or calculate it later.
             # For simplicity, we can pass the path and let BorderScanner handle it if we modify it,
@@ -1189,7 +1163,7 @@ class SplatterGUI(ThemedTk):
                     self._set_input_state("normal")
                     if hasattr(self, "previewer"):
                         self.previewer.reset_video_list_scan()
-                    logger.info(f"==> All process completed.")
+                    logger.info("==> All process completed.")
                     break
 
                 elif message[0] == "total":
@@ -1361,7 +1335,7 @@ class SplatterGUI(ThemedTk):
                 text=f"Auto-Converge: Failed to find a valid anchor. Value remains {fallback_value:.2f}"
             )
             messagebox.showwarning(
-                "Auto-Converge Preview", f"Failed to find a valid anchor point in any mode. No changes were made."
+                "Auto-Converge Preview", "Failed to find a valid anchor point in any mode. No changes were made."
             )
             # If it was triggered by the combo box, reset the combo box to "Off"
             if self.auto_convergence_mode_var.get() == mode:
@@ -1623,7 +1597,7 @@ class SplatterGUI(ThemedTk):
             on_frame_display_callback=self._on_preview_frame_display,
             help_data=self.help_texts,
         )
-        self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
+        self.previewer.pack(fill="x", padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
         for _btn_name in (
             "load_preview_button",
@@ -3318,7 +3292,7 @@ class SplatterGUI(ThemedTk):
                         f"==> Moved processed video '{os.path.basename(video_path)}' to: {finished_source_folder}"
                     )
                     break
-                except PermissionError as e:
+                except PermissionError:
                     logger.warning(
                         f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving '{os.path.basename(video_path)}'. Retrying in {retry_delay_sec}s..."
                     )
@@ -3354,7 +3328,7 @@ class SplatterGUI(ThemedTk):
                         f"==> Moved depth map '{os.path.basename(actual_depth_map_path)}' to: {finished_depth_folder}"
                     )
                     break
-                except PermissionError as e:
+                except PermissionError:
                     logger.warning(
                         f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving depth map '{os.path.basename(actual_depth_map_path)}'. Retrying in {retry_delay_sec}s..."
                     )
@@ -3393,7 +3367,7 @@ class SplatterGUI(ThemedTk):
                             f"==> Moved sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}"
                         )
                         break
-                    except PermissionError as e:
+                    except PermissionError:
                         logger.warning(
                             f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving file '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s..."
                         )
@@ -5805,9 +5779,6 @@ class SplatterGUI(ThemedTk):
             messagebox.showerror("Validation Error", str(e))
             return
 
-        # --- MODIFIED: Delayed cleanup for diagnostic parity ---
-        is_test_active = self.enable_full_res_var.get() or self.enable_low_res_var.get()
-
         # --- MODIFIED: Auto-Switch Preview for Tests ---
         if self.map_test_var.get() or self.splat_test_var.get():
             # If a test is active, sync GUI controls from sidecar once before capture/run (keeps parity without freezing live slider changes).
@@ -6387,7 +6358,6 @@ class SplatterGUI(ThemedTk):
 
 
 # [REFACTORED] Depth processing functions imported from core module
-from core.splatting.depth_processing import compute_global_depth_stats, load_pre_rendered_depth
 
 if __name__ == "__main__":
     CUDA_AVAILABLE = check_cuda_availability()  # Sets the global flag
