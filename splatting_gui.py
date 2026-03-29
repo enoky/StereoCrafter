@@ -163,6 +163,13 @@ class SplatterGUI(ThemedTk):
         "AUTO_BORDER_R": "0.0",
         "FLIP_HORIZONTAL": False,
         "MASK_MODE": "SC",
+        "MESH_WARP_DISPARITY": "25.0",
+        "MESH_WARP_CONVERGENCE": "0.5",
+        "MESH_WARP_VIEW_BIAS": "0.0",
+        "MESH_WARP_DOLLY_ZOOM": "0.0",
+        "MESH_WARP_EXTRUSION_SCALE": "0.5",
+        "MESH_WARP_DENSITY_X": "512",
+        "MESH_WARP_DENSITY_Y": "512",
     }
 
     # ---------------------------------------
@@ -1646,6 +1653,7 @@ class SplatterGUI(ThemedTk):
             "Optimized Anaglyph",
             "Side-by-Side",
             "Wigglegram",
+            "Mesh Warp",
         ]
         if not self.preview_source_var.get():
             self.preview_source_var.set("Splat Result")
@@ -4042,6 +4050,32 @@ class SplatterGUI(ThemedTk):
         elif preview_source == "Wigglegram":
             self.previewer._start_wigglegram_animation(left_eye_tensor_resized, right_eye_tensor)
             return None
+
+        elif preview_source == "Mesh Warp":
+            from core.common.mesh_warp import run_fusion_stereo
+
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+
+            l_img, r_img = run_fusion_stereo(
+                image=left_bgr,
+                depth=depth_normalized,
+                disparity=float(params.get("max_disp", 25.0)),
+                convergence=1.0 - float(params.get("convergence_point", 0.5)),
+                view_bias=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_VIEW_BIAS", -1.0)),
+                dolly_zoom=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_DOLLY_ZOOM", 0.0)),
+                extrusion_scale=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_EXTRUSION_SCALE", 1.0)),
+                density_x=int(left_bgr.shape[1]),
+                density_y=int(left_bgr.shape[0]),
+            )
+
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                sbs_np = np.concatenate([r_img, l_img], axis=1)
+            else:
+                sbs_np = np.concatenate([l_img, r_img], axis=1)
+
+            sbs_rgb = cv2.cvtColor(sbs_np, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(sbs_rgb)
 
         elif preview_source == "Side-by-Side":
             # Concatenate left and right eye as SBS image

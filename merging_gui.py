@@ -73,6 +73,13 @@ class MergingGUI(ThemedTk):
         "enable_color_transfer": True,
         "batch_chunk_size": "20",
         "preview_size": "100%",
+        "MESH_WARP_DISPARITY": "25.0",
+        "MESH_WARP_CONVERGENCE": "0.5",
+        "MESH_WARP_VIEW_BIAS": "0.0",
+        "MESH_WARP_DOLLY_ZOOM": "0.0",
+        "MESH_WARP_EXTRUSION_SCALE": "0.1",
+        "MESH_WARP_DENSITY_X": "512",
+        "MESH_WARP_DENSITY_Y": "512",
     }
 
     def __init__(self):
@@ -569,6 +576,20 @@ class MergingGUI(ThemedTk):
             help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
+        self.previewer.preview_source_combo["values"] = [
+            "Blended Image",
+            "Original (Left Eye)",
+            "Warped (Right BG)",
+            "Inpainted Right Eye",
+            "Processed Mask",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Side-by-Side",
+            "Wigglegram",
+            "Depth Map",
+            "Mesh Warp",
+        ]
 
         # --- FIX: Add previewer's buttons to the list of widgets to disable ---
         self.widgets_to_disable.append(self.previewer.load_preview_button)
@@ -2110,8 +2131,7 @@ class MergingGUI(ThemedTk):
                 "Side-by-Side",
                 "Wigglegram",
             ]
-            if not is_dual_input:
-                preview_options.append("Depth Map")
+            preview_options.extend(["Depth Map", "Mesh Warp"])
             self.previewer.set_preview_source_options(preview_options)
 
             # Convert mask to grayscale ON DEVICE
@@ -2234,6 +2254,32 @@ class MergingGUI(ThemedTk):
                 return None
             elif preview_source == "Depth Map" and depth_map_vis is not None:
                 final_frame_4d = depth_map_vis
+            elif preview_source == "Mesh Warp" and depth_map_vis is not None:
+                from core.common.mesh_warp import run_fusion_stereo
+
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+                depth_np = depth_map_vis.squeeze(0).mean(dim=0).cpu().numpy()
+
+                l_img, r_img = run_fusion_stereo(
+                    image=left_bgr,
+                    depth=depth_np,
+                    disparity=float(sidecar_data.get("max_disparity", 25.0)),
+                    convergence=1.0 - float(sidecar_data.get("convergence_plane", 0.5)),
+                    view_bias=float(self.APP_DEFAULTS.get("MESH_WARP_VIEW_BIAS", -1.0)),
+                    dolly_zoom=float(self.APP_DEFAULTS.get("MESH_WARP_DOLLY_ZOOM", 0.0)),
+                    extrusion_scale=float(self.APP_DEFAULTS.get("MESH_WARP_EXTRUSION_SCALE", 1.0)),
+                    density_x=int(left_bgr.shape[1]),
+                    density_y=int(left_bgr.shape[0]),
+                )
+
+                if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                    sbs_np = np.concatenate([r_img, l_img], axis=1)
+                else:
+                    sbs_np = np.concatenate([l_img, r_img], axis=1)
+
+                sbs_rgb = cv2.cvtColor(sbs_np, cv2.COLOR_BGR2RGB)
+                return Image.fromarray(sbs_rgb)
             else:
                 final_frame_4d = blended_frame
 
