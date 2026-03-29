@@ -26,7 +26,7 @@ try:
 except ImportError:
     psutil = None
 
-from core.common.video_io import encode_frames_to_mp4
+from core.common.video_io import encode_frames_to_mp4, reverse_frames
 from core.common.cli_utils import set_logger_level, draw_progress_bar
 from core.common.gpu_utils import release_cuda_memory
 
@@ -36,6 +36,7 @@ from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
+from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
@@ -43,7 +44,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-28.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -54,6 +55,9 @@ class InpaintingGUI(ThemedTk):
         self.title(f"Stereocrafter Inpainting (Batch) {GUI_VERSION}")
         self.app_config = self.load_config()
         self.help_data = self.load_help_data()
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         self.dark_mode_var = tk.BooleanVar(value=self.app_config.get("dark_mode_enabled", False))
         # Window size and position variables
@@ -135,6 +139,11 @@ class InpaintingGUI(ThemedTk):
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
+        self.inpaint_direction_var = tk.StringVar(value=self.app_config.get("inpaint_direction", "Forward"))
+
+        # DNxHR encoding options
+        self.dnxhr_fullres_split_var = tk.BooleanVar(value=self.app_config.get("dnxhr_fullres_split", False))
+        self.dnxhr_profile_var = tk.StringVar(value=self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -654,6 +663,9 @@ class InpaintingGUI(ThemedTk):
             # ttk.Label styling (for all ttk.Label widgets including the info frame ones)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
 
+            # DnD drop-target highlight style (theme-aware)
+            configure_dnd_styles(self.style, True, self._dnd_enabled)
+
         else:
             # --- Light Theme ---
             bg_color = "#d9d9d9"
@@ -686,6 +698,9 @@ class InpaintingGUI(ThemedTk):
             self.style.configure("TLabelframe", background=bg_color, foreground=fg_color)
             self.style.configure("TLabelframe.Label", background=bg_color, foreground=fg_color)
             self.style.configure("TLabel", background=bg_color, foreground=fg_color)
+
+            # DnD drop-target highlight style (theme-aware)
+            configure_dnd_styles(self.style, False, self._dnd_enabled)
 
         self.update_idletasks()  # Ensure all theme changes are rendered for accurate reqheight
 
@@ -881,13 +896,13 @@ class InpaintingGUI(ThemedTk):
                 )
         self._write_runtime_status(base_video_name, stage, extra=extra)
 
-    def _get_prefinalize_checkpoint_path(self, base_video_name: str) -> str:
+    def _get_prefinalize_checkpoint_path(self, base_video_name: str, suffix: str = "") -> str:
         """Returns the checkpoint path used to resume directly before finalization."""
         output_dir = self.output_folder_var.get().strip() or "."
         resume_dir = os.path.join(output_dir, "_inpaint_resume")
         os.makedirs(resume_dir, exist_ok=True)
         video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
-        return os.path.join(resume_dir, f"{video_stem}.prefinalize.pt")
+        return os.path.join(resume_dir, f"{video_stem}{suffix}.prefinalize.pt")
 
     def _build_prefinalize_signature(
         self,
@@ -995,13 +1010,13 @@ class InpaintingGUI(ThemedTk):
             except OSError:
                 pass
 
-    def _get_chunk_checkpoint_path(self, base_video_name: str, chunk_start_idx: int) -> str:
+    def _get_chunk_checkpoint_path(self, base_video_name: str, chunk_start_idx: int, suffix: str = "") -> str:
         """Returns per-chunk checkpoint path used for mid-inference resume."""
         output_dir = self.output_folder_var.get().strip() or "."
         resume_dir = os.path.join(output_dir, "_inpaint_resume")
         os.makedirs(resume_dir, exist_ok=True)
         video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
-        return os.path.join(resume_dir, f"{video_stem}.chunk_{chunk_start_idx:06d}.pt")
+        return os.path.join(resume_dir, f"{video_stem}{suffix}.chunk_{chunk_start_idx:06d}.pt")
 
     def _load_chunk_checkpoint(
         self, checkpoint_path: str, expected_signature: dict, chunk_start_idx: int, expected_append_length: int
@@ -1123,6 +1138,7 @@ class InpaintingGUI(ThemedTk):
         hires_data: dict,
         base_video_name: str,
         is_dual_input: bool,
+        inpaint_direction: str = "Forward",
     ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """
         Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final output preparation.
@@ -1472,7 +1488,8 @@ class InpaintingGUI(ThemedTk):
         # --- END Apply Color Transfer ---
 
         # --- Apply Post-Inpainting Blending (if enabled) ---
-        if self.enable_post_inpainting_blend.get():
+        # Skip post-inpaint blend if direction is "Both" (both passes save directly without blending)
+        if self.enable_post_inpainting_blend.get() and inpaint_direction != "Both":
             self._log_resource_snapshot(stage="post_blend_start", base_video_name=base_video_name, level=logging.INFO)
             logger.info("Applying post-inpainting blend...")
             frames_output_final = self._apply_post_inpainting_blend(
@@ -1710,6 +1727,9 @@ class InpaintingGUI(ThemedTk):
             "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
             "move_to_finished": self.move_to_finished_var.get(),
+            "inpaint_direction": self.inpaint_direction_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
         }
         return config
 
@@ -2008,7 +2028,7 @@ class InpaintingGUI(ThemedTk):
             frames_blend_mask_processed_unpadded_original_length,
         )
         # This function primarily affects the GUI state.
-        logger.debug(f"Blend parameters state set to: {state}")
+        # logger.debug(f"Blend parameters state set to: {state}")
 
     def _save_debug_image(self, tensor_or_np_array, name_prefix: str, base_video_name: str, frame_idx: int):
         """Saves a tensor or numpy array as a debug image if debug mode is enabled."""
@@ -2076,7 +2096,7 @@ class InpaintingGUI(ThemedTk):
         self.window_width = current_width  # Update instance variable for save_config
 
     def _setup_video_info_and_hires(
-        self, input_video_path: str, save_dir: str, is_dual_input: bool
+        self, input_video_path: str, save_dir: str, is_dual_input: bool, output_suffix: str = ""
     ) -> Tuple[Optional[str], dict]:
         """
         Initializes Hi-Res variables, finds a Hi-Res match, determines the final output path,
@@ -2095,7 +2115,16 @@ class InpaintingGUI(ThemedTk):
             # Quad (SBS) always unflips internally, so it loses the F tag in the filename
             flip_tag = ""
 
-        output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+        default_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+
+        # --- Designate the "R" suffix for reverse video processing when both are selected ---
+        if output_suffix == "R":
+            flip_tag = flip_tag + "R"
+            output_suffix = default_suffix
+        elif output_suffix:
+            output_suffix = output_suffix + default_suffix
+        else:
+            output_suffix = default_suffix
 
         # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
         hires_video_path: Optional[str] = self._find_high_res_match(input_video_path)
@@ -2219,34 +2248,37 @@ class InpaintingGUI(ThemedTk):
 
         # Lo-Res Blend Folder
         input_label = ttk.Label(folder_frame, text="Lo-Res Blend Folder:")
-        input_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
-        )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=current_row, column=2, padx=5)
-        current_row += 1
+        entry_input = ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40)
+        entry_input.grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=0, column=2, padx=5)
 
-        # --- NEW: Hi-Res Blend Folder ---
+        # Hi-Res Blend Folder
         hires_label = ttk.Label(folder_frame, text="Hi-Res Blend Folder:")
-        hires_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        hires_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(hires_label, "Folder containing matching high-resolution splatted files for final blending.")
-        ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
-        )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(
-            row=current_row, column=2, padx=5
-        )
-        current_row += 1
+        entry_hires = ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40)
+        entry_hires.grid(row=1, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=1, column=2, padx=5)
 
         # Output Folder
         output_label = ttk.Label(folder_frame, text="Output Folder:")
-        output_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        output_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_label, self.help_data.get("output_folder", ""))
-        ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40).grid(
-            row=current_row, column=1, padx=5, sticky="ew"
+        entry_output = ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40)
+        entry_output.grid(row=2, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=2, column=2, padx=5)
+
+        # Register Drag & Drop for folder entries
+        register_dnd_entries(
+            [
+                (entry_input, self.input_folder_var, True, None),
+                (entry_hires, self.hires_blend_folder_var, True, None),
+                (entry_output, self.output_folder_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
         )
-        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=current_row, column=2, padx=5)
 
         # --- MAIN PARAMETERS FRAME ---
         param_frame = ttk.LabelFrame(self, text="Parameters", padding=10)
@@ -2290,6 +2322,17 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(
             row=current_row, column=3, sticky="w", padx=5
         )
+        current_row += 1
+
+        # Row 1b: Inpaint Direction
+        inpaint_direction_label = ttk.Label(param_frame, text="Inpaint Direction:")
+        inpaint_direction_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_direction_label, "Direction for inpainting: Forward, Reverse, or Both (Forward then Reverse)")
+        inpaint_direction_options = ["Forward", "Reverse", "Both"]
+        inpaint_direction_menu = ttk.OptionMenu(
+            param_frame, self.inpaint_direction_var, self.inpaint_direction_var.get(), *inpaint_direction_options
+        )
+        inpaint_direction_menu.grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
         # Row 2: Frames Chunk (Left)
@@ -2560,6 +2603,8 @@ class InpaintingGUI(ThemedTk):
         original_input_blend_strength: float = 0.8,
         output_crf: int = 23,
         process_length: int = -1,
+        inpaint_direction: str = "Forward",
+        output_suffix: str = "",
     ) -> Tuple[bool, Optional[str]]:
         """
         Orchestrates the processing of a single video: Setup, Inpainting, Finalization, Encoding.
@@ -2575,11 +2620,13 @@ class InpaintingGUI(ThemedTk):
 
         # 1. SETUP & HI-RES DETECTION
         # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
-        output_video_path, hires_data = self._setup_video_info_and_hires(input_video_path, save_dir, is_dual_input)
+        output_video_path, hires_data = self._setup_video_info_and_hires(
+            input_video_path, save_dir, is_dual_input, output_suffix
+        )
         base_video_name = hires_data["base_video_name"]
         video_name_for_output = hires_data["video_name_for_output"]
         hires_video_path = hires_data["hires_video_path"]  # Optional[str]
-        checkpoint_path = self._get_prefinalize_checkpoint_path(base_video_name)
+        checkpoint_path = self._get_prefinalize_checkpoint_path(base_video_name, output_suffix)
         resume_signature = self._build_prefinalize_signature(
             input_video_path=input_video_path,
             hires_video_path=hires_video_path,
@@ -2712,6 +2759,21 @@ class InpaintingGUI(ThemedTk):
                 frames_blend_mask_processed_unpadded_original_length,
             ) = prepared_inputs
 
+            # --- Handle Inpaint Direction: Reverse ---
+            # If Reverse mode, reverse all frame tensors before inpainting
+            if inpaint_direction == "Reverse":
+                logger.info("Reversing input frames for reverse-direction inpainting...")
+                frames_warpped_padded = reverse_frames(frames_warpped_padded)
+                frames_inpaint_mask_padded = reverse_frames(frames_inpaint_mask_padded)
+                frames_warpped_original_unpadded_normalized = reverse_frames(
+                    frames_warpped_original_unpadded_normalized
+                )
+                frames_blend_mask_processed_unpadded_original_length = reverse_frames(
+                    frames_blend_mask_processed_unpadded_original_length
+                )
+                if frames_left_original_cropped is not None:
+                    frames_left_original_cropped = reverse_frames(frames_left_original_cropped)
+
             # 3. INPAINTING CHUNKS (The main loop)
             total_frames_to_process_actual = num_frames_original
             stride = max(1, frames_chunk - overlap)
@@ -2735,7 +2797,7 @@ class InpaintingGUI(ThemedTk):
                     break
 
                 expected_append_length = actual_sliced_length if i == 0 else max(0, actual_sliced_length - overlap)
-                chunk_checkpoint_path = self._get_chunk_checkpoint_path(base_video_name, i)
+                chunk_checkpoint_path = self._get_chunk_checkpoint_path(base_video_name, i, output_suffix)
                 cached_chunk = self._load_chunk_checkpoint(
                     checkpoint_path=chunk_checkpoint_path,
                     expected_signature=resume_signature,
@@ -2935,6 +2997,19 @@ class InpaintingGUI(ThemedTk):
             )
             self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
 
+        # --- Handle Inpaint Direction: Reverse post-inpaint ---
+        # If Reverse mode, reverse the output back to original orientation after inpainting
+        # This happens before finalization so Post-Inpaint Blend can be applied if enabled
+        if inpaint_direction == "Reverse":
+            logger.info("Reversing inpainted frames back to original orientation...")
+            frames_output_final = reverse_frames(frames_output_final)
+            frames_blend_mask_processed_unpadded_original_length = reverse_frames(
+                frames_blend_mask_processed_unpadded_original_length
+            )
+            frames_warpped_original_unpadded_normalized = reverse_frames(frames_warpped_original_unpadded_normalized)
+            if frames_left_original_cropped is not None:
+                frames_left_original_cropped = reverse_frames(frames_left_original_cropped)
+
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         finalized_outputs = self._finalize_output_frames(
             inpainted_frames=frames_output_final,
@@ -2944,6 +3019,7 @@ class InpaintingGUI(ThemedTk):
             hires_data=hires_data,
             base_video_name=base_video_name,
             is_dual_input=is_dual_input,
+            inpaint_direction=inpaint_direction,
         )
 
         if finalized_outputs is None:
@@ -3048,6 +3124,32 @@ class InpaintingGUI(ThemedTk):
             base_video_name, checkpoint_path=checkpoint_path, keep_prefinalize=self.keep_inpaint_cache_var.get()
         )
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
+
+        # --- Handle Inpaint Direction: Both ---
+        # If "Both" mode, process reverse pass and save with "R" suffix
+        if inpaint_direction == "Both":
+            logger.info("Processing reverse pass for 'Both' mode...")
+            reverse_output_suffix = output_suffix + "R"
+            reverse_completed, _ = self.process_single_video(
+                pipeline=pipeline,
+                input_video_path=input_video_path,
+                save_dir=save_dir,
+                frames_chunk=frames_chunk,
+                overlap=overlap,
+                tile_num=tile_num,
+                vf=vf,
+                num_inference_steps=num_inference_steps,
+                stop_event=stop_event,
+                update_info_callback=update_info_callback,
+                original_input_blend_strength=original_input_blend_strength,
+                output_crf=output_crf,
+                process_length=process_length,
+                inpaint_direction="Reverse",
+                output_suffix=reverse_output_suffix,
+            )
+            if not reverse_completed:
+                logger.warning("Reverse pass failed, but forward pass completed successfully.")
+
         return True, hires_video_path
 
     def processing_done(self, stopped=False):
@@ -3103,6 +3205,7 @@ class InpaintingGUI(ThemedTk):
 
         self.enable_post_inpainting_blend.set(False)  # Default state is OFF
         self.enable_color_transfer.set(True)  # Default state is ON
+        self.inpaint_direction_var.set("Forward")  # Default direction
 
         # Crucially, call the function to disable the entry fields if the blend toggle is now False
         self._toggle_blend_parameters_state()
@@ -3170,6 +3273,7 @@ class InpaintingGUI(ThemedTk):
         gui_output_crf,
         process_length,
         single_clip_id,
+        inpaint_direction,
     ):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
@@ -3345,6 +3449,7 @@ class InpaintingGUI(ThemedTk):
                     original_input_blend_strength=current_original_input_blend_strength,
                     output_crf=current_output_crf,
                     process_length=current_process_length,
+                    inpaint_direction=inpaint_direction,
                 )
 
                 if completed:
@@ -3404,6 +3509,7 @@ class InpaintingGUI(ThemedTk):
     def _show_encoding_settings(self):
         """Show the encoding settings dialog."""
         config = {
+            "codec": self.app_config.get("codec", "H.265"),
             "encoding_encoder": self.app_config.get("encoding_encoder", "Auto"),
             "encoding_quality": self.app_config.get("encoding_quality", "Medium"),
             "encoding_tune": self.app_config.get("encoding_tune", "None"),
@@ -3414,6 +3520,8 @@ class InpaintingGUI(ThemedTk):
             "nvenc_temporal_aq": self.app_config.get("nvenc_temporal_aq", False),
             "nvenc_aq_strength": self.app_config.get("nvenc_aq_strength", 8),
             "color_tags": self.app_config.get("color_tags", "Auto"),
+            "dnxhr_fullres_split": self.app_config.get("dnxhr_fullres_split", False),
+            "dnxhr_profile": self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"),
         }
 
         dialog = EncodingSettingsDialog(
@@ -3421,12 +3529,13 @@ class InpaintingGUI(ThemedTk):
             app_config=config,
             help_data=self.help_data,
             title="Inpainting GUI - Encoding Settings",
-            show_extra_options=False,
+            show_extra_options=True,
             show_color_tags=True,
         )
         self.wait_window(dialog.dialog)
 
         if dialog.result:
+            self.app_config["codec"] = dialog.result.get("codec", "H.265")
             self.app_config["encoding_encoder"] = dialog.result.get("encoding_encoder", "Auto")
             self.app_config["encoding_quality"] = dialog.result.get("encoding_quality", "Medium")
             self.app_config["encoding_tune"] = dialog.result.get("encoding_tune", "None")
@@ -3437,6 +3546,10 @@ class InpaintingGUI(ThemedTk):
             self.app_config["nvenc_temporal_aq"] = dialog.result.get("nvenc_temporal_aq", False)
             self.app_config["nvenc_aq_strength"] = dialog.result.get("nvenc_aq_strength", 8)
             self.app_config["color_tags"] = dialog.result.get("color_tags", "Auto")
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
+            self.app_config["dnxhr_fullres_split"] = dialog.result.get("dnxhr_fullres_split", False)
+            self.app_config["dnxhr_profile"] = dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)")
 
     def start_processing(self):
         input_folder = self.input_folder_var.get()
@@ -3505,6 +3618,7 @@ class InpaintingGUI(ThemedTk):
                 gui_output_crf,
                 process_length,
                 single_clip_id,
+                self.inpaint_direction_var.get(),
             ),
             daemon=True,
         ).start()

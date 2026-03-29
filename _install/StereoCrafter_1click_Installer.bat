@@ -53,26 +53,36 @@ if %errorlevel% neq 0 (
 )
 
 call :log "[3/7] Analyzing Path..."
-for %%I in ("%CD%") do set "CUR_NAME=%%~nxI"
+set "ALREADY_HOME=false"
 
-if /i "!CUR_NAME!"=="_install" (
-    call :log "[INFO] Moving out of _install folder..."
-    cd ..
-    for %%I in ("%CD%") do set "CUR_NAME=%%~nxI"
+REM 1. Check if we are already in the project root
+if exist "pyproject.toml" (
+    call :log "[INFO] Project root detected in current folder."
+    set "ALREADY_HOME=true"
+) else (
+    REM 2. Check if we are inside the _install folder
+    for %%I in ("%CD%") do set "CUR_DIR_NAME=%%~nxI"
+    if /i "!CUR_DIR_NAME!"=="_install" (
+        if exist "..\pyproject.toml" (
+            call :log "[INFO] Moving out of _install folder to project root..."
+            cd ..
+            set "ALREADY_HOME=true"
+        )
+    )
 )
 
-set "PREFIX=!CUR_NAME:~0,13!"
-if /i "!PREFIX!"=="StereoCrafter" (
-    if exist "pyproject.toml" (
-        call :log "[INFO] Project folder verified: !CUR_NAME!"
-        set "ALREADY_HOME=true"
-    ) else (
-        call :log "[INFO] Shell folder detected. Moving up..."
-        cd ..
-        set "ALREADY_HOME=false"
+REM 3. If still not home, check if there's a project subfolder to move into
+if "!ALREADY_HOME!"=="false" (
+    set "FOUND_SUB="
+    for /d %%D in (StereoCrafter*) do (
+        if exist "%%D\pyproject.toml" set "FOUND_SUB=%%D"
     )
-) else (
-    set "ALREADY_HOME=false"
+
+    if defined FOUND_SUB (
+        call :log "[INFO] Found project in subfolder: !FOUND_SUB!"
+        cd "!FOUND_SUB!"
+        set "ALREADY_HOME=true"
+    )
 )
 
 call :log "[4/7] Repository Selection..."
@@ -98,27 +108,17 @@ if "!repo_choice!"=="2" (
     set "PULL_REMOTE=upstream"
 )
 
+REM Only clone if we haven't found a project home yet
 if "!ALREADY_HOME!"=="false" (
-    set "FOUND_SUB="
-    for /d %%D in (StereoCrafter*) do (
-        if exist "%%D\pyproject.toml" set "FOUND_SUB=%%D"
+    call :log "[INFO] No existing project detected. Cloning fresh repository from !SELECTED_URL!..."
+    git clone --recurse-submodules !SELECTED_URL! >> "%LOGFILE%" 2>&1
+    if !errorlevel! neq 0 (
+        call :log "[ERROR] Git clone failed. Check log for details: %LOGFILE%"
+        pause && exit /b 1
     )
-
-    if defined FOUND_SUB (
-        call :log "[INFO] Found project in subfolder: !FOUND_SUB!"
-        cd "!FOUND_SUB!"
-        set "ALREADY_HOME=true"
-    ) else (
-        call :log "[INFO] Cloning fresh repository from !SELECTED_URL!..."
-        git clone --recurse-submodules !SELECTED_URL! >> "%LOGFILE%" 2>&1
-        if !errorlevel! neq 0 (
-            call :log "[ERROR] Git clone failed. Check log for details: %LOGFILE%"
-            pause && exit /b 1
-        )
-        cd StereoCrafter
-        set "ALREADY_HOME=true"
-        set "JUST_CLONED=true"
-    )
+    cd StereoCrafter
+    set "ALREADY_HOME=true"
+    set "JUST_CLONED=true"
 )
 
 REM Standardize Remotes [matching _update.bat structure]

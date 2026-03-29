@@ -4,7 +4,7 @@ import gc
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional, Callable, Dict, Any, Union
+from typing import Optional, Callable, Dict, Any
 import torch
 import numpy as np
 import subprocess
@@ -25,7 +25,7 @@ except Exception:
 
 # Import modularized components
 from core.ui.widgets import Tooltip
-from core.common.gpu_utils import release_cuda_memory
+from core.ui.preview_canvas_window import PreviewCanvasWindow
 from core.common.video_io import get_video_stream_info
 
 import logging
@@ -106,7 +106,6 @@ class VideoPreviewer(ttk.Frame):
         self.current_video_index: int = -1
         self.current_params: Dict[str, Any] = {}
         self.pil_image_for_preview: Optional[Image.Image] = None
-        self.preview_image_tk: Optional[ImageTk.PhotoImage] = None
         self.wiggle_after_id: Optional[str] = None
         self.root_window = self.parent.winfo_toplevel()
         self.last_loaded_video_path: Optional[str] = None
@@ -143,7 +142,6 @@ class VideoPreviewer(ttk.Frame):
         self.video_jump_to_var = tk.StringVar(value="1")
         self.video_status_label_var = tk.StringVar(value="Video: 0 / 0")
         self.frame_label_var = tk.StringVar(value="Frame: 0 / 0")
-        self._is_dragging = False
 
         # Flag to track if we've done the initial video list scan
         self._video_list_scanned = False
@@ -159,6 +157,12 @@ class VideoPreviewer(ttk.Frame):
         self._dp_total_max_video_index = None
         self._dp_signature = None
         self.flip_horizontal = False  # Flip preview horizontally
+
+        # Cross-eye toggle for SBS preview mode
+        self.sbs_cross_eye_var = tk.BooleanVar(value=False)
+
+        # Canvas window (Toplevel) — created in _create_widgets
+        self.canvas_window: Optional[PreviewCanvasWindow] = None
 
         self._create_widgets()
 
@@ -182,6 +186,20 @@ class VideoPreviewer(ttk.Frame):
         except Exception:
             pass
         self._clear_preview_resources()
+        if self.canvas_window:
+            self.canvas_window.destroy_window()
+
+    @property
+    def preview_image_tk(self):
+        """Expose the canvas window's PhotoImage for height calculations by parent GUIs."""
+        if self.canvas_window and self.canvas_window._photo:
+            return self.canvas_window._photo
+        return None
+
+    @preview_image_tk.setter
+    def preview_image_tk(self, value):
+        """Allow setting (used internally during clear)."""
+        pass
 
     def _clear_preview_resources(self):
         """Closes all preview-related video readers and clears the preview display."""
@@ -197,14 +215,12 @@ class VideoPreviewer(ttk.Frame):
                 del self.source_readers[key]
         self.source_readers.clear()
 
-        # --- FIX: Create a dummy image to hold the place, preventing TclError ---
-        # This is the most robust way to clear the image in Tkinter without race conditions.
-        self._dummy_image = ImageTk.PhotoImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
-        self.preview_label.config(image=self._dummy_image, text="Load a video list to see preview")
-        self.preview_label.image = self._dummy_image
-        self.preview_image_tk = None
-        # --- END FIX ---
+        # Clear the canvas window display
+        if self.canvas_window:
+            self.canvas_window.clear()
+
         self.pil_image_for_preview = None
+        self.preview_image_tk = None
 
         # Reset depth-map decode state
 
@@ -221,7 +237,7 @@ class VideoPreviewer(ttk.Frame):
         self._depth_msb_shift = None
 
         gc.collect()
-        logger.info("Preview resources and file handles have been released.")
+        logger.debug("Preview resources and file handles have been released.")
 
     def invalidate_frame_buffer(self):
         """Public method to invalidate the frame buffer. Call when processing parameters change."""
@@ -251,16 +267,10 @@ class VideoPreviewer(ttk.Frame):
         if self._frame_buffer is not None:
             self._frame_buffer.cache_display_frame(frame_idx, display_frame)
 
-    def get_cached_sbs_frame(self, frame_idx: int):
-        """Get cached SBS frame data (left_np, right_np) if available."""
+    def clear_display_buffer(self):
+        """Clear the display buffer (forces re-render on next preview update)."""
         if self._frame_buffer is not None:
-            return self._frame_buffer.get_cached_sbs_frame(frame_idx)
-        return None
-
-    def cache_sbs_frame(self, frame_idx: int, left_np: np.ndarray, right_np: np.ndarray):
-        """Cache SBS frame data."""
-        if self._frame_buffer is not None:
-            self._frame_buffer.cache_sbs_frame(frame_idx, left_np, right_np)
+            self._frame_buffer._display_buffer.clear()
 
     def _create_hover_tooltip(self, widget, help_key, tooltip_info: Optional[str] = None):
         """Creates a mouse-over tooltip for the given widget."""
@@ -271,48 +281,30 @@ class VideoPreviewer(ttk.Frame):
 
     def _create_widgets(self):
         """Creates and lays out all the widgets for the previewer."""
-        self.grid_rowconfigure(0, weight=1)
+        # --- Canvas Window (Toplevel) ---
+        self.canvas_window = PreviewCanvasWindow(
+            self.root_window,
+            title="Preview",
+            zoom_callback=self._handle_zoom,
+            sbs_cross_eye_var=self.sbs_cross_eye_var,
+            on_close_callback=None,
+        )
+        # Aliases for backward compatibility (theme, bindings)
+        self.preview_canvas = self.canvas_window.preview_canvas
+        self.preview_label = self.canvas_window.preview_label
+        self.v_scrollbar = self.canvas_window.v_scrollbar
+        self.h_scrollbar = self.canvas_window.h_scrollbar
+
+        # Right-click to reset zoom to 100% (on canvas window elements)
+        for w in [self.preview_canvas, self.preview_label]:
+            w.bind("<Button-3>", lambda e: (self.preview_size_var.set("100%"), self.on_slider_release(None)))
+
+        # --- Scrubber + Buttons stay in this Frame ---
         self.grid_columnconfigure(0, weight=1)
-
-        # Canvas with scrollbars for the image
-        self.preview_canvas = tk.Canvas(self)
-        v_scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._on_preview_vscroll)
-        h_scrollbar = ttk.Scrollbar(self, orient="horizontal", command=self._on_preview_hscroll)
-        self.preview_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-        self.preview_canvas.bind("<Configure>", lambda e: self._update_preview_layout())
-        # Keep crosshair centered when scrolling (does not override scroll behavior)
-
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
-        v_scrollbar.grid(row=0, column=1, sticky="ns")
-        h_scrollbar.grid(row=1, column=0, sticky="ew")
-
-        self.v_scrollbar = v_scrollbar
-        self.h_scrollbar = h_scrollbar
-
-        self.preview_inner_frame = ttk.Frame(self.preview_canvas)
-        self.preview_canvas_window_id = self.preview_canvas.create_window(
-            (0, 0), window=self.preview_inner_frame, anchor="nw"
-        )
-        self.preview_label = ttk.Label(
-            self.preview_inner_frame, text="Load a video list to see preview", anchor="center"
-        )
-        self.preview_label.pack(fill="both", expand=True)
-
-        # self.preview_canvas.itemconfig(self.preview_canvas_window_id, tags=("content_drag_tag",))
-        # # Start: Call scan_mark and return break
-        # self.preview_label.bind("<ButtonPress-1>",
-        #                         lambda e: (self.preview_canvas.scan_mark(e.x, e.y), "break")[1])
-
-        # # Drag: Call scan_dragto and return break
-        # self.preview_label.bind("<B1-Motion>",
-        #                         lambda e: (self.preview_canvas.scan_dragto(e.x, e.y, gain=1), "break")[1])
-
-        # # End: Call the method to clear the cursor
-        # self.preview_label.bind("<ButtonRelease-1>", self._end_drag_scroll)
 
         # Scrubber Frame
         scrubber_frame = ttk.Frame(self)
-        scrubber_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
+        scrubber_frame.grid(row=0, column=0, sticky="ew", pady=2)
         scrubber_frame.grid_columnconfigure(1, weight=1)
 
         self.frame_label = ttk.Label(scrubber_frame, textvariable=self.frame_label_var, width=15)
@@ -327,7 +319,7 @@ class VideoPreviewer(ttk.Frame):
 
         # Video Navigation Frame
         preview_button_frame = ttk.Frame(self)
-        preview_button_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
+        preview_button_frame.grid(row=1, column=0, sticky="ew", pady=2)
 
         # Bindings are placed on the top-level window for global detection
         self.root_window.bind("<Left>", self._key_jump_frames, add="+")
@@ -355,7 +347,7 @@ class VideoPreviewer(ttk.Frame):
         # Prevent this combobox from stealing focus/keyboard shortcuts (space/enter)
         self.preview_source_combo.configure(takefocus=False)
         self.preview_source_combo.bind(
-            "<<ComboboxSelected>>", lambda e: (self.on_slider_release(e), self.preview_canvas.focus_set())
+            "<<ComboboxSelected>>", lambda e: (self.on_slider_release(e), self.canvas_window.preview_canvas.focus_set())
         )
         self.preview_source_combo.bind("<space>", lambda e: self._key_toggle_play_pause(e) or "break")
         self.preview_source_combo.bind("<Shift-space>", lambda e: self._key_shift_space_fast_forward(e) or "break")
@@ -524,45 +516,6 @@ class VideoPreviewer(ttk.Frame):
             self.preview_size_combo,
         ]
 
-        # --- [START OF ADDITION] ZOOM & DRAG INTERACTION BINDINGS ---
-        # self.preview_canvas.bind("<Enter>", lambda e: self.preview_canvas.focus_set())
-        self.preview_canvas.bind("<Button-1>", lambda e: self.preview_canvas.focus_set(), add="+")
-
-        # Universal Zoom (Mousewheel)
-        for w in [self.preview_canvas, self.preview_label]:
-            w.bind("<MouseWheel>", self._handle_zoom)
-            w.bind("<Button-4>", self._handle_zoom)
-            w.bind("<Button-5>", self._handle_zoom)
-            # Right Click to reset zoom to 100%
-            w.bind("<Button-3>", lambda e: (self.preview_size_var.set("100%"), self.on_slider_release(None)))
-
-        # Universal Drag (Left Click and Middle Click)
-        for b in ["<ButtonPress-1>", "<ButtonPress-2>"]:
-            self.preview_label.bind(b, self._start_drag_scroll)
-        for b in ["<B1-Motion>", "<B2-Motion>"]:
-            self.preview_label.bind(b, self._drag_scroll)
-        for b in ["<ButtonRelease-1>", "<ButtonRelease-2>"]:
-            self.preview_label.bind(b, self._end_drag_scroll)
-
-    def _start_drag_scroll(self, event):
-        """Initiates panning logic if image is larger than the window."""
-        if self.v_scrollbar.winfo_ismapped() or self.h_scrollbar.winfo_ismapped():
-            self._is_dragging = True
-            self.preview_canvas.config(cursor="fleur")
-            self.preview_canvas.scan_mark(int(event.x), int(event.y))
-
-    def _end_drag_scroll(self, event):
-        """Resets the cursor and dragging state when the mouse button is released."""
-        self._is_dragging = False
-        # Remove the 'fleur' panning cursor
-        self.preview_canvas.config(cursor="")
-        logger.debug("_end_drag_scroll: Panning operation concluded.")
-
-    def _drag_scroll(self, event):
-        """Standard Canvas panning using gain=1 for 1:1 mouse movement."""
-        if self._is_dragging:
-            self.preview_canvas.scan_dragto(int(event.x), int(event.y), gain=1)
-
     def _handle_zoom(self, event):
         """Standard Mousewheel Zoom stepping through the percentage list."""
         if not self.preview_size_var:
@@ -620,6 +573,10 @@ class VideoPreviewer(ttk.Frame):
     def _handle_load_refresh(self):
         """Internal handler for the 'Load/Refresh List' button."""
         self._stop_playback()
+
+        # Show the canvas window
+        if self.canvas_window:
+            self.canvas_window.show()
 
         if not self._video_list_scanned:
             # First press: do a full scan
@@ -958,12 +915,6 @@ class VideoPreviewer(ttk.Frame):
         """
         self.video_list = find_sources_callback()
 
-        if not self.video_list:
-            messagebox.showwarning("Not Found", "No valid source videos found.")
-            self.current_video_index = -1
-            self._update_nav_controls()
-            return
-
         target_index = 0
 
         if self.last_loaded_video_path:
@@ -1214,7 +1165,7 @@ class VideoPreviewer(ttk.Frame):
                 self.update_clip_callback()
 
             t_total_load = time.perf_counter()
-            logger.info(f"Previewer: Total video load took {t_total_load - t_load_start:.3f}s")
+            logger.debug(f"Previewer: Total video load took {t_total_load - t_load_start:.3f}s")
 
             if self.parent and hasattr(self.parent, "update_gui_from_sidecar"):
                 self.parent.update_gui_from_sidecar(source_paths.get("depth_map"))
@@ -1512,6 +1463,12 @@ class VideoPreviewer(ttk.Frame):
             frame_was_cached = False
             scale_percent_str = self.current_params.get("preview_size", "100%")
 
+            # Inject sbs_cross_eye into params so buffer signature tracks it
+            if self.sbs_cross_eye_var.get():
+                self.current_params["sbs_cross_eye"] = True
+            else:
+                self.current_params.pop("sbs_cross_eye", None)
+
             if self._frame_buffer is not None:
                 self._frame_buffer.check_and_update_buffer(self.current_params, video_path)
 
@@ -1718,22 +1675,15 @@ class VideoPreviewer(ttk.Frame):
                 self._draw_depth_minmax_overlay(display_image)
 
             self.preview_image_tk = ImageTk.PhotoImage(display_image)
-            # --- FIX: Attach the image reference to the widget to prevent garbage collection ---
-            self.preview_label.config(image=self.preview_image_tk, text="")
-            self.preview_label.image = self.preview_image_tk
-            # --- END FIX ---
 
-            # --- NEW: Trigger parent window resize ---
-            # if self.resize_callback:
-            #     # Force the parent to update its layout to see the new image size
-            #     self.parent.update_idletasks()
-            #     self.resize_callback()
-            # --- END NEW ---
-            self._update_preview_layout()
+            # Display in the canvas window
+            if self.canvas_window:
+                self.canvas_window.update_frame(display_image)
 
         except Exception as e:
             logger.error(f"Error updating preview: {e}", exc_info=True)
-            self.preview_label.config(image=None, text=f"Error:\n{e}")
+            if self.canvas_window:
+                self.canvas_window.clear()
         finally:
             # release_cuda_memory() # REMOVED: too slow for hot path (contains gc.collect)
             self.load_preview_button.config(text="Load/Refresh List", style="CompactAction.TButton")
@@ -1871,42 +1821,6 @@ class VideoPreviewer(ttk.Frame):
 
         return arr.copy()
 
-    def _update_preview_layout(self):
-        """Centers the image if it's smaller than the canvas, and hides/shows scrollbars."""
-        if not hasattr(self, "preview_canvas") or self.pil_image_for_preview is None:
-            if hasattr(self, "v_scrollbar"):
-                self.v_scrollbar.grid_remove()
-            if hasattr(self, "h_scrollbar"):
-                self.h_scrollbar.grid_remove()
-            return
-
-        canvas_w = self.preview_canvas.winfo_width()
-        canvas_h = self.preview_canvas.winfo_height()
-
-        # Use the PhotoImage size for layout, not the original PIL image
-        img_w = self.preview_image_tk.width()
-        img_h = self.preview_image_tk.height()
-
-        v_scroll_needed = img_h > canvas_h
-        h_scroll_needed = img_w > canvas_w
-
-        if v_scroll_needed:
-            self.v_scrollbar.grid()
-        else:
-            self.v_scrollbar.grid_remove()
-        if h_scroll_needed:
-            self.h_scrollbar.grid()
-        else:
-            self.h_scrollbar.grid_remove()
-
-        x = max(0, (canvas_w - img_w) // 2)
-        y = max(0, (canvas_h - img_h) // 2)
-
-        self.preview_canvas.coords(self.preview_canvas_window_id, x, y)
-        self.preview_inner_frame.update_idletasks()
-        # REPLACED VERSION: Force scrollregion to encompass full image boundaries
-        self.preview_canvas.config(scrollregion=(0, 0, max(canvas_w, img_w), max(canvas_h, img_h)))
-
     def replace_source_path_for_current_video(self, key: str, path: str):
         """Replace the source path for the currently loaded video for `key` (e.g., 'depth_map').
 
@@ -1988,17 +1902,13 @@ class VideoPreviewer(ttk.Frame):
         if not hasattr(self, "wiggle_left_tk"):
             return  # Stop if resources were cleared
         current_image = self.wiggle_left_tk if show_left else self.wiggle_right_tk
-        self.preview_label.config(image=current_image)
-        self.preview_label.image = current_image  # Prevent garbage collection
+        if self.canvas_window:
+            try:
+                self.canvas_window.preview_label.config(image=current_image)
+                self.canvas_window.preview_label.image = current_image  # Prevent garbage collection
+            except Exception:
+                pass
         self.wiggle_after_id = self.parent.after(60, self._wiggle_step, not show_left)
-
-    def _on_preview_vscroll(self, *args):
-        """Vertical scrollbar handler."""
-        self.preview_canvas.yview(*args)
-
-    def _on_preview_hscroll(self, *args):
-        """Horizontal scrollbar handler."""
-        self.preview_canvas.xview(*args)
 
     def _crosshair_allowed_for_current_source(self) -> bool:
         """

@@ -68,6 +68,7 @@ SPLATTER_DEFAULT_CONFIG = {
     "border_manual": False,
     "strict_ffmpeg_decode": False,
     "encoding_encoder": "Auto",
+    "codec": "H.265",
     "encoding_quality": "Auto",
     "encoding_tune": "Auto",
     "encoding_nvenc_lookahead_enabled": False,
@@ -246,6 +247,10 @@ def _apply_backward_compat(config: Dict[str, Any]) -> None:
                     config[key] = str(-(val - 30.0))
             except (ValueError, TypeError):
                 pass
+
+    # Note: encoding_encoder and codec are now separate settings
+    # encoding_encoder: Auto/Force CPU (encoder)
+    # codec: H.264/H.265 (codec)
 
 
 def _get_tk_var_value(var) -> Any:

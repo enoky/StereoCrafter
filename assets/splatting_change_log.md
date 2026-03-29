@@ -7,6 +7,7 @@ All notable changes to the splatting GUI and related components.
 ### Added (v26-03-08.0)
 
 - **Unified Encoding Settings Dialog**: Moved all encoding options to a shared dialog (Options → Encoding Settings...).
+  - **Codec**: H.264/H.265
   - **Encoder**: Auto (NVENC/CPU) or Force CPU
   - **Quality Preset**: Fastest to Slowest (controls encoding speed/efficiency)
   - **CPU Tune**: Film, Grain, Animation, etc. (ignored for NVENC)

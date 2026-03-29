@@ -1,7 +1,6 @@
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from PIL import Image
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,6 @@ class PreviewFrameBuffer:
         """
         self._main_buffer: Dict[int, Image.Image] = {}
         self._display_buffer: Dict[int, Image.Image] = {}  # Pre-scaled display images
-        self._sbs_buffer: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         self._params_signature: Optional[str] = None
         self._video_path: Optional[str] = None
         self._preview_size: Optional[str] = None  # Track preview size to invalidate display buffer
@@ -46,6 +44,7 @@ class PreviewFrameBuffer:
         preview_size = params.get("preview_size", "100%")
         key_parts = [
             video_path or "",
+            # Splatting GUI parameters
             str(params.get("max_disp", "")),
             str(params.get("convergence_point", "")),
             str(params.get("depth_gamma", "")),
@@ -63,6 +62,19 @@ class PreviewFrameBuffer:
             str(params.get("enable_global_norm", "")),
             str(params.get("strict_ffmpeg_decode", "")),
             str(params.get("flip_horizontal", False)),
+            # Merging GUI parameters
+            str(params.get("mask_binarize_threshold", "")),
+            str(params.get("mask_dilate_kernel_size", "")),
+            str(params.get("mask_blur_kernel_size", "")),
+            str(params.get("shadow_shift", "")),
+            str(params.get("shadow_decay_gamma", "")),
+            str(params.get("shadow_start_opacity", "")),
+            str(params.get("shadow_opacity_decay", "")),
+            str(params.get("shadow_min_opacity", "")),
+            str(params.get("add_borders", "")),
+            str(params.get("enable_color_transfer", "")),
+            str(params.get("output_format", "")),
+            str(params.get("sbs_cross_eye", False)),
         ]
         return "|".join(key_parts)
 
@@ -118,28 +130,12 @@ class PreviewFrameBuffer:
             del self._display_buffer[oldest_idx]
         self._display_buffer[frame_idx] = display_frame
 
-    def get_cached_sbs_frame(self, frame_idx: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Get cached SBS frame data (left_np, right_np)."""
-        return self._sbs_buffer.get(frame_idx)
-
-    def cache_sbs_frame(self, frame_idx: int, left_np: np.ndarray, right_np: np.ndarray) -> None:
-        """Cache SBS frame data."""
-        if len(self._sbs_buffer) >= self._max_frames:
-            oldest_idx = min(self._sbs_buffer.keys())
-            del self._sbs_buffer[oldest_idx]
-        self._sbs_buffer[frame_idx] = (left_np, right_np)
-
     def clear(self) -> None:
         """Clear all cached frames."""
         self._main_buffer.clear()
         self._display_buffer.clear()
-        self._sbs_buffer.clear()
         logger.debug("Preview frame buffers cleared")
 
     def get_stats(self) -> Dict[str, int]:
         """Get buffer statistics for debugging."""
-        return {
-            "main_buffer_size": len(self._main_buffer),
-            "display_buffer_size": len(self._display_buffer),
-            "sbs_buffer_size": len(self._sbs_buffer),
-        }
+        return {"main_buffer_size": len(self._main_buffer), "display_buffer_size": len(self._display_buffer)}

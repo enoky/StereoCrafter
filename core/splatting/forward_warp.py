@@ -12,6 +12,70 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+
+def fill_edge_occlusions(
+    right_video_tensor: torch.Tensor, occlusion_mask_tensor: torch.Tensor, outline_thickness: int = 2
+) -> torch.Tensor:
+    """
+    Fills horizontal edge occlusions at the FRAME boundaries (both left and right sides) in the right-eye video
+    by drawing an outline of the nearest visible pixels to aid inpainting, rather than extending the image edge inwards.
+
+    Args:
+        right_video_tensor (torch.Tensor): The forward-warped right-eye video tensor [B, C, H, W], values in [0, 1].
+        occlusion_mask_tensor (torch.Tensor): The corresponding occlusion mask tensor [B, 1, H, W], where 1 indicates occlusion.
+        outline_thickness (int): The number of pixels to draw the outline for inside the occlusion gap.
+    Returns:
+        torch.Tensor: The modified right-eye video tensor.
+    """
+    B, C, H, W = right_video_tensor.shape
+
+    # Ensure outline_thickness is within valid bounds
+    outline_thickness = min(W // 2, outline_thickness)
+
+    if outline_thickness <= 0:
+        return right_video_tensor
+
+    modified_right_video_tensor = right_video_tensor.clone()
+
+    is_occluded = occlusion_mask_tensor[:, 0, :, :] > 0.5  # [B, H, W]
+    visible = ~is_occluded
+
+    # --- LEFT EDGE ---
+    # Find the nearest visible pixel from the left for each row
+    first_visible_idx = visible.long().argmax(dim=2, keepdim=True)  # [B, H, 1]
+    first_visible_idx_expanded = first_visible_idx.unsqueeze(1).expand(-1, C, -1, -1)  # [B, C, H, 1]
+
+    # Gather colors of the first visible pixels
+    left_colors = right_video_tensor.gather(3, first_visible_idx_expanded)  # [B, C, H, 1]
+    left_colors_expanded = left_colors.expand(-1, -1, -1, outline_thickness)  # [B, C, H, thickness]
+
+    # Only overwrite the left frame edge IF it is occluded
+    left_occluded = is_occluded[:, :, :outline_thickness].unsqueeze(1).expand(-1, C, -1, -1)  # [B, C, H, thickness]
+
+    modified_right_video_tensor[:, :, :, :outline_thickness] = torch.where(
+        left_occluded, left_colors_expanded, modified_right_video_tensor[:, :, :, :outline_thickness]
+    )
+
+    # --- RIGHT EDGE ---
+    # Find the nearest visible pixel from the right for each row
+    last_visible_idx_rev = visible.flip(dims=[2]).long().argmax(dim=2, keepdim=True)  # [B, H, 1]
+    last_visible_idx = W - 1 - last_visible_idx_rev
+    last_visible_idx_expanded = last_visible_idx.unsqueeze(1).expand(-1, C, -1, -1)  # [B, C, H, 1]
+
+    # Gather colors of the last visible pixels
+    right_colors = right_video_tensor.gather(3, last_visible_idx_expanded)  # [B, C, H, 1]
+    right_colors_expanded = right_colors.expand(-1, -1, -1, outline_thickness)  # [B, C, H, thickness]
+
+    # Only overwrite the right frame edge IF it is occluded
+    right_occluded = is_occluded[:, :, -outline_thickness:].unsqueeze(1).expand(-1, C, -1, -1)  # [B, C, H, thickness]
+
+    modified_right_video_tensor[:, :, :, -outline_thickness:] = torch.where(
+        right_occluded, right_colors_expanded, modified_right_video_tensor[:, :, :, -outline_thickness:]
+    )
+
+    return modified_right_video_tensor
+
+
 try:
     from Forward_Warp import forward_warp
 
@@ -20,6 +84,8 @@ except Exception:
     from dependency.forward_warp_pytorch import forward_warp
 
     logger.info("Forward Warp Pytorch is active.")
+
+from .m2s_mask import build_m2s_occlusion_mask_from_disparity
 
 
 class ForwardWarpStereo(nn.Module):
@@ -38,10 +104,10 @@ class ForwardWarpStereo(nn.Module):
     Example:
         >>> import torch
         >>> from core.splatting.forward_warp import ForwardWarpStereo
-        >>> 
+        >>>
         >>> # Create module
         >>> fws = ForwardWarpStereo(eps=1e-6, occlu_map=False)
-        >>> 
+        >>>
         >>> # Forward pass
         >>> image = torch.randn(1, 3, 512, 1024)  # [B, C, H, W]
         >>> disparity = torch.randn(1, 1, 512, 512)  # [B, 1, H, W]
@@ -60,11 +126,7 @@ class ForwardWarpStereo(nn.Module):
         self.occlu_map = occlu_map
         self.fw = forward_warp()
 
-    def forward(
-        self,
-        im: torch.Tensor,
-        disp: torch.Tensor,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, im: torch.Tensor, disp: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Perform forward warping of image based on disparity.
 
         Args:
@@ -118,7 +180,9 @@ def execute_forward_warp(
     zero_disparity_anchor_val: float,
     input_bias: float = 0.0,
     tv_disp_comp: float = 1.0,
+    edge_outline_thickness: int = 2,
     debug_task_name: str = "Render",
+    mask_mode: str = "SC",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Executes the shared forward stereo projection logic.
@@ -132,33 +196,30 @@ def execute_forward_warp(
         zero_disparity_anchor_val: The convergence anchor value [0, 1]
         input_bias: Depth map float bias adjustment
         tv_disp_comp: TV-range disparity compensation multiplier
+        debug_task_name: Task name for conditional logic (e.g., "Preview", "Render")
+        mask_mode: Mask generation mode - "SC" for StereoCrafter original, "M2S" for M2S-style occupancy mask
 
     Returns:
         Tuple of (right_eye_tensor, occlusion_mask)
     """
-    # from dependency.stereocrafter_util import log_debug_args
-    # log_debug_args(locals(), "execute_forward_warp", "forward_warp")
-
     depth_tensor = torch.clip(depth_tensor, 0.0, 1.0)
 
-    
     if input_bias != 0:
         depth_tensor = torch.clip(depth_tensor + input_bias, 0.0, 1.0)
 
-    # Disparity calculation
     disp_map = (depth_tensor - zero_disparity_anchor_val) * 2.0
     actual_max_disp_pixels = (max_disp / 20.0 / 100.0) * target_width * tv_disp_comp
     disp_map = disp_map * actual_max_disp_pixels
 
     with torch.no_grad():
         right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
-        
-    # from dependency.stereocrafter_util import dump_debug_tensor
-    # dump_debug_tensor(source_tensor, "3_source_video_left", "forward_warp")
-    # dump_debug_tensor(depth_tensor, "4_pre_warp_depth", "forward_warp")
-    # dump_debug_tensor(disp_map, "5_disparity_map", "forward_warp")
-    # dump_debug_tensor(right_eye_raw, "6_warped_right_eye", "forward_warp")
-    # dump_debug_tensor(occlusion_mask, "7_occlusion_mask", "forward_warp")
-        
-    return right_eye_raw, occlusion_mask
 
+        if mask_mode.upper() == "M2S":
+            occlusion_mask = build_m2s_occlusion_mask_from_disparity(disp_map, output_dtype=occlusion_mask.dtype)
+
+        if debug_task_name != "Preview":
+            right_eye_raw = fill_edge_occlusions(
+                right_eye_raw, occlusion_mask, outline_thickness=edge_outline_thickness
+            )
+
+    return right_eye_raw, occlusion_mask

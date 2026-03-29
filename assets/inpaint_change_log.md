@@ -6,6 +6,7 @@
 
 - **Unified Encoding Settings Dialog**: Added encoding options accessible via Options → Encoding Settings....
   - Previously only CRF was available in main UI, now moved to unified dialog
+  - **Codec**: H.264/H.265
   - **Encoder**: Auto (NVENC/CPU) or Force CPU
   - **Quality Preset**: Fastest to Slowest (controls encoding speed/efficiency)
   - **CPU Tune**: Film, Grain, Animation, etc. (ignored for NVENC)

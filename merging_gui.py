@@ -47,8 +47,9 @@ from core.ui.video_previewer import VideoPreviewer
 from core.ui.encoding_settings import EncodingSettingsDialog
 from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 from core.ui.theme_manager import ThemeManager
+from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 
-GUI_VERSION = "26-03-08.0"
+GUI_VERSION = "26-03-08.1"
 
 
 class MergingGUI(ThemedTk):
@@ -72,6 +73,13 @@ class MergingGUI(ThemedTk):
         "enable_color_transfer": True,
         "batch_chunk_size": "20",
         "preview_size": "100%",
+        "MESH_WARP_DISPARITY": "25.0",
+        "MESH_WARP_CONVERGENCE": "0.5",
+        "MESH_WARP_VIEW_BIAS": "0.0",
+        "MESH_WARP_DOLLY_ZOOM": "0.0",
+        "MESH_WARP_EXTRUSION_SCALE": "0.1",
+        "MESH_WARP_DENSITY_X": "512",
+        "MESH_WARP_DENSITY_Y": "512",
     }
 
     def __init__(self):
@@ -79,6 +87,9 @@ class MergingGUI(ThemedTk):
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
         self.app_config = self._load_config()
         self.help_data = self._load_help_texts()
+
+        # --- Drag-and-drop support (requires tkinterdnd2) ---
+        self._dnd_enabled = init_dnd(self)
 
         # --- Sidecar Config Manager ---
         self.sidecar_manager = SidecarConfigManager()
@@ -162,7 +173,8 @@ class MergingGUI(ThemedTk):
         self.preview_size_var = tk.StringVar(value=str(self.app_config.get("preview_size", "100%")))
 
         # --- Encoding Settings ---
-        self.encoding_encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
+        self.codec_var = tk.StringVar(value=self.app_config.get("codec", "H.265"))
+        self.encoder_var = tk.StringVar(value=self.app_config.get("encoding_encoder", "Auto"))
         self.encoding_quality_var = tk.StringVar(value=self.app_config.get("encoding_quality", "Medium"))
         self.encoding_tune_var = tk.StringVar(value=self.app_config.get("encoding_tune", "None"))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
@@ -172,6 +184,8 @@ class MergingGUI(ThemedTk):
         self.nvenc_temporal_aq_var = tk.BooleanVar(value=self.app_config.get("nvenc_temporal_aq", False))
         self.nvenc_aq_strength_var = tk.IntVar(value=self.app_config.get("nvenc_aq_strength", 8))
         self.color_tags_var = tk.StringVar(value=self.app_config.get("color_tags", "Auto"))
+        self.dnxhr_fullres_split_var = tk.BooleanVar(value=self.app_config.get("dnxhr_fullres_split", False))
+        self.dnxhr_profile_var = tk.StringVar(value=self.app_config.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
         # --- GUI Status Variables ---
         self.slider_label_updaters = []
@@ -297,12 +311,15 @@ class MergingGUI(ThemedTk):
             self.theme_manager.apply_theme_to_menus(menus=menus, menubar=self.menubar)
 
         # Previewer Canvas
-        if hasattr(self, "previewer") and hasattr(self.previewer, "preview_canvas"):
-            self.theme_manager.apply_theme_to_canvas(self.previewer.preview_canvas)
+        if hasattr(self, "previewer") and hasattr(self.previewer, "canvas_window"):
+            self.theme_manager.apply_theme_to_canvas(self.previewer.canvas_window.preview_canvas)
 
         # 3. Apply compact/custom widget styles via ThemeManager
         self.theme_manager.configure_compact_styles(self.style)
         self.theme_manager.configure_progressbar_style(self.style)
+
+        # DnD drop-target highlight style (theme-aware)
+        configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
 
         # --- FIX: Re-apply the custom loading button style after the theme changes ---
         # This ensures the red text color is not overridden by the theme's default button style.
@@ -437,35 +454,29 @@ class MergingGUI(ThemedTk):
             current_actual_width = self.window_width
 
         # --- NEW: More accurate height calculation ---
-        # --- FIX: Calculate base_height by summing widgets *other* than the previewer ---
-        # This is more stable than subtracting a potentially out-of-sync canvas height.
+        # Sum heights of all packed children (the previewer frame now only contains controls).
         base_height = 0
         for widget in self.winfo_children():
-            if widget is not self.previewer:
-                # --- FIX: Correctly handle tuple and int for pady ---
-                try:
-                    pady_value = widget.pack_info().get("pady", 0)
-                    total_pady = 0
-                    if isinstance(pady_value, int):
-                        total_pady = pady_value * 2
-                    elif isinstance(pady_value, (tuple, list)):
-                        total_pady = sum(pady_value)
-                    base_height += widget.winfo_reqheight() + total_pady
-                except tk.TclError:
-                    # This widget (e.g., the menubar) is not packed, so it has no pady.
-                    base_height += widget.winfo_reqheight()
+            # --- FIX: Correctly handle tuple and int for pady ---
+            try:
+                pady_value = widget.pack_info().get("pady", 0)
+                total_pady = 0
+                if isinstance(pady_value, int):
+                    total_pady = pady_value * 2
+                elif isinstance(pady_value, (tuple, list)):
+                    total_pady = sum(pady_value)
+                base_height += widget.winfo_reqheight() + total_pady
+            except tk.TclError:
+                # This widget (e.g., the menubar) is not packed, so it has no pady.
+                base_height += widget.winfo_reqheight()
         # --- END FIX ---
-
-        # Get the actual height of the displayed preview image, if it exists
-        preview_image_height = 0
-        if hasattr(self.previewer, "preview_image_tk") and self.previewer.preview_image_tk:
-            preview_image_height = self.previewer.preview_image_tk.height()
 
         # Add a small buffer for padding/borders
         padding = 10
 
-        # The new total height is the base UI height + the actual image height + padding
-        new_height = base_height + preview_image_height + padding
+        # The new total height is the base UI height + padding.
+        # The preview image is now in a separate Toplevel (canvas_window).
+        new_height = base_height + padding
         # --- END NEW ---
 
         self.geometry(f"{current_actual_width}x{new_height}")
@@ -541,6 +552,17 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
 
+        # Register Drag & Drop for folder entries
+        register_dnd_entries(
+            [
+                (entry_inpaint, self.inpainted_folder_var, True, None),
+                (entry_orig, self.original_folder_var, True, None),
+                (entry_mask, self.mask_folder_var, True, None),
+                (entry_out, self.output_folder_var, True, None),
+            ],
+            dnd_enabled=self._dnd_enabled,
+        )
+
         # --- PREVIEW FRAME (using the new module) ---
         # Moved back to its original position after the folder frame.
         self.previewer = VideoPreviewer(
@@ -554,6 +576,20 @@ class MergingGUI(ThemedTk):
             help_data=self.help_data,
         )
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
+        self.previewer.preview_source_combo["values"] = [
+            "Blended Image",
+            "Original (Left Eye)",
+            "Warped (Right BG)",
+            "Inpainted Right Eye",
+            "Processed Mask",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Side-by-Side",
+            "Wigglegram",
+            "Depth Map",
+            "Mesh Warp",
+        ]
 
         # --- FIX: Add previewer's buttons to the list of widgets to disable ---
         self.widgets_to_disable.append(self.previewer.load_preview_button)
@@ -731,16 +767,16 @@ class MergingGUI(ThemedTk):
         self.progress_bar.pack(fill="x")
 
         # Current Filename
-        self.filename_label = ttk.Label(
-            progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")
-        )
-        self.filename_label.pack(pady=(5, 0))
+        # self.filename_label = ttk.Label(
+        #     progress_frame, textvariable=self.current_filename_var, font=("Segoe UI", 9, "bold")
+        # )
+        # self.filename_label.pack(pady=(5, 0))
 
         self.status_label_var = tk.StringVar(value="Ready")
         self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
-        self.status_label.pack(pady=5)
+        self.status_label.pack(pady=1)
 
-        buttons_frame = ttk.Frame(self, padding=10)
+        buttons_frame = ttk.Frame(self, padding=1)
         buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(buttons_frame, text="Start Blending", command=self.start_processing)
         self.start_button.pack(side="left", padx=5, expand=True)
@@ -777,7 +813,7 @@ class MergingGUI(ThemedTk):
     def _show_encoding_settings(self):
         """Show the encoding settings dialog."""
         config = {
-            "encoding_encoder": self.encoding_encoder_var.get(),
+            "codec": self.codec_var.get(),
             "encoding_quality": self.encoding_quality_var.get(),
             "encoding_tune": self.encoding_tune_var.get(),
             "output_crf": self.output_crf_var.get(),
@@ -787,6 +823,8 @@ class MergingGUI(ThemedTk):
             "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
             "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
             "color_tags": self.color_tags_var.get(),
+            "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+            "dnxhr_profile": self.dnxhr_profile_var.get(),
         }
 
         dialog = EncodingSettingsDialog(
@@ -794,13 +832,14 @@ class MergingGUI(ThemedTk):
             app_config=config,
             help_data=self.help_data,
             title="Merging GUI - Encoding Settings",
-            show_extra_options=False,
+            show_extra_options=True,
             show_color_tags=True,
         )
         self.wait_window(dialog.dialog)
 
         if dialog.result:
-            self.encoding_encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
+            self.codec_var.set(dialog.result.get("codec", "H.265"))
+            self.encoder_var.set(dialog.result.get("encoding_encoder", "Auto"))
             self.encoding_quality_var.set(dialog.result.get("encoding_quality", "Medium"))
             self.encoding_tune_var.set(dialog.result.get("encoding_tune", "None"))
             self.output_crf_var.set(str(dialog.result.get("output_crf", 23)))
@@ -810,6 +849,8 @@ class MergingGUI(ThemedTk):
             self.nvenc_temporal_aq_var.set(dialog.result.get("nvenc_temporal_aq", False))
             self.nvenc_aq_strength_var.set(dialog.result.get("nvenc_aq_strength", 8))
             self.color_tags_var.set(dialog.result.get("color_tags", "Auto"))
+            self.dnxhr_fullres_split_var.set(dialog.result.get("dnxhr_fullres_split", False))
+            self.dnxhr_profile_var.set(dialog.result.get("dnxhr_profile", "HQX (10-bit 4:2:2)"))
 
     def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
         """Scans a folder for a file matching the core_name with any common video extension."""
@@ -1268,7 +1309,7 @@ class MergingGUI(ThemedTk):
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 # Encoding params
-                "encoding_encoder": self.encoding_encoder_var.get(),
+                "codec": self.codec_var.get(),
                 "encoding_quality": self.encoding_quality_var.get(),
                 "encoding_tune": self.encoding_tune_var.get(),
                 "output_crf": int(self.output_crf_var.get()),
@@ -1278,6 +1319,8 @@ class MergingGUI(ThemedTk):
                 "nvenc_temporal_aq": self.nvenc_temporal_aq_var.get(),
                 "nvenc_aq_strength": self.nvenc_aq_strength_var.get(),
                 "color_tags": self.color_tags_var.get(),
+                "dnxhr_fullres_split": self.dnxhr_fullres_split_var.get(),
+                "dnxhr_profile": self.dnxhr_profile_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(self.mask_binarize_threshold_var.get()),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
@@ -1528,10 +1571,11 @@ class MergingGUI(ThemedTk):
                     pad_to_16_9=settings["pad_to_16_9"],
                     output_format_str=output_format,
                     encoding_options={
-                        "encoding_encoder": settings.get("encoding_encoder", "Auto"),
+                        "codec": settings.get("codec", "Auto"),
                         "encoding_quality": settings.get("encoding_quality", "Medium"),
                         "encoding_tune": settings.get("encoding_tune", "None"),
                         "output_crf": settings.get("output_crf", 23),
+                        "color_tags": settings.get("color_tags", "Auto"),
                         "nvenc_lookahead_enabled": settings.get("nvenc_lookahead_enabled", False),
                         "nvenc_lookahead": settings.get("nvenc_lookahead", 16),
                         "nvenc_spatial_aq": settings.get("nvenc_spatial_aq", False),
@@ -2084,10 +2128,10 @@ class MergingGUI(ThemedTk):
                 "Anaglyph 3D",
                 "Dubois Anaglyph",
                 "Optimized Anaglyph",
+                "Side-by-Side",
                 "Wigglegram",
             ]
-            if not is_dual_input:
-                preview_options.append("Depth Map")
+            preview_options.extend(["Depth Map", "Mesh Warp"])
             self.previewer.set_preview_source_options(preview_options)
 
             # Convert mask to grayscale ON DEVICE
@@ -2193,12 +2237,49 @@ class MergingGUI(ThemedTk):
                     final_frame_4d = apply_optimized_anaglyph_torch(original_left, blended_frame)
                 else:
                     final_frame_4d = blended_frame
+            elif preview_source == "Side-by-Side":
+                if original_left is not None:
+                    left_np = (original_left[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    right_np = (blended_frame[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                        sbs_np = np.concatenate([right_np, left_np], axis=1)
+                    else:
+                        sbs_np = np.concatenate([left_np, right_np], axis=1)
+                    return Image.fromarray(sbs_np)
+                else:
+                    final_frame_4d = blended_frame
             elif preview_source == "Wigglegram":
                 if original_left is not None:
                     self.previewer._start_wigglegram_animation(original_left, blended_frame)
                 return None
             elif preview_source == "Depth Map" and depth_map_vis is not None:
                 final_frame_4d = depth_map_vis
+            elif preview_source == "Mesh Warp" and depth_map_vis is not None:
+                from core.common.mesh_warp import run_fusion_stereo
+
+                left_np = (original_left.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+                depth_np = depth_map_vis.squeeze(0).mean(dim=0).cpu().numpy()
+
+                l_img, r_img = run_fusion_stereo(
+                    image=left_bgr,
+                    depth=depth_np,
+                    disparity=float(sidecar_data.get("max_disparity", 25.0)),
+                    convergence=1.0 - float(sidecar_data.get("convergence_plane", 0.5)),
+                    view_bias=float(self.APP_DEFAULTS.get("MESH_WARP_VIEW_BIAS", -1.0)),
+                    dolly_zoom=float(self.APP_DEFAULTS.get("MESH_WARP_DOLLY_ZOOM", 0.0)),
+                    extrusion_scale=float(self.APP_DEFAULTS.get("MESH_WARP_EXTRUSION_SCALE", 1.0)),
+                    density_x=int(left_bgr.shape[1]),
+                    density_y=int(left_bgr.shape[0]),
+                )
+
+                if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                    sbs_np = np.concatenate([r_img, l_img], axis=1)
+                else:
+                    sbs_np = np.concatenate([l_img, r_img], axis=1)
+
+                sbs_rgb = cv2.cvtColor(sbs_np, cv2.COLOR_BGR2RGB)
+                return Image.fromarray(sbs_rgb)
             else:
                 final_frame_4d = blended_frame
 
