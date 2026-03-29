@@ -314,6 +314,9 @@ class SplatterGUI(ThemedTk):
         self.mask_mode_var = tk.StringVar(value=defaults["MASK_MODE"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
+        self.mesh_warp_view_bias_var = tk.StringVar(value=defaults["MESH_WARP_VIEW_BIAS"])
+        self.mesh_warp_dolly_zoom_var = tk.StringVar(value=defaults["MESH_WARP_DOLLY_ZOOM"])
+        self.mesh_warp_extrusion_scale_var = tk.StringVar(value=defaults["MESH_WARP_EXTRUSION_SCALE"])
 
         # --- NEW Sync from ConfigManager ---
         self.config_manager.sync_to_tk_vars(self.__dict__)
@@ -736,6 +739,9 @@ class SplatterGUI(ThemedTk):
             self.preview_source_var,
             self.preview_size_var,
             self.mask_mode_var,
+            self.mesh_warp_view_bias_var,
+            self.mesh_warp_dolly_zoom_var,
+            self.mesh_warp_extrusion_scale_var,
         ]
         for var in vars_to_trace:
             var.trace_add("write", _invalidate_buffer)
@@ -1628,6 +1634,7 @@ class SplatterGUI(ThemedTk):
             "Side-by-Side",
             "Wigglegram",
             "Mesh Warp",
+            "SBS + Mesh",
         ]
         if not self.preview_source_var.get():
             self.preview_source_var.set("Splat Result")
@@ -1855,6 +1862,32 @@ class SplatterGUI(ThemedTk):
 
         # Track these for disabling during processing
         self.widgets_to_disable.extend([self.combo_border_mode, self.btn_border_rescan])
+
+        # Row 2: Mesh Warp Calibration (spans both columns)
+        self.mesh_calib_frame = ttk.Frame(self.output_settings_frame)
+        self.mesh_calib_frame.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=0)
+
+        ttk.Label(self.mesh_calib_frame, text="Mesh:").pack(side="left", padx=(0, 3))
+
+        ttk.Label(self.mesh_calib_frame, text="Bias").pack(side="left", padx=(3, 1))
+        self.entry_mesh_bias = ttk.Entry(self.mesh_calib_frame, textvariable=self.mesh_warp_view_bias_var, width=5)
+        self.entry_mesh_bias.pack(side="left")
+
+        ttk.Label(self.mesh_calib_frame, text="Dolly").pack(side="left", padx=(3, 1))
+        self.entry_mesh_dolly = ttk.Entry(self.mesh_calib_frame, textvariable=self.mesh_warp_dolly_zoom_var, width=5)
+        self.entry_mesh_dolly.pack(side="left")
+
+        ttk.Label(self.mesh_calib_frame, text="Extrusion").pack(side="left", padx=(3, 1))
+        self.entry_mesh_extrusion = ttk.Entry(
+            self.mesh_calib_frame, textvariable=self.mesh_warp_extrusion_scale_var, width=5
+        )
+        self.entry_mesh_extrusion.pack(side="left")
+
+        for entry in (self.entry_mesh_bias, self.entry_mesh_dolly, self.entry_mesh_extrusion):
+            entry.bind("<FocusOut>", self.on_slider_release)
+            entry.bind("<Return>", self.on_slider_release)
+
+        self.widgets_to_disable.extend([self.entry_mesh_bias, self.entry_mesh_dolly, self.entry_mesh_extrusion])
 
         # Row 3, Col 0: Strict FFmpeg decode toggle (affects how the source video is decoded for splatting/preview)
         self.strict_decode_frame = ttk.Frame(self.preprocessing_frame)
@@ -4036,9 +4069,9 @@ class SplatterGUI(ThemedTk):
                 depth=depth_normalized,
                 disparity=float(params.get("max_disp", 25.0)),
                 convergence=1.0 - float(params.get("convergence_point", 0.5)),
-                view_bias=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_VIEW_BIAS", -1.0)),
-                dolly_zoom=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_DOLLY_ZOOM", 0.0)),
-                extrusion_scale=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_EXTRUSION_SCALE", 1.0)),
+                view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
+                dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
+                extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
                 density_x=int(left_bgr.shape[1]),
                 density_y=int(left_bgr.shape[0]),
             )
@@ -4050,6 +4083,45 @@ class SplatterGUI(ThemedTk):
 
             sbs_rgb = cv2.cvtColor(sbs_np, cv2.COLOR_BGR2RGB)
             return Image.fromarray(sbs_rgb)
+
+        elif preview_source == "SBS + Mesh":
+            from core.common.mesh_warp import run_fusion_stereo
+
+            # Top half: SBS (same as Side-by-Side branch)
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                sbs_view = np.concatenate([right_np, left_np], axis=1)
+            else:
+                sbs_view = np.concatenate([left_np, right_np], axis=1)
+
+            # Bottom half: Mesh Warp
+            left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+            l_img, r_img = run_fusion_stereo(
+                image=left_bgr,
+                depth=depth_normalized,
+                disparity=float(params.get("max_disp", 25.0)),
+                convergence=1.0 - float(params.get("convergence_point", 0.5)),
+                view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
+                dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
+                extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
+                density_x=int(left_bgr.shape[1]),
+                density_y=int(left_bgr.shape[0]),
+            )
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                mesh_bgr = np.concatenate([r_img, l_img], axis=1)
+            else:
+                mesh_bgr = np.concatenate([l_img, r_img], axis=1)
+            mesh_rgb = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2RGB)
+
+            # Width-match if needed
+            if sbs_view.shape[1] != mesh_rgb.shape[1]:
+                target_w = min(sbs_view.shape[1], mesh_rgb.shape[1])
+                sbs_view = cv2.resize(sbs_view, (target_w, sbs_view.shape[0]))
+                mesh_rgb = cv2.resize(mesh_rgb, (target_w, mesh_rgb.shape[0]))
+
+            combined = np.concatenate([sbs_view, mesh_rgb], axis=0)
+            return Image.fromarray(combined)
 
         elif preview_source == "Side-by-Side":
             # Concatenate left and right eye as SBS image
