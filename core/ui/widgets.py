@@ -135,6 +135,38 @@ def create_single_slider_with_label_updater(
             except Exception:
                 pass
             default_marker_label = None
+        def _handle_marker_interaction(event):
+            """Redirects mouse events on the marker to the slider's logic."""
+            try:
+                # Determine marker's current X position relative to slider
+                info = marker_canvas.place_info()
+                if not info:
+                    return
+                mx = int(info.get("x", 0))
+
+                # Convert click coordinates to slider-relative X
+                # anchor is 's', so mx is center of 4px marker.
+                slider_x = event.x + mx - 2
+                slider_width = slider.winfo_width()
+                if slider_width <= 1:
+                    return
+
+                # Calculate value
+                rel_x = slider_x / slider_width
+                rel_x = max(0.0, min(1.0, rel_x))
+                new_notch = int(rel_x * total_steps)
+
+                # Update states
+                internal_int_var.set(new_notch)
+                on_slider_move(new_notch)
+
+                # If it's a release, also trigger on_slider_release
+                if event.type == "5":  # ButtonRelease
+                    if hasattr(GUI_self, "on_slider_release"):
+                        GUI_self.on_slider_release(event)
+            except Exception:
+                pass
+
         try:
             slider.update_idletasks()
             slider_width = slider.winfo_width()
@@ -147,9 +179,14 @@ def create_single_slider_with_label_updater(
             track_end = slider_width - knob_offset
             track_width = track_end - track_start
             x_pos = track_start + int(track_width * range_ratio)
-            marker_canvas = tk.Canvas(slider, width=4, height=10, highlightthickness=0)
-            marker_canvas.create_line(2, 0, 2, 10, fill=DEFAULT_TICK_COLOR, width=2)
+
+            marker_canvas = tk.Canvas(slider, width=4, height=10, highlightthickness=0, bg=DEFAULT_TICK_COLOR)
+            # Use bg instead of line for simpler rendering/hitbox
             marker_canvas.place(x=x_pos, y=slider.winfo_height() - 2, anchor="s")
+            marker_canvas.bind("<Button-1>", _handle_marker_interaction)
+            marker_canvas.bind("<B1-Motion>", _handle_marker_interaction)
+            marker_canvas.bind("<ButtonRelease-1>", _handle_marker_interaction)
+
             default_marker_label = marker_canvas
         except Exception as e:
             print(f"Marker error: {e}")
@@ -170,7 +207,7 @@ def create_single_slider_with_label_updater(
             x_pos = track_start + int(track_width * range_ratio)
             default_marker_label.place_configure(x=x_pos, y=slider.winfo_height() - 2, anchor="s")
         except Exception as e:
-            print(f"Update marker error: {e}")
+            pass
 
     def _on_right_click(event):
         if default_value is not None:

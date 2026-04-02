@@ -57,7 +57,7 @@ from core.common.cli_utils import set_logger_level
 from core.common.gpu_utils import check_cuda_availability, release_cuda_memory
 
 logger = logging.getLogger(__name__)
-from core.common.video_io import get_video_stream_info
+from core.common.video_io import get_video_stream_info, _infer_depth_bit_depth
 from core.ui.widgets import Tooltip, create_single_slider_with_label_updater, create_dual_slider_layout
 
 from core.ui.video_previewer import VideoPreviewer
@@ -81,7 +81,6 @@ from core.splatting.depth_processing import (
     load_pre_rendered_depth,
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
-    _infer_depth_bit_depth,
     normalize_and_gamma_depth,
     process_depth_batch,
 )
@@ -145,6 +144,7 @@ class SplatterGUI(ThemedTk):
         "MESH_WARP_EXTRUSION_SCALE": "0.5",
         "MESH_WARP_DENSITY_X": "512",
         "MESH_WARP_DENSITY_Y": "512",
+        "MESH_WARP_DENSITY_MULT": "0.5",
     }
 
     # ---------------------------------------
@@ -317,6 +317,7 @@ class SplatterGUI(ThemedTk):
         self.mesh_warp_view_bias_var = tk.StringVar(value=defaults["MESH_WARP_VIEW_BIAS"])
         self.mesh_warp_dolly_zoom_var = tk.StringVar(value=defaults["MESH_WARP_DOLLY_ZOOM"])
         self.mesh_warp_extrusion_scale_var = tk.StringVar(value=defaults["MESH_WARP_EXTRUSION_SCALE"])
+        self.mesh_warp_preview_density_var = tk.StringVar(value=defaults["MESH_WARP_DENSITY_MULT"])
 
         # --- NEW Sync from ConfigManager ---
         self.config_manager.sync_to_tk_vars(self.__dict__)
@@ -1883,11 +1884,34 @@ class SplatterGUI(ThemedTk):
         )
         self.entry_mesh_extrusion.pack(side="left")
 
-        for entry in (self.entry_mesh_bias, self.entry_mesh_dolly, self.entry_mesh_extrusion):
+        ttk.Label(self.mesh_calib_frame, text="Density").pack(side="left", padx=(3, 1))
+        self.entry_mesh_density = ttk.Entry(
+            self.mesh_calib_frame, textvariable=self.mesh_warp_preview_density_var, width=5
+        )
+        self.entry_mesh_density.pack(side="left")
+
+        for entry in (
+            self.entry_mesh_bias,
+            self.entry_mesh_dolly,
+            self.entry_mesh_extrusion,
+            self.entry_mesh_density,
+        ):
             entry.bind("<FocusOut>", self.on_slider_release)
             entry.bind("<Return>", self.on_slider_release)
 
-        self.widgets_to_disable.extend([self.entry_mesh_bias, self.entry_mesh_dolly, self.entry_mesh_extrusion])
+        self.widgets_to_disable.extend(
+            [
+                self.entry_mesh_bias,
+                self.entry_mesh_dolly,
+                self.entry_mesh_extrusion,
+                self.entry_mesh_density,
+            ]
+        )
+
+        self._create_hover_tooltip(self.entry_mesh_bias, "mesh_warp_view_bias")
+        self._create_hover_tooltip(self.entry_mesh_dolly, "mesh_warp_dolly_zoom")
+        self._create_hover_tooltip(self.entry_mesh_extrusion, "mesh_warp_extrusion_scale")
+        self._create_hover_tooltip(self.entry_mesh_density, "mesh_warp_preview_density")
 
         # Row 3, Col 0: Strict FFmpeg decode toggle (affects how the source video is decoded for splatting/preview)
         self.strict_decode_frame = ttk.Frame(self.preprocessing_frame)
@@ -3656,6 +3680,14 @@ class SplatterGUI(ThemedTk):
         else:
             left_eye_tensor_resized = left_eye_tensor.cuda()  # Use original res
 
+        # --- OPTIMIZATION: Early exit for non-processed views ---
+        if preview_source == "Original (Left Eye)":
+            left_np = (
+                left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
+            ).astype(np.uint8)
+            logger.debug("Preview: Early exit for 'Original (Left Eye)' mode.")
+            return Image.fromarray(left_np)
+
         t_resize_rgb = time.perf_counter()
 
         logger.debug(f"Preview Params: {params}")
@@ -3950,25 +3982,48 @@ class SplatterGUI(ThemedTk):
 
         t_metrics = time.perf_counter()
 
-        right_eye_tensor_raw, occlusion_mask = execute_forward_warp(
-            stereo_projector=stereo_projector,
-            source_tensor=left_eye_tensor_resized,
-            depth_tensor=disp_map_tensor,
-            target_width=W_target,
-            max_disp=params["max_disp"],
-            zero_disparity_anchor_val=params["convergence_point"],
-            input_bias=0.0,
-            tv_disp_comp=tv_disp_comp,
-            debug_task_name="Preview",
-            mask_mode=params.get("mask_mode", "SC"),
+        # --- BRANCHING EXECUTION: Only run the warp needed for the current view ---
+        needs_forward_warp = preview_source in (
+            "Splat Result",
+            "Splat Result(Low)",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Side-by-Side",
+            "Wigglegram",
+            "SBS + Mesh",
+            "Occlusion Mask",
+            "Occlusion Mask(Low)",
         )
+        needs_mesh_warp = preview_source in ("Mesh Warp", "SBS + Mesh")
+
+        right_eye_tensor = None
+        occlusion_mask = None
+
+        if needs_forward_warp:
+            right_eye_tensor_raw, occlusion_mask = execute_forward_warp(
+                stereo_projector=stereo_projector,
+                source_tensor=left_eye_tensor_resized,
+                depth_tensor=disp_map_tensor,
+                target_width=W_target,
+                max_disp=params["max_disp"],
+                zero_disparity_anchor_val=params["convergence_point"],
+                input_bias=0.0,
+                tv_disp_comp=tv_disp_comp,
+                debug_task_name="Preview",
+                mask_mode=params.get("mask_mode", "SC"),
+            )
+            right_eye_tensor = right_eye_tensor_raw
 
         t_warp = time.perf_counter()
 
-        right_eye_tensor = right_eye_tensor_raw
-
         # --- Apply black borders for Anaglyph and Wigglegram ---
-        if preview_source in ["Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph", "Wigglegram"]:
+        if right_eye_tensor is not None and preview_source in [
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Wigglegram",
+        ]:
             l_pct = params.get("left_border_pct", 0.0)
             r_pct = params.get("right_border_pct", 0.0)
 
@@ -4064,6 +4119,8 @@ class SplatterGUI(ThemedTk):
             left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
 
+            d_mult = self._safe_float(self.mesh_warp_preview_density_var, 0.5)
+
             l_img, r_img = run_fusion_stereo(
                 image=left_bgr,
                 depth=depth_normalized,
@@ -4072,8 +4129,8 @@ class SplatterGUI(ThemedTk):
                 view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
                 dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
                 extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
-                density_x=int(left_bgr.shape[1]),
-                density_y=int(left_bgr.shape[0]),
+                density_x=int(left_bgr.shape[1] * d_mult),
+                density_y=int(left_bgr.shape[0] * d_mult),
             )
 
             if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
@@ -4097,6 +4154,8 @@ class SplatterGUI(ThemedTk):
 
             # Bottom half: Mesh Warp
             left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+            d_mult = self._safe_float(self.mesh_warp_preview_density_var, 0.5)
+
             l_img, r_img = run_fusion_stereo(
                 image=left_bgr,
                 depth=depth_normalized,
@@ -4105,8 +4164,8 @@ class SplatterGUI(ThemedTk):
                 view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
                 dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
                 extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
-                density_x=int(left_bgr.shape[1]),
-                density_y=int(left_bgr.shape[0]),
+                density_x=int(left_bgr.shape[1] * d_mult),
+                density_y=int(left_bgr.shape[0] * d_mult),
             )
             if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
                 mesh_bgr = np.concatenate([r_img, l_img], axis=1)

@@ -34,6 +34,7 @@ except ImportError:
 
 # --- Public API ---------------------------------------------------------------
 
+
 def init_dnd(root) -> bool:
     """Load the tkdnd Tcl package into *root* (a Tk or ThemedTk window).
 
@@ -72,7 +73,7 @@ def register_dnd_entries(entries, dnd_enabled: bool = True):
             extensions = None
         else:
             entry, var, folder_only, extensions = entry_data
-            
+
         _register_single(entry, var, folder_only, extensions)
     logger.info(f"Drag-and-drop registered on {len(entries)} path entries.")
 
@@ -93,6 +94,7 @@ def configure_dnd_styles(style, is_dark: bool, dnd_enabled: bool = True):
 
 # --- Internal -----------------------------------------------------------------
 
+
 def _register_single(entry, var, folder_only=False, extensions=None):
     """Wire up DnD events on a single ``ttk.Entry`` widget."""
     try:
@@ -107,7 +109,7 @@ def _register_single(entry, var, folder_only=False, extensions=None):
             return event.action
 
         is_dir = os.path.isdir(path)
-        
+
         if folder_only:
             # If it's a file, take the directory it lives in
             if not is_dir:

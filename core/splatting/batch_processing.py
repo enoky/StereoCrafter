@@ -17,19 +17,21 @@ import torch
 from decord import VideoReader, cpu
 
 from core.common.file_organizer import move_files_to_finished
-from core.common.video_io import get_video_stream_info
+from core.common.video_io import (
+    FFmpegDepthPipeReader,
+    _infer_depth_bit_depth,
+    get_video_stream_info,
+    read_video_frames,
+)
 from core.common.gpu_utils import release_cuda_memory
 from .depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
-    FFmpegDepthPipeReader,
-    _infer_depth_bit_depth,
     compute_global_depth_stats,
     load_pre_rendered_depth,
 )
 from .render_processor import RenderProcessor
 from .convergence import ConvergenceEstimatorWrapper
-from core.common.video_io import read_video_frames
 
 logger = logging.getLogger(__name__)
 
