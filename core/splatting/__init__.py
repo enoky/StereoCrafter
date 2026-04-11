@@ -24,7 +24,6 @@ from .convergence import ConvergenceEstimatorWrapper
 from .depth_processing import (
     compute_global_depth_stats,
     load_pre_rendered_depth,
-    FFmpegDepthPipeReader,
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
 )

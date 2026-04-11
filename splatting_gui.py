@@ -1,4 +1,3 @@
-import gc
 import os
 import re
 import csv
@@ -7,11 +6,9 @@ import glob
 import shutil
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 # from torchvision.io import write_video
-from decord import VideoReader, cpu
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import tkinter.font as tkfont
@@ -19,21 +16,16 @@ from ttkthemes import ThemedTk
 import json
 import threading
 import queue
-import subprocess
 import time
 import logging
-import platform
-from typing import Optional, Tuple, Any, Dict
+from typing import Optional, Tuple
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-import math
 
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
 # not the depth values used for splatting.
 DEPTH_VIS_APPLY_TV_RANGE_EXPANSION_10BIT = True
-DEPTH_VIS_TV10_BLACK_NORM = 64.0 / 1023.0
-DEPTH_VIS_TV10_WHITE_NORM = 940.0 / 1023.0
 
 try:
     from moviepy.editor import VideoFileClip
@@ -57,32 +49,17 @@ except ImportError:
 
 # Import custom modules
 CUDA_AVAILABLE = False  # start state, will check automaticly later
-GUI_VERSION = "26-03-08.2"
+GUI_VERSION = "26-03-29.0"
 
+# ruff: noqa: E402
 # --- MODIFIED IMPORT ---
-from core.common.video_io import start_ffmpeg_pipe_process
-from core.common.cli_utils import draw_progress_bar, set_logger_level
-from core.common.gpu_utils import CUDA_AVAILABLE, check_cuda_availability, release_cuda_memory
+from core.common.cli_utils import set_logger_level
+from core.common.gpu_utils import check_cuda_availability, release_cuda_memory
 
 logger = logging.getLogger(__name__)
-from core.common.image_processing import (
-    custom_blur,
-    custom_dilate,
-    custom_dilate_left,
-    apply_dubois_anaglyph,
-    apply_optimized_anaglyph,
-)
-from core.common.video_io import get_video_stream_info
+from core.common.video_io import get_video_stream_info, _infer_depth_bit_depth
 from core.ui.widgets import Tooltip, create_single_slider_with_label_updater, create_dual_slider_layout
 
-try:
-    from Forward_Warp import forward_warp
-
-    logger.info("CUDA Forward Warp is available.")
-except:
-    from dependency.forward_warp_pytorch import forward_warp
-
-    logger.info("Forward Warp Pytorch is active.")
 from core.ui.video_previewer import VideoPreviewer
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
@@ -101,12 +78,9 @@ from core.splatting import (
     ConvergenceCache,
 )
 from core.splatting.depth_processing import (
-    compute_global_depth_stats,
     load_pre_rendered_depth,
-    FFmpegDepthPipeReader,
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
-    _infer_depth_bit_depth,
     normalize_and_gamma_depth,
     process_depth_batch,
 )
@@ -117,8 +91,8 @@ from core.splatting.config_manager import ConfigManager
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
 from core.ui import ThemeManager, init_dnd, register_dnd_entries, configure_dnd_styles
 from core.ui.encoding_settings import EncodingSettingsDialog
-from core.common.video_io import read_video_frames, _NumpyBatch
-from core.common.sidecar_manager import SidecarConfigManager, find_sidecar_file, read_clip_sidecar
+from core.common.video_io import read_video_frames
+from core.common.sidecar_manager import SidecarConfigManager
 from core.common.image_processing import apply_dubois_anaglyph_torch, apply_optimized_anaglyph_torch
 
 
@@ -170,6 +144,7 @@ class SplatterGUI(ThemedTk):
         "MESH_WARP_EXTRUSION_SCALE": "0.5",
         "MESH_WARP_DENSITY_X": "512",
         "MESH_WARP_DENSITY_Y": "512",
+        "MESH_WARP_DENSITY_MULT": "0.5",
     }
 
     # ---------------------------------------
@@ -339,6 +314,10 @@ class SplatterGUI(ThemedTk):
         self.mask_mode_var = tk.StringVar(value=defaults["MASK_MODE"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
+        self.mesh_warp_view_bias_var = tk.StringVar(value=defaults["MESH_WARP_VIEW_BIAS"])
+        self.mesh_warp_dolly_zoom_var = tk.StringVar(value=defaults["MESH_WARP_DOLLY_ZOOM"])
+        self.mesh_warp_extrusion_scale_var = tk.StringVar(value=defaults["MESH_WARP_EXTRUSION_SCALE"])
+        self.mesh_warp_preview_density_var = tk.StringVar(value=defaults["MESH_WARP_DENSITY_MULT"])
 
         # --- NEW Sync from ConfigManager ---
         self.config_manager.sync_to_tk_vars(self.__dict__)
@@ -522,7 +501,7 @@ class SplatterGUI(ThemedTk):
         # 4. Handle window geometry adjustment
         self.update_idletasks()
 
-    def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode):
+    def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, fallback_value, gamma, mode):
         """Worker thread for running the Auto-Convergence calculation."""
 
         # Use the extracted ConvergenceEstimatorWrapper
@@ -541,7 +520,6 @@ class SplatterGUI(ThemedTk):
 
         # Determine TV range compensation for border calculation
         # This is fast if called here (usually cached or metadata-only)
-        tv_disp_comp = 1.0
         if hasattr(self, "border_scanner"):
             # We don't have a VideoReader here, so we'll let BorderScanner handle it or calculate it later.
             # For simplicity, we can pass the path and let BorderScanner handle it if we modify it,
@@ -762,6 +740,9 @@ class SplatterGUI(ThemedTk):
             self.preview_source_var,
             self.preview_size_var,
             self.mask_mode_var,
+            self.mesh_warp_view_bias_var,
+            self.mesh_warp_dolly_zoom_var,
+            self.mesh_warp_extrusion_scale_var,
         ]
         for var in vars_to_trace:
             var.trace_add("write", _invalidate_buffer)
@@ -1189,7 +1170,7 @@ class SplatterGUI(ThemedTk):
                     self._set_input_state("normal")
                     if hasattr(self, "previewer"):
                         self.previewer.reset_video_list_scan()
-                    logger.info(f"==> All process completed.")
+                    logger.info("==> All process completed.")
                     break
 
                 elif message[0] == "total":
@@ -1361,7 +1342,7 @@ class SplatterGUI(ThemedTk):
                 text=f"Auto-Converge: Failed to find a valid anchor. Value remains {fallback_value:.2f}"
             )
             messagebox.showwarning(
-                "Auto-Converge Preview", f"Failed to find a valid anchor point in any mode. No changes were made."
+                "Auto-Converge Preview", "Failed to find a valid anchor point in any mode. No changes were made."
             )
             # If it was triggered by the combo box, reset the combo box to "Off"
             if self.auto_convergence_mode_var.get() == mode:
@@ -1623,7 +1604,7 @@ class SplatterGUI(ThemedTk):
             on_frame_display_callback=self._on_preview_frame_display,
             help_data=self.help_texts,
         )
-        self.previewer.pack(fill="both", expand=True, padx=10, pady=1)
+        self.previewer.pack(fill="x", padx=10, pady=1)
         self.previewer.preview_source_combo.configure(textvariable=self.preview_source_var)
         for _btn_name in (
             "load_preview_button",
@@ -1654,6 +1635,7 @@ class SplatterGUI(ThemedTk):
             "Side-by-Side",
             "Wigglegram",
             "Mesh Warp",
+            "SBS + Mesh",
         ]
         if not self.preview_source_var.get():
             self.preview_source_var.set("Splat Result")
@@ -1881,6 +1863,55 @@ class SplatterGUI(ThemedTk):
 
         # Track these for disabling during processing
         self.widgets_to_disable.extend([self.combo_border_mode, self.btn_border_rescan])
+
+        # Row 2: Mesh Warp Calibration (spans both columns)
+        self.mesh_calib_frame = ttk.Frame(self.output_settings_frame)
+        self.mesh_calib_frame.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=0)
+
+        ttk.Label(self.mesh_calib_frame, text="Mesh:").pack(side="left", padx=(0, 3))
+
+        ttk.Label(self.mesh_calib_frame, text="Bias").pack(side="left", padx=(3, 1))
+        self.entry_mesh_bias = ttk.Entry(self.mesh_calib_frame, textvariable=self.mesh_warp_view_bias_var, width=5)
+        self.entry_mesh_bias.pack(side="left")
+
+        ttk.Label(self.mesh_calib_frame, text="Dolly").pack(side="left", padx=(3, 1))
+        self.entry_mesh_dolly = ttk.Entry(self.mesh_calib_frame, textvariable=self.mesh_warp_dolly_zoom_var, width=5)
+        self.entry_mesh_dolly.pack(side="left")
+
+        ttk.Label(self.mesh_calib_frame, text="Extrusion").pack(side="left", padx=(3, 1))
+        self.entry_mesh_extrusion = ttk.Entry(
+            self.mesh_calib_frame, textvariable=self.mesh_warp_extrusion_scale_var, width=5
+        )
+        self.entry_mesh_extrusion.pack(side="left")
+
+        ttk.Label(self.mesh_calib_frame, text="Density").pack(side="left", padx=(3, 1))
+        self.entry_mesh_density = ttk.Entry(
+            self.mesh_calib_frame, textvariable=self.mesh_warp_preview_density_var, width=5
+        )
+        self.entry_mesh_density.pack(side="left")
+
+        for entry in (
+            self.entry_mesh_bias,
+            self.entry_mesh_dolly,
+            self.entry_mesh_extrusion,
+            self.entry_mesh_density,
+        ):
+            entry.bind("<FocusOut>", self.on_slider_release)
+            entry.bind("<Return>", self.on_slider_release)
+
+        self.widgets_to_disable.extend(
+            [
+                self.entry_mesh_bias,
+                self.entry_mesh_dolly,
+                self.entry_mesh_extrusion,
+                self.entry_mesh_density,
+            ]
+        )
+
+        self._create_hover_tooltip(self.entry_mesh_bias, "mesh_warp_view_bias")
+        self._create_hover_tooltip(self.entry_mesh_dolly, "mesh_warp_dolly_zoom")
+        self._create_hover_tooltip(self.entry_mesh_extrusion, "mesh_warp_extrusion_scale")
+        self._create_hover_tooltip(self.entry_mesh_density, "mesh_warp_preview_density")
 
         # Row 3, Col 0: Strict FFmpeg decode toggle (affects how the source video is decoded for splatting/preview)
         self.strict_decode_frame = ttk.Frame(self.preprocessing_frame)
@@ -3318,7 +3349,7 @@ class SplatterGUI(ThemedTk):
                         f"==> Moved processed video '{os.path.basename(video_path)}' to: {finished_source_folder}"
                     )
                     break
-                except PermissionError as e:
+                except PermissionError:
                     logger.warning(
                         f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving '{os.path.basename(video_path)}'. Retrying in {retry_delay_sec}s..."
                     )
@@ -3354,7 +3385,7 @@ class SplatterGUI(ThemedTk):
                         f"==> Moved depth map '{os.path.basename(actual_depth_map_path)}' to: {finished_depth_folder}"
                     )
                     break
-                except PermissionError as e:
+                except PermissionError:
                     logger.warning(
                         f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving depth map '{os.path.basename(actual_depth_map_path)}'. Retrying in {retry_delay_sec}s..."
                     )
@@ -3393,7 +3424,7 @@ class SplatterGUI(ThemedTk):
                             f"==> Moved sidecar file '{os.path.basename(json_sidecar_path_to_move)}' to: {finished_depth_folder}"
                         )
                         break
-                    except PermissionError as e:
+                    except PermissionError:
                         logger.warning(
                             f"Attempt {attempt + 1}/{max_retries}: PermissionError (file in use) when moving file '{os.path.basename(json_sidecar_path_to_move)}'. Retrying in {retry_delay_sec}s..."
                         )
@@ -3648,6 +3679,14 @@ class SplatterGUI(ThemedTk):
                 left_eye_tensor_resized = left_eye_tensor.cuda()
         else:
             left_eye_tensor_resized = left_eye_tensor.cuda()  # Use original res
+
+        # --- OPTIMIZATION: Early exit for non-processed views ---
+        if preview_source == "Original (Left Eye)":
+            left_np = (
+                left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255
+            ).astype(np.uint8)
+            logger.debug("Preview: Early exit for 'Original (Left Eye)' mode.")
+            return Image.fromarray(left_np)
 
         t_resize_rgb = time.perf_counter()
 
@@ -3943,25 +3982,48 @@ class SplatterGUI(ThemedTk):
 
         t_metrics = time.perf_counter()
 
-        right_eye_tensor_raw, occlusion_mask = execute_forward_warp(
-            stereo_projector=stereo_projector,
-            source_tensor=left_eye_tensor_resized,
-            depth_tensor=disp_map_tensor,
-            target_width=W_target,
-            max_disp=params["max_disp"],
-            zero_disparity_anchor_val=params["convergence_point"],
-            input_bias=0.0,
-            tv_disp_comp=tv_disp_comp,
-            debug_task_name="Preview",
-            mask_mode=params.get("mask_mode", "SC"),
+        # --- BRANCHING EXECUTION: Only run the warp needed for the current view ---
+        needs_forward_warp = preview_source in (
+            "Splat Result",
+            "Splat Result(Low)",
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Side-by-Side",
+            "Wigglegram",
+            "SBS + Mesh",
+            "Occlusion Mask",
+            "Occlusion Mask(Low)",
         )
+        needs_mesh_warp = preview_source in ("Mesh Warp", "SBS + Mesh")
+
+        right_eye_tensor = None
+        occlusion_mask = None
+
+        if needs_forward_warp:
+            right_eye_tensor_raw, occlusion_mask = execute_forward_warp(
+                stereo_projector=stereo_projector,
+                source_tensor=left_eye_tensor_resized,
+                depth_tensor=disp_map_tensor,
+                target_width=W_target,
+                max_disp=params["max_disp"],
+                zero_disparity_anchor_val=params["convergence_point"],
+                input_bias=0.0,
+                tv_disp_comp=tv_disp_comp,
+                debug_task_name="Preview",
+                mask_mode=params.get("mask_mode", "SC"),
+            )
+            right_eye_tensor = right_eye_tensor_raw
 
         t_warp = time.perf_counter()
 
-        right_eye_tensor = right_eye_tensor_raw
-
         # --- Apply black borders for Anaglyph and Wigglegram ---
-        if preview_source in ["Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph", "Wigglegram"]:
+        if right_eye_tensor is not None and preview_source in [
+            "Anaglyph 3D",
+            "Dubois Anaglyph",
+            "Optimized Anaglyph",
+            "Wigglegram",
+        ]:
             l_pct = params.get("left_border_pct", 0.0)
             r_pct = params.get("right_border_pct", 0.0)
 
@@ -4057,16 +4119,18 @@ class SplatterGUI(ThemedTk):
             left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
 
+            d_mult = self._safe_float(self.mesh_warp_preview_density_var, 0.5)
+
             l_img, r_img = run_fusion_stereo(
                 image=left_bgr,
                 depth=depth_normalized,
                 disparity=float(params.get("max_disp", 25.0)),
-                convergence=1.0 - float(params.get("convergence_point", 0.5)),
-                view_bias=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_VIEW_BIAS", -1.0)),
-                dolly_zoom=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_DOLLY_ZOOM", 0.0)),
-                extrusion_scale=float(self.APP_CONFIG_DEFAULTS.get("MESH_WARP_EXTRUSION_SCALE", 1.0)),
-                density_x=int(left_bgr.shape[1]),
-                density_y=int(left_bgr.shape[0]),
+                convergence=float(params.get("convergence_point", 0.5)),
+                view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
+                dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
+                extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
+                density_x=int(left_bgr.shape[1] * d_mult),
+                density_y=int(left_bgr.shape[0] * d_mult),
             )
 
             if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
@@ -4076,6 +4140,47 @@ class SplatterGUI(ThemedTk):
 
             sbs_rgb = cv2.cvtColor(sbs_np, cv2.COLOR_BGR2RGB)
             return Image.fromarray(sbs_rgb)
+
+        elif preview_source == "SBS + Mesh":
+            from core.common.mesh_warp import run_fusion_stereo
+
+            # Top half: SBS (same as Side-by-Side branch)
+            left_np = (left_eye_tensor_resized.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            right_np = (right_eye_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                sbs_view = np.concatenate([right_np, left_np], axis=1)
+            else:
+                sbs_view = np.concatenate([left_np, right_np], axis=1)
+
+            # Bottom half: Mesh Warp
+            left_bgr = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
+            d_mult = self._safe_float(self.mesh_warp_preview_density_var, 0.5)
+
+            l_img, r_img = run_fusion_stereo(
+                image=left_bgr,
+                depth=depth_normalized,
+                disparity=float(params.get("max_disp", 25.0)),
+                convergence=float(params.get("convergence_point", 0.5)),
+                view_bias=self._safe_float(self.mesh_warp_view_bias_var, 0.0),
+                dolly_zoom=self._safe_float(self.mesh_warp_dolly_zoom_var, 0.0),
+                extrusion_scale=self._safe_float(self.mesh_warp_extrusion_scale_var, 0.5),
+                density_x=int(left_bgr.shape[1] * d_mult),
+                density_y=int(left_bgr.shape[0] * d_mult),
+            )
+            if getattr(self.previewer, "sbs_cross_eye_var", None) and self.previewer.sbs_cross_eye_var.get():
+                mesh_bgr = np.concatenate([r_img, l_img], axis=1)
+            else:
+                mesh_bgr = np.concatenate([l_img, r_img], axis=1)
+            mesh_rgb = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2RGB)
+
+            # Width-match if needed
+            if sbs_view.shape[1] != mesh_rgb.shape[1]:
+                target_w = min(sbs_view.shape[1], mesh_rgb.shape[1])
+                sbs_view = cv2.resize(sbs_view, (target_w, sbs_view.shape[0]))
+                mesh_rgb = cv2.resize(mesh_rgb, (target_w, mesh_rgb.shape[0]))
+
+            combined = np.concatenate([sbs_view, mesh_rgb], axis=0)
+            return Image.fromarray(combined)
 
         elif preview_source == "Side-by-Side":
             # Concatenate left and right eye as SBS image
@@ -5805,9 +5910,6 @@ class SplatterGUI(ThemedTk):
             messagebox.showerror("Validation Error", str(e))
             return
 
-        # --- MODIFIED: Delayed cleanup for diagnostic parity ---
-        is_test_active = self.enable_full_res_var.get() or self.enable_low_res_var.get()
-
         # --- MODIFIED: Auto-Switch Preview for Tests ---
         if self.map_test_var.get() or self.splat_test_var.get():
             # If a test is active, sync GUI controls from sidecar once before capture/run (keeps parity without freezing live slider changes).
@@ -6387,7 +6489,6 @@ class SplatterGUI(ThemedTk):
 
 
 # [REFACTORED] Depth processing functions imported from core module
-from core.splatting.depth_processing import compute_global_depth_stats, load_pre_rendered_depth
 
 if __name__ == "__main__":
     CUDA_AVAILABLE = check_cuda_availability()  # Sets the global flag

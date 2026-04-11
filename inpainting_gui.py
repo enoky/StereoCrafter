@@ -5,7 +5,7 @@ import shutil
 import threading
 import gc
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, Toplevel, Label
+from tkinter import filedialog, messagebox, ttk
 from ttkthemes import ThemedTk
 from typing import Optional, Tuple, Callable
 
@@ -16,7 +16,6 @@ from decord import VideoReader, cpu
 
 import torch.nn.functional as F
 import time
-import subprocess  # NEW: For running ffprobe and ffmpeg
 import cv2  # NEW: For saving 16-bit PNGs
 import logging
 import re
@@ -31,7 +30,8 @@ from core.common.cli_utils import set_logger_level, draw_progress_bar
 from core.common.gpu_utils import release_cuda_memory
 
 logger = logging.getLogger(__name__)
-from core.common.video_io import get_video_stream_info
+
+# ruff: noqa: E402
 from core.common.video_io import read_video_frames_decord
 from core.ui.widgets import Tooltip
 from core.ui.encoding_settings import EncodingSettingsDialog
@@ -44,7 +44,7 @@ from pipelines.stereo_video_inpainting import (
     load_inpainting_pipeline,
 )
 
-GUI_VERSION = "26-03-28.0"
+GUI_VERSION = "26-03-29.0"
 
 # torch.backends.cudnn.benchmark = True
 
@@ -3091,7 +3091,7 @@ class InpaintingGUI(ThemedTk):
                     0,
                     lambda: update_info_callback(
                         base_video_name,
-                        f"Encoding video...",
+                        "Encoding video...",
                         total_output_frames,
                         overlap,
                         original_input_blend_strength,
@@ -3327,7 +3327,6 @@ class InpaintingGUI(ThemedTk):
             # --- Resume/Skip Logic ---
             if self.move_to_finished_var.get():
                 low_res_finished_dir = os.path.join(input_folder, "finished")
-                hires_input_folder_pref = self.hires_blend_folder_var.get()
 
                 if os.path.isdir(low_res_finished_dir):
                     finished_files = set(os.listdir(low_res_finished_dir))
@@ -3492,7 +3491,10 @@ class InpaintingGUI(ThemedTk):
 
         except Exception as e:
             logger.exception("An unhandled error occurred during batch processing.")  # Log full traceback
-            self.after(0, lambda: messagebox.showerror("Error", f"An error occurred during batch processing: {str(e)}"))
+            error_msg = str(e) if str(e) else "Unknown error"
+            self.after(
+                0, lambda: messagebox.showerror("Error", f"An error occurred during batch processing: {error_msg}")
+            )
             self.after(0, self.processing_done)
 
     def show_about_dialog(self):

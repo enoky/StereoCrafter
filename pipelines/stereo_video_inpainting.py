@@ -13,7 +13,7 @@ from diffusers.schedulers import EulerDiscreteScheduler
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor 
+from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor
 
 
 logger = logging.get_logger(__name__)
@@ -89,11 +89,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         super().__init__()
 
         self.register_modules(
-            vae=vae,
-            image_encoder=image_encoder,
-            unet=unet,
-            scheduler=scheduler,
-            feature_extractor=feature_extractor,
+            vae=vae, image_encoder=image_encoder, unet=unet, scheduler=scheduler, feature_extractor=feature_extractor
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -137,7 +133,6 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
                 do_rescale=False,
                 return_tensors="pt",
             ).pixel_values
-            
 
         image = image.to(device=device, dtype=dtype)
         image_embeddings = self.image_encoder(image).image_embeds
@@ -158,13 +153,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
 
         return image_embeddings
 
-    def _encode_vae_image(
-        self,
-        image: torch.Tensor,
-        device,
-        num_videos_per_prompt,
-        do_classifier_free_guidance,
-    ):
+    def _encode_vae_image(self, image: torch.Tensor, device, num_videos_per_prompt, do_classifier_free_guidance):
         image = image.to(device=device)
         image_latents = self.vae.encode(image).latent_dist.mode()
 
@@ -180,24 +169,18 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
         return image_latents
-    
+
     def _encode_vae_frames(
-        self,
-        frames: torch.Tensor,
-        device,
-        num_videos_per_prompt,
-        do_classifier_free_guidance,
-        n_frames_per_time=5,
+        self, frames: torch.Tensor, device, num_videos_per_prompt, do_classifier_free_guidance, n_frames_per_time=5
     ):
-        frames = frames.to(device=device) # f c h w
-        
+        frames = frames.to(device=device)  # f c h w
+
         # self.vae.to(device=device,dtype=torch.float16)
         latent_list = []
-        for i in range(0,frames.shape[0],n_frames_per_time):
-            frame_latent = self.vae.encode(frames[i:i+n_frames_per_time]).latent_dist.mode()
+        for i in range(0, frames.shape[0], n_frames_per_time):
+            frame_latent = self.vae.encode(frames[i : i + n_frames_per_time]).latent_dist.mode()
             latent_list.append(frame_latent)
-        frame_latents = torch.cat(latent_list,dim=0).unsqueeze(0)
-        
+        frame_latents = torch.cat(latent_list, dim=0).unsqueeze(0)
 
         if do_classifier_free_guidance:
             negative_frame_latents = torch.zeros_like(frame_latents)
@@ -213,24 +196,19 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         return frame_latents
 
     def _encode_mask_frames(
-        self,
-        frames_mask: torch.Tensor,
-        device,
-        num_videos_per_prompt,
-        do_classifier_free_guidance,
+        self, frames_mask: torch.Tensor, device, num_videos_per_prompt, do_classifier_free_guidance
     ):
         # f 1 h w
         frames_mask = frames_mask.to(device=device)
-        frames_mask= torch.nn.functional.interpolate(frames_mask,scale_factor=1/self.vae_scale_factor)
-        frames_mask =frames_mask.unsqueeze(0)
-        
+        frames_mask = torch.nn.functional.interpolate(frames_mask, scale_factor=1 / self.vae_scale_factor)
+        frames_mask = frames_mask.unsqueeze(0)
+
         if do_classifier_free_guidance:
             negative_frames_mask = torch.zeros_like(frames_mask)
-            frames_mask = torch.cat([negative_frames_mask,frames_mask])
-        
-        frames_mask = frames_mask.repeat(num_videos_per_prompt,1,1,1,1)
-        return frames_mask
+            frames_mask = torch.cat([negative_frames_mask, frames_mask])
 
+        frames_mask = frames_mask.repeat(num_videos_per_prompt, 1, 1, 1, 1)
+        return frames_mask
 
     def _get_add_time_ids(
         self,
@@ -304,16 +282,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
     def prepare_latents(
-        self,
-        batch_size,
-        num_frames,
-        num_channels_latents,
-        height,
-        width,
-        dtype,
-        device,
-        generator,
-        latents=None,
+        self, batch_size, num_frames, num_channels_latents, height, width, dtype, device, generator, latents=None
     ):
         shape = (
             batch_size,
@@ -481,7 +450,9 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         self._guidance_scale = max_guidance_scale
 
         # 3. Encode input image
-        image_embeddings = self._encode_image(frames[0:1], device, num_videos_per_prompt, self.do_classifier_free_guidance)
+        image_embeddings = self._encode_image(
+            frames[0:1], device, num_videos_per_prompt, self.do_classifier_free_guidance
+        )
 
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.
@@ -492,8 +463,8 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         frames = self.image_processor.preprocess(frames, height=height, width=width)
         noise = randn_tensor(frames.shape, generator=generator, device=frames.device, dtype=frames.dtype)
         frames = frames + noise_aug_strength * noise
-        
-        frames_mask = self.mask_processor.preprocess(frames_mask, height=height,width=width)
+
+        frames_mask = self.mask_processor.preprocess(frames_mask, height=height, width=width)
         if mask_binarize_threshold is not None:
             try:
                 threshold = float(mask_binarize_threshold)
@@ -509,11 +480,12 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
-
         frame_latents = self._encode_vae_frames(frames, device, num_videos_per_prompt, self.do_classifier_free_guidance)
         frame_latents = frame_latents.to(image_embeddings.dtype)
-        
-        mask_latents = self._encode_mask_frames(frames_mask,device, num_videos_per_prompt, self.do_classifier_free_guidance)
+
+        mask_latents = self._encode_mask_frames(
+            frames_mask, device, num_videos_per_prompt, self.do_classifier_free_guidance
+        )
         mask_latents = mask_latents.to(image_embeddings.dtype)
 
         # cast back to fp16 if needed
@@ -572,7 +544,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # Concatenate image_latents over channels dimention
-                latent_model_input = torch.cat([latent_model_input, frame_latents,mask_latents], dim=2)
+                latent_model_input = torch.cat([latent_model_input, frame_latents, mask_latents], dim=2)
 
                 # predict the noise residual
                 # print(f'latent_model_input: {latent_model_input.dtype}, image_embeddings: {image_embeddings.dtype}, t: {t.dtype},added_time_ids:{added_time_ids.dtype} ')
@@ -619,6 +591,7 @@ class StableVideoDiffusionInpaintingPipeline(DiffusionPipeline):
 
         return StableVideoDiffusionPipelineOutput(frames=frames)
 
+
 # resizing utils
 # TODO: clean up later
 def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
@@ -627,10 +600,7 @@ def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corner
 
     # First, we have to determine sigma
     # Taken from skimage: https://github.com/scikit-image/scikit-image/blob/v0.19.2/skimage/transform/_warps.py#L171
-    sigmas = (
-        max((factors[0] - 1.0) / 2.0, 0.001),
-        max((factors[1] - 1.0) / 2.0, 0.001),
-    )
+    sigmas = (max((factors[0] - 1.0) / 2.0, 0.001), max((factors[1] - 1.0) / 2.0, 0.001))
 
     # Now kernel size. Good results are for 3 sigma, but that is kind of slow. Pillow uses 1 sigma
     # https://github.com/python-pillow/Pillow/blob/master/src/libImaging/Resample.c#L206
@@ -647,6 +617,7 @@ def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corner
 
     output = torch.nn.functional.interpolate(input, size=size, mode=interpolation, align_corners=align_corners)
     return output
+
 
 def _compute_padding(kernel_size):
     """Compute padding tuple."""
@@ -670,6 +641,7 @@ def _compute_padding(kernel_size):
 
     return out_padding
 
+
 def _filter2d(input, kernel):
     # prepare kernel
     b, c, h, w = input.shape
@@ -692,6 +664,7 @@ def _filter2d(input, kernel):
     out = output.view(b, c, h, w)
     return out
 
+
 def _gaussian(window_size: int, sigma):
     if isinstance(sigma, float):
         sigma = torch.tensor([[sigma]])
@@ -707,11 +680,12 @@ def _gaussian(window_size: int, sigma):
 
     return gauss / gauss.sum(-1, keepdim=True)
 
+
 def _gaussian_blur2d(input, kernel_size, sigma):
     if isinstance(sigma, tuple):
-        sigma = torch.tensor([sigma], dtype=input.dtype,device=input.device)
+        sigma = torch.tensor([sigma], dtype=input.dtype, device=input.device)
     else:
-        sigma = sigma.to(dtype=input.dtype,device=input.device)
+        sigma = sigma.to(dtype=input.dtype, device=input.device)
 
     ky, kx = int(kernel_size[0]), int(kernel_size[1])
     bs = sigma.shape[0]
@@ -721,6 +695,7 @@ def _gaussian_blur2d(input, kernel_size, sigma):
     out = _filter2d(out_x, kernel_y[..., None])
 
     return out
+
 
 def configure_attention_processors(pipeline: StableVideoDiffusionInpaintingPipeline):
     """
@@ -745,12 +720,13 @@ def configure_attention_processors(pipeline: StableVideoDiffusionInpaintingPipel
     if not attention_set:
         logger.info("Using default attention processor")
 
+
 def load_inpainting_pipeline(
     pre_trained_path: str,
     unet_path: str,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
-    offload_type: str = "model"
+    offload_type: str = "model",
 ) -> StableVideoDiffusionInpaintingPipeline:
     """
     Loads the stable video diffusion inpainting pipeline components and returns the pipeline object.
@@ -758,22 +734,13 @@ def load_inpainting_pipeline(
     logger.info("Loading pipeline components...")
 
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        pre_trained_path,
-        subfolder="image_encoder",
-        variant="fp16",
-        torch_dtype=dtype,
+        pre_trained_path, subfolder="image_encoder", variant="fp16", torch_dtype=dtype
     )
     vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        pre_trained_path,
-        subfolder="vae",
-        variant="fp16",
-        torch_dtype=dtype,
+        pre_trained_path, subfolder="vae", variant="fp16", torch_dtype=dtype
     )
     unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        unet_path,
-        subfolder="unet_diffusers",
-        low_cpu_mem_usage=True,
-        torch_dtype=dtype,
+        unet_path, subfolder="unet_diffusers", low_cpu_mem_usage=True, torch_dtype=dtype
     )
 
     image_encoder.requires_grad_(False)
@@ -781,16 +748,12 @@ def load_inpainting_pipeline(
     unet.requires_grad_(False)
 
     pipeline = StableVideoDiffusionInpaintingPipeline.from_pretrained(
-        pre_trained_path,
-        image_encoder=image_encoder,
-        vae=vae,
-        unet=unet,
-        torch_dtype=dtype,
+        pre_trained_path, image_encoder=image_encoder, vae=vae, unet=unet, torch_dtype=dtype
     ).to(device)
 
     # NEW: Call the helper function to configure attention processors
     configure_attention_processors(pipeline)
-    
+
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()
     elif offload_type == "sequential":

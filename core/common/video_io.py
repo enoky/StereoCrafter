@@ -5,17 +5,18 @@ for efficient video loading.
 """
 
 import os
+import re
 import json
 import shutil
 import threading
 import time
 import logging
-from typing import Optional, Tuple
-
-import subprocess  # Needed for FFmpeg-based preview readers
+import subprocess
+from typing import Optional, Tuple, Any
 
 import numpy as np
 import torch
+import cv2
 from decord import VideoReader, cpu
 
 from core.common.gpu_utils import CUDA_AVAILABLE
@@ -365,6 +366,226 @@ class FFmpegRGBSingleFrameReader:
         return _NumpyBatch(frames)
 
 
+def _infer_depth_bit_depth(depth_stream_info: Optional[dict]) -> int:
+    """Infer the bit depth of a depth stream from ffprobe info."""
+    if not depth_stream_info:
+        return 8
+    pix_fmt = str(depth_stream_info.get("pix_fmt", "")).lower()
+    profile = str(depth_stream_info.get("profile", "")).lower()
+    m = re.search(r"(?:p|gray)(\d+)", pix_fmt)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    if "main10" in profile or "10" in profile:
+        return 10
+    return 8
+
+
+def _build_depth_vf(pix_fmt: str, out_w: int, out_h: int) -> str:
+    """Build FFmpeg video filter for depth map extraction."""
+    pix_fmt = (pix_fmt or "").lower()
+    if pix_fmt.startswith("gray"):
+        return f"scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
+    return f"extractplanes=y,scale={out_w}:{out_h}:flags=bilinear,format=gray16le"
+
+
+class FFmpegDepthPipeReader:
+    """Sequential FFmpeg-backed depth reader preserving 10-bit+ values."""
+
+    def __init__(self, path: str, out_w: int, out_h: int, bit_depth: int, num_frames: int, pix_fmt: str = ""):
+        self.path = path
+        self.out_w = int(out_w)
+        self.out_h = int(out_h)
+        self.bit_depth = int(bit_depth) if bit_depth else 16
+        try:
+            if isinstance(num_frames, (int, float)) and not isinstance(num_frames, bool):
+                self._num_frames = int(num_frames)
+            elif isinstance(num_frames, str) and num_frames not in ("", "N/A"):
+                self._num_frames = int(float(num_frames))
+            else:
+                self._num_frames = 0
+        except (ValueError, TypeError):
+            self._num_frames = 0
+        self._pix_fmt = pix_fmt or ""
+        self._proc: Optional[subprocess.Popen] = None
+        self._next_index = 0
+        self._frame_bytes = self.out_w * self.out_h * 2
+        self._msb_shift: Optional[int] = None
+        self._use_16_to_n_scale: bool = False
+        self._start_process()
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def _start_process(self):
+        self.close()
+        vf = _build_depth_vf(self._pix_fmt, self.out_w, self.out_h)
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            self.path,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vframes",
+            str(self._num_frames) if isinstance(self._num_frames, int) and self._num_frames > 0 else "999999999",
+            "-vf",
+            vf,
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._next_index = 0
+        self._msb_shift = None
+
+    def close(self):
+        try:
+            if self._proc is not None:
+                if self._proc.stdout:
+                    try:
+                        self._proc.stdout.close()
+                    except Exception:
+                        pass
+                if self._proc.stderr:
+                    try:
+                        self._proc.stderr.close()
+                    except Exception:
+                        pass
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+        finally:
+            self._proc = None
+
+    def __del__(self):
+        self.close()
+
+    def seek(self, idx: int):
+        idx = int(idx)
+        if idx == self._next_index:
+            return
+        if idx < self._next_index:
+            self._start_process()
+        to_skip = idx - self._next_index
+        if to_skip <= 0:
+            self._next_index = idx
+            return
+        if self._proc is None or self._proc.stdout is None:
+            self._start_process()
+        discard_bytes = to_skip * self._frame_bytes
+        _ = self._proc.stdout.read(discard_bytes)
+        self._next_index = idx
+
+    def _read_exact(self, nbytes: int) -> bytes:
+        if self._proc is None or self._proc.stdout is None:
+            self._start_process()
+        buf = b""
+        while len(buf) < nbytes:
+            chunk = self._proc.stdout.read(nbytes - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def _maybe_apply_shift(self, arr_u16: np.ndarray) -> np.ndarray:
+        if self._msb_shift is None:
+            expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
+            if expected_max is None:
+                self._msb_shift = 0
+                self._use_16_to_n_scale = False
+            else:
+                flat = arr_u16.reshape(-1)
+                step = max(1, flat.size // 50000)
+                sample = flat[::step]
+                max_val = int(sample.max(initial=0))
+                if max_val <= expected_max:
+                    self._msb_shift = 0
+                    self._use_16_to_n_scale = False
+                else:
+                    shift = 16 - self.bit_depth
+                    if shift <= 0:
+                        self._msb_shift = 0
+                        self._use_16_to_n_scale = False
+                    else:
+                        low_mask = (1 << shift) - 1
+                        low_bits_max = int((sample & low_mask).max(initial=0))
+                        if low_bits_max == 0:
+                            self._msb_shift = shift
+                            self._use_16_to_n_scale = False
+                        else:
+                            self._msb_shift = 0
+                            self._use_16_to_n_scale = True
+        expected_max = (1 << self.bit_depth) - 1 if 0 < self.bit_depth < 16 else None
+        if expected_max is None:
+            return arr_u16
+        if self._msb_shift and self._msb_shift > 0:
+            return (arr_u16 >> self._msb_shift).astype(np.uint16)
+        if self._use_16_to_n_scale:
+            arr32 = arr_u16.astype(np.uint32)
+            return ((arr32 * expected_max + 32767) // 65535).astype(np.uint16)
+        return arr_u16
+
+    def get_batch(self, indices):
+        indices = list(indices)
+        if not indices:
+            return _NumpyBatch(np.zeros((0, self.out_h, self.out_w, 1), dtype=np.uint16))
+        first = int(indices[0])
+        if first != self._next_index:
+            self.seek(first)
+        n = len(indices)
+        expected = self._frame_bytes * n
+        buf = self._read_exact(expected)
+        if len(buf) != expected:
+            raise EOFError(f"FFmpegDepthPipeReader: expected {expected} bytes, got {len(buf)}")
+        arr = np.frombuffer(buf, dtype=np.uint16).reshape(n, self.out_h, self.out_w, 1)
+        arr = self._maybe_apply_shift(arr)
+        self._next_index = first + n
+        return _NumpyBatch(arr.copy())
+
+
+class _ResizingDepthReader:
+    """Wrapper reader that resizes depth frames to target resolution."""
+
+    def __init__(self, inner_reader, out_w, out_h):
+        self._inner = inner_reader
+        self._out_w = int(out_w)
+        self._out_h = int(out_h)
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+    def seek(self, *args, **kwargs):
+        return self._inner.seek(*args, **kwargs)
+
+    def get_batch(self, indices):
+        _batch = self._inner.get_batch(indices)
+        arr = _batch.asnumpy()
+        in_h, in_w = arr.shape[1:3]
+        if in_w == self._out_w and in_h == self._out_h:
+            return _batch
+        interp = cv2.INTER_LINEAR if (self._out_w > in_w or self._out_h > in_h) else cv2.INTER_AREA
+        if arr.ndim == 4:
+            out = np.empty((arr.shape[0], self._out_h, self._out_w, arr.shape[3]), dtype=arr.dtype)
+            for i in range(arr.shape[0]):
+                res = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+                if res.ndim == 2:
+                    res = res[..., np.newaxis]
+                out[i] = res
+        else:
+            out = np.empty((arr.shape[0], self._out_h, self._out_w), dtype=arr.dtype)
+            for i in range(arr.shape[0]):
+                out[i] = cv2.resize(arr[i], (self._out_w, self._out_h), interpolation=interp)
+        return _NumpyBatch(out)
+
+
 def read_video_frames(
     video_path: str,
     process_length: int,
@@ -373,130 +594,102 @@ def read_video_frames(
     pre_res_height: int,
     strict_ffmpeg_decode: bool = False,
     dataset: str = "open",
-) -> Tuple[VideoReader, float, int, int, int, int, Optional[dict], int]:
-    """Initialize a VideoReader for chunked reading.
-
-    Args:
-        video_path: Path to the video file
-        process_length: Number of frames to process (-1 for all)
-        set_pre_res: Whether to set custom resolution
-        pre_res_width: Target width if set_pre_res is True
-        pre_res_height: Target height if set_pre_res is True
-        dataset: Dataset type (only 'open' supported)
-
-    Returns:
-        Tuple of (video_reader, fps, original_height, original_width,
-                  actual_processed_height, actual_processed_width,
-                  video_stream_info, total_frames_to_process)
-
-    Raises:
-        NotImplementedError: If dataset is not 'open'
-    """
-    # Handle process_length that might be passed as string
+    is_depth: bool = False,
+) -> Tuple[Any, float, int, int, int, int, Optional[dict], int]:
+    """Initialize a VideoReader for chunked reading, with optional high-bit depth support."""
     try:
         process_length = int(process_length) if process_length not in (None, "", "N/A") else -1
     except (ValueError, TypeError):
         process_length = -1
 
-    logger.debug(f"read_video_frames: process_length = {process_length} (type: {type(process_length)})")
-    if dataset == "open":
-        logger.info(f"==> Initializing VideoReader for: {video_path}")
-        vid_info_only = VideoReader(video_path, ctx=cpu(0))  # Use separate reader for info
-        original_height, original_width = vid_info_only.get_batch([0]).shape[1:3]
-        try:
-            total_frames_original = int(len(vid_info_only)) if len(vid_info_only) not in (None, "", "N/A") else 0
-        except (ValueError, TypeError):
-            total_frames_original = 0
-        logger.info(
-            f"==> Original video shape: {total_frames_original} frames, {original_height}x{original_width} per frame"
-        )
-
-        height_for_reader = original_height
-        width_for_reader = original_width
-
-        if set_pre_res and pre_res_width > 0 and pre_res_height > 0:
-            height_for_reader = pre_res_height
-            width_for_reader = pre_res_width
-            logger.debug(f"==> Pre-processing resolution set to: {width_for_reader}x{height_for_reader}")
-        else:
-            logger.debug(f"==> Using original video resolution for reading: {width_for_reader}x{height_for_reader}")
-
-    else:
+    if dataset != "open":
         raise NotImplementedError(f"Dataset '{dataset}' not supported.")
 
-    # decord automatically resizes if width/height are passed to VideoReader
-    video_reader = VideoReader(video_path, ctx=cpu(0), width=width_for_reader, height=height_for_reader)
+    logger.info(f"==> Initializing VideoReader for: {video_path}")
+    video_stream_info = get_video_stream_info(video_path)
+    fps = 0.0
+    original_height, original_width = 0, 0
+    total_frames_available = 0
 
-    # Verify the actual shape after Decord processing, using the first frame
-    first_frame_shape = video_reader.get_batch([0]).shape
-    actual_processed_height, actual_processed_width = first_frame_shape[1:3]
+    # Use bit-depth awareness for depth maps
+    bit_depth = 8
+    if is_depth:
+        bit_depth = _infer_depth_bit_depth(video_stream_info)
 
-    fps = float(video_reader.get_avg_fps())  # Use actual FPS from the reader
-
-    # Handle case where len(video_reader) might return a string
+    # Determine dimensions and frame count
     try:
-        total_frames_available_raw = len(video_reader)
-        if isinstance(total_frames_available_raw, int) and total_frames_available_raw > 0:
-            total_frames_available = total_frames_available_raw
-        else:
-            total_frames_available = 0
-    except (ValueError, TypeError):
-        total_frames_available = 0
+        # Use decord for metadata if ffprobe failed or was insufficient
+        tmp = VideoReader(video_path, ctx=cpu(0))
+        original_height, original_width = tmp.get_batch([0]).asnumpy().shape[1:3]
+        total_frames_available = len(tmp)
+        fps = float(tmp.get_avg_fps())
+        del tmp
+    except Exception:
+        if video_stream_info:
+            original_height = int(video_stream_info.get("height", 0))
+            original_width = int(video_stream_info.get("width", 0))
+            total_frames_available = int(video_stream_info.get("nb_frames", 0))
+            fr_str = video_stream_info.get("r_frame_rate", "0/0")
+            if "/" in fr_str:
+                num, den = fr_str.split("/")
+                fps = float(num) / float(den) if float(den) > 0 else 0.0
 
-    total_frames_to_process = total_frames_available  # Use available frames directly
-    if total_frames_available > 0 and process_length != -1 and process_length < total_frames_available:
-        total_frames_to_process = process_length
+    if original_height == 0 or original_width == 0:
+        raise ValueError(f"Could not determine video dimensions for {video_path}")
 
-    logger.debug(
-        f"==> VideoReader initialized. Final processing dimensions: "
-        f"{actual_processed_width}x{actual_processed_height}. "
-        f"Total frames for processing: {total_frames_to_process}"
-    )
+    h_reader = pre_res_height if set_pre_res and pre_res_height > 0 else original_height
+    w_reader = pre_res_width if set_pre_res and pre_res_width > 0 else original_width
 
-    video_stream_info = get_video_stream_info(video_path)  # Get stream info for FFmpeg later
-
-    # If strict FFmpeg decode is requested, swap in an FFmpeg-backed reader for frame fetch.
-    # This keeps decode/colorspace conversion consistent across preview + renders for problem clips.
-    if strict_ffmpeg_decode:
+    # Choose reader implementation
+    if is_depth and bit_depth > 8:
+        logger.info(f"==> Using high-bit depth path (FFmpegDepthPipeReader) for {bit_depth}-bit source.")
+        video_reader = FFmpegDepthPipeReader(
+            video_path,
+            out_w=w_reader,
+            out_h=h_reader,
+            bit_depth=bit_depth,
+            num_frames=total_frames_available,
+            pix_fmt=str(video_stream_info.get("pix_fmt", "")),
+        )
+    elif strict_ffmpeg_decode:
+        in_range, in_matrix = "tv", "bt709"
         try:
-            in_range = "tv"
-            in_matrix = "bt709"
-            try:
-                cr = str((video_stream_info or {}).get("color_range") or "").lower()
-                cs = str((video_stream_info or {}).get("color_space") or "").lower()
-                if "full" in cr or cr == "pc":
-                    in_range = "pc"
-                if "2020" in cs:
-                    in_matrix = "bt2020"
-                elif "601" in cs:
-                    in_matrix = "bt601"
-            except Exception:
-                pass
+            cr = str((video_stream_info or {}).get("color_range") or "").lower()
+            cs = str((video_stream_info or {}).get("color_space") or "").lower()
+            if "full" in cr or cr == "pc":
+                in_range = "pc"
+            if "2020" in cs:
+                in_matrix = "bt2020"
+            elif "601" in cs:
+                in_matrix = "bt601"
+        except Exception:
+            pass
+        video_reader = FFmpegRGBPipeReader(
+            video_path=video_path,
+            width=w_reader,
+            height=h_reader,
+            fps=fps,
+            total_frames=total_frames_available,
+            in_range=in_range,
+            in_matrix=in_matrix,
+        )
+    else:
+        video_reader = VideoReader(video_path, ctx=cpu(0), width=w_reader, height=h_reader)
+        # Wrap in ResizingDepthReader if Decord didn't resize or if we need specific parity
+        if is_depth:
+            actual_h, actual_w = video_reader.get_batch([0]).asnumpy().shape[1:3]
+            if actual_h != h_reader or actual_w != w_reader:
+                video_reader = _ResizingDepthReader(video_reader, out_w=w_reader, out_h=h_reader)
 
-            video_reader = FFmpegRGBPipeReader(
-                video_path=video_path,
-                width=width_for_reader,
-                height=height_for_reader,
-                fps=float(fps),
-                total_frames=total_frames_available,
-                in_range=in_range,
-                in_matrix=in_matrix,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Strict FFmpeg decode requested, but FFmpeg reader init failed; falling back to Decord. ({e})"
-            )
+    # Verify final dimensions
+    first_shape = video_reader.get_batch([0]).asnumpy().shape
+    actual_h, actual_w = first_shape[1:3]
 
-    return (
-        video_reader,
-        fps,
-        original_height,
-        original_width,
-        actual_processed_height,
-        actual_processed_width,
-        video_stream_info,
-        total_frames_to_process,
-    )
+    total_to_process = total_frames_available
+    if total_frames_available > 0 and process_length != -1 and process_length < total_frames_available:
+        total_to_process = process_length
+
+    return (video_reader, fps, original_height, original_width, actual_h, actual_w, video_stream_info, total_to_process)
 
 
 _FFPROBE_AVAIL: Optional[bool] = None

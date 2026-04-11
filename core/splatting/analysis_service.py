@@ -16,11 +16,13 @@ from typing import Optional, Tuple
 import numpy as np
 from decord import VideoReader, cpu
 
-from core.common.video_io import get_video_stream_info
+from core.common.video_io import (
+    _infer_depth_bit_depth,
+    get_video_stream_info,
+)
 from core.splatting.depth_processing import (
     DEPTH_VIS_TV10_BLACK_NORM,
     DEPTH_VIS_TV10_WHITE_NORM,
-    _infer_depth_bit_depth,
     load_pre_rendered_depth,
     process_depth_batch,
 )

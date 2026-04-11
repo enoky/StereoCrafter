@@ -11,8 +11,8 @@ from typing import Optional, Tuple
 import numpy as np
 from decord import VideoReader, cpu
 
-from .depth_processing import DEPTH_VIS_TV10_BLACK_NORM, DEPTH_VIS_TV10_WHITE_NORM, _infer_depth_bit_depth
-from core.common.video_io import get_video_stream_info
+from .depth_processing import DEPTH_VIS_TV10_BLACK_NORM, DEPTH_VIS_TV10_WHITE_NORM
+from core.common.video_io import _infer_depth_bit_depth, get_video_stream_info
 
 logger = logging.getLogger(__name__)
 

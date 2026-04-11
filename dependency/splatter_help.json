@@ -68,5 +68,9 @@
   "encoding_nvenc_aq_strength": "Strength for NVENC AQ (1\u201315). Higher is stronger. Use moderate values to avoid artifacts.",
   "dnxhr_profile": "DNxHR profile used for the Full-Res Splat file when DNxHR Split is enabled.\n\u2022 SQ / HQ: 8-bit 4:2:2 (smaller)\n\u2022 HQX: 10-bit 4:2:2 (great Resolve-friendly default)\n\u2022 444: 10-bit 4:4:4 (very large)",
   "dnxhr_fullres_split_tooltip": "Outputs Full-Res Dual mode as two separate files instead of a side-by-side grid:\n\u2022 Mask \u2192 normal encode (same as current settings)\n\u2022 Splat \u2192 DNxHR .mov (Resolve-friendly intermediate)\nUse HQX (10-bit 4:2:2) for best quality/compatibility; SQ/HQ are smaller; 444 is huge.",
-  "sbs_preview": "Opens a separate Side-by-Side preview window for 3D monitors.\nLeft = Original (Left Eye), Right = Full Splat result.\nCrosshair + D/P overlays are duplicated on both halves at identical pixels (screen-level in 3D).\nEnabling SBS auto-switches the main preview source to Splat Result (Full) once.\nPreview-only: does not affect render, tests, or exports."
+  "sbs_preview": "Opens a separate Side-by-Side preview window for 3D monitors.\nLeft = Original (Left Eye), Right = Full Splat result.\nCrosshair + D/P overlays are duplicated on both halves at identical pixels (screen-level in 3D).\nEnabling SBS auto-switches the main preview source to Splat Result (Full) once.\nPreview-only: does not affect render, tests, or exports.",
+  "mesh_warp_view_bias": "Simulates a horizontal camera shift (view bias) in the 3D scene. Adjusts the perspective of the generated stereo pair.",
+  "mesh_warp_dolly_zoom": "Adjusts the virtual camera focal length while moving the camera to maintain the same subject size, creating a 'dolly zoom' effect.",
+  "mesh_warp_extrusion_scale": "Scales the 'thickness' or depth intensity of the 3D mesh. Higher values result in more pronounced 3D geometry.",
+  "mesh_warp_preview_density": "Multiplier for the mesh resolution in preview mode (e.g., 0.2-0.5 is recommended for speed). Lower values are faster but less detailed."
 }
