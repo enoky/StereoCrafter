@@ -725,17 +725,16 @@ def plan_next_chunk(global_len, total_frames, frames_chunk, frames_overlap, vae_
         # Middle chunk: step forward by exactly the requested overlap.
         return desired_start, round_down(frames_chunk)
 
-    # Final chunk: size it to reach the last frame with a valid length, keeping
-    # overlap <= frames_overlap (rounding the length DOWN shrinks the overlap).
-    length = round_down(remaining)
-    start = total_frames - length
-    if start > global_len:
-        # Rounding down left tail frames uncovered (only when overlap is tiny);
-        # bump up one temporal step to guarantee full coverage.
-        length += vsft
-        start = total_frames - length
-    start = max(0, start)
-    length = round_down(total_frames - start)
+    # Final chunk: anchor the end on the last frame so the output length matches the
+    # input length. Pick the largest valid length that fits the clip (and frames_chunk)
+    # and keeps overlap <= frames_overlap; rounding the length DOWN only ever shrinks
+    # the overlap, never grows it.
+    uncovered = total_frames - global_len
+    max_len = min(frames_chunk, total_frames)
+    length = round_down(min(uncovered + frames_overlap, max_len))
+    start = max(0, total_frames - length)
+    start = min(start, global_len)             # never produce a negative overlap
+    length = round_down(total_frames - start)  # exact valid length for [start, total_frames]
     return start, length
 
 
