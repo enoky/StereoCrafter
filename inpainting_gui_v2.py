@@ -1190,7 +1190,6 @@ class WanInpaintingGUI(ThemedTk):
 
         self.input_folder_var = tk.StringVar(value=cfg.get("input_folder", "./output_splatted"))
         self.output_folder_var = tk.StringVar(value=cfg.get("output_folder", "./completed_output"))
-        self.input_layout_var = tk.StringVar(value=cfg.get("input_layout", "Auto"))
 
         self.frames_chunk_var = tk.StringVar(value=str(cfg.get("frames_chunk", 81)))
         self.frames_overlap_var = tk.StringVar(value=str(cfg.get("frames_overlap", 10)))
@@ -1200,13 +1199,11 @@ class WanInpaintingGUI(ThemedTk):
         self.seed_var = tk.StringVar(value=str(cfg.get("seed", 0)))
         self.offload_mode_var = tk.StringVar(value=cfg.get("offload_mode", "Group offload"))
         self.num_blocks_per_group_var = tk.StringVar(value=str(cfg.get("num_blocks_per_group", 1)))
-        self.prompt_var = cfg.get("prompt", "")  # held in Text widget; seeded here
 
         # Window geometry
-        self.window_x = cfg.get("window_x", None)
-        self.window_y = cfg.get("window_y", None)
-        self.window_width = cfg.get("window_width", 620)
-        self.window_height = cfg.get("window_height", None)
+        # Full "WxH+X+Y" string so size *and* on-screen position round-trip exactly.
+        self.window_geometry = cfg.get("window_geometry", None)
+        self.default_width = 620
 
         # Status / progress
         self.status_var = tk.StringVar(value="Ready")
@@ -1223,25 +1220,26 @@ class WanInpaintingGUI(ThemedTk):
         paths.pack(fill="x", **pad)
         paths.columnconfigure(1, weight=1)
         self._dnd_entries = []
-        self._add_path_row(paths, 0, "Input (folder or file):", self.input_folder_var,
-                           lambda: self._browse_input(),
-                           "A folder of SBS splatting-result videos, or a single video file.",
-                           folder_only=False, extensions=VIDEO_EXTENSIONS)
+
+        # Input row: pick a single file OR a folder to batch-process.
+        input_tip = ("A single video file (processed alone) or a folder of videos "
+                     "(every supported video is batch-processed).")
+        in_lbl = ttk.Label(paths, text="Input file/folder:")
+        in_lbl.grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        in_entry = ttk.Entry(paths, textvariable=self.input_folder_var)
+        in_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+        in_btns = ttk.Frame(paths)
+        in_btns.grid(row=0, column=2, padx=4, pady=2)
+        ttk.Button(in_btns, text="File", width=6, command=self._browse_input_file).pack(side="left", padx=(0, 2))
+        ttk.Button(in_btns, text="Folder", width=7, command=self._browse_input_folder).pack(side="left")
+        Tooltip(in_lbl, input_tip)
+        Tooltip(in_entry, input_tip)
+        self._dnd_entries.append((in_entry, self.input_folder_var, False, VIDEO_EXTENSIONS))
+
         self._add_path_row(paths, 1, "Output folder:", self.output_folder_var,
                            lambda: self._browse_folder(self.output_folder_var),
                            "Where the inpainted videos are written.", folder_only=True)
         register_dnd_entries(self._dnd_entries, self._dnd_enabled)
-
-        layout_tip = ("Input frame layout.\nAuto: detect from filename "
-                      "(_splatted2 / _splatted2F = dual).\nQuad (2x2): left / mask / warped -> SBS + anaglyph.\n"
-                      "Dual (1x2): mask | warped -> inpainted right eye only.")
-        layout_lbl = ttk.Label(paths, text="Input layout:")
-        layout_lbl.grid(row=2, column=0, sticky="w", padx=4, pady=2)
-        layout_combo = ttk.Combobox(paths, textvariable=self.input_layout_var,
-                                    values=["Auto", "Dual", "Quad"], state="readonly", width=8)
-        layout_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
-        Tooltip(layout_lbl, layout_tip)
-        Tooltip(layout_combo, layout_tip)
 
         # --- Parameters ---
         params = ttk.LabelFrame(self, text="Parameters")
@@ -1283,14 +1281,6 @@ class WanInpaintingGUI(ThemedTk):
             Tooltip(w, offload_tip)
         for w in (blocks_lbl, blocks_entry):
             Tooltip(w, blocks_tip)
-
-        # --- Prompt ---
-        prompt_frame = ttk.LabelFrame(self, text="Prompt (optional)")
-        prompt_frame.pack(fill="x", **pad)
-        self.prompt_text = tk.Text(prompt_frame, height=2, wrap="word")
-        self.prompt_text.pack(fill="x", padx=4, pady=4)
-        if self.prompt_var:
-            self.prompt_text.insert("1.0", self.prompt_var)
 
         # --- Controls ---
         controls = ttk.Frame(self)
@@ -1363,17 +1353,21 @@ class WanInpaintingGUI(ThemedTk):
         if folder:
             var.set(folder)
 
-    def _browse_input(self):
-        # Offer a file picker; user can clear it and use the folder field manually.
+    def _browse_input_file(self):
+        current = self.input_folder_var.get()
+        initial = current if os.path.isdir(current) else os.path.dirname(current)
         path = filedialog.askopenfilename(
-            initialdir=self.input_folder_var.get() or ".",
-            title="Select a video file (or Cancel to pick a folder)",
+            initialdir=initial or ".",
+            title="Select a video file",
             filetypes=[("Video files", " ".join(f"*{e}" for e in VIDEO_EXTENSIONS)), ("All files", "*.*")],
         )
         if path:
             self.input_folder_var.set(path)
-            return
-        folder = filedialog.askdirectory(initialdir=self.input_folder_var.get() or ".")
+
+    def _browse_input_folder(self):
+        current = self.input_folder_var.get()
+        initial = current if os.path.isdir(current) else os.path.dirname(current)
+        folder = filedialog.askdirectory(initialdir=initial or ".")
         if folder:
             self.input_folder_var.set(folder)
 
@@ -1385,12 +1379,12 @@ class WanInpaintingGUI(ThemedTk):
         )
         colors = self.theme_manager.get_colors()
         # tk.Text widgets aren't ttk-themed; style them directly.
-        for w in (getattr(self, "prompt_text", None), getattr(self, "log_widget", None)):
-            if w is not None:
-                try:
-                    w.configure(bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
-                except tk.TclError:
-                    pass
+        log_widget = getattr(self, "log_widget", None)
+        if log_widget is not None:
+            try:
+                log_widget.configure(bg=colors["entry_bg"], fg=colors["fg"], insertbackground=colors["fg"])
+            except tk.TclError:
+                pass
         configure_dnd_styles(self.style, self.dark_mode_var.get(), self._dnd_enabled)
 
     def toggle_dark_mode(self):
@@ -1419,7 +1413,6 @@ class WanInpaintingGUI(ThemedTk):
             "dark_mode_enabled": self.dark_mode_var.get(),
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
-            "input_layout": self.input_layout_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frames_overlap": self.frames_overlap_var.get(),
             "tile_overlap": self.tile_overlap_var.get(),
@@ -1428,11 +1421,7 @@ class WanInpaintingGUI(ThemedTk):
             "seed": self.seed_var.get(),
             "offload_mode": self.offload_mode_var.get(),
             "num_blocks_per_group": self.num_blocks_per_group_var.get(),
-            "prompt": self.prompt_text.get("1.0", "end-1c"),
-            "window_x": self.winfo_x(),
-            "window_y": self.winfo_y(),
-            "window_width": self.winfo_width(),
-            "window_height": self.winfo_height(),
+            "window_geometry": self.geometry(),
         }
 
     def save_config(self):
@@ -1458,9 +1447,6 @@ class WanInpaintingGUI(ThemedTk):
                     var.set(bool(value))
                 elif isinstance(var, tk.StringVar):
                     var.set(str(value))
-                elif key == "prompt":
-                    self.prompt_text.delete("1.0", "end")
-                    self.prompt_text.insert("1.0", str(value))
             self._apply_theme()
             self.update_status(f"Loaded settings from {os.path.basename(filename)}")
         except Exception as e:
@@ -1480,12 +1466,34 @@ class WanInpaintingGUI(ThemedTk):
             messagebox.showerror("Save error", f"Failed to save settings:\n{e}")
 
     def _set_saved_geometry(self):
-        width = self.window_width or 620
-        height = self.window_height or self.winfo_reqheight()
-        if self.window_x is not None and self.window_y is not None:
-            self.geometry(f"{width}x{height}+{self.window_x}+{self.window_y}")
-        else:
-            self.geometry(f"{width}x{height}")
+        geom = self.window_geometry
+        if geom and self._geometry_visible(geom):
+            try:
+                self.geometry(geom)
+                return
+            except tk.TclError:
+                pass
+        self.geometry(f"{self.default_width}x{self.winfo_reqheight()}")
+
+    def _geometry_visible(self, geom):
+        """True if the saved "WxH+X+Y" leaves a usable chunk of the title bar on screen.
+
+        Guards against restoring onto a monitor that is no longer connected. Uses the
+        virtual desktop bounds so multi-monitor (including negative coords) is honored."""
+        match = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", geom.strip())
+        if not match:
+            return False
+        w, h, x, y = (int(g) for g in match.groups())
+        vx = self.winfo_vrootx()
+        vy = self.winfo_vrooty()
+        vw = self.winfo_vrootwidth() or self.winfo_screenwidth()
+        vh = self.winfo_vrootheight() or self.winfo_screenheight()
+        margin = 80  # keep at least this many px of the window grabbable
+        if x + w < vx + margin or x > vx + vw - margin:
+            return False
+        if y + h < vy + margin or y > vy + vh - margin:
+            return False
+        return True
 
     # ----------------------------------------------------------------- logging
     def _configure_logging(self):
@@ -1599,8 +1607,7 @@ class WanInpaintingGUI(ThemedTk):
             messagebox.showerror("Invalid value", "'frames_overlap' must be smaller than 'frames_chunk'.")
             return None
 
-        prompt = self.prompt_text.get("1.0", "end-1c")
-        return videos, params, output_dir, prompt
+        return videos, params, output_dir
 
     def start_processing(self):
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -1608,14 +1615,15 @@ class WanInpaintingGUI(ThemedTk):
         validated = self._validate_and_gather()
         if validated is None:
             return
-        videos, params, output_dir, prompt = validated
+        videos, params, output_dir = validated
+        prompt = PROMPT  # prompt input removed from the GUI; always use the default
 
         # Model paths are hardcoded (not exposed in the GUI).
         pre_trained = PRE_TRAINED_PATH
         transformer = TRANSFORMER_PATH
 
-        # Resolve layout / offload here on the main thread (None layout = auto-detect per file).
-        is_dual_input = resolve_layout(self.input_layout_var.get())
+        # Input layout is always auto-detected per file (see detect_dual_input).
+        is_dual_input = None
         offload_mode = resolve_offload(self.offload_mode_var.get())
         try:
             num_blocks = max(1, int(self.num_blocks_per_group_var.get()))
