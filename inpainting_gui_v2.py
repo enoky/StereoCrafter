@@ -701,6 +701,44 @@ def spatial_tiled_process(
     return torch.cat(pixels, dim=3)
 
 
+def plan_next_chunk(global_len, total_frames, frames_chunk, frames_overlap, vae_scale_factor_temporal):
+    """Decide the next temporal chunk's start and (valid) length.
+
+    Returns ``(start, length)`` where ``length`` is always a valid VAE temporal size
+    (``length % vsft == 1``). For the final chunk the start is chosen so the chunk
+    lands exactly on the last frame while keeping the overlap at or just below
+    ``frames_overlap`` -- instead of the old behaviour that forced a full
+    ``frames_chunk`` window and produced a huge overlap on the tail.
+    """
+    vsft = vae_scale_factor_temporal
+
+    def round_down(n):
+        return ((n - 1) // vsft) * vsft + 1
+
+    if global_len == 0:
+        return 0, round_down(min(frames_chunk, total_frames))
+
+    desired_start = global_len - frames_overlap
+    remaining = total_frames - desired_start  # frames from the desired start to the end
+
+    if remaining > frames_chunk:
+        # Middle chunk: step forward by exactly the requested overlap.
+        return desired_start, round_down(frames_chunk)
+
+    # Final chunk: size it to reach the last frame with a valid length, keeping
+    # overlap <= frames_overlap (rounding the length DOWN shrinks the overlap).
+    length = round_down(remaining)
+    start = total_frames - length
+    if start > global_len:
+        # Rounding down left tail frames uncovered (only when overlap is tiny);
+        # bump up one temporal step to guarantee full coverage.
+        length += vsft
+        start = total_frames - length
+    start = max(0, start)
+    length = round_down(total_frames - start)
+    return start, length
+
+
 class WanInpaintEngine:
     """Holds the loaded Wan VACE models and derived constants so they can be
     reused across multiple videos (load once, run many)."""
@@ -942,23 +980,9 @@ def run_inpaint(
     while global_len < total_frames:
         if should_stop():
             raise InferenceCancelled()
-        if global_len == 0:
-            # 第一段：从 0 开始
-            cur_i = 0
-            cur_chunk_size = min(frames_chunk, total_frames)
-            # 安全修正（防止输入视频本身不到 81 帧）
-            valid_chunk_size = ((cur_chunk_size - 1) // vae_scale_factor_temporal) * vae_scale_factor_temporal + 1
-        else:
-            # 正常步长推进
-            cur_i = global_len - frames_overlap
-            
-            # 如果按正常步长取，超出了总帧数，说明这是最后一段
-            if cur_i + frames_chunk > total_frames:
-                # 强制把截取起点向前推，确保这一段刚好能取满 frames_chunk (81帧) 并直达视频结尾
-                cur_i = max(0, total_frames - frames_chunk)
-                
-            cur_chunk_size = min(frames_chunk, total_frames - cur_i)
-            valid_chunk_size = ((cur_chunk_size - 1) // vae_scale_factor_temporal) * vae_scale_factor_temporal + 1
+        cur_i, valid_chunk_size = plan_next_chunk(
+            global_len, total_frames, frames_chunk, frames_overlap, vae_scale_factor_temporal
+        )
 
         chunk_cond = all_frames[:, :, cur_i : cur_i + valid_chunk_size].clone()
         chunk_mask = all_masks[:, :, cur_i : cur_i + valid_chunk_size]
