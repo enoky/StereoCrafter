@@ -89,6 +89,7 @@ temp/
 config.json
 config_depthcrafter.json
 config_inpaint.json
+config_inpaint_v2.json
 config_splat.json
 yolo12s.pt
 yolo12n.pt
