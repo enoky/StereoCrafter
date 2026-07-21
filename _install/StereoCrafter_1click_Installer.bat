@@ -172,9 +172,13 @@ if exist "venv" (
     )
 )
 
-call :log "[INFO] Pinning Python 3.12 and syncing..."
-uv python pin 3.12 >> "%LOGFILE%" 2>&1
+call :log "[INFO] Pinning Python 3.13 and syncing..."
+uv python pin 3.13 >> "%LOGFILE%" 2>&1
 uv sync >> "%LOGFILE%" 2>&1
+if !errorlevel! neq 0 (
+    call :log "[ERROR] uv sync failed. Environment is incomplete. Check log for details: %LOGFILE%"
+    pause && exit /b 1
+)
 
 REM --- [6/7] WEIGHTS SECTION [Parenthesis Safe] ---
 echo.

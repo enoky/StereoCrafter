@@ -1527,7 +1527,6 @@ dependencies = [
     { name = "transformers" },
     { name = "triton-windows" },
     { name = "ttkthemes" },
-    { name = "xformers" },
 ]
 
 [package.dev-dependencies]
@@ -1562,7 +1561,6 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.1.0" },
     { name = "triton-windows", specifier = ">=3.6.0.post25" },
     { name = "ttkthemes", specifier = ">=3.3.0" },
-    { name = "xformers", specifier = ">=0.0.33.post2", index = "https://download.pytorch.org/whl/cu130" },
 ]
 
 [package.metadata.requires-dev]
@@ -1825,19 +1823,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/35/a2/8e3becb46433538a38726c948d3399905a4c7cabd0df578ede5dc51f0ec2/wcwidth-0.6.0.tar.gz", hash = "sha256:cdc4e4262d6ef9a1a57e018384cbeb1208d8abbc64176027e2c2455c81313159", size = 159684, upload-time = "2026-02-06T19:19:40.919Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/68/5a/199c59e0a824a3db2b89c5d2dade7ab5f9624dbf6448dc291b46d5ec94d3/wcwidth-0.6.0-py3-none-any.whl", hash = "sha256:1a3a1e510b553315f8e146c54764f4fb6264ffad731b3d78088cdb1478ffbdad", size = 94189, upload-time = "2026-02-06T19:19:39.646Z" },
-]
-
-[[package]]
-name = "xformers"
-version = "0.0.35"
-source = { registry = "https://download.pytorch.org/whl/cu130" }
-dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
-]
-wheels = [
-    { url = "https://download.pytorch.org/whl/cu130/xformers-0.0.35-py39-none-manylinux_2_28_x86_64.whl", hash = "sha256:962eb73f7243fb6a6b68ed85ed8f97780070ee35c1be464eefe3299b0382391d", upload-time = "2026-04-27T20:28:11Z" },
-    { url = "https://download.pytorch.org/whl/cu130/xformers-0.0.35-py39-none-win_amd64.whl", hash = "sha256:517d5a92d0b08393185f02580cf03ad17e9db12d739fc21e790ed1393df85cf4", upload-time = "2026-04-27T20:28:12Z" },
 ]
 
 [[package]]

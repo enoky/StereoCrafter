@@ -9,32 +9,28 @@ This guide walks you through manually installing the **StereoCrafter** using the
 Ensure the following tools are installed and available in your system's PATH:
 
 - [Git](https://git-scm.com/)
-- [CUDA Toolkit 12.8 or 12.9](https://developer.nvidia.com/cuda-toolkit)
+- A recent [NVIDIA GPU driver](https://www.nvidia.com/drivers/) (CUDA 13 capable, version 580 or newer)
 - [FFMPEG](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/)
+
+> The CUDA Toolkit is **not** required. All CUDA components ship prebuilt with the Python packages: PyTorch cu130 wheels bundle the CUDA runtime, SageAttention installs as a prebuilt wheel, and triton-windows bundles its own compiler tools.
 
 ---
 
 ## 🚀 Installation Steps
 
-### 1. Verify CUDA Toolkit Installation
+### 1. Verify NVIDIA Driver
 
-Check that `nvcc` is available and the version is 12.8 or 12.9:
+Check that your driver supports CUDA 13:
 
 ```bash
 
-nvcc --version
+nvidia-smi
 
 ```
 
-Look for output like:
+Look for `CUDA Version: 13.0` (or higher) in the top-right corner of the output.
 
-```
-
-Cuda compilation tools, release 12.8, V12.8.89
-
-```
-
-> If `nvcc` is not found or the version is incorrect, install the correct version from [NVIDIA's CUDA Toolkit page](https://developer.nvidia.com/cuda-toolkit).
+> If the reported CUDA version is lower than 13.0, update your driver from [NVIDIA's driver page](https://www.nvidia.com/drivers/).
 
 ### 2. Install uv Package Manager
 
@@ -151,5 +147,5 @@ Your downloaded weights should contain files matching the visual hiearchy below.
 
 - If any step fails, check your environment variables and permissions.
 - Refer to `install_log.txt` (if generated during script-based install) for troubleshooting.
-- CUDA support is critical for GPU acceleration. Ensure your drivers and toolkit are correctly installed.
+- CUDA support is critical for GPU acceleration. Ensure your NVIDIA driver is up to date (CUDA 13 capable).
 

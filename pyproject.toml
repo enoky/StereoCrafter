@@ -30,7 +30,6 @@ dependencies = [
     "transformers>=5.1.0",
     "triton-windows>=3.6.0.post25",
     "ttkthemes>=3.3.0",
-    "xformers>=0.0.33.post2",
 ]
 
 [[tool.uv.index]]
@@ -42,7 +41,6 @@ explicit = true
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-xformers = { index = "pytorch" }
 sageattention = { url = "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0%2Bcu130torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl" }
 
 [tool.ruff]
