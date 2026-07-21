@@ -1,178 +1,144 @@
-# StereoCrafter GUI + DepthCrafter GUI Seg
+# StereoCrafter GUI Suite
 
-You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billynom8/DepthCrafter_GUI_Seg">here</a>.
+**A heavily modified fork of [TencentARC/StereoCrafter](https://github.com/TencentARC/StereoCrafter) — a complete, GUI-driven 2D-to-stereoscopic-3D video conversion pipeline for Windows.**
 
-## Installation
+The original research code has been rebuilt into a suite of five batch-capable desktop GUIs covering every stage of the conversion: video depth estimation, depth-based splatting, diffusion inpainting of the right-eye view, and final high-quality stereo assembly. Output can be viewed on 3D displays, 3D glasses, Apple Vision Pro, Quest, and similar devices.
 
-### Option 1: Installer script (Windows)
-
-#### PREREQUISITES:
-   - GIT: Ensure Git is installed and added to your system’s PATH.<br>
-     Download here: https://git-scm.com/downloads/win<br>
-     You can check the installation by running the command:<br>
-       `git --version`<br>
-     If it shows a version, Git is installed and on PATH.
-   
-   - CUDA ToolKit: Ensure CUDA 12.8 is installed and added to your PATH.<br>
-     Download here: https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&target_arch=x86_64<br>
-
-   - FFMPEG: Ensure FFMpeg is installed and added to your PATH.<br>
-     See [Here](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/) for a tutorial on how to install.
-
-
-#### INSTALL:
-   - Run <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
-   - Download and extract <a href="https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso">model</a> "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
-
-<hr>
-
-### Option 2: Manual Install
-
-For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_Manual_Install.md">Click Here</a>
-
-<hr>
 <div align="center">
-<h2>StereoCrafter: Diffusion-based Generation of Long and High-fidelity Stereoscopic 3D from Monocular Videos</h2>
-
-Sijie Zhao*&emsp;
-Wenbo Hu*&emsp;
-Xiaodong Cun*&emsp;
-Yong Zhang&dagger;&emsp;
-Xiaoyu Li&dagger;&emsp;<br>
-Zhe Kong&emsp;
-Xiangjun Gao&emsp;
-Muyao Niu&emsp;
-Ying Shan
-
-&emsp;* equal contribution &emsp; &dagger; corresponding author 
-
-<h3>Tencent AI Lab&emsp;&emsp;ARC Lab, Tencent PCG</h3>
-
-<a href='https://arxiv.org/abs/2409.07447'><img src='https://img.shields.io/badge/arXiv-PDF-a92225'></a> &emsp;
-<a href='https://stereocrafter.github.io/'><img src='https://img.shields.io/badge/Project_Page-Page-64fefe' alt='Project Page'></a> &emsp;
-<a href='https://huggingface.co/TencentARC/StereoCrafter'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Weights-yellow'></a>
+    <img src="assets/demo.gif" alt="Anaglyph 3D showcase">
 </div>
 
-## 💡 Abstract
+---
 
-We propose a novel framework to convert any 2D videos to immersive stereoscopic 3D ones that can be viewed on different display devices, like 3D Glasses, Apple Vision Pro and 3D Display. It can be applied to various video sources, such as movies, vlogs, 3D cartoons, and AIGC videos.
+## ✨ What this fork adds
 
-![teaser](assets/teaser.jpg)
+- **Five full-featured Tkinter GUIs** replacing the original CLI scripts — all with batch folder processing, resume support, live previews, tooltips, dark mode, and persistent settings.
+- **Modern environment**: [uv](https://docs.astral.sh/uv/)-managed Python 3.13, PyTorch 2.13 (CUDA 13), diffusers 0.36 — installed with one command, no CUDA Toolkit or compiler required.
+- **Fast attention**: cuDNN SDPA enabled automatically, plus optional [SageAttention 2.2](https://github.com/thu-ml/SageAttention) (prebuilt Windows wheel, installed automatically) with per-GUI toggles — up to ~2× faster UNet attention on top of cuDNN at 1080p tile sizes, with sub-1% numeric deviation.
+- **Segment-based depth workflow** with per-segment resume, seamless merging (shift & scale or linear blend alignment), and MP4 / PNG / EXR / NPZ outputs.
+- **Advanced splatting**: forward-warp and mesh-warp modes, auto-convergence (average / peak / hybrid), dual- or quad-panel outputs, full-res + low-res passes, sidecar JSON settings per clip, multi-depth-map comparison, and live SBS preview.
+- **Two inpainting backends**: the original SVD-based StereoCrafter model (V1) and the Wan 2.1 VACE-based StereoCrafter2 transformer (V2), each with its own GUI.
+- **Dedicated Merging GUI** for final assembly: blends the inpainted right eye with the original left eye using the hi-res occlusion mask, with mask feathering, shadow controls, color transfer, and professional encoding options.
+- **1-click installer and updater** for Windows.
 
-## 📣 News
-- `2024/12/27` We released our inference code and model weights.
-- `2024/09/11` We submitted our technical report on arXiv and released our project page.
+---
 
-## 🎞️ Showcases
-Here we show some examples of input videos and their corresponding stereo outputs in Anaglyph 3D format.
-<div align="center">
-    <img src="assets/demo.gif">
-</div>
+## 🧭 Pipeline overview
 
+```mermaid
+flowchart LR
+    A["2D source video"] --> B["1. Depth estimation<br>DepthCrafter GUI Seg"]
+    B --> C["2. Splatting<br>Splatting GUI"]
+    C --> D["3. Inpainting<br>Inpainting GUI V1 or V2"]
+    C -->|hi-res mask| E
+    D --> E["4. Merging<br>Merging GUI"]
+    A -->|left eye| E
+    E --> F["Final SBS 3D video"]
+```
 
-## 🛠️ Installation (for the original repository)
+| Stage | GUI | Launcher | In → Out (defaults) |
+|---|---|---|---|
+| 1. Depth estimation | `depthcrafter_gui_seg.py` | `_RUN_DepthCrafter_GUI_Seg.bat` | `input_clips/` → `output_depthmaps/` |
+| 2. Splatting | `splatting_gui.py` | `_RUN_Splatting_GUI.bat` | clips + depth maps → `output_splatted/` |
+| 3. Inpainting (V1, SVD) | `inpainting_gui.py` | `_RUN_Inpainting_GUI.bat` | `output_splatted/` → `completed_output/` |
+| 3. Inpainting (V2, Wan VACE) | `inpainting_gui_v2.py` | `_RUN_Inpainting_GUI_V2.bat` | `output_splatted/` → `completed_output/` |
+| 4. Merging | `merging_gui.py` | `_RUN_Merging_GUI.bat` | inpainted + original + mask → final SBS |
 
-#### 1. Set up the environment
-We run our code on Python 3.8 and Cuda 11.8.
-You can use Anaconda or Docker to build this basic environment.
+Each launcher activates the project environment and, on multi-GPU systems, lets you pick which GPU to use.
 
-#### 2. Clone the repo
+---
+
+## 📋 Requirements
+
+- **Windows 10/11** with an **NVIDIA GPU** (16 GB VRAM recommended; smaller cards work with CPU offload and tiling — the V2 / Wan 14B workflow is significantly heavier than V1)
+- A recent **NVIDIA driver** (CUDA 13 capable, version 580+ — check with `nvidia-smi`). The CUDA Toolkit is **not** required.
+- **[Git](https://git-scm.com/downloads/win)** on PATH
+- **[FFmpeg](https://techtactician.com/how-to-install-ffmpeg-and-add-it-to-path-on-windows/)** on PATH
+
+---
+
+## 🛠️ Installation
+
+### Option 1: 1-click installer (recommended)
+
+Download and run [`_install/StereoCrafter_1click_Installer.bat`](_install/StereoCrafter_1click_Installer.bat) from the folder where you want StereoCrafter installed. It installs Git and uv if missing, clones the repository, sets up the Python environment (`uv sync`), and offers to download the model weights.
+
+### Option 2: Manual install
+
+Follow the [Manual Installation Guide](_install/StereoCrafter_Manual_Install.md). The short version:
+
 ```bash
-# use --recursive to clone the dependent submodules
-git clone --recursive https://github.com/TencentARC/StereoCrafter
+git clone --recursive https://github.com/enoky/StereoCrafter.git
 cd StereoCrafter
+uv sync
 ```
 
-#### 3. Install the requirements
-```bash
-pip install -r requirements.txt
-```
+### Updating
 
+Run [`_update.bat`](_update.bat) in the project root to pull the latest code and re-sync the environment.
 
-#### 4. Install customized 'Forward-Warp' package for forward splatting
-```
-cd ./dependency/Forward-Warp
-chmod a+x install.sh
-./install.sh
-```
+---
 
+## 📦 Model weights
 
-## 📦 Model Weights
-
-#### 1. Download the [SVD img2vid model](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) for the image encoder and VAE.
+All weights live under `./weights/`. The installer can download the core set for you; to do it manually, first accept the terms on the [SVD XT 1.1 page](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) (gated model), log in with `uv run hf auth login`, then:
 
 ```bash
-# in StereoCrafter project root directory
-mkdir weights
-cd ./weights
-git lfs install
-git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1
+uv run hf download stabilityai/stable-video-diffusion-img2vid-xt-1-1 --local-dir weights/stable-video-diffusion-img2vid-xt-1-1
+uv run hf download tencent/DepthCrafter --local-dir weights/DepthCrafter
+uv run hf download TencentARC/StereoCrafter --local-dir weights/StereoCrafter
 ```
 
-#### 2. Download the [DepthCrafter model](https://huggingface.co/tencent/DepthCrafter) for the video depth estimation.
-```bash
-git clone https://huggingface.co/tencent/DepthCrafter
-```
+| Model | Used by | Target folder |
+|---|---|---|
+| [SVD img2vid-xt-1-1](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) (gated) | Depth + V1 inpainting | `weights/stable-video-diffusion-img2vid-xt-1-1` |
+| [DepthCrafter](https://huggingface.co/tencent/DepthCrafter) | Depth estimation | `weights/DepthCrafter` |
+| [StereoCrafter](https://huggingface.co/TencentARC/StereoCrafter) | V1 inpainting | `weights/StereoCrafter` |
+| Wan 2.1 VACE 14B (diffusers) | V2 inpainting (optional) | `weights/Wan2.1-VACE-14B-diffusers` |
+| StereoCrafter2 VACE transformer | V2 inpainting (optional) | `weights/StereoCrafter2` |
 
-#### 3. Download the [StereoCrafter model](https://huggingface.co/TencentARC/StereoCrafter) for the stereo video generation.
-```bash
-git clone https://huggingface.co/TencentARC/StereoCrafter
-```
+Total size for the core set is roughly 22 GB. A torrent of the core weights is also available [here](https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso) (open with [qBittorrent](https://www.qbittorrent.org)); extract into the `weights` folder.
 
+---
 
-## 🔄 Inference
+## 🎬 Using the pipeline
 
-Script:
+### 1. Depth estimation — DepthCrafter GUI Seg
 
-```bash
-# in StereoCrafter project root directory
-sh run_inference.sh
-```
+Batch-generates temporally consistent video depth maps with DepthCrafter. Long videos are processed as overlapping segments with per-segment resume, then merged seamlessly (shift & scale or linear blend alignment) with optional dithering, gamma, and percentile normalization. Outputs MP4, PNG sequence, EXR, or raw NPZ — named `videoname_depth.*` so the Splatting GUI finds them automatically. Also supports single images and image sequences. Based on [DepthCrafter_GUI_Seg](https://github.com/Billynom8/DepthCrafter_GUI_Seg).
 
-There are two main steps in this script for generating stereo video.
+### 2. Splatting — Splatting GUI
 
-#### 1. Depth-Based Video Splatting Using the Video Depth from DepthCrafter
-Execute the following command:
-```bash
-python depth_splatting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                                    --input_video_path [PATH] --output_video_path [PATH]
-```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the DepthCrafter model weights (e.g., `./weights/DepthCrafter`).
-- `--input_video_path`: Path to the input video (e.g., `./source_video/camel.mp4`).
-- `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
+Warps the source video into the right-eye view using the depth map, producing the occlusion mask that the inpainting stage fills. Forward-warp and mesh-warp modes, disparity and convergence controls with auto-convergence, dual-panel output (right eye + mask) for inpainting and quad-panel output for debugging/manual blends, separate full-resolution and low-resolution passes, per-clip sidecar JSON settings, and a live preview with multi-depth-map comparison. See the [Splatting GUI Guide](assets/splatting_gui_guide.md).
 
-The first step generates a video grid with input video, visualized depth map, occlusion mask, and splatting right video, as shown below:
+### 3. Inpainting — V1 (SVD) or V2 (Wan VACE)
 
-<img src="assets/camel_splatting_results.jpg" alt="camel_splatting_results" width="800"/> 
+Fills the occluded regions of the splatted right-eye view with a fine-tuned video diffusion model:
 
-#### 2. Stereo Video Inpainting of the Splatting Video
-Execute the following command:
-```bash
-python inpainting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
-                               --input_video_path [PATH] --save_dir [PATH]
-```
-Arguments:
-- `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
-- `--unet_path`: Path to the StereoCrafter model weights (e.g., `./weights/StereoCrafter`).
-- `--input_video_path`: Path to the splatting video result generated by the first stage (e.g., `./outputs/camel_splatting_results.mp4`).
-- `--save_dir`: Directory for the output stereo video (e.g., `./outputs`).
-- `--tile_num`: The number of tiles in width and height dimensions for tiled processing, which allows for handling high resolution input without requiring more GPU memory. The default value is `1` (1 $\times$ 1 tile). For input videos with a resolution of 2K or higher, you could use more tiles to avoid running out of memory.
+- **V1** (`inpainting_gui.py`) — the original StereoCrafter SVD-based UNet. Chunked processing with frame overlap and resume checkpoints, spatial tiling for high resolutions, mask pre-processing controls, post-inpainting blend, color transfer, and forward/reverse/both inpaint directions.
+- **V2** (`inpainting_gui_v2.py`) — the StereoCrafter2 transformer built on Wan 2.1 VACE 14B. Higher quality, much heavier; supports group offloading for VRAM-constrained systems.
 
-The stereo video inpainting generates the stereo video result in side-by-side format and anaglyph 3D format, as shown below:
+### 4. Merging — Merging GUI
 
-<img src="assets/camel_sbs.jpg" alt="camel_sbs" width="800"/> 
+Assembles the final stereo video: combines the original left eye with the inpainted right eye, blending only inside the processed hi-res occlusion mask. Live per-frame preview with layer inspection, mask binarize/dilate/blur controls, shadow shift/gamma/opacity for improved depth perception, GPU-accelerated mask processing, and final encoding options. See the [Merging GUI Guide](assets/merger_gui_guide.md).
 
-<img src="assets/camel_anaglyph.jpg" alt="camel_anaglyph" width="400"/>
+---
+
+## ⚡ Performance notes
+
+- The **cuDNN SDPA attention backend is enabled automatically** at startup. Windows builds of PyTorch otherwise fall back to a ~2× slower attention kernel — this fix alone roughly doubles attention throughput, with exact math.
+- **SageAttention** (quantized INT8/FP8 attention) can be toggled in the DepthCrafter GUI (File menu) and the V1 Inpainting GUI (parameters panel). It accelerates the large spatial self-attention a further ~2× over cuDNN and is dispatched selectively — short temporal/cross attention stays on exact SDPA. Quality impact is negligible for typical use, but the toggle makes A/B comparison easy.
+- Everything needed (PyTorch cu130, SageAttention wheel, Triton for Windows) is installed by `uv sync` — no compilers, no CUDA Toolkit.
+
+---
 
 ## 🤝 Acknowledgements
 
-We would like to express our gratitude to the following open-source projects:
-- [Stable Video Diffusion](https://github.com/Stability-AI/generative-models): A latent diffusion model trained to generate video clips from an image or text conditioning.
-- [DepthCrafter](https://github.com/Tencent/DepthCrafter): A novel method to generate temporally consistent depth sequences from videos.
-
+- [TencentARC/StereoCrafter](https://github.com/TencentARC/StereoCrafter) — the original research code and models this fork is built on ([arXiv](https://arxiv.org/abs/2409.07447) · [project page](https://stereocrafter.github.io/) · [weights](https://huggingface.co/TencentARC/StereoCrafter))
+- [Billynom8/StereoCrafter](https://github.com/Billynom8/StereoCrafter) — sibling fork with many shared improvements, and [DepthCrafter_GUI_Seg](https://github.com/Billynom8/DepthCrafter_GUI_Seg)
+- [DepthCrafter](https://github.com/Tencent/DepthCrafter) — temporally consistent video depth estimation
+- [Stable Video Diffusion](https://github.com/Stability-AI/generative-models) and [Wan 2.1](https://github.com/Wan-Video/Wan2.1) — the underlying video diffusion models
+- [SageAttention](https://github.com/thu-ml/SageAttention) and [woct0rdho](https://github.com/woct0rdho/SageAttention)'s Windows wheels, plus [triton-windows](https://github.com/woct0rdho/triton-windows)
 
 ## 📚 Citation
 
