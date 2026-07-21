@@ -139,6 +139,7 @@ class InpaintingGUI(ThemedTk):
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
+        self.use_sageattention_var = tk.BooleanVar(value=self.app_config.get("use_sageattention", True))
         self.inpaint_direction_var = tk.StringVar(value=self.app_config.get("inpaint_direction", "Forward"))
 
         # DNxHR encoding options
@@ -1710,6 +1711,7 @@ class InpaintingGUI(ThemedTk):
             "original_input_blend_strength": self.original_input_blend_strength_var.get(),
             "output_crf": self.output_crf_var.get(),
             "offload_type": self.offload_type_var.get(),
+            "use_sageattention": self.use_sageattention_var.get(),
             # Inference mask processing (applied before model inpainting)
             "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
             "inpaint_mask_post_threshold": self.inpaint_mask_post_threshold_var.get(),
@@ -2335,12 +2337,26 @@ class InpaintingGUI(ThemedTk):
         inpaint_direction_menu.grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 2: Frames Chunk (Left)
+        # Row 2: Frames Chunk (Left) & SageAttention (Right)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(
             row=current_row, column=1, sticky="w", padx=5
+        )
+
+        sageattention_check = ttk.Checkbutton(
+            param_frame,
+            text="Use SageAttention",
+            variable=self.use_sageattention_var,
+            command=self.save_config,
+        )
+        sageattention_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(
+            sageattention_check,
+            "Use the quantized SageAttention kernel for the UNet's spatial self-attention "
+            "(~2x faster attention at 1080p tile sizes). Near-exact quality; uncheck to "
+            "A/B against standard SDPA attention. Takes effect on the next processing run.",
         )
         current_row += 1
 
@@ -3187,6 +3203,7 @@ class InpaintingGUI(ThemedTk):
         self.original_input_blend_strength_var.set("0.5")
         self.single_clip_id_var.set("")
         self.offload_type_var.set("model")
+        self.use_sageattention_var.set(True)
 
         self.inpaint_mask_initial_threshold_var.set("0.3")
         self.inpaint_mask_post_threshold_var.set("0.3")
@@ -3286,6 +3303,7 @@ class InpaintingGUI(ThemedTk):
                 device="cuda",
                 dtype=torch.float16,
                 offload_type=offload_type,
+                use_sageattention=self.use_sageattention_var.get(),
             )
             input_videos = sorted(glob.glob(os.path.join(input_folder, "*.mp4")))
             if not input_videos:

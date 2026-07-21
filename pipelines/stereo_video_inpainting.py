@@ -13,10 +13,23 @@ from diffusers.schedulers import EulerDiscreteScheduler
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.models.attention_processor import AttnProcessor2_0, XFormersAttnProcessor
+from diffusers.models.attention_processor import AttnProcessor2_0
+
+try:
+    from depthcrafter.attention import SageAttnProcessor2_0, SAGE_ATTENTION_AVAILABLE
+except ImportError:
+    SageAttnProcessor2_0 = None
+    SAGE_ATTENTION_AVAILABLE = False
 
 
 logger = logging.get_logger(__name__)
+
+# Windows builds of PyTorch ship without flash-attention kernels and leave the
+# cuDNN SDPA backend runtime-disabled, so SDPA silently dispatches to the slow
+# memory-efficient backend (~2x slower on the large spatial attention here).
+# cuDNN attention is numerically exact.
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_cudnn_sdp(True)
 
 
 def _append_dims(x, target_dims):
@@ -697,28 +710,25 @@ def _gaussian_blur2d(input, kernel_size, sigma):
     return out
 
 
-def configure_attention_processors(pipeline: StableVideoDiffusionInpaintingPipeline):
+def configure_attention_processors(
+    pipeline: StableVideoDiffusionInpaintingPipeline, use_sageattention: bool = False
+):
     """
-    Attempts to enable efficient attention processors for the pipeline's UNet.
-    Prioritizes AttnProcessor2_0 (Flash Attention) then falls back to xFormers.
+    Configures attention processors for the pipeline's UNet.
+
+    With use_sageattention, large spatial self-attention runs through the
+    quantized SageAttention kernel (~2x faster than cuDNN SDPA at 1080p tile
+    sizes) with SDPA handling temporal/cross attention. Otherwise standard
+    SDPA (AttnProcessor2_0) is used everywhere.
     """
-    attention_set = False
-    if AttnProcessor2_0 is not None:
-        try:
-            pipeline.unet.set_attn_processor(AttnProcessor2_0())
-            logger.info("Efficient attention (AttnProcessor2_0) enabled for UNet")
-            attention_set = True
-        except Exception as e:
-            logger.warning(f"Failed to enable AttnProcessor2_0: {e}")
-    if not attention_set and XFormersAttnProcessor is not None:
-        try:
-            pipeline.unet.set_attn_processor(XFormersAttnProcessor())
-            logger.info("xFormers attention enabled for UNet")
-            attention_set = True
-        except Exception as e:
-            logger.warning(f"Failed to enable xFormers attention: {e}")
-    if not attention_set:
-        logger.info("Using default attention processor")
+    if use_sageattention:
+        if SAGE_ATTENTION_AVAILABLE:
+            pipeline.unet.set_attn_processor(SageAttnProcessor2_0())
+            logger.info("SageAttention enabled for UNet spatial self-attention (SDPA fallback elsewhere)")
+            return
+        logger.warning("SageAttention requested but the 'sageattention' package is not available; using SDPA")
+    pipeline.unet.set_attn_processor(AttnProcessor2_0())
+    logger.info("Efficient attention (AttnProcessor2_0 / SDPA) enabled for UNet")
 
 
 def load_inpainting_pipeline(
@@ -727,6 +737,7 @@ def load_inpainting_pipeline(
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
     offload_type: str = "model",
+    use_sageattention: bool = False,
 ) -> StableVideoDiffusionInpaintingPipeline:
     """
     Loads the stable video diffusion inpainting pipeline components and returns the pipeline object.
@@ -752,7 +763,7 @@ def load_inpainting_pipeline(
     ).to(device)
 
     # NEW: Call the helper function to configure attention processors
-    configure_attention_processors(pipeline)
+    configure_attention_processors(pipeline, use_sageattention=use_sageattention)
 
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()
