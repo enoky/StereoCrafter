@@ -122,6 +122,11 @@ if %errorlevel% neq 0 (
     set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 )
 
+REM Re-pin Python: installs made before the 3.13 upgrade carry a stale
+REM .python-version file (3.12) that git pull never updates, which would
+REM make uv sync fail against the project's requires-python >=3.13.
+uv python pin 3.13
+
 REM Run the sync
 uv sync
 
@@ -143,7 +148,10 @@ if %errorlevel% equ 0 (
     )
 ) else (
     echo.
-    echo [WARNING] uv sync failed. Your environment might be inconsistent.
+    echo [ERROR] uv sync failed. Your environment might be inconsistent.
+    echo Check the output above for details.
+    pause
+    exit /b 1
 )
 
 echo.
