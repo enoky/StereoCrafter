@@ -3,7 +3,7 @@ name = "stereocrafter"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.12.0",
     "decord>=0.6.0",
@@ -22,10 +22,11 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "openexr>=3.4.4",
     "pyperclip>=1.11.0",
+    "sageattention",
     "tkinterdnd2>=0.4.3",
-    "torch>=2.9.1",
+    "torch==2.13.0",
     "torchaudio>=2.9.1",
-    "torchvision>=0.24.1",
+    "torchvision>=0.28.0",
     "transformers>=5.1.0",
     "triton-windows>=3.6.0.post25",
     "ttkthemes>=3.3.0",
@@ -34,7 +35,7 @@ dependencies = [
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
@@ -42,6 +43,7 @@ torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
 xformers = { index = "pytorch" }
+sageattention = { url = "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post6/sageattention-2.2.0%2Bcu130torch2.10.0andhigher.post6-cp310-abi3-win_amd64.whl" }
 
 [tool.ruff]
 # Global settings go here

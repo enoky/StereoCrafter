@@ -20,6 +20,7 @@ _logger = logging.getLogger(__name__)
 from diffusers.training_utils import set_seed
 from depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
 from depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
+from depthcrafter.attention import SageAttnProcessor2_0, SAGE_ATTENTION_AVAILABLE
 
 # --- MODIFIED IMPORTS from depthcrafter.utils ---
 from depthcrafter.utils import (
@@ -55,8 +56,12 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="diffusers.mode
 
 from typing import Optional, Tuple, Union
 
-# --- Global Configuration Flags ---
-_ENABLE_XFORMERS_ATTENTION = True  # Set to True or False to enable/disable xFormers.
+# Windows builds of PyTorch ship without flash-attention kernels and leave the
+# cuDNN SDPA backend runtime-disabled, so SDPA silently dispatches to the slow
+# memory-efficient backend. cuDNN attention is ~2x faster on the shapes
+# DepthCrafter uses and is numerically exact.
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_cudnn_sdp(True)
 
 
 class DepthCrafterDemo:
@@ -67,7 +72,7 @@ class DepthCrafterDemo:
         cpu_offload: Union[str, None] = "model",
         use_cudnn_benchmark: bool = False,
         local_files_only: bool = False,
-        disable_xformers=False,
+        use_sageattention: bool = False,
     ):
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
@@ -95,36 +100,18 @@ class DepthCrafterDemo:
                     f"CPU Offload set to '{cpu_offload}' (unrecognized/None option). Model loaded entirely on CUDA."
                 )
 
-            # Decide if xFormers should be enabled:
-            # It's only enabled if the global flag is True AND the GUI flag (disable_xformers) is False.
-            should_enable_xformers = _ENABLE_XFORMERS_ATTENTION and not disable_xformers
-
-            if should_enable_xformers:
-                try:
-                    from diffusers.utils.logging import set_verbosity_info
-
-                    set_verbosity_info()
-
-                    self.pipe.enable_xformers_memory_efficient_attention()
-                    _logger.info("xFormers memory-efficient attention ENABLED (Globally ON, GUI OFF).")
-                except ImportError:
-                    _logger.warning("xFormers library not found, cannot enable.")
-                except Exception as e:
-                    _logger.warning(f"Failed to enable xFormers: {e}. Falling back to standard attention.")
-                finally:
-                    pass
+            if use_sageattention:
+                if SAGE_ATTENTION_AVAILABLE:
+                    self.pipe.unet.set_attn_processor(SageAttnProcessor2_0())
+                    _logger.info(
+                        "SageAttention ENABLED for UNet spatial self-attention (SDPA fallback for short/cross attention)."
+                    )
+                else:
+                    _logger.warning(
+                        "SageAttention requested but the 'sageattention' package is not available. Using standard SDPA."
+                    )
             else:
-                # Even if the global flag was True, if disable_xformers is True, we explicitly disable it
-                if disable_xformers:
-                    try:
-                        # Explicitly call disable_xformers_memory_efficient_attention to ensure standard kernels are used.
-                        self.pipe.disable_xformers_memory_efficient_attention()
-                        _logger.info("xFormers memory-efficient attention DISABLED by GUI setting (VRAM Save Mode).")
-                    except Exception:
-                        _logger.debug("Attempt to disable xformers failed, likely already disabled or not present.")
-                        pass
-                else:  # This block handles the case where _ENABLE_XFORMERS_ATTENTION was False
-                    _logger.info("xFormers memory-efficient attention disabled by global setting.")
+                _logger.info("Using standard PyTorch SDPA attention (SageAttention disabled).")
 
             _logger.debug(
                 "DepthCrafterPipeline initialized successfully."
