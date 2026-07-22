@@ -46,6 +46,13 @@ TRANSFORMER_PATH = "./weights/StereoCrafter2"             # fine-tuned VACE tran
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16
+
+# Windows builds of PyTorch ship without flash-attention kernels and leave the
+# cuDNN SDPA backend runtime-disabled, so SDPA silently dispatches to a much
+# slower backend. cuDNN attention is ~2.5x faster at Wan's sequence lengths
+# and is numerically exact.
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_cudnn_sdp(True)
 PROMPT = ""
 
 
@@ -758,7 +765,8 @@ class WanInpaintEngine:
 
 
 def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
-                offload_mode="none", num_blocks_per_group=1, progress_cb=None):
+                offload_mode="none", num_blocks_per_group=1, use_sageattention=False,
+                progress_cb=None):
     """Loads the tokenizer, text encoder, VAE and transformer once and returns a
     :class:`WanInpaintEngine`. Heavy and slow; call once and reuse the engine.
 
@@ -801,6 +809,13 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
     text_encoder.requires_grad_(False)
     vae.requires_grad_(False)
     transformer.requires_grad_(False)
+
+    if use_sageattention:
+        try:
+            transformer.set_attention_backend("sage")
+            logger.info("SageAttention attention backend enabled for the Wan transformer.")
+        except Exception as e:
+            logger.warning("Could not enable SageAttention (%s); using PyTorch SDPA instead.", e)
 
     if use_offload:
         progress_cb("load_models", 4, 4, "Enabling group offload...")
@@ -1108,12 +1123,15 @@ def main(
     input_layout="auto",
     offload_mode="none",
     num_blocks_per_group=1,
+    use_sageattention=True,
 ):
     """CLI entrypoint (via Fire). Loads the models then inpaints a single video.
 
     ``input_layout`` is one of ``auto`` (detect from filename), ``dual``, or ``quad``.
     ``offload_mode`` is ``none`` or ``group`` (block-level CPU offload to save VRAM);
     ``num_blocks_per_group`` trades VRAM for speed when offloading (higher = faster, more VRAM).
+    ``use_sageattention`` runs the transformer's attention through the quantized
+    SageAttention kernel (much faster at Wan's sequence lengths, near-exact quality).
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s", datefmt="%H:%M:%S")
 
@@ -1124,6 +1142,7 @@ def main(
     engine = load_models(
         pre_trained_path, transformer_path,
         offload_mode=offload_mode, num_blocks_per_group=num_blocks_per_group,
+        use_sageattention=use_sageattention,
         progress_cb=console_progress,
     )
     try:
@@ -1222,6 +1241,7 @@ class WanInpaintingGUI(ThemedTk):
         self.seed_var = tk.StringVar(value=str(cfg.get("seed", 0)))
         self.offload_mode_var = tk.StringVar(value=cfg.get("offload_mode", "Group offload"))
         self.num_blocks_per_group_var = tk.StringVar(value=str(cfg.get("num_blocks_per_group", 1)))
+        self.use_sageattention_var = tk.BooleanVar(value=cfg.get("use_sageattention", True))
 
         # Window geometry
         # Full "WxH+X+Y" string so size *and* on-screen position round-trip exactly.
@@ -1304,6 +1324,13 @@ class WanInpaintingGUI(ThemedTk):
             Tooltip(w, offload_tip)
         for w in (blocks_lbl, blocks_entry):
             Tooltip(w, blocks_tip)
+
+        sage_check = ttk.Checkbutton(vram, text="Use SageAttention", variable=self.use_sageattention_var)
+        sage_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+        Tooltip(sage_check, ("Run the transformer's attention through the quantized SageAttention "
+                             "kernel - much faster at Wan's long sequence lengths, near-exact "
+                             "quality. Uncheck to A/B against standard SDPA attention. "
+                             "Takes effect when models are (re)loaded at the next Start."))
 
         # --- Controls ---
         controls = ttk.Frame(self)
@@ -1444,6 +1471,7 @@ class WanInpaintingGUI(ThemedTk):
             "seed": self.seed_var.get(),
             "offload_mode": self.offload_mode_var.get(),
             "num_blocks_per_group": self.num_blocks_per_group_var.get(),
+            "use_sageattention": self.use_sageattention_var.get(),
             "window_geometry": self.geometry(),
         }
 
@@ -1662,13 +1690,13 @@ class WanInpaintingGUI(ThemedTk):
         self.worker_thread = threading.Thread(
             target=self._run_batch,
             args=(videos, params, output_dir, prompt, pre_trained, transformer,
-                  is_dual_input, offload_mode, num_blocks),
+                  is_dual_input, offload_mode, num_blocks, self.use_sageattention_var.get()),
             daemon=True,
         )
         self.worker_thread.start()
 
     def _run_batch(self, videos, params, output_dir, prompt, pre_trained, transformer,
-                   is_dual_input, offload_mode, num_blocks):
+                   is_dual_input, offload_mode, num_blocks, use_sageattention):
         """Worker thread: load models once, then inpaint each video.
 
         Must not touch Tk widgets/variables directly — all UI updates go through
@@ -1676,7 +1704,7 @@ class WanInpaintingGUI(ThemedTk):
         """
         succeeded, failed = 0, 0
         try:
-            engine_key = (pre_trained, transformer, offload_mode, num_blocks)
+            engine_key = (pre_trained, transformer, offload_mode, num_blocks, use_sageattention)
             if self.engine is None or self._engine_paths != engine_key:
                 # Drop any previous engine first so its VRAM is freed before reloading.
                 self.engine = None
@@ -1686,6 +1714,7 @@ class WanInpaintingGUI(ThemedTk):
                 self.engine = load_models(
                     pre_trained, transformer,
                     offload_mode=offload_mode, num_blocks_per_group=num_blocks,
+                    use_sageattention=use_sageattention,
                     progress_cb=self._on_progress,
                 )
                 self._engine_paths = engine_key
