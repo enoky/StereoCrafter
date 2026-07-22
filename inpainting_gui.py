@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Callable
 
 import numpy as np
 import torch
-from decord import VideoReader, cpu
+from decord import cpu
 # FlashAttention requires optional dependency; attempt safe imports
 
 import torch.nn.functional as F
@@ -82,9 +82,6 @@ class InpaintingGUI(ThemedTk):
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
         self.single_clip_id_var = tk.StringVar(value=str(self.app_config.get("single_clip_id", "")))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
-        self.hires_blend_folder_var = tk.StringVar(
-            value=self.app_config.get("hires_blend_folder", "./output_splatted_hires")
-        )
 
         # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
         self.inpaint_mask_initial_threshold_var = tk.StringVar(
@@ -124,20 +121,7 @@ class InpaintingGUI(ThemedTk):
             )
         )
 
-        self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
-        self.mask_post_threshold_var = tk.StringVar(
-            value=str(self.app_config.get("mask_post_threshold", self.app_config.get("mask_initial_threshold", 0.3)))
-        )
-        self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 0.0)))
-        self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 5)))
-        self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 5)))
-        self.blend_mask_source_var = tk.StringVar(value=str(self.app_config.get("blend_mask_source", "hybrid")).lower())
-
-        self.enable_post_inpainting_blend = tk.BooleanVar(
-            value=self.app_config.get("enable_post_inpainting_blend", False)
-        )
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
-        self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
         self.use_sageattention_var = tk.BooleanVar(value=self.app_config.get("use_sageattention", True))
         self.inpaint_direction_var = tk.StringVar(value=self.app_config.get("inpaint_direction", "Forward"))
@@ -156,7 +140,6 @@ class InpaintingGUI(ThemedTk):
         self.video_overlap_var = tk.StringVar(value="N/A")
         self.video_bias_var = tk.StringVar(value="N/A")
 
-        self.mask_param_widgets = []
         self._file_log_handler: Optional[logging.FileHandler] = None
         self._file_log_path: Optional[str] = None
         self._runtime_status_path: Optional[str] = None
@@ -393,7 +376,7 @@ class InpaintingGUI(ThemedTk):
         blur_kernel_raw: str,
         context_label: str,
     ) -> Tuple[float, float, int, int, int]:
-        """Parses and validates mask processing params for inference/blend mask pipelines."""
+        """Parses and validates mask processing params for the mask pipelines."""
         try:
             pre_threshold = float(pre_threshold_raw)
             if not (0.0 <= pre_threshold <= 1.0):
@@ -516,111 +499,6 @@ class InpaintingGUI(ThemedTk):
 
         return current_processed_mask
 
-    def _apply_post_inpainting_blend(
-        self,
-        inpainted_frames: torch.Tensor,  # Generated frames from pipeline
-        original_warped_frames: torch.Tensor,  # Original warped frames (bottom-right)
-        mask: torch.Tensor,  # Processed mask (dilated, blurred)
-        base_video_name: str,
-    ) -> torch.Tensor:
-        """
-        Blends the inpainted frames with the original warped frames using the mask.
-        Ensures all input tensors are on CPU and have matching shapes before blending.
-        Expected format: [T, C, H, W] float [0, 1].
-        """
-        if not self.enable_post_inpainting_blend.get():
-            return inpainted_frames
-
-        # Check if temporal (T) and spatial (H, W) dimensions match
-        if (
-            inpainted_frames.shape[0] != original_warped_frames.shape[0]
-            or inpainted_frames.shape[2] != original_warped_frames.shape[2]
-            or inpainted_frames.shape[3] != original_warped_frames.shape[3]
-        ):
-            logger.error(
-                f"Temporal or Spatial shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Original Warped {original_warped_frames.shape}. Skipping blend."
-            )
-            return inpainted_frames
-
-        if (
-            inpainted_frames.shape[0] != mask.shape[0]
-            or inpainted_frames.shape[2] != mask.shape[2]
-            or inpainted_frames.shape[3] != mask.shape[3]
-            or mask.shape[1] != 1
-        ):  # Explicitly check mask has 1 channel
-            logger.error(
-                f"Mask shape mismatch for post-inpainting blend: Inpainted {inpainted_frames.shape} vs Mask {mask.shape} (Mask must be 1-channel). Skipping blend."
-            )
-            return inpainted_frames
-
-        try:
-            # Keep everything on CPU and blend in place, frame by frame, to avoid full-size temporary tensors.
-            inpainted_frames_cpu = inpainted_frames.cpu()
-            original_warped_frames_cpu = original_warped_frames.cpu()
-            mask_cpu = mask.cpu()
-
-            if mask_cpu.shape[1] != 1:
-                logger.warning(
-                    f"Mask has {mask_cpu.shape[1]} channels for blending, expecting 1. Using mean for blending if necessary."
-                )
-                mask_blend = mask_cpu.mean(dim=1, keepdim=True)
-            else:
-                mask_blend = mask_cpu
-
-            debug_count = min(5, inpainted_frames_cpu.shape[0]) if self.debug_mode_var.get() else 0
-            debug_original_samples = []
-            debug_inpainted_samples = []
-            if debug_count > 0:
-                for t in range(debug_count):
-                    debug_original_samples.append(original_warped_frames_cpu[t].clone())
-                    debug_inpainted_samples.append(inpainted_frames_cpu[t].clone())
-
-            for t in range(inpainted_frames_cpu.shape[0]):
-                frame_mask = mask_blend[t]
-                frame_mask_inv = 1.0 - frame_mask
-                inpainted_frames_cpu[t].mul_(frame_mask)
-                inpainted_frames_cpu[t].add_(original_warped_frames_cpu[t] * frame_mask_inv)
-
-            logger.debug("Applied post-inpainting blending (in-place).")
-
-            if debug_count > 0:
-                debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_blend")
-                os.makedirs(debug_output_dir, exist_ok=True)
-                video_basename_for_debug_blend = os.path.splitext(base_video_name)[0]
-
-                for t in range(debug_count):
-                    original_warped_img = (debug_original_samples[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    inpainted_img = (debug_inpainted_samples[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    mask_img = (mask_blend[t].squeeze(0).numpy() * 255).astype(np.uint8)
-                    blended_img = (inpainted_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-                    cv2.imwrite(
-                        os.path.join(
-                            debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_original_warped.png"
-                        ),
-                        cv2.cvtColor(original_warped_img, cv2.COLOR_RGB2BGR),
-                    )
-                    cv2.imwrite(
-                        os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_inpainted.png"),
-                        cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR),
-                    )
-                    cv2.imwrite(
-                        os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_mask.png"),
-                        mask_img,
-                    )
-                    cv2.imwrite(
-                        os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_blended.png"),
-                        cv2.cvtColor(blended_img, cv2.COLOR_RGB2BGR),
-                    )
-                logger.debug(f"Saved debug blend frames to {debug_output_dir}")
-
-            return inpainted_frames_cpu
-        except Exception as e:
-            logger.error(
-                f"Error during post-inpainting blending: {e}. Returning original inpainted frames.", exc_info=True
-            )
-            return inpainted_frames
-
     def _apply_theme(self: "InpaintingGUI", is_startup: bool = False):
         """Applies the selected theme (dark or light) to the GUI, and adjusts window height."""
         if self.dark_mode_var.get():
@@ -720,10 +598,6 @@ class InpaintingGUI(ThemedTk):
             # Update the stored width for next time save_config is called.
             self.window_width = current_actual_width
 
-    def _browse_hires_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.hires_blend_folder_var.get())
-        if folder:
-            self.hires_blend_folder_var.set(folder)
 
     def _browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
@@ -908,7 +782,6 @@ class InpaintingGUI(ThemedTk):
     def _build_prefinalize_signature(
         self,
         input_video_path: str,
-        hires_video_path: Optional[str],
         is_dual_input: bool,
         frames_chunk: int,
         overlap: int,
@@ -1108,16 +981,10 @@ class InpaintingGUI(ThemedTk):
         if removed > 0:
             logger.info(f"Removed {removed} chunk checkpoint(s) for {video_stem}.")
 
-    def _cleanup_all_checkpoints(
-        self, base_video_name: str, checkpoint_path: Optional[str] = None, keep_prefinalize: bool = False
-    ):
+    def _cleanup_all_checkpoints(self, base_video_name: str, checkpoint_path: Optional[str] = None):
         """Removes all resume checkpoints for a video after successful completion."""
         prefinalize_path = checkpoint_path or self._get_prefinalize_checkpoint_path(base_video_name)
         self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=prefinalize_path)
-
-        if keep_prefinalize:
-            logger.info(f"Keeping pre-finalize checkpoint for re-merge: {prefinalize_path}")
-            return
 
         removed_prefinalize = 0
         for path in (prefinalize_path, f"{prefinalize_path}.tmp"):
@@ -1136,279 +1003,17 @@ class InpaintingGUI(ThemedTk):
         mask_frames: torch.Tensor,
         original_warped_frames: torch.Tensor,
         original_left_frames: Optional[torch.Tensor],
-        hires_data: dict,
         base_video_name: str,
         is_dual_input: bool,
-        inpaint_direction: str = "Forward",
     ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """
-        Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final output preparation.
+        Applies Color Transfer (if enabled) and final output preparation.
         Returns (right_or_dual_frames, left_frames_or_none), or None on error.
         """
         frames_output_final = inpainted_frames
         frames_mask_processed = mask_frames
         frames_warpped_original_unpadded_normalized = original_warped_frames
         frames_left_original_cropped = original_left_frames
-        blend_mask_source = str(self.blend_mask_source_var.get()).strip().lower()
-        if blend_mask_source not in ("lowres", "hires", "hybrid"):
-            logger.warning(f"Invalid blend_mask_source '{blend_mask_source}', defaulting to 'hybrid'.")
-            blend_mask_source = "hybrid"
-        blend_mask_pre_threshold, blend_mask_post_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = (
-            self._resolve_mask_processing_params(
-                pre_threshold_raw=self.mask_initial_threshold_var.get(),
-                post_threshold_raw=self.mask_post_threshold_var.get(),
-                morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
-                dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
-                blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
-                context_label="blend_mask",
-            )
-        )
-        if not hires_data["is_hires_blend_enabled"] and blend_mask_source != "lowres":
-            logger.info(
-                f"Blend mask source '{blend_mask_source}' requested but no hi-res match was found; "
-                "using low-res blend mask."
-            )
-            blend_mask_source = "lowres"
-
-        if hires_data["is_hires_blend_enabled"]:
-            hires_H, hires_W = hires_data["hires_H"], hires_data["hires_W"]
-            num_frames_original = frames_output_final.shape[0]
-            hires_video_path = hires_data["hires_video_path"]
-
-            logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
-            logger.info(f"Hi-Res blend mask source: {blend_mask_source}")
-            self._log_resource_snapshot(
-                stage="hires_blend_start",
-                base_video_name=base_video_name,
-                extra={"resolution": f"{hires_W}x{hires_H}", "frames": num_frames_original},
-                level=logging.INFO,
-            )
-            per_frame_pixels = hires_H * hires_W
-            bytes_per_float32 = 4
-            estimated_channels = (
-                frames_output_final.shape[1]
-                + frames_mask_processed.shape[1]
-                + frames_warpped_original_unpadded_normalized.shape[1]
-                + (
-                    frames_left_original_cropped.shape[1]
-                    if (not is_dual_input and frames_left_original_cropped is not None)
-                    else 0
-                )
-            )
-            estimated_working_set_gib = (
-                num_frames_original * per_frame_pixels * estimated_channels * bytes_per_float32
-            ) / (1024**3)
-            logger.info(
-                f"Hi-Res preflight estimate for {base_video_name}: "
-                f"~{estimated_working_set_gib:.2f} GiB float32 working set before temporary buffers."
-            )
-
-            hires_reader = None
-            try:
-                hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
-                chunk_size = max(1, int(self.frames_chunk_var.get()))
-                total_chunks = (num_frames_original + chunk_size - 1) // chunk_size
-
-                lowres_inpainted = frames_output_final
-                lowres_mask = frames_mask_processed
-
-                frames_output_hires = torch.empty(
-                    (num_frames_original, lowres_inpainted.shape[1], hires_H, hires_W),
-                    dtype=lowres_inpainted.dtype,
-                    device=lowres_inpainted.device,
-                )
-                frames_mask_hires = torch.empty(
-                    (num_frames_original, lowres_mask.shape[1], hires_H, hires_W),
-                    dtype=lowres_mask.dtype,
-                    device=lowres_mask.device,
-                )
-                frames_warped_hires = torch.empty(
-                    (num_frames_original, frames_warpped_original_unpadded_normalized.shape[1], hires_H, hires_W),
-                    dtype=frames_warpped_original_unpadded_normalized.dtype,
-                    device=frames_warpped_original_unpadded_normalized.device,
-                )
-                frames_left_hires = None
-                if not is_dual_input:
-                    if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
-                        logger.error(
-                            f"Hi-Res blending needs left-eye frames for non-dual input {base_video_name}, but none were found."
-                        )
-                        return None
-                    frames_left_hires = torch.empty(
-                        (num_frames_original, frames_left_original_cropped.shape[1], hires_H, hires_W),
-                        dtype=frames_left_original_cropped.dtype,
-                        device=frames_left_original_cropped.device,
-                    )
-
-                for chunk_index, i in enumerate(range(0, num_frames_original, chunk_size), start=1):
-                    start_idx, end_idx = i, min(i + chunk_size, num_frames_original)
-                    frame_indices = list(range(start_idx, end_idx))
-                    if not frame_indices:
-                        break
-
-                    logger.info(f"Hi-Res chunk {chunk_index}/{total_chunks}: frames {start_idx}-{end_idx}")
-                    self._write_runtime_status(
-                        base_video_name=base_video_name,
-                        stage="hires_chunk_start",
-                        extra={
-                            "chunk_index": chunk_index,
-                            "total_chunks": total_chunks,
-                            "start_idx": start_idx,
-                            "end_idx": end_idx,
-                        },
-                    )
-
-                    inpainted_chunk_hires = F.interpolate(
-                        lowres_inpainted[start_idx:end_idx],
-                        size=(hires_H, hires_W),
-                        mode="bicubic",
-                        align_corners=False,
-                    )
-                    lowres_mask_chunk_hires = F.interpolate(
-                        lowres_mask[start_idx:end_idx], size=(hires_H, hires_W), mode="bilinear", align_corners=False
-                    )
-
-                    hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
-                    hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
-                    hires_mask_chunk_processed = None
-
-                    if is_dual_input:
-                        half_w_hires = hires_frames_torch.shape[3] // 2
-                        if blend_mask_source in ("hires", "hybrid"):
-                            hires_mask_chunk_raw = hires_frames_torch[:, :, :, :half_w_hires]
-                            hires_mask_chunk_processed = self._process_mask_frames(
-                                frames_mask_raw=hires_mask_chunk_raw,
-                                pre_threshold=blend_mask_pre_threshold,
-                                post_threshold=blend_mask_post_threshold,
-                                morph_kernel_size=blend_mask_morph,
-                                dilate_kernel_size=blend_mask_dilate,
-                                blur_kernel_size=blend_mask_blur,
-                                base_video_name=base_video_name,
-                                debug_prefix=None,
-                                save_debug=False,
-                            )
-                        hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:] / 255.0
-                    else:
-                        half_h_hires = hires_frames_torch.shape[2] // 2
-                        half_w_hires = hires_frames_torch.shape[3] // 2
-                        if blend_mask_source in ("hires", "hybrid"):
-                            hires_mask_chunk_raw = hires_frames_torch[:, :, half_h_hires:, :half_w_hires]
-                            hires_mask_chunk_processed = self._process_mask_frames(
-                                frames_mask_raw=hires_mask_chunk_raw,
-                                pre_threshold=blend_mask_pre_threshold,
-                                post_threshold=blend_mask_post_threshold,
-                                morph_kernel_size=blend_mask_morph,
-                                dilate_kernel_size=blend_mask_dilate,
-                                blur_kernel_size=blend_mask_blur,
-                                base_video_name=base_video_name,
-                                debug_prefix=None,
-                                save_debug=False,
-                            )
-                        hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
-                        hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
-                        if frames_left_hires is not None:
-                            frames_left_hires[start_idx:end_idx] = hires_left_chunk
-                        del hires_left_chunk
-
-                    if blend_mask_source == "lowres":
-                        mask_chunk_hires = lowres_mask_chunk_hires
-                    elif hires_mask_chunk_processed is None:
-                        logger.warning(
-                            f"Blend mask source '{blend_mask_source}' requested but hi-res mask unavailable; "
-                            f"falling back to low-res mask for chunk {chunk_index}/{total_chunks}."
-                        )
-                        mask_chunk_hires = lowres_mask_chunk_hires
-                    elif blend_mask_source == "hires":
-                        mask_chunk_hires = hires_mask_chunk_processed.to(
-                            device=lowres_mask_chunk_hires.device, dtype=lowres_mask_chunk_hires.dtype
-                        )
-                    else:  # hybrid
-                        hires_mask_chunk_processed = hires_mask_chunk_processed.to(
-                            device=lowres_mask_chunk_hires.device, dtype=lowres_mask_chunk_hires.dtype
-                        )
-                        mask_chunk_hires = torch.where(
-                            hires_mask_chunk_processed > 0, hires_mask_chunk_processed, lowres_mask_chunk_hires
-                        )
-
-                    frames_output_hires[start_idx:end_idx] = inpainted_chunk_hires
-                    frames_mask_hires[start_idx:end_idx] = mask_chunk_hires
-                    frames_warped_hires[start_idx:end_idx] = hires_warped_chunk
-
-                    del (
-                        inpainted_chunk_hires,
-                        lowres_mask_chunk_hires,
-                        mask_chunk_hires,
-                        hires_frames_np,
-                        hires_frames_torch,
-                        hires_warped_chunk,
-                        hires_mask_chunk_processed,
-                    )
-
-                    if chunk_index == 1 or chunk_index == total_chunks or chunk_index % 5 == 0:
-                        self._log_resource_snapshot(
-                            stage="hires_chunk_checkpoint",
-                            base_video_name=base_video_name,
-                            extra={"chunk_index": chunk_index, "total_chunks": total_chunks},
-                            level=logging.INFO,
-                        )
-
-                frames_output_final = frames_output_hires
-                frames_mask_processed = frames_mask_hires
-                frames_warpped_original_unpadded_normalized = frames_warped_hires
-                if not is_dual_input:
-                    frames_left_original_cropped = frames_left_hires
-
-                self._save_debug_image(
-                    frames_warpped_original_unpadded_normalized, "07a_hires_warped_input", base_video_name, 0
-                )
-
-                del lowres_inpainted, lowres_mask
-                release_cuda_memory()
-                gc.collect()
-                self._log_resource_snapshot(
-                    stage="hires_blend_complete", base_video_name=base_video_name, level=logging.INFO
-                )
-                logger.info("Hi-Res chunk processing complete.")
-            except (MemoryError, RuntimeError) as e:
-                error_text = str(e).lower()
-                if (
-                    isinstance(e, MemoryError)
-                    or "out of memory" in error_text
-                    or "cannot allocate memory" in error_text
-                ):
-                    logger.error(
-                        f"Memory exhaustion during Hi-Res blending for {base_video_name}. "
-                        "This is typically host RAM OOM."
-                    )
-                    self._log_resource_snapshot(
-                        stage="hires_blend_memory_error",
-                        base_video_name=base_video_name,
-                        extra={"error": str(e)},
-                        level=logging.ERROR,
-                    )
-                    return None
-                logger.error(f"RuntimeError during Hi-Res blending for {base_video_name}: {e}", exc_info=True)
-                self._log_resource_snapshot(
-                    stage="hires_blend_runtime_error",
-                    base_video_name=base_video_name,
-                    extra={"error": str(e)},
-                    level=logging.ERROR,
-                )
-                return None
-            except Exception as e:
-                logger.error(f"Unexpected failure during Hi-Res blending for {base_video_name}: {e}", exc_info=True)
-                self._log_resource_snapshot(
-                    stage="hires_blend_exception",
-                    base_video_name=base_video_name,
-                    extra={"error": str(e)},
-                    level=logging.ERROR,
-                )
-                return None
-            finally:
-                if hires_reader is not None:
-                    del hires_reader
-
-        # The rest of the logic remains largely the same, but uses the now-guaranteed-to-be-set frames_output_final
 
         # --- Apply Color Transfer (if enabled) ---
         if self.enable_color_transfer.get():
@@ -1488,24 +1093,7 @@ class InpaintingGUI(ThemedTk):
                 logger.info("Color transfer complete.")
         # --- END Apply Color Transfer ---
 
-        # --- Apply Post-Inpainting Blending (if enabled) ---
-        # Skip post-inpaint blend if direction is "Both" (both passes save directly without blending)
-        if self.enable_post_inpainting_blend.get() and inpaint_direction != "Both":
-            self._log_resource_snapshot(stage="post_blend_start", base_video_name=base_video_name, level=logging.INFO)
-            logger.info("Applying post-inpainting blend...")
-            frames_output_final = self._apply_post_inpainting_blend(
-                inpainted_frames=frames_output_final,
-                original_warped_frames=frames_warpped_original_unpadded_normalized,
-                mask=frames_mask_processed,  # Note: using the simplified variable name
-                base_video_name=base_video_name,
-            )
-            self._save_debug_image(frames_output_final, "09_final_blended_right_eye", base_video_name, 0)
-            self._log_resource_snapshot(
-                stage="post_blend_complete", base_video_name=base_video_name, level=logging.INFO
-            )
-            logger.info("Post-inpainting blend complete.")
-
-        # These are no longer needed after optional post-blend and can be released before SBS concat.
+        # These are no longer needed after color transfer and can be released before SBS concat.
         del frames_mask_processed, frames_warpped_original_unpadded_normalized
         gc.collect()
 
@@ -1567,135 +1155,12 @@ class InpaintingGUI(ThemedTk):
 
         return final_right_or_dual_frames, final_left_frames_for_sbs
 
-    def _find_high_res_match(self, low_res_video_path: str) -> Optional[str]:
-        """
-        Attempts to find a matching high-resolution splatted file in the hi-res folder.
-        Applies safety checks.
-        Returns the full path to the hi-res video or None.
-        """
-        low_res_input_folder = self.input_folder_var.get()
-        hires_blend_folder = self.hires_blend_folder_var.get()
-
-        logger.debug(f"Hires Check: Low-Res Path: {low_res_video_path}")
-        logger.debug(f"Hires Check: Low-Res Folder: {low_res_input_folder}")
-        logger.debug(f"Hires Check: Hi-Res Folder: {hires_blend_folder}")
-
-        # Safety Check 1: Hires folder is the same as the low-res input folder
-        if os.path.normpath(low_res_input_folder) == os.path.normpath(hires_blend_folder):
-            logger.warning("Hi-Res Blend Folder is the same as Input Folder. Disabling Hi-Res blending.")
-            return None
-
-        # 1. Extract Base Name and Splatting Suffix
-        low_res_filename = os.path.basename(low_res_video_path)
-        low_res_name_without_ext = os.path.splitext(low_res_filename)[0]
-
-        splatted_suffix = None
-        if low_res_name_without_ext.endswith("_splatted2F"):
-            splatted_suffix = "_splatted2F.mp4"
-            splatted_core = "_splatted2F"
-        elif low_res_name_without_ext.endswith("_splatted2"):
-            splatted_suffix = "_splatted2.mp4"
-            splatted_core = "_splatted2"
-        elif low_res_name_without_ext.endswith("_splatted4F"):
-            splatted_suffix = "_splatted4F.mp4"
-            splatted_core = "_splatted4F"
-        elif low_res_name_without_ext.endswith("_splatted4"):
-            splatted_suffix = "_splatted4.mp4"
-            splatted_core = "_splatted4"
-        else:
-            logger.warning(f"Could not parse splatting suffix from {low_res_filename}. Skipping Hi-Res match.")
-            return None
-
-        # --- NEW ULTRA-SIMPLIFIED NAME STRIPPING ---
-        # The key is to strip the resolution number AND the splatting suffix.
-
-        # Find the index of the splatted core (e.g., '_splatted2')
-        splat_index = low_res_name_without_ext.rfind(splatted_core)
-        if splat_index == -1:
-            logger.warning(f"Failed to find splatted core in {low_res_name_without_ext}. Skipping Hi-Res match.")
-            return None
-
-        # Take everything before the splatted core, e.g., 'FSC-clips_crp_cropped-0006_640'
-        name_core_with_dim = low_res_name_without_ext[:splat_index]
-
-        # Find the last underscore, which precedes the dimension
-        last_underscore_index = name_core_with_dim.rfind("_")
-
-        if last_underscore_index == -1:
-            # If no underscore is found (unlikely for your file names)
-            base_pattern_no_dim = name_core_with_dim
-        else:
-            # Take everything up to the last underscore (removes the resolution number)
-            # Result: 'FSC-clips_crp_cropped-0006'
-            base_pattern_no_dim = name_core_with_dim[:last_underscore_index]
-
-        if not base_pattern_no_dim:
-            logger.warning(
-                f"Failed to find true base name for {low_res_filename} after stripping resolution. Skipping Hi-Res match."
-            )
-            return None
-        # --- END NEW ULTRA-SIMPLIFIED NAME STRIPPING ---
-
-        # 2. Search Hi-Res Folder for Match
-        search_pattern = os.path.join(hires_blend_folder, f"{base_pattern_no_dim}_*{splatted_suffix}")
-        logger.debug(f"Hi-Res Search Pattern: {search_pattern}")
-        matches = glob.glob(search_pattern)
-
-        logger.debug(f"Hi-Res Glob Matches Found: {[os.path.basename(m) for m in matches]}")
-
-        if not matches:
-            logger.debug(f"No Hi-Res match found for {low_res_filename} in {hires_blend_folder}.")
-            return None
-
-        # Filter out the current low-res video if it somehow ended up in the search list
-        matches = [m for m in matches if os.path.normpath(m) != os.path.normpath(low_res_video_path)]
-
-        if len(matches) > 1:
-            logger.warning(
-                f"Multiple Hi-Res matches found for {low_res_filename}. Using the first match: {os.path.basename(matches[0])}"
-            )
-
-        # 3. Final Path
-        hires_path = matches[0] if matches else None
-
-        # Safety Check 2: Check resolution equality (requires loading a frame)
-        if hires_path:
-            try:
-                # 1. Get low-res width
-                low_res_reader = VideoReader(low_res_video_path, ctx=cpu(0))
-                low_res_w_raw = low_res_reader.get_batch([0]).shape[2]
-                del low_res_reader
-
-                # 2. Get hi-res width
-                hires_reader = VideoReader(hires_path, ctx=cpu(0))
-                hires_w_raw = hires_reader.get_batch([0]).shape[2]
-                del hires_reader
-            except Exception as e:
-                logger.error(f"Failed to read raw video width for resolution check: {e}")
-                return None
-
-            # --- NEW DEBUG LINE HERE ---
-            logger.debug(f"Hires Check: Low-Res Raw Width: {low_res_w_raw} | Hi-Res Raw Width: {hires_w_raw}")
-            # --- END NEW DEBUG LINE HERE ---
-
-            if hires_w_raw <= low_res_w_raw:  # Check if Hi-Res is NOT strictly higher resolution
-                logger.warning(
-                    f"Hi-Res candidate {os.path.basename(hires_path)} ({hires_w_raw}px) is not higher resolution than Low-Res ({low_res_w_raw}px). Disabling Hi-Res blending."
-                )
-                return None
-
-            logger.info(f"Found Hi-Res match: {os.path.basename(hires_path)} ({hires_w_raw}px).")
-            return hires_path
-
-        return None
-
     def _get_current_config(self):
         """Collects all current GUI variable values into a single dictionary."""
         config = {
             # Folder Configurations
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
-            "hires_blend_folder": self.hires_blend_folder_var.get(),
             # GUI State Configurations
             "dark_mode_enabled": self.dark_mode_var.get(),
             "window_width": self.winfo_width(),
@@ -1719,14 +1184,6 @@ class InpaintingGUI(ThemedTk):
             "inpaint_mask_dilate_kernel_size": self.inpaint_mask_dilate_kernel_size_var.get(),
             "inpaint_mask_blur_kernel_size": self.inpaint_mask_blur_kernel_size_var.get(),
             # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
-            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
-            "mask_post_threshold": self.mask_post_threshold_var.get(),
-            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
-            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
-            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
-            "blend_mask_source": self.blend_mask_source_var.get(),
-            "keep_inpaint_cache": self.keep_inpaint_cache_var.get(),
-            "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
             "move_to_finished": self.move_to_finished_var.get(),
             "inpaint_direction": self.inpaint_direction_var.get(),
@@ -1954,17 +1411,6 @@ class InpaintingGUI(ThemedTk):
             blur_kernel_raw=self.inpaint_mask_blur_kernel_size_var.get(),
             context_label="inpaint_mask",
         )
-        blend_mask_pre_threshold, blend_mask_post_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = (
-            self._resolve_mask_processing_params(
-                pre_threshold_raw=self.mask_initial_threshold_var.get(),
-                post_threshold_raw=self.mask_post_threshold_var.get(),
-                morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
-                dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
-                blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
-                context_label="blend_mask",
-            )
-        )
-
         inpaint_processed_mask = self._process_mask_frames(
             frames_mask_raw=frames_mask_raw,
             pre_threshold=inpaint_mask_pre_threshold,
@@ -1976,21 +1422,10 @@ class InpaintingGUI(ThemedTk):
             debug_prefix="inpaint_mask",
             save_debug=self.debug_mode_var.get(),
         )
-        blend_processed_mask = self._process_mask_frames(
-            frames_mask_raw=frames_mask_raw,
-            pre_threshold=blend_mask_pre_threshold,
-            post_threshold=blend_mask_post_threshold,
-            morph_kernel_size=blend_mask_morph,
-            dilate_kernel_size=blend_mask_dilate,
-            blur_kernel_size=blend_mask_blur,
-            base_video_name=base_video_name,
-            debug_prefix="blend_mask",
-            save_debug=self.debug_mode_var.get(),
-        )
 
-        # --- Store original-length, unpadded versions for post-blending ---
+        # --- Store original-length, unpadded versions for post-processing (color transfer) ---
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
-        frames_blend_mask_processed_unpadded_original_length = blend_processed_mask[:num_frames_original].clone()
+        frames_blend_mask_processed_unpadded_original_length = inpaint_processed_mask[:num_frames_original].clone()
 
         # --- Prepare Tiling (for pipeline input) ---
         # Note: legacy pad_for_tiling was removed; spatial_tiled_process now handles its own padding.
@@ -2097,13 +1532,12 @@ class InpaintingGUI(ThemedTk):
         # Store the actual width that was applied (which is current_width) for save_config
         self.window_width = current_width  # Update instance variable for save_config
 
-    def _setup_video_info_and_hires(
+    def _setup_video_info(
         self, input_video_path: str, save_dir: str, is_dual_input: bool, output_suffix: str = ""
-    ) -> Tuple[Optional[str], dict]:
+    ) -> Tuple[str, str, str]:
         """
-        Initializes Hi-Res variables, finds a Hi-Res match, determines the final output path,
-        and initializes variables for process flow.
-        Returns (output_video_path, hires_data).
+        Determines the final output path and naming variables for process flow.
+        Returns (output_video_path, base_video_name, video_name_for_output).
         """
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
@@ -2128,71 +1562,23 @@ class InpaintingGUI(ThemedTk):
         else:
             output_suffix = default_suffix
 
-        # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
-        hires_video_path: Optional[str] = self._find_high_res_match(input_video_path)
-        is_hires_blend_enabled = False
-        hires_H, hires_W = 0, 0
-
-        if hires_video_path:
-            is_hires_blend_enabled = True
-            try:
-                # Load first frame of Hi-Res video to get its dimensions
-                temp_reader = VideoReader(hires_video_path, ctx=cpu(0))
-                full_h_hires, full_w_hires = temp_reader.get_batch([0]).shape[1:3]
-                del temp_reader
-
-                if is_dual_input:
-                    hires_H, hires_W = full_h_hires, full_w_hires // 2
-                else:
-                    hires_H, hires_W = full_h_hires // 2, full_w_hires // 2
-
-                logger.info(f"Hi-Res blending enabled. Target resolution: {hires_W}x{hires_H}")
-            except Exception as e:
-                logger.error(f"Failed to read Hi-Res video dimensions from {hires_video_path}: {e}")
-                is_hires_blend_enabled = False  # Disable blending if dimensions can't be read
-                hires_video_path = None  # Ensure it's None on failure
-
-        # --- CALCULATE FINAL OUTPUT FILENAME (STEP 2) ---
-        if is_hires_blend_enabled and hires_video_path:
-            hires_base_name = os.path.basename(hires_video_path)
-            hires_name_without_ext = os.path.splitext(hires_base_name)[0]
-            video_name_for_output = (
-                hires_name_without_ext.replace("_splatted4F", "")
-                .replace("_splatted2F", "")
-                .replace("_splatted4", "")
-                .replace("_splatted2", "")
-            )
-            logger.debug(f"Output filename base set to Hi-Res: {video_name_for_output}")
-        else:
-            video_name_for_output = (
-                video_name_without_ext.replace("_splatted4F", "")
-                .replace("_splatted2F", "")
-                .replace("_splatted4", "")
-                .replace("_splatted2", "")
-            )
+        # --- CALCULATE FINAL OUTPUT FILENAME ---
+        video_name_for_output = (
+            video_name_without_ext.replace("_splatted4F", "")
+            .replace("_splatted2F", "")
+            .replace("_splatted4", "")
+            .replace("_splatted2", "")
+        )
 
         output_video_filename = f"{video_name_for_output}{output_suffix}{flip_tag}.mp4"
         output_video_path = os.path.join(save_dir, output_video_filename)
 
-        hires_data = {
-            "hires_video_path": hires_video_path,
-            "is_hires_blend_enabled": is_hires_blend_enabled,
-            "hires_H": hires_H,
-            "hires_W": hires_W,
-            "base_video_name": base_video_name,  # Keep this for update_info_callback
-            "video_name_for_output": video_name_for_output,  # For temp PNG dir
-        }
-        return output_video_path, hires_data
+        return output_video_path, base_video_name, video_name_for_output
 
     def _toggle_color_transfer_state(self):
         """Callback for the Enable Color Transfer checkbox. Saves config."""
         self.save_config()  # Simply save the config to persist the checkbox state
         logger.debug(f"Color Transfer state changed to: {self.enable_color_transfer.get()}")
-
-    def _toggle_keep_inpaint_cache_state(self):
-        """Callback for cache-retention checkbox."""
-        self.save_config()
-        logger.debug(f"Keep inpaint cache state changed to: {self.keep_inpaint_cache_var.get()}")
 
     def _toggle_debug_mode(self):
         """Toggles debug mode on/off and updates logging."""
@@ -2200,17 +1586,6 @@ class InpaintingGUI(ThemedTk):
         # Save the current debug mode state to config immediately
         self.save_config()
         # messagebox.showinfo("Debug Mode", f"Debug mode is now {'ON' if self.debug_mode_var.get() else 'OFF'}.\nLog level set to {logging.getLevelName(logger.level)}.\n(Restart may be needed for some changes to take full effect).")
-
-    def _toggle_blend_parameters_state(self):
-        """Enables or disables mask processing parameter entry widgets based on the blend toggle."""
-        state = tk.NORMAL if self.enable_post_inpainting_blend.get() else tk.DISABLED
-        for widget in self.mask_param_widgets:
-            widget.config(state=state)
-        # We might also want to disable the blending execution if the toggle is off,
-        # but the `if not self.enable_post_inpainting_blend.get(): return inpainted_frames`
-        # check in `_apply_post_inpainting_blend` already handles this.
-        # This function primarily affects the GUI state.
-        logger.debug(f"Blend parameters state set to: {state}")
 
     def create_widgets(self):
 
@@ -2248,35 +1623,26 @@ class InpaintingGUI(ThemedTk):
 
         current_row = 0  # Initialize row counter for folder_frame
 
-        # Lo-Res Blend Folder
-        input_label = ttk.Label(folder_frame, text="Lo-Res Blend Folder:")
+        # Input Folder
+        input_label = ttk.Label(folder_frame, text="Input Folder:")
         input_label.grid(row=0, column=0, sticky="e", padx=5, pady=2)
         Tooltip(input_label, self.help_data.get("input_folder", ""))
         entry_input = ttk.Entry(folder_frame, textvariable=self.input_folder_var, width=40)
         entry_input.grid(row=0, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=0, column=2, padx=5)
 
-        # Hi-Res Blend Folder
-        hires_label = ttk.Label(folder_frame, text="Hi-Res Blend Folder:")
-        hires_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(hires_label, "Folder containing matching high-resolution splatted files for final blending.")
-        entry_hires = ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40)
-        entry_hires.grid(row=1, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=1, column=2, padx=5)
-
         # Output Folder
         output_label = ttk.Label(folder_frame, text="Output Folder:")
-        output_label.grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        output_label.grid(row=1, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_label, self.help_data.get("output_folder", ""))
         entry_output = ttk.Entry(folder_frame, textvariable=self.output_folder_var, width=40)
-        entry_output.grid(row=2, column=1, padx=5, sticky="ew")
-        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=2, column=2, padx=5)
+        entry_output.grid(row=1, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_output).grid(row=1, column=2, padx=5)
 
         # Register Drag & Drop for folder entries
         register_dnd_entries(
             [
                 (entry_input, self.input_folder_var, True, None),
-                (entry_hires, self.hires_blend_folder_var, True, None),
                 (entry_output, self.output_folder_var, True, None),
             ],
             dnd_enabled=self._dnd_enabled,
@@ -2448,38 +1814,15 @@ class InpaintingGUI(ThemedTk):
 
         current_row = 0  # Reset row counter for post_process_frame
 
-        # Row 0: Enable Post-Inpainting Blend Checkbox
-        blend_enable_check = ttk.Checkbutton(
-            post_process_frame,
-            text="Enable Post-Inpainting Blend",
-            variable=self.enable_post_inpainting_blend,
-            command=self._toggle_blend_parameters_state,
-        )
-        blend_enable_check.grid(
-            row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2
-        )  # Spans all 4 columns
-        Tooltip(blend_enable_check, self.help_data.get("enable_post_inpainting_blend", ""))
-
+        # Row 0: Enable Color Transfer Checkbox
         color_transfer_check = ttk.Checkbutton(
             post_process_frame,
             text="Enable Color Transfer",
             variable=self.enable_color_transfer,
             command=self._toggle_color_transfer_state,
         )  # Will create this command
-        color_transfer_check.grid(
-            row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2
-        )  # Occupies right side
+        color_transfer_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         Tooltip(color_transfer_check, self.help_data.get("enable_color_transfer", ""))
-        current_row += 1
-
-        keep_cache_check = ttk.Checkbutton(
-            post_process_frame,
-            text="Keep Inpaint Cache For Re-Merge",
-            variable=self.keep_inpaint_cache_var,
-            command=self._toggle_keep_inpaint_cache_state,
-        )
-        keep_cache_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
-        Tooltip(keep_cache_check, self.help_data.get("keep_inpaint_cache", ""))
 
         move_finished_check = ttk.Checkbutton(
             post_process_frame, text="Resume", variable=self.move_to_finished_var, command=self.save_config
@@ -2487,67 +1830,6 @@ class InpaintingGUI(ThemedTk):
         move_finished_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
         Tooltip(move_finished_check, self.help_data.get("move_to_finished", ""))
         current_row += 1
-
-        # Row 1: Blend Mask Source
-        blend_mask_source_label = ttk.Label(post_process_frame, text="Blend Mask Source:")
-        blend_mask_source_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(blend_mask_source_label, self.help_data.get("blend_mask_source", ""))
-        blend_mask_source_menu = ttk.OptionMenu(
-            post_process_frame,
-            self.blend_mask_source_var,
-            self.blend_mask_source_var.get(),
-            "hybrid",
-            "hires",
-            "lowres",
-            command=lambda *_: self.save_config(),
-        )
-        blend_mask_source_menu.grid(row=current_row, column=1, sticky="w", padx=5)
-        self.mask_param_widgets.append(blend_mask_source_menu)
-        current_row += 1
-
-        # Row 2: Blend Pre-Threshold (Left) & Blend Post-Threshold (Right)
-        bin_thresh_label = ttk.Label(post_process_frame, text="Mask Pre Thresh:")
-        bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(bin_thresh_label, self.help_data.get("mask_initial_threshold", ""))
-        bin_thresh_entry = ttk.Entry(post_process_frame, textvariable=self.mask_initial_threshold_var, width=10)
-        bin_thresh_entry.grid(row=current_row, column=1, sticky="w", padx=5)
-        self.mask_param_widgets.append(bin_thresh_entry)  # Store reference
-
-        post_thresh_label = ttk.Label(post_process_frame, text="Mask Post Thresh:")
-        post_thresh_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(post_thresh_label, self.help_data.get("mask_post_threshold", ""))
-        post_thresh_entry = ttk.Entry(post_process_frame, textvariable=self.mask_post_threshold_var, width=10)
-        post_thresh_entry.grid(row=current_row, column=3, sticky="w", padx=5)
-        self.mask_param_widgets.append(post_thresh_entry)
-        current_row += 1
-
-        # Row 3: Blend Morph Close (Left) & Blend Dilate Kernel (Right)
-        morph_kernel_label = ttk.Label(post_process_frame, text="Morph Close Kernel:")
-        morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(morph_kernel_label, self.help_data.get("mask_morph_kernel_size", ""))
-        morph_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_morph_kernel_size_var, width=10)
-        morph_kernel_entry.grid(row=current_row, column=1, sticky="w", padx=5)
-        self.mask_param_widgets.append(morph_kernel_entry)  # Store reference
-
-        dilate_kernel_label = ttk.Label(post_process_frame, text="Mask Dilate Kernel:")
-        dilate_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(dilate_kernel_label, self.help_data.get("mask_dilate_kernel_size", ""))
-        dilate_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_dilate_kernel_size_var, width=10)
-        dilate_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
-        self.mask_param_widgets.append(dilate_kernel_entry)
-        current_row += 1
-
-        # Row 4: Blend Blur Kernel
-        blur_kernel_label = ttk.Label(post_process_frame, text="Mask Blur Kernel:")
-        blur_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(blur_kernel_label, self.help_data.get("mask_blur_kernel_size", ""))
-        blur_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_blur_kernel_size_var, width=10)
-        blur_kernel_entry.grid(row=current_row, column=1, sticky="w", padx=5)
-        self.mask_param_widgets.append(blur_kernel_entry)
-        current_row += 1
-
-        # Initialize the state of blend parameters immediately after creation
-        self._toggle_blend_parameters_state()
 
         # --- PROGRESS FRAME (no change) ---
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
@@ -2621,10 +1903,10 @@ class InpaintingGUI(ThemedTk):
         process_length: int = -1,
         inpaint_direction: str = "Forward",
         output_suffix: str = "",
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> bool:
         """
         Orchestrates the processing of a single video: Setup, Inpainting, Finalization, Encoding.
-        Returns (completion_status, hi_res_input_path).
+        Returns the completion status.
         """
         os.makedirs(save_dir, exist_ok=True)
 
@@ -2634,18 +1916,13 @@ class InpaintingGUI(ThemedTk):
         is_dual_input = video_name_without_ext.endswith("_splatted2") or video_name_without_ext.endswith("_splatted2F")
         self._log_resource_snapshot(stage="video_start", base_video_name=base_video_name, level=logging.INFO)
 
-        # 1. SETUP & HI-RES DETECTION
-        # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
-        output_video_path, hires_data = self._setup_video_info_and_hires(
+        # 1. SETUP
+        output_video_path, base_video_name, video_name_for_output = self._setup_video_info(
             input_video_path, save_dir, is_dual_input, output_suffix
         )
-        base_video_name = hires_data["base_video_name"]
-        video_name_for_output = hires_data["video_name_for_output"]
-        hires_video_path = hires_data["hires_video_path"]  # Optional[str]
         checkpoint_path = self._get_prefinalize_checkpoint_path(base_video_name, output_suffix)
         resume_signature = self._build_prefinalize_signature(
             input_video_path=input_video_path,
-            hires_video_path=hires_video_path,
             is_dual_input=is_dual_input,
             frames_chunk=frames_chunk,
             overlap=overlap,
@@ -2699,7 +1976,7 @@ class InpaintingGUI(ThemedTk):
                 extra={"checkpoint_path": checkpoint_path},
                 level=logging.INFO,
             )
-            # Recompute blend mask using current blend parameters so blend-only sweeps can reuse cached inpaint frames.
+            # Recompute processed mask using current mask parameters so mask-only sweeps can reuse cached inpaint frames.
             try:
                 recomputed_inputs = self._prepare_video_inputs(
                     input_video_path=input_video_path,
@@ -2727,9 +2004,9 @@ class InpaintingGUI(ThemedTk):
                     ) = recomputed_inputs
                     if recomputed_blend_mask.shape == frames_blend_mask_processed_unpadded_original_length.shape:
                         frames_blend_mask_processed_unpadded_original_length = recomputed_blend_mask
-                        logger.info("Recomputed blend mask using current blend settings.")
+                        logger.info("Recomputed processed mask using current mask settings.")
                     else:
-                        logger.warning("Recomputed blend mask shape mismatch; using cached blend mask from checkpoint.")
+                        logger.warning("Recomputed mask shape mismatch; using cached mask from checkpoint.")
 
                     del (
                         tmp_frames_warped_padded,
@@ -2740,9 +2017,9 @@ class InpaintingGUI(ThemedTk):
                     release_cuda_memory()
                     gc.collect()
                 else:
-                    logger.warning("Blend mask recomputation failed; using cached blend mask from checkpoint.")
+                    logger.warning("Mask recomputation failed; using cached mask from checkpoint.")
             except Exception as e:
-                logger.warning(f"Blend mask recomputation failed with exception; using cached blend mask: {e}")
+                logger.warning(f"Mask recomputation failed with exception; using cached mask: {e}")
             self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         else:
             # 2. INPUT PREPARATION (Low-Res)
@@ -2759,7 +2036,7 @@ class InpaintingGUI(ThemedTk):
             )
 
             if prepared_inputs is None:
-                return False, None  # Preparation failed
+                return False  # Preparation failed
 
             # Unpack, ensuring all torch.Tensor return values are not None
             (
@@ -2799,7 +2076,7 @@ class InpaintingGUI(ThemedTk):
             for i in range(0, total_frames_to_process_actual, stride):
                 if stop_event and stop_event.is_set():
                     logger.info(f"Stopping processing of {input_video_path}")
-                    return False, None
+                    return False
 
                 end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
                 actual_sliced_length = end_idx_for_slicing - i
@@ -2982,14 +2259,14 @@ class InpaintingGUI(ThemedTk):
                             base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength
                         ),
                     )
-                return False, None
+                return False
 
             frames_output = torch.cat(results, dim=0).cpu()
             if frames_output.numel() == 0 or frames_output.shape[2] < padded_H or frames_output.shape[3] < padded_W:
                 logger.error(
                     f"Generated frames_output has invalid dimensions (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W})."
                 )
-                return False, None
+                return False
 
             frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
             self._log_resource_snapshot(
@@ -3014,8 +2291,8 @@ class InpaintingGUI(ThemedTk):
             self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
 
         # --- Handle Inpaint Direction: Reverse post-inpaint ---
+        # This happens before finalization so color transfer sees frames in original order
         # If Reverse mode, reverse the output back to original orientation after inpainting
-        # This happens before finalization so Post-Inpaint Blend can be applied if enabled
         if inpaint_direction == "Reverse":
             logger.info("Reversing inpainted frames back to original orientation...")
             frames_output_final = reverse_frames(frames_output_final)
@@ -3026,16 +2303,14 @@ class InpaintingGUI(ThemedTk):
             if frames_left_original_cropped is not None:
                 frames_left_original_cropped = reverse_frames(frames_left_original_cropped)
 
-        # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
+        # 5. FINALIZATION (Color Transfer, Concat)
         finalized_outputs = self._finalize_output_frames(
             inpainted_frames=frames_output_final,
             mask_frames=frames_blend_mask_processed_unpadded_original_length,
             original_warped_frames=frames_warpped_original_unpadded_normalized,
             original_left_frames=frames_left_original_cropped,
-            hires_data=hires_data,
             base_video_name=base_video_name,
             is_dual_input=is_dual_input,
-            inpaint_direction=inpaint_direction,
         )
 
         if finalized_outputs is None:
@@ -3047,7 +2322,7 @@ class InpaintingGUI(ThemedTk):
                         base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength
                     ),
                 )
-            return False, None
+            return False
         final_right_or_dual_frames, final_left_frames_for_sbs = finalized_outputs
         if final_right_or_dual_frames.numel() == 0:
             logger.error(f"Final output frames are empty after finalization for {base_video_name}.")
@@ -3058,7 +2333,7 @@ class InpaintingGUI(ThemedTk):
                         base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength
                     ),
                 )
-            return False, None
+            return False
 
         output_width = int(final_right_or_dual_frames.shape[3])
         if final_left_frames_for_sbs is not None:
@@ -3088,7 +2363,7 @@ class InpaintingGUI(ThemedTk):
                 if stop_event_non_optional.is_set():
                     logger.debug(f"Stopping PNG sequence saving for {input_video_path}")
                     shutil.rmtree(temp_png_dir, ignore_errors=True)
-                    return False, None
+                    return False
 
                 frame_tensor = final_right_or_dual_frames[frame_idx]
                 if final_left_frames_for_sbs is not None:
@@ -3128,16 +2403,16 @@ class InpaintingGUI(ThemedTk):
 
             if not encoding_success:
                 logger.info(f"Encoding stopped or failed for {input_video_path}.")
-                return False, None
+                return False
 
         except Exception as e:
             logger.error(f"Error during PNG saving or Encoding for {base_video_name}: {e}", exc_info=True)
             messagebox.showerror("Error", f"Error during PNG saving or Encoding for {base_video_name}: {str(e)}")
             shutil.rmtree(temp_png_dir, ignore_errors=True)
-            return False, None
+            return False
 
         self._cleanup_all_checkpoints(
-            base_video_name, checkpoint_path=checkpoint_path, keep_prefinalize=self.keep_inpaint_cache_var.get()
+            base_video_name, checkpoint_path=checkpoint_path
         )
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
 
@@ -3166,7 +2441,7 @@ class InpaintingGUI(ThemedTk):
             if not reverse_completed:
                 logger.warning("Reverse pass failed, but forward pass completed successfully.")
 
-        return True, hires_video_path
+        return True
 
     def processing_done(self, stopped=False):
         if self.pipeline:
@@ -3211,21 +2486,10 @@ class InpaintingGUI(ThemedTk):
         self.inpaint_mask_dilate_kernel_size_var.set("5")
         self.inpaint_mask_blur_kernel_size_var.set("7")
 
-        self.mask_initial_threshold_var.set("0.3")
-        self.mask_post_threshold_var.set("0.3")
-        self.mask_morph_kernel_size_var.set("0.0")
-        self.mask_dilate_kernel_size_var.set("5")
-        self.mask_blur_kernel_size_var.set("7")
-        self.blend_mask_source_var.set("hybrid")
-        self.keep_inpaint_cache_var.set(False)
         self.move_to_finished_var.set(True)
 
-        self.enable_post_inpainting_blend.set(False)  # Default state is OFF
         self.enable_color_transfer.set(True)  # Default state is ON
         self.inpaint_direction_var.set("Forward")  # Default direction
-
-        # Crucially, call the function to disable the entry fields if the blend toggle is now False
-        self._toggle_blend_parameters_state()
 
         self.save_config()  # Save these new default settings
         messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
@@ -3240,13 +2504,8 @@ class InpaintingGUI(ThemedTk):
             return
 
         input_folder = self.input_folder_var.get()
-        hires_input_folder = self.hires_blend_folder_var.get()
 
         restore_dirs = [(input_folder, "finished")]
-
-        # Only check the hires folder if it's different from the low-res folder
-        if os.path.normpath(input_folder) != os.path.normpath(hires_input_folder):
-            restore_dirs.append((hires_input_folder, "finished"))
 
         restored_count, errors_count, failed_files = _restore_finished_files(
             restore_dirs=restore_dirs, logger=logger, wait_before_move=0.5
@@ -3349,9 +2608,6 @@ class InpaintingGUI(ThemedTk):
                 if os.path.isdir(low_res_finished_dir):
                     finished_files = set(os.listdir(low_res_finished_dir))
 
-                    # If hires folder is different, we might also want to check it,
-                    # but typically checking the primary input folder is enough to identify processed clips.
-
                     original_count = len(input_videos)
                     input_videos = [v for v in input_videos if os.path.basename(v) not in finished_files]
                     skipped_count = original_count - len(input_videos)
@@ -3452,7 +2708,7 @@ class InpaintingGUI(ThemedTk):
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
 
                 logger.info(f"Starting processing of {video_path}")
-                completed, hi_res_input_path = self.process_single_video(
+                completed = self.process_single_video(
                     pipeline=self.pipeline,
                     input_video_path=video_path,
                     save_dir=output_folder,
@@ -3477,24 +2733,15 @@ class InpaintingGUI(ThemedTk):
                     elif not self.move_to_finished_var.get():
                         logger.info("Move to Finished disabled: leaving processed input files in place.")
                     else:
-                        # Define finished folder paths dynamically
-                        low_res_input_folder = input_folder
-                        hires_input_folder = self.hires_blend_folder_var.get()
-
                         files_to_move = []
 
-                        # 1. Add LOW-RES input file
-                        files_to_move.append((video_path, low_res_input_folder))
+                        # 1. Add input file
+                        files_to_move.append((video_path, input_folder))
 
                         # 2. Add sidecar file (if exists)
                         json_path = os.path.splitext(video_path)[0] + ".spsidecar"
                         if os.path.exists(json_path):
-                            files_to_move.append((json_path, low_res_input_folder))
-
-                        # 3. Add HI-RES input file if it was used
-                        if hi_res_input_path:
-                            if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
-                                files_to_move.append((hi_res_input_path, hires_input_folder))
+                            files_to_move.append((json_path, input_folder))
 
                         # Perform the move with a delay to ensure handles are released
                         move_files_to_finished(files_to_move=files_to_move, logger=logger, wait_before_move=0.5)
@@ -3521,7 +2768,7 @@ class InpaintingGUI(ThemedTk):
             "Batch Video Inpainting Application\n"
             "Version: 1.0\n"
             "This tool processes 'splatted' videos to fill occlusions using a Stable Video Diffusion inpainting pipeline.\n"
-            "It supports custom mask processing, color transfer, and post-inpainting blending for high-quality outputs.\n\n"
+            "It supports custom mask processing and color transfer for high-quality outputs.\n\n"
             "Developed by [Your Name/Alias] for StereoCrafter projects."  # Customize this!
         )
         messagebox.showinfo("About Batch Video Inpainting", about_text)
@@ -3727,9 +2974,6 @@ class InpaintingGUI(ThemedTk):
                     logger.debug(f"Skipping config key {key}: No matching tk.Variable or direct attribute found.")
 
             self._apply_theme()  # Re-apply theme in case dark mode setting was loaded
-            # --- FIX: Correct function name for updating blend fields state ---
-            self._toggle_blend_parameters_state()  # Update state of dependent fields
-            # --- END FIX ---
 
             messagebox.showinfo("Settings Loaded", f"Successfully loaded settings from:\n{os.path.basename(filename)}")
             self.status_label.config(text="Settings loaded.")
