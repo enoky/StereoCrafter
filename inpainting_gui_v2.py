@@ -33,6 +33,7 @@ from core.ui.theme_manager import ThemeManager
 from core.ui.dnd_support import init_dnd, register_dnd_entries, configure_dnd_styles
 from core.common.gpu_utils import check_cuda_availability, release_cuda_memory
 from core.common.video_io import get_video_stream_info
+from core.common.file_organizer import move_files_to_finished, restore_finished_files as _restore_finished_files
 
 logger = logging.getLogger(__name__)
 
@@ -1242,6 +1243,7 @@ class WanInpaintingGUI(ThemedTk):
         self.offload_mode_var = tk.StringVar(value=cfg.get("offload_mode", "Group offload"))
         self.num_blocks_per_group_var = tk.StringVar(value=str(cfg.get("num_blocks_per_group", 1)))
         self.use_sageattention_var = tk.BooleanVar(value=cfg.get("use_sageattention", True))
+        self.move_to_finished_var = tk.BooleanVar(value=cfg.get("move_to_finished", True))
 
         # Window geometry
         # Full "WxH+X+Y" string so size *and* on-screen position round-trip exactly.
@@ -1301,6 +1303,12 @@ class WanInpaintingGUI(ThemedTk):
                             "Number of denoising steps. More = slower, potentially higher quality.")
         self._add_param_row(params, 2, 2, "Seed:", self.seed_var,
                             "Random seed for reproducible results.")
+        resume_check = ttk.Checkbutton(params, text="Resume", variable=self.move_to_finished_var,
+                                       command=self.save_config)
+        resume_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=2)
+        Tooltip(resume_check, ("After a video finishes successfully, move it into a 'finished' subfolder "
+                               "of the input folder so re-running the batch skips it. "
+                               "Use File > Restore Finished to move files back."))
 
         # --- VRAM / Performance ---
         vram = ttk.LabelFrame(self, text="VRAM / Performance")
@@ -1359,6 +1367,8 @@ class WanInpaintingGUI(ThemedTk):
         self.file_menu = tk.Menu(self.menubar, tearoff=0)
         self.file_menu.add_command(label="Load settings...", command=self.load_settings)
         self.file_menu.add_command(label="Save settings...", command=self.save_settings)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Restore Finished", command=self.restore_finished_files)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.exit_application)
         self.menubar.add_cascade(label="File", menu=self.file_menu)
@@ -1472,6 +1482,7 @@ class WanInpaintingGUI(ThemedTk):
             "offload_mode": self.offload_mode_var.get(),
             "num_blocks_per_group": self.num_blocks_per_group_var.get(),
             "use_sageattention": self.use_sageattention_var.get(),
+            "move_to_finished": self.move_to_finished_var.get(),
             "window_geometry": self.geometry(),
         }
 
@@ -1482,6 +1493,25 @@ class WanInpaintingGUI(ThemedTk):
             logger.info("Configuration saved.")
         except Exception as e:
             logger.warning("Failed to save config: %s", e)
+
+    def restore_finished_files(self):
+        """Moves all files from the 'finished' folder back to the input folder."""
+        if not messagebox.askyesno(
+            "Restore Finished Files",
+            "Are you sure you want to move all processed videos from the 'finished' "
+            "folder back to the input folder?",
+        ):
+            return
+        input_path = self.input_folder_var.get().strip()
+        input_folder = input_path if os.path.isdir(input_path) else os.path.dirname(input_path)
+        if not input_folder or not os.path.isdir(input_folder):
+            messagebox.showerror("Restore Finished", "Input folder does not exist.")
+            return
+        restored_count, errors_count, _failed = _restore_finished_files([(input_folder, "finished")], logger=logger)
+        messagebox.showinfo(
+            "Restore Finished",
+            f"Finished files restoration attempted.\n{restored_count} files moved.\n{errors_count} errors occurred.",
+        )
 
     def load_settings(self):
         filename = filedialog.askopenfilename(
@@ -1615,6 +1645,24 @@ class WanInpaintingGUI(ThemedTk):
             return None
 
         videos = self._gather_videos(input_path)
+        if videos and os.path.isdir(input_path) and self.move_to_finished_var.get():
+            finished_dir = os.path.join(input_path, "finished")
+            if os.path.isdir(finished_dir):
+                finished_names = set(os.listdir(finished_dir))
+                remaining = [v for v in videos if os.path.basename(v) not in finished_names]
+                if len(remaining) < len(videos):
+                    logger.info(
+                        "Resume mode: skipped %d already processed video(s) found in 'finished'.",
+                        len(videos) - len(remaining),
+                    )
+                if not remaining:
+                    messagebox.showinfo(
+                        "All videos processed",
+                        "All input videos were already processed (found in the 'finished' folder).\n"
+                        "Use File > Restore Finished to re-process them.",
+                    )
+                    return None
+                videos = remaining
         if not videos:
             messagebox.showerror(
                 "No videos",
@@ -1676,6 +1724,12 @@ class WanInpaintingGUI(ThemedTk):
         # Input layout is always auto-detected per file (see detect_dual_input).
         is_dual_input = None
         offload_mode = resolve_offload(self.offload_mode_var.get())
+        # Only batch (folder) inputs move to 'finished'; an explicitly chosen
+        # single file is left in place.
+        input_path = self.input_folder_var.get().strip()
+        move_finished = self.move_to_finished_var.get() and os.path.isdir(input_path)
+        if self.move_to_finished_var.get() and not move_finished:
+            logger.info("Single-file input: processed file will be left in place (no move to 'finished').")
         try:
             num_blocks = max(1, int(self.num_blocks_per_group_var.get()))
         except ValueError:
@@ -1690,13 +1744,14 @@ class WanInpaintingGUI(ThemedTk):
         self.worker_thread = threading.Thread(
             target=self._run_batch,
             args=(videos, params, output_dir, prompt, pre_trained, transformer,
-                  is_dual_input, offload_mode, num_blocks, self.use_sageattention_var.get()),
+                  is_dual_input, offload_mode, num_blocks, self.use_sageattention_var.get(),
+                  move_finished),
             daemon=True,
         )
         self.worker_thread.start()
 
     def _run_batch(self, videos, params, output_dir, prompt, pre_trained, transformer,
-                   is_dual_input, offload_mode, num_blocks, use_sageattention):
+                   is_dual_input, offload_mode, num_blocks, use_sageattention, move_finished):
         """Worker thread: load models once, then inpaint each video.
 
         Must not touch Tk widgets/variables directly — all UI updates go through
@@ -1724,6 +1779,7 @@ class WanInpaintingGUI(ThemedTk):
                 if self.stop_event.is_set():
                     break
                 self._batch_prefix = f"[{idx}/{total}] {os.path.basename(video)}"
+                completed = False
                 try:
                     run_inpaint(
                         self.engine, video, output_dir, prompt=prompt,
@@ -1732,6 +1788,7 @@ class WanInpaintingGUI(ThemedTk):
                         **params,
                     )
                     succeeded += 1
+                    completed = True
                 except InferenceCancelled:
                     logger.warning("Cancelled during %s.", os.path.basename(video))
                     break
@@ -1741,6 +1798,11 @@ class WanInpaintingGUI(ThemedTk):
                 finally:
                     release_cuda_memory()
                     gc.collect()
+                if completed and move_finished:
+                    move_files_to_finished(
+                        files_to_move=[(video, os.path.dirname(video))],
+                        logger=logger, wait_before_move=0.5,
+                    )
         except Exception as e:
             logger.error("Fatal error (model load?): %s", e, exc_info=True)
         finally:
