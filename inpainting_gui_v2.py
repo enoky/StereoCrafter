@@ -766,42 +766,55 @@ class WanInpaintEngine:
 
 
 def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
-                offload_mode="none", num_blocks_per_group=1, use_sageattention=False,
+                offload_mode="none", use_sageattention=False,
                 progress_cb=None):
     """Loads the tokenizer, text encoder, VAE and transformer once and returns a
     :class:`WanInpaintEngine`. Heavy and slow; call once and reuse the engine.
 
     ``offload_mode``:
-      * ``"none"``  -> all models resident on ``device`` (fastest; needs the VRAM).
-      * ``"group"`` -> block-level CPU offload with CUDA-stream overlap. The models
-        stay on CPU and their blocks are streamed to the GPU on demand, letting the
-        14B transformer run on far less VRAM (slower due to PCIe transfers).
+      * ``"none"``        -> all models resident on ``device`` (fastest; needs the VRAM).
+      * ``"transformer"`` -> only the 14B transformer is block-level CPU-offloaded;
+        the text encoder + VAE stay resident on the GPU. Saves ~12 GB of system RAM
+        vs ``"group"`` at the cost of ~12 GB more VRAM (needs a ~24 GB+ card).
+      * ``"group"``       -> everything CPU-offloaded. The models stay on CPU and
+        their weights are streamed to the GPU on demand, letting the 14B
+        transformer run on far less VRAM (slower due to PCIe transfers; needs
+        enough system RAM/pagefile to hold all weights).
     """
     progress_cb = progress_cb or _noop_progress
     offload_mode = str(offload_mode).strip().lower()
 
-    use_offload = offload_mode == "group"
-    if use_offload and device.type != "cuda":
-        logger.warning("Group offload requested but CUDA is unavailable; loading without offload.")
-        use_offload, offload_mode = False, "none"
+    offload_transformer = offload_mode in ("group", "transformer")
+    offload_others = offload_mode == "group"
+    if offload_transformer and device.type != "cuda":
+        logger.warning("CPU offload requested but CUDA is unavailable; loading without offload.")
+        offload_transformer = offload_others = False
+        offload_mode = "none"
 
-    def place(model):
-        # With group offload, keep weights on CPU; the offload hooks stream them to GPU.
-        return model if use_offload else model.to(device)
+    def place(model, offloaded):
+        # Offloaded models keep their weights on CPU; the offload hooks stream them to GPU.
+        return model if offloaded else model.to(device)
 
     progress_cb("load_models", 0, 4, "Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(pre_trained_path, subfolder="tokenizer")
 
     progress_cb("load_models", 1, 4, "Loading text encoder...")
     text_encoder = place(
-        UMT5EncoderModel.from_pretrained(pre_trained_path, subfolder="text_encoder", torch_dtype=dtype)
+        UMT5EncoderModel.from_pretrained(pre_trained_path, subfolder="text_encoder", torch_dtype=dtype),
+        offload_others,
     )
 
     progress_cb("load_models", 2, 4, "Loading VAE...")
-    vae = place(AutoencoderKLWan.from_pretrained(pre_trained_path, subfolder="vae", torch_dtype=dtype))
+    vae = place(
+        AutoencoderKLWan.from_pretrained(pre_trained_path, subfolder="vae", torch_dtype=dtype),
+        offload_others,
+    )
 
     progress_cb("load_models", 3, 4, "Loading transformer...")
-    transformer = place(WanVACETransformer3DModel.from_pretrained(transformer_path, torch_dtype=dtype))
+    transformer = place(
+        WanVACETransformer3DModel.from_pretrained(transformer_path, torch_dtype=dtype),
+        offload_transformer,
+    )
 
     transformer.eval()
     vae.eval()
@@ -818,25 +831,26 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
         except Exception as e:
             logger.warning("Could not enable SageAttention (%s); using PyTorch SDPA instead.", e)
 
-    if use_offload:
-        progress_cb("load_models", 4, 4, "Enabling group offload...")
-        num_blocks_per_group = max(1, int(num_blocks_per_group))
-        offload_device = torch.device("cpu")
+    offload_device = torch.device("cpu")
+    if offload_transformer:
+        progress_cb("load_models", 4, 4, "Enabling CPU offload...")
         logger.info(
-            "Enabling group (block-level) CPU offload: %d block(s)/group, stream overlap on.",
-            num_blocks_per_group,
+            "Enabling block-level CPU offload for the transformer (stream overlap on)%s.",
+            "" if offload_others else "; text encoder + VAE stay on GPU",
         )
-        # Transformer is the large one -> block-level streaming.
+        # Transformer is the large one -> block-level streaming. Stream overlap
+        # requires num_blocks_per_group=1 (diffusers clamps anything else to 1).
+        # low_cpu_mem_usage is essential: without it, diffusers pins ALL weights
+        # (page-locked RAM) upfront at load. Pinned memory cannot be backed by
+        # the page file, so on RAM-constrained systems that instantly fails with
+        # a raw "CUDA error: out of memory" even though the GPU is nearly empty.
         apply_group_offloading(
             transformer, onload_device=device, offload_device=offload_device,
-            offload_type="block_level", num_blocks_per_group=num_blocks_per_group,
+            offload_type="block_level", num_blocks_per_group=1,
             use_stream=True, low_cpu_mem_usage=True,
         )
+    if offload_others:
         # VAE + text encoder are smaller -> leaf-level offload.
-        # low_cpu_mem_usage is essential here too: without it, diffusers pins ALL
-        # weights (page-locked RAM) upfront at load. Pinned memory cannot be backed
-        # by the page file, so on RAM-constrained systems that instantly fails with
-        # a raw "CUDA error: out of memory" even though the GPU is nearly empty.
         apply_group_offloading(
             vae, onload_device=device, offload_device=offload_device,
             offload_type="leaf_level", use_stream=True, low_cpu_mem_usage=True,
@@ -1110,7 +1124,12 @@ def resolve_layout(mode):
 
 def resolve_offload(mode):
     """Map a GUI offload label to a ``load_models`` offload_mode string."""
-    return "group" if str(mode).strip().lower().startswith("group") else "none"
+    mode = str(mode).strip().lower()
+    if mode.startswith("group"):
+        return "group"
+    if mode.startswith("transformer"):
+        return "transformer"
+    return "none"
 
 
 def main(
@@ -1127,14 +1146,14 @@ def main(
     prompt=PROMPT,
     input_layout="auto",
     offload_mode="none",
-    num_blocks_per_group=1,
     use_sageattention=True,
 ):
     """CLI entrypoint (via Fire). Loads the models then inpaints a single video.
 
     ``input_layout`` is one of ``auto`` (detect from filename), ``dual``, or ``quad``.
-    ``offload_mode`` is ``none`` or ``group`` (block-level CPU offload to save VRAM);
-    ``num_blocks_per_group`` trades VRAM for speed when offloading (higher = faster, more VRAM).
+    ``offload_mode`` is ``none``, ``transformer`` (offload only the 14B transformer;
+    text encoder + VAE stay on GPU — saves system RAM, needs ~24 GB+ VRAM) or
+    ``group`` (offload everything — lowest VRAM, highest system RAM use).
     ``use_sageattention`` runs the transformer's attention through the quantized
     SageAttention kernel (much faster at Wan's sequence lengths, near-exact quality).
     """
@@ -1146,7 +1165,7 @@ def main(
 
     engine = load_models(
         pre_trained_path, transformer_path,
-        offload_mode=offload_mode, num_blocks_per_group=num_blocks_per_group,
+        offload_mode=offload_mode,
         use_sageattention=use_sageattention,
         progress_cb=console_progress,
     )
@@ -1245,7 +1264,6 @@ class WanInpaintingGUI(ThemedTk):
         self.inference_steps_var = tk.StringVar(value=str(cfg.get("inference_steps", 10)))
         self.seed_var = tk.StringVar(value=str(cfg.get("seed", 0)))
         self.offload_mode_var = tk.StringVar(value=cfg.get("offload_mode", "Group offload"))
-        self.num_blocks_per_group_var = tk.StringVar(value=str(cfg.get("num_blocks_per_group", 1)))
         self.use_sageattention_var = tk.BooleanVar(value=cfg.get("use_sageattention", True))
         self.move_to_finished_var = tk.BooleanVar(value=cfg.get("move_to_finished", True))
 
@@ -1319,23 +1337,19 @@ class WanInpaintingGUI(ThemedTk):
         vram.pack(fill="x", **pad)
         offload_tip = ("CPU offloading to save VRAM.\n"
                        "None: all models stay on the GPU (fastest, needs the VRAM).\n"
-                       "Group offload: stream transformer blocks CPU<->GPU on demand "
-                       "(runs the 14B model on low VRAM, slower).")
-        blocks_tip = ("Transformer blocks kept on the GPU per group when offloading.\n"
-                      "Higher = faster but more VRAM; 1 = lowest VRAM.")
+                       "Transformer only: stream the 14B transformer CPU<->GPU on demand; "
+                       "text encoder + VAE stay on the GPU. Saves ~12 GB of system RAM vs "
+                       "Group offload but needs ~24 GB+ VRAM.\n"
+                       "Group offload: stream everything CPU<->GPU on demand "
+                       "(lowest VRAM, highest system RAM use, slower).")
         off_lbl = ttk.Label(vram, text="Offload mode:")
         off_lbl.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.offload_combo = ttk.Combobox(vram, textvariable=self.offload_mode_var,
-                                          values=["None", "Group offload"], state="readonly", width=14)
+                                          values=["None", "Transformer only", "Group offload"],
+                                          state="readonly", width=16)
         self.offload_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
-        blocks_lbl = ttk.Label(vram, text="Blocks / group:")
-        blocks_lbl.grid(row=0, column=2, sticky="w", padx=4, pady=2)
-        blocks_entry = ttk.Entry(vram, textvariable=self.num_blocks_per_group_var, width=6)
-        blocks_entry.grid(row=0, column=3, sticky="w", padx=4, pady=2)
         for w in (off_lbl, self.offload_combo):
             Tooltip(w, offload_tip)
-        for w in (blocks_lbl, blocks_entry):
-            Tooltip(w, blocks_tip)
 
         sage_check = ttk.Checkbutton(vram, text="Use SageAttention", variable=self.use_sageattention_var)
         sage_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=2)
@@ -1484,7 +1498,6 @@ class WanInpaintingGUI(ThemedTk):
             "inference_steps": self.inference_steps_var.get(),
             "seed": self.seed_var.get(),
             "offload_mode": self.offload_mode_var.get(),
-            "num_blocks_per_group": self.num_blocks_per_group_var.get(),
             "use_sageattention": self.use_sageattention_var.get(),
             "move_to_finished": self.move_to_finished_var.get(),
             "window_geometry": self.geometry(),
@@ -1734,11 +1747,6 @@ class WanInpaintingGUI(ThemedTk):
         move_finished = self.move_to_finished_var.get() and os.path.isdir(input_path)
         if self.move_to_finished_var.get() and not move_finished:
             logger.info("Single-file input: processed file will be left in place (no move to 'finished').")
-        try:
-            num_blocks = max(1, int(self.num_blocks_per_group_var.get()))
-        except ValueError:
-            messagebox.showerror("Invalid value", "'Blocks / group' must be an integer >= 1.")
-            return
 
         self.stop_event.clear()
         self._set_running_state(True)
@@ -1748,14 +1756,14 @@ class WanInpaintingGUI(ThemedTk):
         self.worker_thread = threading.Thread(
             target=self._run_batch,
             args=(videos, params, output_dir, prompt, pre_trained, transformer,
-                  is_dual_input, offload_mode, num_blocks, self.use_sageattention_var.get(),
+                  is_dual_input, offload_mode, self.use_sageattention_var.get(),
                   move_finished),
             daemon=True,
         )
         self.worker_thread.start()
 
     def _run_batch(self, videos, params, output_dir, prompt, pre_trained, transformer,
-                   is_dual_input, offload_mode, num_blocks, use_sageattention, move_finished):
+                   is_dual_input, offload_mode, use_sageattention, move_finished):
         """Worker thread: load models once, then inpaint each video.
 
         Must not touch Tk widgets/variables directly — all UI updates go through
@@ -1763,7 +1771,7 @@ class WanInpaintingGUI(ThemedTk):
         """
         succeeded, failed = 0, 0
         try:
-            engine_key = (pre_trained, transformer, offload_mode, num_blocks, use_sageattention)
+            engine_key = (pre_trained, transformer, offload_mode, use_sageattention)
             if self.engine is None or self._engine_paths != engine_key:
                 # Drop any previous engine first so its VRAM is freed before reloading.
                 self.engine = None
@@ -1772,7 +1780,7 @@ class WanInpaintingGUI(ThemedTk):
                 self._on_progress("load_models", 0, 1, "Loading models...")
                 self.engine = load_models(
                     pre_trained, transformer,
-                    offload_mode=offload_mode, num_blocks_per_group=num_blocks,
+                    offload_mode=offload_mode,
                     use_sageattention=use_sageattention,
                     progress_cb=self._on_progress,
                 )
