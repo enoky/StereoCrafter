@@ -37,7 +37,7 @@ from core.common.file_organizer import move_files_to_finished, restore_finished_
 
 logger = logging.getLogger(__name__)
 
-GUI_VERSION = "26-06-27.0"
+GUI_VERSION = "26-07-22.0"
 CONFIG_FILE = "config_inpaint_v2.json"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
@@ -833,13 +833,17 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
             use_stream=True, low_cpu_mem_usage=True,
         )
         # VAE + text encoder are smaller -> leaf-level offload.
+        # low_cpu_mem_usage is essential here too: without it, diffusers pins ALL
+        # weights (page-locked RAM) upfront at load. Pinned memory cannot be backed
+        # by the page file, so on RAM-constrained systems that instantly fails with
+        # a raw "CUDA error: out of memory" even though the GPU is nearly empty.
         apply_group_offloading(
             vae, onload_device=device, offload_device=offload_device,
-            offload_type="leaf_level", use_stream=True,
+            offload_type="leaf_level", use_stream=True, low_cpu_mem_usage=True,
         )
         apply_group_offloading(
             text_encoder, onload_device=device, offload_device=offload_device,
-            offload_type="leaf_level", use_stream=True,
+            offload_type="leaf_level", use_stream=True, low_cpu_mem_usage=True,
         )
 
     progress_cb("load_models", 4, 4, "Models loaded.")
