@@ -1752,13 +1752,16 @@ class WanInpaintingGUI(ThemedTk):
         input_path = self.input_folder_var.get().strip()
         output_dir = self.output_folder_var.get().strip()
 
+        offload_sel = resolve_offload(self.offload_mode_var.get())
         if not os.path.isdir(PRE_TRAINED_PATH):
             messagebox.showerror("Missing models", f"Base model folder not found:\n{PRE_TRAINED_PATH}")
             return None
-        if not os.path.isdir(TRANSFORMER_PATH):
+        # FP8 mode loads only the -FP8 folder (checked below); the bf16
+        # transformer is not required for it, enabling FP8-only installs.
+        if offload_sel != "fp8" and not os.path.isdir(TRANSFORMER_PATH):
             messagebox.showerror("Missing models", f"Transformer folder not found:\n{TRANSFORMER_PATH}")
             return None
-        if resolve_offload(self.offload_mode_var.get()) == "mmgp":
+        if offload_sel == "mmgp":
             try:
                 import mmgp  # noqa: F401
             except ImportError:
@@ -1768,14 +1771,15 @@ class WanInpaintingGUI(ThemedTk):
                     "Run 'uv sync' in the StereoCrafter folder (or _update.bat) and retry.",
                 )
                 return None
-        if resolve_offload(self.offload_mode_var.get()) == "fp8":
+        if offload_sel == "fp8":
             fp8_dir = TRANSFORMER_PATH.rstrip("/\\") + "-FP8"
             if not os.path.isfile(os.path.join(fp8_dir, FP8_STATE_FILE)):
                 messagebox.showerror(
                     "FP8 checkpoint missing",
                     f"FP8 resident mode needs the pre-quantized transformer at:\n{fp8_dir}\n\n"
-                    "Run 'uv run python export_fp8_transformer.py' on a machine with ~64 GB RAM, "
-                    "or copy the folder from a machine that has.",
+                    "Download it:  uv run hf download enoky/StereoCrafter2-FP8 "
+                    "--local-dir weights/StereoCrafter2-FP8\n"
+                    "or export it locally with export_fp8_transformer.py (needs ~64 GB RAM).",
                 )
                 return None
             if torch.cuda.is_available():

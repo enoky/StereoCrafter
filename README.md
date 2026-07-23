@@ -89,11 +89,17 @@ uv run hf download tencent/DepthCrafter --local-dir weights/DepthCrafter
 uv run hf download TencentARC/StereoCrafter --local-dir weights/StereoCrafter
 ```
 
-For the optional V2 (Wan VACE) inpainting backend:
+For the optional V2 (Wan VACE) inpainting backend (the `--include` skips the base repo's own ~28 GB transformer, which SC uses none of):
 
 ```bash
-uv run hf download Wan-AI/Wan2.1-VACE-14B-diffusers --local-dir weights/Wan2.1-VACE-14B-diffusers
+uv run hf download Wan-AI/Wan2.1-VACE-14B-diffusers --include "tokenizer/*" "text_encoder/*" "vae/*" --local-dir weights/Wan2.1-VACE-14B-diffusers
 uv run hf download TencentARC/StereoCrafter2 --local-dir weights/StereoCrafter2
+```
+
+For the V2 "FP8 resident" mode (20 GB+ VRAM GPUs; can replace the bf16 transformer above entirely):
+
+```bash
+uv run hf download enoky/StereoCrafter2-FP8 --local-dir weights/StereoCrafter2-FP8
 ```
 
 | Model | Used by | Target folder |

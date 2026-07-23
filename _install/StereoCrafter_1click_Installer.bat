@@ -207,6 +207,44 @@ if /i "!get_weights!"=="Y" (
     call :log "[SKIP] User skipped weights."
 )
 
+REM --- OPTIONAL V2 [Wan VACE] WEIGHTS ---
+echo.
+echo =========================================================
+echo OPTIONAL: V2 [Wan VACE] INPAINTING WEIGHTS
+echo =========================================================
+echo The V2 inpainting GUI needs the Wan 2.1 VACE base components
+echo [~15 GB] plus ONE of these transformer variants:
+echo   1. bf16 [~32 GB] - for None / Transformer only / Group offload / MMGP modes
+echo   2. FP8  [~16 GB] - for the "FP8 resident" mode [needs a 20 GB+ VRAM GPU, e.g. RTX 4090/5090]
+echo   3. both
+echo.
+set /p get_v2="Download V2 weights now? [Y/N]: "
+
+if /i "!get_v2!"=="Y" (
+    if not exist "weights" mkdir weights
+    call :log "[INFO] Downloading Wan 2.1 VACE base [tokenizer + text encoder + VAE only]..."
+    uv run hf download Wan-AI/Wan2.1-VACE-14B-diffusers --include "tokenizer/*" "text_encoder/*" "vae/*" --local-dir weights/Wan2.1-VACE-14B-diffusers
+
+    set "v2_variant=1"
+    set /p v2_variant="Transformer variant [1=bf16, 2=FP8, 3=both]: "
+    if "!v2_variant!"=="1" (
+        call :log "[INFO] Downloading StereoCrafter2 [bf16]..."
+        uv run hf download TencentARC/StereoCrafter2 --local-dir weights/StereoCrafter2
+    )
+    if "!v2_variant!"=="2" (
+        call :log "[INFO] Downloading StereoCrafter2-FP8..."
+        uv run hf download enoky/StereoCrafter2-FP8 --local-dir weights/StereoCrafter2-FP8
+    )
+    if "!v2_variant!"=="3" (
+        call :log "[INFO] Downloading StereoCrafter2 [bf16] and StereoCrafter2-FP8..."
+        uv run hf download TencentARC/StereoCrafter2 --local-dir weights/StereoCrafter2
+        uv run hf download enoky/StereoCrafter2-FP8 --local-dir weights/StereoCrafter2-FP8
+    )
+    call :log "[SUCCESS] V2 weights downloaded."
+) else (
+    call :log "[SKIP] User skipped V2 weights."
+)
+
 call :log "[7/7] Finalizing..."
 echo.
 echo INSTALLATION SUCCESSFUL
