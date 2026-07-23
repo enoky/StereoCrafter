@@ -37,7 +37,7 @@ from core.common.file_organizer import move_files_to_finished, restore_finished_
 
 logger = logging.getLogger(__name__)
 
-GUI_VERSION = "26-07-22.0"
+GUI_VERSION = "26-07-23.0"
 CONFIG_FILE = "config_inpaint_v2.json"
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
@@ -751,7 +751,8 @@ class WanInpaintEngine:
     """Holds the loaded Wan VACE models and derived constants so they can be
     reused across multiple videos (load once, run many)."""
 
-    def __init__(self, tokenizer, text_encoder, vae, transformer, device, dtype, offload_mode="none"):
+    def __init__(self, tokenizer, text_encoder, vae, transformer, device, dtype, offload_mode="none",
+                 offloadobj=None):
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
         self.vae = vae
@@ -759,11 +760,21 @@ class WanInpaintEngine:
         self.device = device
         self.dtype = dtype
         self.offload_mode = offload_mode
+        self.offloadobj = offloadobj  # mmgp offload handle (release() before dropping the engine)
 
         self.videoprocessor = VideoProcessor(vae_scale_factor=vae.config.scale_factor_spatial)
         self.transformer_patch_size = transformer.config.patch_size[1]
         self.vae_scale_factor_temporal = 2 ** sum(vae.temperal_downsample)
         self.vae_scale_factor_spatial = 2 ** len(vae.temperal_downsample)
+
+    def release(self):
+        """Release external offload resources (mmgp pinned buffers/hooks), if any."""
+        if self.offloadobj is not None:
+            try:
+                self.offloadobj.release()
+            except Exception as e:
+                logger.warning("mmgp offload release failed: %s", e)
+            self.offloadobj = None
 
 
 def _load_fp8_transformer(fp8_dir):
@@ -805,6 +816,11 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
         leaf-level CPU-offloaded. No PCIe streaming for the transformer ->
         fastest option on cards that fit it. Requires running
         export_fp8_transformer.py once (or copying its output folder).
+      * ``"mmgp"``        -> all models managed by the mmgp library: the
+        transformer is quantized to int8 (quanto) at load and streamed through
+        an async pinned-RAM shuttle. ~28%% faster than ``"group"``, roughly half
+        the system RAM (~20 GB), and ~3-4 GB VRAM. One-time ~30 s quantization
+        at load. Requires the ``mmgp`` package (GPLv3; installed by uv sync).
     """
     progress_cb = progress_cb or _noop_progress
     offload_mode = str(offload_mode).strip().lower()
@@ -820,11 +836,26 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
                 "Use 'Transformer only' or 'Group offload' instead."
             )
 
+    mmgp_mode = offload_mode == "mmgp"
+    if mmgp_mode and device.type != "cuda":
+        raise RuntimeError("MMGP streaming mode requires a CUDA GPU.")
+    if mmgp_mode:
+        try:
+            from mmgp import offload as mmgp_offload, profile_type as mmgp_profile_type
+        except ImportError as e:
+            raise RuntimeError(
+                "MMGP streaming mode needs the 'mmgp' package. Run 'uv sync' to install it."
+            ) from e
+
+    # keep-on-CPU vs apply-diffusers-hooks are separate concerns: mmgp manages
+    # its own onloading, so its models stay CPU-side but get NO diffusers hooks.
     offload_transformer = offload_mode in ("group", "transformer")
     offload_others = offload_mode in ("group", "fp8")
+    keep_cpu_transformer = offload_transformer or mmgp_mode
+    keep_cpu_others = offload_others or mmgp_mode
     if offload_transformer and device.type != "cuda":
         logger.warning("CPU offload requested but CUDA is unavailable; loading without offload.")
-        offload_transformer = offload_others = False
+        offload_transformer = offload_others = keep_cpu_transformer = keep_cpu_others = False
         offload_mode = "none"
 
     def place(model, offloaded):
@@ -837,13 +868,13 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
     progress_cb("load_models", 1, 4, "Loading text encoder...")
     text_encoder = place(
         UMT5EncoderModel.from_pretrained(pre_trained_path, subfolder="text_encoder", torch_dtype=dtype),
-        offload_others,
+        keep_cpu_others,
     )
 
     progress_cb("load_models", 2, 4, "Loading VAE...")
     vae = place(
         AutoencoderKLWan.from_pretrained(pre_trained_path, subfolder="vae", torch_dtype=dtype),
-        offload_others,
+        keep_cpu_others,
     )
 
     progress_cb("load_models", 3, 4, "Loading transformer...")
@@ -854,7 +885,7 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
     else:
         transformer = place(
             WanVACETransformer3DModel.from_pretrained(transformer_path, torch_dtype=dtype),
-            offload_transformer,
+            keep_cpu_transformer,
         )
 
     transformer.eval()
@@ -871,6 +902,16 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
             logger.info("SageAttention attention backend enabled for the Wan transformer.")
         except Exception as e:
             logger.warning("Could not enable SageAttention (%s); using PyTorch SDPA instead.", e)
+
+    offloadobj = None
+    if mmgp_mode:
+        progress_cb("load_models", 4, 4, "MMGP setup (int8 quantize + pinning, ~30 s)...")
+        pipe = {"transformer": transformer, "text_encoder": text_encoder, "vae": vae}
+        offloadobj = mmgp_offload.profile(
+            pipe, profile_no=mmgp_profile_type.HighRAM_LowVRAM,
+            quantizeTransformer=True, verboseLevel=1,
+        )
+        logger.info("MMGP streaming enabled: int8 transformer, async pinned shuttle.")
 
     offload_device = torch.device("cpu")
     if offload_transformer:
@@ -903,7 +944,8 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
 
     progress_cb("load_models", 4, 4, "Models loaded.")
     logger.info("Wan VACE models loaded (%s, offload=%s).", dtype, offload_mode)
-    return WanInpaintEngine(tokenizer, text_encoder, vae, transformer, device, dtype, offload_mode)
+    return WanInpaintEngine(tokenizer, text_encoder, vae, transformer, device, dtype, offload_mode,
+                            offloadobj=offloadobj)
 
 
 def run_inpaint(
@@ -1172,6 +1214,8 @@ def resolve_offload(mode):
         return "transformer"
     if mode.startswith("fp8"):
         return "fp8"
+    if mode.startswith("mmgp"):
+        return "mmgp"
     return "none"
 
 
@@ -1196,10 +1240,11 @@ def main(
     ``input_layout`` is one of ``auto`` (detect from filename), ``dual``, or ``quad``.
     ``offload_mode`` is ``none``, ``transformer`` (offload only the 14B transformer;
     text encoder + VAE stay on GPU — saves system RAM, needs ~24 GB+ VRAM),
-    ``group`` (offload everything — lowest VRAM, highest system RAM use), or
+    ``group`` (offload everything — lowest VRAM, highest system RAM use),
     ``fp8`` (pre-quantized FP8 transformer fully GPU-resident — fastest on
     ~24 GB+ cards; requires the ``<transformer>-FP8`` folder from
-    export_fp8_transformer.py).
+    export_fp8_transformer.py), or ``mmgp`` (int8 transformer streamed via the
+    mmgp library — faster and lighter than ``group`` on most systems).
     ``use_sageattention`` runs the transformer's attention through the quantized
     SageAttention kernel (much faster at Wan's sequence lengths, near-exact quality).
     """
@@ -1391,12 +1436,16 @@ class WanInpaintingGUI(ThemedTk):
                        "FP8 resident: load the pre-quantized FP8 transformer fully onto the "
                        "GPU (needs ~20 GB+ VRAM, e.g. RTX 4090/5090; no PCIe streaming = "
                        "fastest on such cards). Requires the StereoCrafter2-FP8 folder from "
-                       "export_fp8_transformer.py.")
+                       "export_fp8_transformer.py.\n"
+                       "MMGP streaming: int8-quantized transformer streamed via async pinned-RAM "
+                       "shuttle (mmgp library). ~28% faster than Group offload, ~half the system "
+                       "RAM (~20 GB), ~4 GB VRAM. One-time ~30 s quantize at model load.")
         off_lbl = ttk.Label(vram, text="Offload mode:")
         off_lbl.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.offload_combo = ttk.Combobox(vram, textvariable=self.offload_mode_var,
-                                          values=["None", "Transformer only", "Group offload", "FP8 resident"],
-                                          state="readonly", width=16)
+                                          values=["None", "Transformer only", "Group offload",
+                                                  "FP8 resident", "MMGP streaming (int8)"],
+                                          state="readonly", width=20)
         self.offload_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
         for w in (off_lbl, self.offload_combo):
             Tooltip(w, offload_tip)
@@ -1707,6 +1756,16 @@ class WanInpaintingGUI(ThemedTk):
         if not os.path.isdir(TRANSFORMER_PATH):
             messagebox.showerror("Missing models", f"Transformer folder not found:\n{TRANSFORMER_PATH}")
             return None
+        if resolve_offload(self.offload_mode_var.get()) == "mmgp":
+            try:
+                import mmgp  # noqa: F401
+            except ImportError:
+                messagebox.showerror(
+                    "mmgp not installed",
+                    "MMGP streaming mode needs the 'mmgp' package.\n"
+                    "Run 'uv sync' in the StereoCrafter folder (or _update.bat) and retry.",
+                )
+                return None
         if resolve_offload(self.offload_mode_var.get()) == "fp8":
             fp8_dir = TRANSFORMER_PATH.rstrip("/\\") + "-FP8"
             if not os.path.isfile(os.path.join(fp8_dir, FP8_STATE_FILE)):
@@ -1843,6 +1902,8 @@ class WanInpaintingGUI(ThemedTk):
             engine_key = (pre_trained, transformer, offload_mode, use_sageattention)
             if self.engine is None or self._engine_paths != engine_key:
                 # Drop any previous engine first so its VRAM is freed before reloading.
+                if self.engine is not None:
+                    self.engine.release()  # free mmgp pinned buffers/hooks, if any
                 self.engine = None
                 release_cuda_memory()
                 gc.collect()
