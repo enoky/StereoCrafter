@@ -818,9 +818,10 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
         export_fp8_transformer.py once (or copying its output folder).
       * ``"mmgp"``        -> all models managed by the mmgp library: the
         transformer is quantized to int8 (quanto) at load and streamed through
-        an async pinned-RAM shuttle. ~28%% faster than ``"group"``, roughly half
-        the system RAM (~20 GB), and ~3-4 GB VRAM. One-time ~30 s quantization
-        at load. Requires the ``mmgp`` package (GPLv3; installed by uv sync).
+        an async pinned-RAM shuttle. ~30%% faster than ``"group"`` at ~3-4 GB
+        VRAM, but pins ~31 GB of system RAM (page-locked; the page file cannot
+        back it -> 48 GB+ RAM recommended). One-time ~30 s quantization at
+        load. Requires the ``mmgp`` package (GPLv3; installed by uv sync).
     """
     progress_cb = progress_cb or _noop_progress
     offload_mode = str(offload_mode).strip().lower()
@@ -1438,8 +1439,9 @@ class WanInpaintingGUI(ThemedTk):
                        "fastest on such cards). Requires the StereoCrafter2-FP8 folder from "
                        "export_fp8_transformer.py.\n"
                        "MMGP streaming: int8-quantized transformer streamed via async pinned-RAM "
-                       "shuttle (mmgp library). ~28% faster than Group offload, ~half the system "
-                       "RAM (~20 GB), ~4 GB VRAM. One-time ~30 s quantize at model load.")
+                       "shuttle (mmgp library). ~30% faster than Group offload at ~4 GB VRAM. "
+                       "Pins ~31 GB of system RAM (48 GB+ recommended; page file cannot back "
+                       "pinned memory). One-time ~30 s quantize at model load.")
         off_lbl = ttk.Label(vram, text="Offload mode:")
         off_lbl.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.offload_combo = ttk.Combobox(vram, textvariable=self.offload_mode_var,
