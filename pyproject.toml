@@ -24,6 +24,9 @@ dependencies = [
     "pyperclip>=1.11.0",
     "sageattention",
     "tkinterdnd2>=0.4.3",
+    # <0.16: newer torchao removes module paths that diffusers 0.36 hard-imports,
+    # breaking ALL diffusers model loading when torchao is merely installed.
+    "torchao>=0.13,<0.16",
     "torch==2.13.0",
     "torchaudio>=2.9.1",
     "torchvision>=0.28.0",

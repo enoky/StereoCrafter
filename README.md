@@ -17,7 +17,7 @@ The original research code has been rebuilt into a suite of five batch-capable d
 - **Fast attention**: cuDNN SDPA enabled automatically, plus optional [SageAttention 2.2](https://github.com/thu-ml/SageAttention) (prebuilt Windows wheel, installed automatically) with per-GUI toggles — up to ~2× faster UNet attention on top of cuDNN at 1080p tile sizes, with sub-1% numeric deviation.
 - **Segment-based depth workflow** with per-segment resume, seamless merging (shift & scale or linear blend alignment), and MP4 / PNG / EXR / NPZ outputs.
 - **Advanced splatting**: forward-warp and mesh-warp modes, auto-convergence (average / peak / hybrid), dual- or quad-panel outputs, full-res + low-res passes, sidecar JSON settings per clip, multi-depth-map comparison, and live SBS preview.
-- **Two inpainting backends**: the original SVD-based StereoCrafter model (V1) and the Wan 2.1 VACE-based StereoCrafter2 transformer (V2), each with its own GUI.
+- **Two inpainting backends**: the original SVD-based StereoCrafter model (V1) and the Wan 2.1 VACE-based StereoCrafter2 transformer (V2), each with its own GUI. V2 offers selectable CPU-offload modes — including a fully GPU-resident **FP8-quantized** option for ~20 GB+ cards.
 - **Dedicated Merging GUI** for final assembly: blends the inpainted right eye with the original left eye using the hi-res occlusion mask, with mask feathering, shadow controls, color transfer, and professional encoding options.
 - **1-click installer and updater** for Windows.
 
@@ -89,13 +89,23 @@ uv run hf download tencent/DepthCrafter --local-dir weights/DepthCrafter
 uv run hf download TencentARC/StereoCrafter --local-dir weights/StereoCrafter
 ```
 
+For the optional V2 (Wan VACE) inpainting backend:
+
+```bash
+uv run hf download Wan-AI/Wan2.1-VACE-14B-diffusers --local-dir weights/Wan2.1-VACE-14B-diffusers
+uv run hf download TencentARC/StereoCrafter2 --local-dir weights/StereoCrafter2
+```
+
 | Model | Used by | Target folder |
 |---|---|---|
 | [SVD img2vid-xt-1-1](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) (gated) | Depth + V1 inpainting | `weights/stable-video-diffusion-img2vid-xt-1-1` |
 | [DepthCrafter](https://huggingface.co/tencent/DepthCrafter) | Depth estimation | `weights/DepthCrafter` |
 | [StereoCrafter](https://huggingface.co/TencentARC/StereoCrafter) | V1 inpainting | `weights/StereoCrafter` |
-| Wan 2.1 VACE 14B (diffusers) | V2 inpainting (optional) | `weights/Wan2.1-VACE-14B-diffusers` |
-| StereoCrafter2 VACE transformer | V2 inpainting (optional) | `weights/StereoCrafter2` |
+| [Wan 2.1 VACE 14B (diffusers)](https://huggingface.co/Wan-AI/Wan2.1-VACE-14B-diffusers) | V2 inpainting (optional) | `weights/Wan2.1-VACE-14B-diffusers` |
+| [StereoCrafter2](https://huggingface.co/TencentARC/StereoCrafter2) | V2 inpainting (optional) | `weights/StereoCrafter2` |
+| [StereoCrafter2 FP8](https://huggingface.co/enoky/StereoCrafter2-FP8) | V2 "FP8 resident" mode (optional; ~20 GB+ VRAM GPUs) | `weights/StereoCrafter2-FP8` |
+
+The FP8 checkpoint can also be generated locally from `weights/StereoCrafter2` with `uv run python export_fp8_transformer.py` (needs ~64 GB system RAM; the download needs only ~17 GB).
 
 Total size for the core set is roughly 22 GB. A torrent of the core weights is also available [here](https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso) (open with [qBittorrent](https://www.qbittorrent.org)); extract into the `weights` folder.
 
@@ -115,8 +125,8 @@ Warps the source video into the right-eye view using the depth map, producing th
 
 Fills the occluded regions of the splatted right-eye view with a fine-tuned video diffusion model:
 
-- **V1** (`inpainting_gui.py`) — the original StereoCrafter SVD-based UNet. Chunked processing with frame overlap and resume checkpoints, spatial tiling for high resolutions, mask pre-processing controls, post-inpainting blend, color transfer, and forward/reverse/both inpaint directions.
-- **V2** (`inpainting_gui_v2.py`) — the StereoCrafter2 transformer built on Wan 2.1 VACE 14B. Higher quality, much heavier; supports group offloading for VRAM-constrained systems.
+- **V1** (`inpainting_gui.py`) — the original StereoCrafter SVD-based UNet. Chunked processing with frame overlap and resume checkpoints, spatial tiling for high resolutions, mask pre-processing controls, color transfer, and forward/reverse/both inpaint directions. (Blending against the original is done in the Merging stage.)
+- **V2** (`inpainting_gui_v2.py`) — the StereoCrafter2 transformer built on Wan 2.1 VACE 14B. Higher quality, much heavier. Batch resume via a `finished` folder (with File → Restore Finished), SageAttention toggle, and selectable offload modes: **None** (all on GPU), **Transformer only** (text encoder + VAE stay on GPU), **Group offload** (lowest VRAM), or **FP8 resident** (pre-quantized FP8 transformer fully on-GPU — fastest on ~20 GB+ cards, no PCIe streaming).
 
 ### 4. Merging — Merging GUI
 
@@ -127,7 +137,8 @@ Assembles the final stereo video: combines the original left eye with the inpain
 ## ⚡ Performance notes
 
 - The **cuDNN SDPA attention backend is enabled automatically** at startup. Windows builds of PyTorch otherwise fall back to a ~2× slower attention kernel — this fix alone roughly doubles attention throughput, with exact math.
-- **SageAttention** (quantized INT8/FP8 attention) can be toggled in the DepthCrafter GUI (File menu) and the V1 Inpainting GUI (parameters panel). It accelerates the large spatial self-attention a further ~2× over cuDNN and is dispatched selectively — short temporal/cross attention stays on exact SDPA. Quality impact is negligible for typical use, but the toggle makes A/B comparison easy.
+- **SageAttention** (quantized INT8/FP8 attention) can be toggled in the DepthCrafter GUI (File menu), the V1 Inpainting GUI (parameters panel), and the V2 Inpainting GUI (VRAM/Performance section). It accelerates the large spatial self-attention a further ~2× over cuDNN (up to ~3× at Wan's long sequence lengths) and is dispatched selectively — short temporal/cross attention stays on exact SDPA. Quality impact is negligible for typical use, but the toggle makes A/B comparison easy.
+- **FP8 resident mode (V2)**: on ~20 GB+ GPUs (RTX 4090/5090), the V2 GUI can load a pre-quantized FP8 copy of the 14B transformer fully onto the GPU — eliminating CPU-offload streaming entirely and cutting the load-time RAM requirement to ~17 GB. Download it (see weights table) or export it once locally with `export_fp8_transformer.py`.
 - Everything needed (PyTorch cu130, SageAttention wheel, Triton for Windows) is installed by `uv sync` — no compilers, no CUDA Toolkit.
 
 ---

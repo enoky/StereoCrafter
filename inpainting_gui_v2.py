@@ -44,6 +44,7 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 # Hardcoded model locations (not exposed in the GUI).
 PRE_TRAINED_PATH = "./weights/Wan2.1-VACE-14B-diffusers"  # base Wan model (tokenizer/text_encoder/vae)
 TRANSFORMER_PATH = "./weights/StereoCrafter2"             # fine-tuned VACE transformer
+FP8_STATE_FILE = "diffusion_pytorch_model_fp8.pt"         # inside <transformer>-FP8/ (see export_fp8_transformer.py)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.bfloat16
@@ -765,6 +766,24 @@ class WanInpaintEngine:
         self.vae_scale_factor_spatial = 2 ** len(vae.temperal_downsample)
 
 
+def _load_fp8_transformer(fp8_dir):
+    """Load a pre-quantized FP8 transformer exported by export_fp8_transformer.py.
+
+    Meta-device init + ``assign`` load keeps peak RAM at ~the checkpoint size
+    (~16 GiB) instead of materializing the ~28 GiB bf16 model first."""
+    import torchao  # noqa: F401  - required to unpickle Float8Tensor weights
+    from accelerate import init_empty_weights
+
+    cfg = WanVACETransformer3DModel.load_config(fp8_dir)
+    with init_empty_weights():
+        tf = WanVACETransformer3DModel.from_config(cfg)
+    # weights_only=False: the file contains torchao tensor subclasses and is a
+    # locally generated, trusted artifact (see export_fp8_transformer.py).
+    sd = torch.load(os.path.join(fp8_dir, FP8_STATE_FILE), map_location="cpu", weights_only=False)
+    tf.load_state_dict(sd, assign=True)
+    return tf
+
+
 def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
                 offload_mode="none", use_sageattention=False,
                 progress_cb=None):
@@ -780,12 +799,29 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
         their weights are streamed to the GPU on demand, letting the 14B
         transformer run on far less VRAM (slower due to PCIe transfers; needs
         enough system RAM/pagefile to hold all weights).
+      * ``"fp8"``         -> the transformer is loaded from the pre-quantized FP8
+        checkpoint at ``<transformer_path>-FP8`` and kept fully GPU-resident
+        (~16 GiB weights; needs a ~24 GB+ card). Text encoder + VAE are
+        leaf-level CPU-offloaded. No PCIe streaming for the transformer ->
+        fastest option on cards that fit it. Requires running
+        export_fp8_transformer.py once (or copying its output folder).
     """
     progress_cb = progress_cb or _noop_progress
     offload_mode = str(offload_mode).strip().lower()
 
+    fp8_resident = offload_mode == "fp8"
+    if fp8_resident and device.type != "cuda":
+        raise RuntimeError("FP8 resident mode requires a CUDA GPU.")
+    if fp8_resident:
+        total_gib = torch.cuda.get_device_properties(device).total_memory / 2**30
+        if total_gib < 20:
+            raise RuntimeError(
+                f"FP8 resident mode needs ~20 GB VRAM; this GPU has {total_gib:.0f} GB. "
+                "Use 'Transformer only' or 'Group offload' instead."
+            )
+
     offload_transformer = offload_mode in ("group", "transformer")
-    offload_others = offload_mode == "group"
+    offload_others = offload_mode in ("group", "fp8")
     if offload_transformer and device.type != "cuda":
         logger.warning("CPU offload requested but CUDA is unavailable; loading without offload.")
         offload_transformer = offload_others = False
@@ -811,10 +847,15 @@ def load_models(pre_trained_path, transformer_path, device=DEVICE, dtype=DTYPE,
     )
 
     progress_cb("load_models", 3, 4, "Loading transformer...")
-    transformer = place(
-        WanVACETransformer3DModel.from_pretrained(transformer_path, torch_dtype=dtype),
-        offload_transformer,
-    )
+    if fp8_resident:
+        fp8_dir = transformer_path.rstrip("/\\") + "-FP8"
+        logger.info("Loading pre-quantized FP8 transformer from %s (GPU-resident).", fp8_dir)
+        transformer = _load_fp8_transformer(fp8_dir).to(device)
+    else:
+        transformer = place(
+            WanVACETransformer3DModel.from_pretrained(transformer_path, torch_dtype=dtype),
+            offload_transformer,
+        )
 
     transformer.eval()
     vae.eval()
@@ -1129,6 +1170,8 @@ def resolve_offload(mode):
         return "group"
     if mode.startswith("transformer"):
         return "transformer"
+    if mode.startswith("fp8"):
+        return "fp8"
     return "none"
 
 
@@ -1152,8 +1195,11 @@ def main(
 
     ``input_layout`` is one of ``auto`` (detect from filename), ``dual``, or ``quad``.
     ``offload_mode`` is ``none``, ``transformer`` (offload only the 14B transformer;
-    text encoder + VAE stay on GPU — saves system RAM, needs ~24 GB+ VRAM) or
-    ``group`` (offload everything — lowest VRAM, highest system RAM use).
+    text encoder + VAE stay on GPU — saves system RAM, needs ~24 GB+ VRAM),
+    ``group`` (offload everything — lowest VRAM, highest system RAM use), or
+    ``fp8`` (pre-quantized FP8 transformer fully GPU-resident — fastest on
+    ~24 GB+ cards; requires the ``<transformer>-FP8`` folder from
+    export_fp8_transformer.py).
     ``use_sageattention`` runs the transformer's attention through the quantized
     SageAttention kernel (much faster at Wan's sequence lengths, near-exact quality).
     """
@@ -1341,11 +1387,15 @@ class WanInpaintingGUI(ThemedTk):
                        "text encoder + VAE stay on the GPU. Saves ~12 GB of system RAM vs "
                        "Group offload but needs ~24 GB+ VRAM.\n"
                        "Group offload: stream everything CPU<->GPU on demand "
-                       "(lowest VRAM, highest system RAM use, slower).")
+                       "(lowest VRAM, highest system RAM use, slower).\n"
+                       "FP8 resident: load the pre-quantized FP8 transformer fully onto the "
+                       "GPU (needs ~20 GB+ VRAM, e.g. RTX 4090/5090; no PCIe streaming = "
+                       "fastest on such cards). Requires the StereoCrafter2-FP8 folder from "
+                       "export_fp8_transformer.py.")
         off_lbl = ttk.Label(vram, text="Offload mode:")
         off_lbl.grid(row=0, column=0, sticky="w", padx=4, pady=2)
         self.offload_combo = ttk.Combobox(vram, textvariable=self.offload_mode_var,
-                                          values=["None", "Transformer only", "Group offload"],
+                                          values=["None", "Transformer only", "Group offload", "FP8 resident"],
                                           state="readonly", width=16)
         self.offload_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
         for w in (off_lbl, self.offload_combo):
@@ -1657,6 +1707,25 @@ class WanInpaintingGUI(ThemedTk):
         if not os.path.isdir(TRANSFORMER_PATH):
             messagebox.showerror("Missing models", f"Transformer folder not found:\n{TRANSFORMER_PATH}")
             return None
+        if resolve_offload(self.offload_mode_var.get()) == "fp8":
+            fp8_dir = TRANSFORMER_PATH.rstrip("/\\") + "-FP8"
+            if not os.path.isfile(os.path.join(fp8_dir, FP8_STATE_FILE)):
+                messagebox.showerror(
+                    "FP8 checkpoint missing",
+                    f"FP8 resident mode needs the pre-quantized transformer at:\n{fp8_dir}\n\n"
+                    "Run 'uv run python export_fp8_transformer.py' on a machine with ~64 GB RAM, "
+                    "or copy the folder from a machine that has.",
+                )
+                return None
+            if torch.cuda.is_available():
+                total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+                if total_gib < 20:
+                    messagebox.showerror(
+                        "Not enough VRAM",
+                        f"FP8 resident mode needs ~20 GB VRAM; this GPU has {total_gib:.0f} GB.\n"
+                        "Use 'Transformer only' or 'Group offload' instead.",
+                    )
+                    return None
         if not input_path or not os.path.exists(input_path):
             messagebox.showerror("Invalid path", "Input folder/file does not exist.")
             return None
