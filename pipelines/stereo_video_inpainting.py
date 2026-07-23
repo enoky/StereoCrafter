@@ -1,4 +1,5 @@
 import inspect
+import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
@@ -731,6 +732,29 @@ def configure_attention_processors(
     logger.info("Efficient attention (AttnProcessor2_0 / SDPA) enabled for UNet")
 
 
+def _enable_torch_compile(pipeline: StableVideoDiffusionInpaintingPipeline) -> None:
+    """torch.compile the UNet and VAE decoder (the conv-heavy 89% of compute).
+
+    Mirrors the M2SVid integration: dynamic shapes (chunk/tile variants), raised
+    recompile limit, and suppress_errors so a broken toolchain degrades to eager
+    instead of failing the run. First forward carries a one-time compile warmup;
+    kernels persist across sessions via the local inductor cache.
+    """
+    try:
+        import torch._dynamo as dynamo
+
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(os.getcwd(), "torchinductor_cache"))
+        for knob in ("recompile_limit", "cache_size_limit"):
+            if hasattr(dynamo.config, knob):
+                setattr(dynamo.config, knob, 64)
+        dynamo.config.suppress_errors = True
+        pipeline.unet.compile(dynamic=True)
+        pipeline.vae.decoder.compile(dynamic=True)
+        logger.info("torch.compile ENABLED for UNet and VAE decoder (first chunk includes one-time warmup)")
+    except Exception as e:
+        logger.warning(f"Could not enable torch.compile ({e}). Continuing in eager mode.")
+
+
 def load_inpainting_pipeline(
     pre_trained_path: str,
     unet_path: str,
@@ -738,6 +762,7 @@ def load_inpainting_pipeline(
     dtype: torch.dtype = torch.float16,
     offload_type: str = "model",
     use_sageattention: bool = False,
+    use_compile: bool = False,
 ) -> StableVideoDiffusionInpaintingPipeline:
     """
     Loads the stable video diffusion inpainting pipeline components and returns the pipeline object.
@@ -764,6 +789,13 @@ def load_inpainting_pipeline(
 
     # NEW: Call the helper function to configure attention processors
     configure_attention_processors(pipeline, use_sageattention=use_sageattention)
+
+    if use_compile:
+        if offload_type == "sequential":
+            # per-layer offload hooks would graph-break everywhere; not worth compiling
+            logger.warning("torch.compile skipped: incompatible with sequential CPU offload.")
+        else:
+            _enable_torch_compile(pipeline)
 
     if offload_type == "model":
         pipeline.enable_model_cpu_offload()

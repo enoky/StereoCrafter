@@ -124,6 +124,7 @@ class InpaintingGUI(ThemedTk):
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
         self.move_to_finished_var = tk.BooleanVar(value=self.app_config.get("move_to_finished", True))
         self.use_sageattention_var = tk.BooleanVar(value=self.app_config.get("use_sageattention", True))
+        self.use_compile_var = tk.BooleanVar(value=self.app_config.get("use_torch_compile", False))
         self.inpaint_direction_var = tk.StringVar(value=self.app_config.get("inpaint_direction", "Forward"))
 
         # DNxHR encoding options
@@ -1177,6 +1178,7 @@ class InpaintingGUI(ThemedTk):
             "output_crf": self.output_crf_var.get(),
             "offload_type": self.offload_type_var.get(),
             "use_sageattention": self.use_sageattention_var.get(),
+            "use_torch_compile": self.use_compile_var.get(),
             # Inference mask processing (applied before model inpainting)
             "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
             "inpaint_mask_post_threshold": self.inpaint_mask_post_threshold_var.get(),
@@ -1723,6 +1725,23 @@ class InpaintingGUI(ThemedTk):
             "Use the quantized SageAttention kernel for the UNet's spatial self-attention "
             "(~2x faster attention at 1080p tile sizes). Near-exact quality; uncheck to "
             "A/B against standard SDPA attention. Takes effect on the next processing run.",
+        )
+        current_row += 1
+
+        compile_check = ttk.Checkbutton(
+            param_frame,
+            text="Use torch.compile",
+            variable=self.use_compile_var,
+            command=self.save_config,
+        )
+        compile_check.grid(row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(
+            compile_check,
+            "Compile the UNet and VAE decoder with torch.compile (~15% faster processing, "
+            "exact math). Warmup happens during the first chunk and looks stalled - it isn't: "
+            "~9 min the first time ever, ~3 min in later sessions (kernel cache). Worth it for "
+            "long batch runs; skip for single short clips. Compiler warnings in the log are "
+            "normal. Not applied with 'sequential' offload.",
         )
         current_row += 1
 
@@ -2479,6 +2498,7 @@ class InpaintingGUI(ThemedTk):
         self.single_clip_id_var.set("")
         self.offload_type_var.set("model")
         self.use_sageattention_var.set(True)
+        self.use_compile_var.set(False)
 
         self.inpaint_mask_initial_threshold_var.set("0.3")
         self.inpaint_mask_post_threshold_var.set("0.3")
@@ -2563,6 +2583,7 @@ class InpaintingGUI(ThemedTk):
                 dtype=torch.float16,
                 offload_type=offload_type,
                 use_sageattention=self.use_sageattention_var.get(),
+                use_compile=self.use_compile_var.get(),
             )
             input_videos = sorted(glob.glob(os.path.join(input_folder, "*.mp4")))
             if not input_videos:
